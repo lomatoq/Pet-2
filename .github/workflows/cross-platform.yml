@@ -11,9 +11,11 @@ permissions:
 jobs:
   materialize-vita:
     if: >-
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/codex/pet2-vita-embodied-iteration' &&
-      !contains(github.event.head_commit.message, '[vita-materialized-a]')
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.ref == 'codex/pet2-vita-embodied-iteration') ||
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/codex/pet2-vita-embodied-iteration' &&
+       !contains(github.event.head_commit.message, '[vita-materialized-a]'))
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'push' && 'codex/pet2-vita-embodied-iteration' || github.sha }}
+          ref: codex/pet2-vita-embodied-iteration
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -91,7 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'push' && 'codex/pet2-vita-embodied-iteration' || github.sha }}
+          ref: codex/pet2-vita-embodied-iteration
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
