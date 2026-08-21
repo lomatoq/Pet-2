@@ -36,22 +36,24 @@ VITA invariants:
 
 ## Materialized implementation
 
-The branch now contains the morphic renderer, embodied face and soft-body runtime,
+The branch contains the morphic renderer, embodied face and soft-body runtime,
 lock-free audio articulation, privacy-preserving perception runtime, VITA attention,
 appraisal, emotion episodes, predictive self-model, agency estimation, favorite-place
 learning, bounded influence policy, desktop-loop integration, headless simulation, and
-portable optional VITA state. Cross-platform validation is driven from the branch and
-publishes a reproducible source-level report for each correction pass.
+portable optional VITA state.
 
-The strict-Clippy corrections for the gaze default, body-feedback test construction,
-and mesh triangle iteration are materialized. Procedural-mesh fingerprints now
-canonicalize tiny floating-point differences instead of treating a Rust toolchain math
-implementation change as identity drift. The fixture still verifies deterministic
-regeneration, topology, genome identity, memories, habits, and voice motifs.
+The Windows desktop host now samples a bounded 7×5 global grid and a 5×5 local grid at
+5 Hz. Samples are reduced immediately to luminance, local luminance, contrast,
+colorfulness, warmth, dominant hue, motion energy, edge density, and sudden change.
+Only those scalar features enter `SensorFrame` and `pet_perception`; the embodied pupil
+controller responds to local brightness. No screenshot or pixel buffer is persisted.
+macOS and portable fallback hosts expose the same capability seam and safely return no
+visual sample until a permission-aware native provider is added.
 
-The Windows visual host sampler is materialized. This checkpoint triggers the final
-wiring pass that connects its scalar features to `SensorFrame`, `pet_perception`, VITA
-appraisal, and embodied pupil adaptation.
+Procedural-mesh fingerprints canonicalize tiny floating-point differences rather than
+treating a Rust toolchain math implementation change as identity drift. The portable
+fixture still verifies deterministic regeneration, topology, genome identity,
+memories, habits, voice motifs, and cross-platform state restoration.
 
 ## Privacy boundary
 
