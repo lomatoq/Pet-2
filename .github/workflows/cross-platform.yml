@@ -6,13 +6,65 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  windows-x64:
+  materialize-vita:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/pet2-vita-embodied-iteration' &&
+      !contains(github.event.head_commit.message, '[vita-materialized-a]')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: codex/pet2-vita-embodied-iteration
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - name: Materialize VITA core and perception
+        shell: pwsh
+        run: python .github/scripts/materialize_vita_stage_a.py
+      - name: Format and validate generated sources
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Commit validated generated sources
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- `
+            Cargo.toml `
+            Cargo.lock `
+            crates/lifecore/src/lib.rs `
+            crates/lifecore/src/vita.rs `
+            crates/pet_perception/Cargo.toml `
+            crates/pet_perception/src/lib.rs `
+            crates/pet_audio/src/motif.rs `
+            crates/pet_body/src/embodiment.rs `
+            crates/pet_body/src/lib.rs `
+            crates/pet_body/src/renderer.rs
+          if (git diff --cached --quiet) {
+            exit 0
+          }
+          git commit -m "feat: add VITA perception self-model and influence [vita-materialized-a]"
+          git push origin HEAD:codex/pet2-vita-embodied-iteration
+
+  windows-x64:
+    needs: materialize-vita
+    if: >-
+      always() &&
+      (needs.materialize-vita.result == 'success' || needs.materialize-vita.result == 'skipped')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && 'codex/pet2-vita-embodied-iteration' || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -29,11 +81,17 @@ jobs:
           path: dist/Pet2-windows-x64.zip
 
   macos-arm64:
+    needs: materialize-vita
+    if: >-
+      always() &&
+      (needs.materialize-vita.result == 'success' || needs.materialize-vita.result == 'skipped')
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: '13.0'
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && 'codex/pet2-vita-embodied-iteration' || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
