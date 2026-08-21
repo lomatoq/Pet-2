@@ -15,6 +15,11 @@ def require_final(path: str, final: str) -> None:
         raise RuntimeError(f"expected final source form not found in {path}")
 
 
+def require_missing(path: str, obsolete: str) -> None:
+    if obsolete in Path(path).read_text(encoding="utf-8"):
+        raise RuntimeError(f"obsolete source form still present in {path}")
+
+
 def main() -> None:
     perception_path = "crates/pet_perception/src/lib.rs"
     perception_final = (
@@ -89,6 +94,42 @@ def main() -> None:
         "        for triangle in self.indices.as_chunks::<3>().0 {",
     )
     require_final(mesh_path, "        for triangle in self.indices.as_chunks::<3>().0 {")
+
+    vita_runtime_path = "app/src/vita_runtime.rs"
+    replace_if_present(
+        vita_runtime_path,
+        "use pet_perception::{PerceptionRuntime, VisualFeatureFrame};",
+        "use pet_perception::PerceptionRuntime;",
+    )
+    replace_if_present(vita_runtime_path, "    last_output: Option<VitaOutput>,\n", "")
+    replace_if_present(vita_runtime_path, "            last_output: None,\n", "")
+    replace_if_present(
+        vita_runtime_path,
+        "        let output = self\n"
+        "            .mind\n"
+        "            .tick(&self.percept, sensors, life, body, base_intent, dt);\n"
+        "        self.last_output = Some(output.clone());\n"
+        "        output",
+        "        self.mind\n"
+        "            .tick(&self.percept, sensors, life, body, base_intent, dt)",
+    )
+    replace_if_present(
+        vita_runtime_path,
+        "\n    pub fn set_visual_features(&mut self, frame: VisualFeatureFrame) {\n"
+        "        self.perception.set_visual_features(frame);\n"
+        "    }\n",
+        "",
+    )
+    replace_if_present(
+        vita_runtime_path,
+        "\n    #[must_use]\n"
+        "    pub fn last_output(&self) -> Option<&VitaOutput> {\n"
+        "        self.last_output.as_ref()\n"
+        "    }\n",
+        "",
+    )
+    require_missing(vita_runtime_path, "VisualFeatureFrame")
+    require_missing(vita_runtime_path, "last_output")
 
 
 if __name__ == "__main__":
