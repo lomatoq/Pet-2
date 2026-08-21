@@ -40,8 +40,8 @@ The branch now contains the morphic renderer, embodied face and soft-body runtim
 lock-free audio articulation, privacy-preserving perception runtime, VITA attention,
 appraisal, emotion episodes, predictive self-model, agency estimation, favorite-place
 learning, bounded influence policy, desktop-loop integration, headless simulation, and
-portable optional VITA state. The remaining gate is validated cross-platform build,
-tests, packaging, and hands-on visual tuning.
+portable optional VITA state. Cross-platform validation is driven from the branch and
+publishes a reproducible source-level report for each correction pass.
 
 ## Privacy boundary
 
