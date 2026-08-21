@@ -1,0 +1,38 @@
+name: format-vita-branch
+
+on:
+  push:
+    branches:
+      - codex/pet2-vita-embodied-iteration
+
+permissions:
+  contents: write
+
+jobs:
+  rustfmt:
+    if: ${{ !contains(github.event.head_commit.message, 'style: apply rustfmt') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/pet2-vita-embodied-iteration
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all
+      - name: Commit only the intended formatted sources
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            crates/pet_audio/src/motif.rs \
+            crates/pet_body/src/embodiment.rs \
+            crates/pet_body/src/lib.rs \
+            crates/pet_body/src/renderer.rs
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "style: apply rustfmt to VITA embodiment"
+          git push origin HEAD:codex/pet2-vita-embodied-iteration
