@@ -1,21 +1,42 @@
 from pathlib import Path
 
 
-def replace_once(path: str, old: str, new: str) -> None:
+def replace_first_available(path: str, replacements: list[tuple[str, str]], final: str) -> None:
     file_path = Path(path)
     text = file_path.read_text(encoding="utf-8")
-    if new in text:
+    if final in text:
         return
-    if old not in text:
-        raise RuntimeError(f"expected source anchor not found in {path}")
-    file_path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    for old, new in replacements:
+        if old in text:
+            file_path.write_text(text.replace(old, new, 1), encoding="utf-8")
+            return
+    raise RuntimeError(f"expected source anchor not found in {path}")
 
 
 def main() -> None:
-    replace_once(
+    final = (
+        "        let sensors = SensorFrame {\n"
+        "            timestamp: 1.2,\n"
+        "            ..SensorFrame::default()\n"
+        "        };"
+    )
+    replace_first_available(
         "crates/pet_perception/src/lib.rs",
-        "        let mut sensors = SensorFrame::default();\n        sensors.timestamp = 1.2;",
-        "        let mut sensors = SensorFrame {\n            timestamp: 1.2,\n            ..SensorFrame::default()\n        };",
+        [
+            (
+                "        let mut sensors = SensorFrame::default();\n"
+                "        sensors.timestamp = 1.2;",
+                final,
+            ),
+            (
+                "        let mut sensors = SensorFrame {\n"
+                "            timestamp: 1.2,\n"
+                "            ..SensorFrame::default()\n"
+                "        };",
+                final,
+            ),
+        ],
+        final,
     )
 
 
