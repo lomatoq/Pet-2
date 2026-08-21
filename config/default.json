@@ -1,0 +1,11 @@
+{
+  "active_fps": 60,
+  "sleeping_fps": 15,
+  "overlay_size_px": 512,
+  "safe_area_margin": 0.05,
+  "audio_enabled": true,
+  "lifecore_hz": 20,
+  "body_physics_hz": 120,
+  "sensor_poll_hz": 60,
+  "save_interval_seconds": 30
+}

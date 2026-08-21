@@ -1,0 +1,47 @@
+name: cross-platform
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - shell: pwsh
+        run: ./scripts/build_windows.ps1
+      - shell: pwsh
+        run: ./scripts/test_headless.ps1
+      - shell: pwsh
+        run: ./scripts/package_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pet2-windows-x64
+          path: dist/Pet2-windows-x64.zip
+
+  macos-arm64:
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy
+      - run: bash ./scripts/build_macos.sh
+      - run: bash ./scripts/test_headless.sh
+      - run: bash ./scripts/package_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pet2-macos-arm64
+          path: dist/Pet2-macos-arm64.zip

@@ -1,0 +1,37 @@
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+mod portable_fallback;
+#[cfg(target_os = "windows")]
+mod windows;
+
+use crate::PlatformBackend;
+use winit::window::WindowAttributes;
+
+#[must_use]
+pub fn prepare_overlay_window_attributes(attributes: WindowAttributes) -> WindowAttributes {
+    #[cfg(target_os = "windows")]
+    {
+        windows::prepare_overlay_window_attributes(attributes)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        attributes
+    }
+}
+
+#[must_use]
+pub fn create_platform_backend() -> Box<dyn PlatformBackend> {
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(windows::WindowsBackend::default())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::MacOsBackend::default())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Box::new(portable_fallback::PortableFallback::default())
+    }
+}

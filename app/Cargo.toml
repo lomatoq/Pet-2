@@ -1,0 +1,17 @@
+[package]
+name = "pet2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+desktop_host = { path = "../crates/desktop_host" }
+glam.workspace = true
+lifecore = { path = "../crates/lifecore" }
+pet_audio = { path = "../crates/pet_audio" }
+pet_body = { path = "../crates/pet_body" }
+pollster.workspace = true
+serde_json.workspace = true
+winit.workspace = true

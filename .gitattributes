@@ -1,0 +1,14 @@
+* text=auto
+
+*.md text eol=lf
+*.json text eol=lf
+*.rs text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.wgsl text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ps1 text eol=crlf
+
+*.icns binary
+*.ico binary

@@ -1,0 +1,12 @@
+[package]
+name = "pet_audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cpal.workspace = true
+lifecore = { path = "../lifecore" }
+serde.workspace = true
+thiserror.workspace = true

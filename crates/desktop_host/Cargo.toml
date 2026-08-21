@@ -1,0 +1,43 @@
+[package]
+name = "desktop_host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+directories.workspace = true
+glam.workspace = true
+lifecore = { path = "../lifecore" }
+raw-window-handle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+winit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std", "libc", "NSColor", "NSEvent", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "NSWorkspace"
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std", "CFArray", "CFCGTypes", "CFDictionary", "CFNumber", "CFString"
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGWindow"
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
+
+[dev-dependencies]
+pet_body = { path = "../pet_body" }

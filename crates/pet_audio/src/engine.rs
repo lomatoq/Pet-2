@@ -1,0 +1,320 @@
+use std::{
+    fs::File,
+    io::{self, Write},
+    path::Path,
+    sync::Arc,
+};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use lifecore::{VocalMotif, VocalRequest, VoiceGenome};
+use thiserror::Error;
+
+use crate::{COMMAND_CAPACITY, SpscRing, SynthVoice, VoiceCommand};
+
+const ERROR_CAPACITY: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSampleFormat {
+    F32,
+    I16,
+    U16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedOutputConfig {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub sample_format: RuntimeSampleFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputConfigCandidate {
+    pub min_sample_rate: u32,
+    pub max_sample_rate: u32,
+    pub channels: u16,
+    pub sample_format: RuntimeSampleFormat,
+}
+
+#[must_use]
+pub fn choose_output_config(candidates: &[OutputConfigCandidate]) -> Option<SelectedOutputConfig> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.channels > 0
+                && candidate.min_sample_rate > 0
+                && candidate.max_sample_rate >= candidate.min_sample_rate
+        })
+        .map(|candidate| {
+            let sample_rate =
+                48_000_u32.clamp(candidate.min_sample_rate, candidate.max_sample_rate);
+            let channel_penalty = u64::from(candidate.channels.abs_diff(2)) * 10_000;
+            let rate_penalty = u64::from(sample_rate.abs_diff(48_000));
+            let format_penalty = match candidate.sample_format {
+                RuntimeSampleFormat::F32 => 0,
+                RuntimeSampleFormat::I16 => 1,
+                RuntimeSampleFormat::U16 => 2,
+            };
+            (
+                channel_penalty + rate_penalty + format_penalty,
+                SelectedOutputConfig {
+                    sample_rate,
+                    channels: candidate.channels,
+                    sample_format: candidate.sample_format,
+                },
+            )
+        })
+        .min_by_key(|(score, _)| *score)
+        .map(|(_, config)| config)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioRuntimeEvent {
+    StreamError,
+}
+
+#[derive(Debug, Error)]
+pub enum AudioError {
+    #[error("no default audio output device is available")]
+    NoOutputDevice,
+    #[error("could not enumerate output formats: {0}")]
+    SupportedConfigs(#[from] cpal::SupportedStreamConfigsError),
+    #[error("the output device exposes none of f32, i16, or u16")]
+    NoSupportedConfig,
+    #[error("could not create the audio stream: {0}")]
+    BuildStream(#[from] cpal::BuildStreamError),
+    #[error("could not start the audio stream: {0}")]
+    PlayStream(#[from] cpal::PlayStreamError),
+    #[error("the audio command ring is full")]
+    CommandQueueFull,
+}
+
+pub struct AudioEngine {
+    _stream: cpal::Stream,
+    selected: SelectedOutputConfig,
+    commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
+    errors: Arc<SpscRing<AudioRuntimeEvent, ERROR_CAPACITY>>,
+}
+
+impl AudioEngine {
+    pub fn try_start() -> Result<Self, AudioError> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or(AudioError::NoOutputDevice)?;
+        let supported: Vec<_> = device.supported_output_configs()?.collect();
+        let candidates: Vec<_> = supported.iter().filter_map(candidate_from_cpal).collect();
+        let selected = choose_output_config(&candidates).ok_or(AudioError::NoSupportedConfig)?;
+        let config = cpal::StreamConfig {
+            channels: selected.channels,
+            sample_rate: cpal::SampleRate(selected.sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let commands = Arc::new(SpscRing::new());
+        let errors = Arc::new(SpscRing::new());
+        let errors_for_callback = Arc::clone(&errors);
+        let error_callback = move |_error: cpal::StreamError| {
+            let _ = errors_for_callback.push(AudioRuntimeEvent::StreamError);
+        };
+        let stream = match selected.sample_format {
+            RuntimeSampleFormat::F32 => {
+                let mut synth = SynthVoice::new(Arc::clone(&commands), selected.sample_rate);
+                let channels = usize::from(selected.channels);
+                device.build_output_stream(
+                    &config,
+                    move |output: &mut [f32], _| fill_f32(&mut synth, output, channels),
+                    error_callback,
+                    None,
+                )?
+            }
+            RuntimeSampleFormat::I16 => {
+                let mut synth = SynthVoice::new(Arc::clone(&commands), selected.sample_rate);
+                let channels = usize::from(selected.channels);
+                device.build_output_stream(
+                    &config,
+                    move |output: &mut [i16], _| fill_i16(&mut synth, output, channels),
+                    error_callback,
+                    None,
+                )?
+            }
+            RuntimeSampleFormat::U16 => {
+                let mut synth = SynthVoice::new(Arc::clone(&commands), selected.sample_rate);
+                let channels = usize::from(selected.channels);
+                device.build_output_stream(
+                    &config,
+                    move |output: &mut [u16], _| fill_u16(&mut synth, output, channels),
+                    error_callback,
+                    None,
+                )?
+            }
+        };
+        stream.play()?;
+        Ok(Self {
+            _stream: stream,
+            selected,
+            commands,
+            errors,
+        })
+    }
+
+    pub fn enqueue(
+        &self,
+        voice: &VoiceGenome,
+        motif: &VocalMotif,
+        request: &VocalRequest,
+    ) -> Result<(), AudioError> {
+        self.commands
+            .push(VoiceCommand::prepare(voice, motif, request))
+            .map_err(|_| AudioError::CommandQueueFull)
+    }
+
+    #[must_use]
+    pub fn selected_config(&self) -> SelectedOutputConfig {
+        self.selected
+    }
+
+    pub fn poll_runtime_event(&self) -> Option<AudioRuntimeEvent> {
+        self.errors.pop()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflineSampleFormat {
+    F32,
+    I16,
+    U16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OfflinePcm {
+    F32(Vec<f32>),
+    I16(Vec<i16>),
+    U16(Vec<u16>),
+}
+
+impl OfflinePcm {
+    #[must_use]
+    pub fn sample_count(&self) -> usize {
+        match self {
+            Self::F32(samples) => samples.len(),
+            Self::I16(samples) => samples.len(),
+            Self::U16(samples) => samples.len(),
+        }
+    }
+}
+
+#[must_use]
+pub fn render_motif(
+    voice: &VoiceGenome,
+    motif: &VocalMotif,
+    request: &VocalRequest,
+    sample_rate: u32,
+    channels: u16,
+    format: OfflineSampleFormat,
+) -> OfflinePcm {
+    let command = VoiceCommand::prepare(voice, motif, request);
+    let commands = Arc::new(SpscRing::new());
+    commands
+        .push(command)
+        .expect("fresh offline command ring accepts one command");
+    let mut synth = SynthVoice::new(commands, sample_rate);
+    let channels = usize::from(channels.max(1));
+    let frame_count = command.total_frames(sample_rate);
+    let mut f32_samples = Vec::with_capacity(frame_count * channels);
+    for _ in 0..frame_count {
+        write_frame_f32(synth.next_stereo_frame(), &mut f32_samples, channels);
+    }
+    match format {
+        OfflineSampleFormat::F32 => OfflinePcm::F32(f32_samples),
+        OfflineSampleFormat::I16 => OfflinePcm::I16(f32_samples.into_iter().map(to_i16).collect()),
+        OfflineSampleFormat::U16 => OfflinePcm::U16(f32_samples.into_iter().map(to_u16).collect()),
+    }
+}
+
+pub fn export_debug_wav(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    let data_size = samples.len() as u32 * 2;
+    file.write_all(b"RIFF")?;
+    file.write_all(&(36 + data_size).to_le_bytes())?;
+    file.write_all(b"WAVEfmt ")?;
+    file.write_all(&16_u32.to_le_bytes())?;
+    file.write_all(&1_u16.to_le_bytes())?;
+    file.write_all(&channels.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    let byte_rate = sample_rate * u32::from(channels) * 2;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&(channels * 2).to_le_bytes())?;
+    file.write_all(&16_u16.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&data_size.to_le_bytes())?;
+    for sample in samples {
+        file.write_all(&to_i16(*sample).to_le_bytes())?;
+    }
+    file.flush()
+}
+
+fn fill_f32(synth: &mut SynthVoice, output: &mut [f32], channels: usize) {
+    for frame in output.chunks_mut(channels.max(1)) {
+        write_frame_slice(synth.next_stereo_frame(), frame, |sample| sample);
+    }
+}
+
+fn fill_i16(synth: &mut SynthVoice, output: &mut [i16], channels: usize) {
+    for frame in output.chunks_mut(channels.max(1)) {
+        write_frame_slice(synth.next_stereo_frame(), frame, to_i16);
+    }
+}
+
+fn fill_u16(synth: &mut SynthVoice, output: &mut [u16], channels: usize) {
+    for frame in output.chunks_mut(channels.max(1)) {
+        write_frame_slice(synth.next_stereo_frame(), frame, to_u16);
+    }
+}
+
+fn write_frame_slice<T: Copy>(stereo: [f32; 2], frame: &mut [T], convert: impl Fn(f32) -> T) {
+    if frame.is_empty() {
+        return;
+    }
+    frame[0] = convert(stereo[0]);
+    if frame.len() > 1 {
+        frame[1] = convert(stereo[1]);
+    }
+    for channel in frame.iter_mut().skip(2) {
+        *channel = convert(0.0);
+    }
+}
+
+fn write_frame_f32(stereo: [f32; 2], output: &mut Vec<f32>, channels: usize) {
+    output.push(stereo[0]);
+    if channels > 1 {
+        output.push(stereo[1]);
+        output.extend(std::iter::repeat_n(0.0, channels.saturating_sub(2)));
+    }
+}
+
+fn candidate_from_cpal(config: &cpal::SupportedStreamConfigRange) -> Option<OutputConfigCandidate> {
+    let sample_format = match config.sample_format() {
+        cpal::SampleFormat::F32 => RuntimeSampleFormat::F32,
+        cpal::SampleFormat::I16 => RuntimeSampleFormat::I16,
+        cpal::SampleFormat::U16 => RuntimeSampleFormat::U16,
+        _ => return None,
+    };
+    Some(OutputConfigCandidate {
+        min_sample_rate: config.min_sample_rate().0,
+        max_sample_rate: config.max_sample_rate().0,
+        channels: config.channels(),
+        sample_format,
+    })
+}
+
+fn to_i16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
+}
+
+fn to_u16(sample: f32) -> u16 {
+    ((sample.clamp(-1.0, 1.0) * 0.5 + 0.5) * f32::from(u16::MAX)).round() as u16
+}
