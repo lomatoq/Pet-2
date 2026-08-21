@@ -310,6 +310,7 @@ struct PetRuntime {
     body_accumulator: f32,
     life_accumulator: f32,
     sensor_accumulator: f32,
+    visual_accumulator: f32,
     save_accumulator: f32,
     was_sleeping: bool,
     visible_after_first_frame: bool,
@@ -360,6 +361,7 @@ impl PetApplication {
         runtime.body_accumulator += elapsed;
         runtime.life_accumulator += elapsed;
         runtime.sensor_accumulator += elapsed;
+        runtime.visual_accumulator += elapsed;
         runtime.save_accumulator += elapsed;
         runtime.debug_accumulator += elapsed;
         runtime.fps_accumulator += elapsed;
@@ -379,6 +381,17 @@ impl PetApplication {
                 runtime.pointer,
                 local_time_01(),
             );
+            if runtime.visual_accumulator >= 0.2 {
+                runtime.visual_accumulator %= 0.2;
+                if let Some(sample) = runtime.platform.poll_visual_features(
+                    &runtime.topology,
+                    runtime.body.simulation.feedback.world_position,
+                ) {
+                    runtime.sensors.mean_luminance = Some(sample.mean_luminance);
+                    runtime.sensors.local_luminance = Some(sample.local_luminance);
+                    runtime.vita.set_visual_features(sample);
+                }
+            }
             runtime.vita.observe(
                 &runtime.sensors,
                 &runtime.body.simulation.feedback,
@@ -605,6 +618,7 @@ impl ApplicationHandler for PetApplication {
             body_accumulator: 0.0,
             life_accumulator: 0.0,
             sensor_accumulator: 1.0,
+            visual_accumulator: 0.2,
             save_accumulator: 0.0,
             was_sleeping: false,
             visible_after_first_frame: false,

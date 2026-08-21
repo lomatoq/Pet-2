@@ -1,8 +1,9 @@
+use desktop_host::DesktopVisualSample;
 use lifecore::{
     BodyFeedback, BodyIntent, FeedbackEvent, LifeState, SensorFrame, VitaMind, VitaOutput,
     VitaPerceptFrame, VitaState,
 };
-use pet_perception::PerceptionRuntime;
+use pet_perception::{PerceptionRuntime, VisualFeatureFrame};
 
 /// Owns VITA's persistent mind and its transient privacy-preserving perception state.
 /// Raw device events are reduced to timestamps or scalar features before entering here.
@@ -65,6 +66,20 @@ impl VitaRuntime {
 
     pub fn note_scroll(&mut self, normalized_delta: f32) {
         self.perception.note_scroll(normalized_delta);
+    }
+
+    pub fn set_visual_features(&mut self, sample: DesktopVisualSample) {
+        self.perception.set_visual_features(VisualFeatureFrame {
+            mean_luminance: sample.mean_luminance,
+            local_luminance: sample.local_luminance,
+            contrast: sample.contrast,
+            colorfulness: sample.colorfulness,
+            warmth: sample.warmth,
+            dominant_hue: sample.dominant_hue,
+            motion_energy: sample.motion_energy,
+            edge_density: sample.edge_density,
+            sudden_change: sample.sudden_change,
+        });
     }
 
     #[must_use]

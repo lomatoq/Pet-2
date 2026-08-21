@@ -190,7 +190,10 @@ impl EmbodiedRuntime {
             13.0,
             dt,
         );
-        let luminance: f32 = 0.5;
+        let luminance = sensors
+            .local_luminance
+            .or(sensors.mean_luminance)
+            .unwrap_or(0.5);
         let light_response = (0.65 - luminance).clamp(-0.35, 0.35);
         let pupil_target =
             (0.43 + affect.arousal * 0.27 + light_response * 0.42 + self.saccade_strength * 0.08
