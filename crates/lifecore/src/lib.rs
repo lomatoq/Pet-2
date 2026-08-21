@@ -13,6 +13,7 @@ mod genome;
 mod memory;
 mod microbrain;
 mod persistence;
+mod vita;
 
 use std::{array, collections::VecDeque};
 
@@ -30,6 +31,7 @@ pub use genome::*;
 pub use memory::*;
 pub use microbrain::*;
 pub use persistence::*;
+pub use vita::*;
 
 pub const LIFECORE_HZ: f32 = 20.0;
 const RECENT_ACTION_CAPACITY: usize = 16;

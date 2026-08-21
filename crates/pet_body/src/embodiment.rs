@@ -197,12 +197,10 @@ impl EmbodiedRuntime {
         );
         let luminance: f32 = 0.5;
         let light_response = (0.65 - luminance).clamp(-0.35, 0.35);
-        let pupil_target = (0.43
-            + affect.arousal * 0.27
-            + light_response * 0.42
-            + self.saccade_strength * 0.08
-            - affect.stress * 0.08)
-            .clamp(0.22, 0.86);
+        let pupil_target =
+            (0.43 + affect.arousal * 0.27 + light_response * 0.42 + self.saccade_strength * 0.08
+                - affect.stress * 0.08)
+                .clamp(0.22, 0.86);
         self.pose.pupil_size = smooth(self.pose.pupil_size, pupil_target, 8.0, dt);
         self.pose.cheek_glow = smooth(
             self.pose.cheek_glow,
@@ -248,10 +246,7 @@ impl EmbodiedRuntime {
             frequency,
             dt,
         );
-        self.pose.gaze = self
-            .pose
-            .gaze
-            .clamp(Vec2::splat(-0.95), Vec2::splat(0.95));
+        self.pose.gaze = self.pose.gaze.clamp(Vec2::splat(-0.95), Vec2::splat(0.95));
         self.pose.gaze_mode = mode;
         self.pose.vergence = if mode == GazeMode::DirectViewer {
             0.08
@@ -321,8 +316,8 @@ impl EmbodiedRuntime {
                 self.blink_kind = BlinkKind::None;
                 self.blink_phase = 0.0;
                 self.blink_clock = 0.0;
-                self.next_blink = 2.0
-                    + 4.2 * (0.5 + 0.5 * (self.elapsed * 0.37 + self.seed_phase).sin());
+                self.next_blink =
+                    2.0 + 4.2 * (0.5 + 0.5 * (self.elapsed * 0.37 + self.seed_phase).sin());
             }
         } else if mode == GazeMode::Sleep {
             self.pose.blink_left = smooth(self.pose.blink_left, 0.92, 4.0, dt);
@@ -365,8 +360,8 @@ impl EmbodiedRuntime {
             (pose_compression + impact * 0.35 + affect.stress * 0.08).clamp(-0.08, 0.48);
         self.pose.compression = smooth(self.pose.compression, compression_target, 15.0, dt);
 
-        let stretch = (speed * (0.12 + softness * 0.16) - self.pose.compression * 0.48)
-            .clamp(-0.18, 0.30);
+        let stretch =
+            (speed * (0.12 + softness * 0.16) - self.pose.compression * 0.48).clamp(-0.18, 0.30);
         let squash_target = Vec2::new(
             (1.0 - stretch * 0.58 + self.pose.compression * 0.30).clamp(0.72, 1.28),
             (1.0 + stretch - self.pose.compression * 0.45).clamp(0.68, 1.34),
@@ -378,15 +373,12 @@ impl EmbodiedRuntime {
             10.0 + (1.0 - softness) * 8.0,
             dt,
         );
-        let volume = (self.pose.squash.x * self.pose.squash.y)
-            .max(0.05)
-            .sqrt();
+        let volume = (self.pose.squash.x * self.pose.squash.y).max(0.05).sqrt();
         self.pose.squash /= volume;
 
         let tilt_target = (-velocity.x * 0.34 - acceleration.x * 0.10).clamp(-0.42, 0.42);
         self.pose.tilt = smooth(self.pose.tilt, tilt_target, 8.0, dt);
-        let head_target =
-            Vec2::new(-acceleration.x, -acceleration.y) * (0.028 + softness * 0.035);
+        let head_target = Vec2::new(-acceleration.x, -acceleration.y) * (0.028 + softness * 0.035);
         spring_vec2(
             &mut self.pose.head_lag,
             &mut self.head_velocity,
@@ -404,8 +396,7 @@ impl EmbodiedRuntime {
         );
         let breathing_rate =
             1.2 + affect.arousal * 1.8 + voice_breath_boost(self.pose.audio_envelope);
-        let breath_target =
-            0.5 + 0.5 * (self.elapsed * breathing_rate + self.seed_phase).sin();
+        let breath_target = 0.5 + 0.5 * (self.elapsed * breathing_rate + self.seed_phase).sin();
         self.pose.breath = smooth(self.pose.breath, breath_target, 3.0, dt);
     }
 }
@@ -487,15 +478,8 @@ fn voice_breath_boost(envelope: f32) -> f32 {
     envelope.clamp(0.0, 1.0) * 2.2
 }
 
-fn spring_vec2(
-    current: &mut Vec2,
-    velocity: &mut Vec2,
-    target: Vec2,
-    frequency: f32,
-    dt: f32,
-) {
-    let acceleration =
-        (target - *current) * frequency * frequency - *velocity * (2.0 * frequency);
+fn spring_vec2(current: &mut Vec2, velocity: &mut Vec2, target: Vec2, frequency: f32, dt: f32) {
+    let acceleration = (target - *current) * frequency * frequency - *velocity * (2.0 * frequency);
     *velocity += acceleration * dt;
     *current += *velocity * dt;
     if !current.is_finite() || !velocity.is_finite() {

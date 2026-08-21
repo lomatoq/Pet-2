@@ -1511,11 +1511,22 @@ dependencies = [
  "glam",
  "lifecore",
  "naga",
+ "pet_audio",
  "serde",
  "thiserror 2.0.20",
  "wgpu",
  "wgpu-types",
  "winit",
+]
+
+[[package]]
+name = "pet_perception"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "lifecore",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

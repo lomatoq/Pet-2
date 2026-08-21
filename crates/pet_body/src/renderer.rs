@@ -287,11 +287,7 @@ impl Renderer {
         self.queue.write_buffer(
             &self.globals_buffer,
             0,
-            bytemuck::bytes_of(&globals_for(
-                &self.config,
-                parameters,
-                self.organism_scale,
-            )),
+            bytemuck::bytes_of(&globals_for(&self.config, parameters, self.organism_scale)),
         );
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,

@@ -144,7 +144,11 @@ pub struct SynthVoice {
 impl SynthVoice {
     #[must_use]
     pub fn new(commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>, sample_rate: u32) -> Self {
-        Self::with_feedback(commands, sample_rate, Arc::new(AudioVisualBridge::default()))
+        Self::with_feedback(
+            commands,
+            sample_rate,
+            Arc::new(AudioVisualBridge::default()),
+        )
     }
 
     #[must_use]
@@ -233,9 +237,8 @@ impl SynthVoice {
         let voiced = self
             .oscillator
             .sample(frequency, self.sample_rate, command.harmonic_mix);
-        let noisiness =
-            (command.breathiness + syllable.noisiness * 0.65 + command.stress * 0.12)
-                .clamp(0.0, 1.0);
+        let noisiness = (command.breathiness + syllable.noisiness * 0.65 + command.stress * 0.12)
+            .clamp(0.0, 1.0);
         let noise = self.noise.sample(command.brightness) * noisiness;
         let impulse = if self.click_pending {
             self.click_pending = false;

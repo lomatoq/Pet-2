@@ -18,7 +18,9 @@ pub use mesh::{MeshError, MeshVertex, ProceduralMesh, ProjectedHitShape};
 pub use renderer::{OcclusionMode, RenderOutcome, RenderParameters, Renderer, RendererError};
 
 use glam::Vec2;
-use lifecore::{AffectState, BodyFeedback, BodyGenome, BodyIntent, Genome, PoseIntent, SensorFrame};
+use lifecore::{
+    AffectState, BodyFeedback, BodyGenome, BodyIntent, Genome, PoseIntent, SensorFrame,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProceduralBody {
@@ -99,7 +101,8 @@ impl ProceduralBody {
         voice: VoiceVisualState,
         dt: f32,
     ) {
-        self.animation.update(&self.graph, intent, affect.arousal, dt);
+        self.animation
+            .update(&self.graph, intent, affect.arousal, dt);
         self.expression
             .update(intent.expression, self.animation.blink, dt);
         self.embodiment.update(
