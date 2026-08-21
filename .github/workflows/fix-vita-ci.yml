@@ -1,0 +1,51 @@
+name: fix-vita-ci
+
+on:
+  push:
+    branches:
+      - codex/pet2-vita-embodied-iteration
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fix-vita-ci
+  cancel-in-progress: true
+
+jobs:
+  fix-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[vita-ci-fixed]') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/pet2-vita-embodied-iteration
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - name: Apply idempotent fixes
+        shell: pwsh
+        run: python .github/scripts/fix_vita_ci.py
+      - name: Format and validate
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Commit validated fixes
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- `
+            crates/pet_perception/src/lib.rs `
+            crates/lifecore/src/vita.rs `
+            app/src/vita_runtime.rs `
+            app/src/main.rs
+          if (git diff --cached --quiet) {
+            exit 0
+          }
+          git commit -m "fix: validate VITA runtime [vita-ci-fixed]"
+          git push origin HEAD:codex/pet2-vita-embodied-iteration
