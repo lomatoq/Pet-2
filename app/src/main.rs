@@ -3,6 +3,8 @@
     windows_subsystem = "windows"
 )]
 
+mod vita_runtime;
+
 use std::{
     collections::BTreeMap,
     env,
@@ -21,15 +23,16 @@ use desktop_host::{
 use glam::Vec2;
 use lifecore::{
     ActionId, BodyIntent, DebugState, ExpressionState, FeedbackEvent, Genome, LIFECORE_HZ,
-    LifeCore, LocomotionMode, PoseIntent, SensorFrame, stable_hash_bytes,
+    LifeCore, LocomotionMode, PoseIntent, SensorFrame, VitaOutput, stable_hash_bytes,
 };
 use pet_audio::AudioEngine;
-use pet_body::{ProceduralBody, RenderOutcome, Renderer};
+use pet_body::{ProceduralBody, RenderOutcome, Renderer, VoiceVisualState};
+use vita_runtime::VitaRuntime;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
-    event::{ElementState, MouseButton, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowId, WindowLevel},
 };
@@ -130,6 +133,7 @@ impl Arguments {
 struct PreparedState {
     life: LifeCore,
     position: PersistedPetPosition,
+    vita: VitaRuntime,
 }
 
 fn prepare_state(
@@ -149,26 +153,39 @@ fn prepare_state(
     } else {
         store.load_state()?
     };
-    let (mut life, position) = if let Some(saved) = saved {
-        (LifeCore::restore(saved.life)?, saved.position)
+    let (mut life, position, vita_state) = if let Some(saved) = saved {
+        (LifeCore::restore(saved.life)?, saved.position, saved.vita)
     } else {
         (
             LifeCore::new(Genome::from_seed(seed), seed ^ 0xA11F_EC0A),
             PersistedPetPosition::default(),
+            None,
         )
     };
+    let identity_seed = life.state.genome.identity_seed;
+    let mut vita = VitaRuntime::new(identity_seed, vita_state);
     if arguments.reset_learning {
         life.reset_learning();
+        vita.reset_learning(identity_seed);
     }
     if arguments.evolve {
         life.trigger_metamorphosis();
+        vita.note_metamorphosis();
     }
     life.set_focus_mode(arguments.focus_mode);
-    Ok(PreparedState { life, position })
+    Ok(PreparedState {
+        life,
+        position,
+        vita,
+    })
 }
 
 fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn Error>> {
-    let PreparedState { mut life, position } = prepare_state(&arguments, &store)?;
+    let PreparedState {
+        mut life,
+        position,
+        mut vita,
+    } = prepare_state(&arguments, &store)?;
     let mut body = ProceduralBody::generate(&life.state.genome)?;
     let duration_seconds = arguments
         .simulate_hours
@@ -201,7 +218,16 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         sensors.cursor_distance_to_pet = sensors.cursor_position.distance(feedback.world_position);
         sensors.user_idle_seconds = 3.0 + 15.0 * (time * 0.013).sin().abs();
         sensors.user_activity_rate = (1.0 - sensors.user_idle_seconds / 30.0).clamp(0.0, 1.0);
-        let output = life.tick(&sensors, &feedback, dt);
+        if tick % 11 == 0 {
+            vita.note_key_activity(sensors.timestamp);
+        }
+        if tick % 97 == 0 {
+            vita.note_scroll((time * 0.7).sin());
+        }
+        vita.observe(&sensors, &feedback, dt);
+        let mut output = life.tick(&sensors, &feedback, dt);
+        let vita_output = vita.think(&life.state, &sensors, &feedback, &output.body_intent, dt);
+        vita_output.apply_to_intent(&mut output.body_intent);
         *action_counts
             .entry(format!("{:?}", output.selected_action))
             .or_default() += 1;
@@ -211,23 +237,32 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             &sensors,
             dt.min(1.0 / 30.0),
         );
-        body.animation_update(&output.body_intent, output.affect.arousal, dt.min(0.05));
+        body.embodied_update(
+            &output.body_intent,
+            &sensors,
+            output.affect,
+            VoiceVisualState::default(),
+            dt.min(0.05),
+        );
         feedback = body.simulation.feedback.clone();
         if output.selected_action == ActionId::Sleep && tick % 1_200 == 0 {
             life.consolidate_sleep();
         }
         if tick > 0 && tick % feedback_interval == 0 {
             let interaction = tick / feedback_interval;
-            life.apply_feedback(if interaction.is_multiple_of(3) {
+            let event = if interaction.is_multiple_of(3) {
                 FeedbackEvent::Ignored
             } else {
                 FeedbackEvent::PettingStarted
-            });
+            };
+            vita.apply_feedback(&event);
+            life.apply_feedback(event);
         }
     }
     let portable = PortablePetState {
         schema_version: PORTABLE_STATE_SCHEMA_VERSION,
         life: life.snapshot(),
+        vita: Some(vita.snapshot()),
         position,
     };
     portable.validate()?;
@@ -244,6 +279,11 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         "action_counts": action_counts,
         "drives": life.state.drives,
         "affect": life.state.affect,
+        "vita_attention": format!("{:?}", vita.state().attention.kind),
+        "vita_agency": vita.state().self_model.agency,
+        "vita_uncertainty": vita.state().self_model.uncertainty,
+        "vita_calibration_urge": vita.state().self_model.calibration_urge,
+        "vita_attention_switches": vita.state().attention_switches,
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
     store.save_state(&portable)?;
@@ -260,6 +300,7 @@ struct PetRuntime {
     topology: DisplayTopology,
     normalizer: SensorNormalizer,
     life: LifeCore,
+    vita: VitaRuntime,
     body: ProceduralBody,
     audio: Option<AudioEngine>,
     sensors: SensorFrame,
@@ -280,6 +321,7 @@ struct PetRuntime {
     fps: f32,
     brain_tick_microseconds: f64,
     last_debug: Option<DebugState>,
+    last_vita: Option<VitaOutput>,
 }
 
 struct PetApplication {
@@ -337,6 +379,11 @@ impl PetApplication {
                 runtime.pointer,
                 local_time_01(),
             );
+            runtime.vita.observe(
+                &runtime.sensors,
+                &runtime.body.simulation.feedback,
+                1.0 / 60.0,
+            );
             runtime.pointer.pressed = false;
             runtime.pointer.released = false;
             runtime.pointer.pet_touched = false;
@@ -360,21 +407,33 @@ impl PetApplication {
                 &runtime.sensors,
                 BODY_DT,
             );
-            runtime.body.animation_update(
+            let voice = voice_visual_state(runtime.audio.as_ref());
+            runtime.body.embodied_update(
                 &runtime.intent,
-                runtime.life.state.affect.arousal,
+                &runtime.sensors,
+                runtime.life.state.affect,
+                voice,
                 BODY_DT,
             );
             runtime.body_accumulator -= BODY_DT;
         }
         while runtime.life_accumulator >= LIFE_DT {
             let tick_started = Instant::now();
-            let output =
+            let mut output =
                 runtime
                     .life
                     .tick(&runtime.sensors, &runtime.body.simulation.feedback, LIFE_DT);
+            let vita_output = runtime.vita.think(
+                &runtime.life.state,
+                &runtime.sensors,
+                &runtime.body.simulation.feedback,
+                &output.body_intent,
+                LIFE_DT,
+            );
+            vita_output.apply_to_intent(&mut output.body_intent);
             runtime.brain_tick_microseconds = tick_started.elapsed().as_secs_f64() * 1_000_000.0;
             runtime.last_debug = Some(output.debug.clone());
+            runtime.last_vita = Some(vita_output);
             runtime.intent = output.body_intent;
             let sleeping = output.selected_action == ActionId::Sleep;
             if sleeping && !runtime.was_sleeping {
@@ -415,6 +474,16 @@ impl PetApplication {
                         "plastic_weight_range": debug.plastic_weight_range,
                         "fps": runtime.fps,
                         "brain_tick_microseconds": runtime.brain_tick_microseconds,
+                        "vita_attention": runtime.last_vita.as_ref().map(|output| format!("{:?}", output.attention.kind)),
+                        "vita_emotion": runtime.last_vita.as_ref().and_then(|output| output.dominant_emotion).map(|emotion| format!("{:?}", emotion.kind)),
+                        "vita_influence": runtime.last_vita.as_ref().and_then(|output| output.influence.as_ref()).map(|decision| format!("{:?}", decision.strategy)),
+                        "vita_agency": runtime.vita.state().self_model.agency,
+                        "vita_prediction_error": runtime.vita.state().self_model.prediction_error,
+                        "vita_uncertainty": runtime.vita.state().self_model.uncertainty,
+                        "vita_calibration_urge": runtime.vita.state().self_model.calibration_urge,
+                        "typing_rate_hz": runtime.vita.percept().typing_rate_hz,
+                        "scroll_velocity": runtime.vita.percept().scroll_velocity,
+                        "window_pressure": runtime.vita.percept().window_pressure,
                     }),
                 });
             }
@@ -447,6 +516,7 @@ impl PetApplication {
 
 impl ApplicationHandler for PetApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.listen_device_events(DeviceEvents::Always);
         if self.runtime.is_some() {
             if let Some(runtime) = self.runtime.as_mut() {
                 runtime.platform.on_resume();
@@ -528,6 +598,7 @@ impl ApplicationHandler for PetApplication {
             intent: neutral_intent(),
             body,
             life: prepared.life,
+            vita: prepared.vita,
             audio,
             pointer: PointerState::default(),
             last_update: Instant::now(),
@@ -545,6 +616,7 @@ impl ApplicationHandler for PetApplication {
             fps: 0.0,
             brain_tick_microseconds: 0.0,
             last_debug: None,
+            last_vita: None,
         });
     }
 
@@ -583,7 +655,7 @@ impl ApplicationHandler for PetApplication {
                 runtime.pointer.down = down;
                 runtime.pointer.pet_touched = down;
                 if down {
-                    runtime.life.apply_feedback(FeedbackEvent::PettingStarted);
+                    apply_shared_feedback(runtime, FeedbackEvent::PettingStarted);
                     runtime.save_accumulator = 30.0;
                 }
             }
@@ -595,15 +667,19 @@ impl ApplicationHandler for PetApplication {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyF) => {
                             let enabled = !runtime.life.state.focus_mode;
-                            runtime.life.apply_feedback(if enabled {
-                                FeedbackEvent::FocusModeEnabled
-                            } else {
-                                FeedbackEvent::FocusModeDisabled
-                            });
+                            apply_shared_feedback(
+                                runtime,
+                                if enabled {
+                                    FeedbackEvent::FocusModeEnabled
+                                } else {
+                                    FeedbackEvent::FocusModeDisabled
+                                },
+                            );
                             runtime.save_accumulator = 30.0;
                         }
                         PhysicalKey::Code(KeyCode::KeyM) => {
                             runtime.life.trigger_metamorphosis();
+                            runtime.vita.note_metamorphosis();
                             if let Ok(body) = ProceduralBody::generate(&runtime.life.state.genome) {
                                 runtime.renderer.replace_mesh(&body.mesh);
                                 runtime.body = body;
@@ -611,11 +687,11 @@ impl ApplicationHandler for PetApplication {
                             runtime.save_accumulator = 30.0;
                         }
                         PhysicalKey::Code(KeyCode::KeyR) => {
-                            runtime.life.apply_feedback(FeedbackEvent::Reward(1.0));
+                            apply_shared_feedback(runtime, FeedbackEvent::Reward(1.0));
                             runtime.save_accumulator = 30.0;
                         }
                         PhysicalKey::Code(KeyCode::KeyN) => {
-                            runtime.life.apply_feedback(FeedbackEvent::Reward(-1.0));
+                            apply_shared_feedback(runtime, FeedbackEvent::Reward(-1.0));
                             runtime.save_accumulator = 30.0;
                         }
                         PhysicalKey::Code(KeyCode::KeyD) => {
@@ -657,6 +733,33 @@ impl ApplicationHandler for PetApplication {
         }
     }
 
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        let timestamp = runtime.normalizer.monotonic_seconds();
+        match event {
+            DeviceEvent::Key(event) if event.state == ElementState::Pressed => {
+                runtime.vita.note_key_activity(timestamp);
+            }
+            DeviceEvent::MouseWheel { delta } => {
+                runtime.vita.note_scroll(normalized_scroll(delta));
+            }
+            DeviceEvent::Button {
+                state: ElementState::Pressed,
+                ..
+            } => {
+                runtime.vita.note_click(timestamp);
+            }
+            _ => {}
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.update_runtime(event_loop);
     }
@@ -692,6 +795,7 @@ fn persist_runtime(store: &StateStore, export: Option<&PathBuf>, runtime: &PetRu
     let portable = PortablePetState {
         schema_version: PORTABLE_STATE_SCHEMA_VERSION,
         life: runtime.life.snapshot(),
+        vita: Some(runtime.vita.snapshot()),
         position,
     };
     if let Err(error) = store.save_state(&portable) {
@@ -701,6 +805,32 @@ fn persist_runtime(store: &StateStore, export: Option<&PathBuf>, runtime: &PetRu
         && let Err(error) = store.export_state(&portable, path)
     {
         eprintln!("could not export Pet 2 state: {error}");
+    }
+}
+
+fn apply_shared_feedback(runtime: &mut PetRuntime, event: FeedbackEvent) {
+    runtime.vita.apply_feedback(&event);
+    runtime.life.apply_feedback(event);
+}
+
+fn voice_visual_state(audio: Option<&AudioEngine>) -> VoiceVisualState {
+    let feedback = audio.map(AudioEngine::visual_feedback).unwrap_or_default();
+    VoiceVisualState {
+        active: feedback.active,
+        motif_id: feedback.motif_id,
+        syllable_index: feedback.syllable_index,
+        envelope: feedback.envelope,
+        mouth_open: feedback.mouth_open,
+        pitch_normalized: feedback.pitch_normalized,
+        noisiness: feedback.noisiness,
+        purr: feedback.purr,
+    }
+}
+
+fn normalized_scroll(delta: MouseScrollDelta) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, vertical) => (vertical / 6.0).clamp(-1.0, 1.0),
+        MouseScrollDelta::PixelDelta(position) => (position.y as f32 / 360.0).clamp(-1.0, 1.0),
     }
 }
 

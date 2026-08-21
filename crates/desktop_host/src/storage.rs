@@ -5,7 +5,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use lifecore::{LifeError, LifeSnapshot};
+use lifecore::{LifeError, LifeSnapshot, VitaState};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -18,6 +18,8 @@ pub const PORTABLE_STATE_SCHEMA_VERSION: u32 = 1;
 pub struct PortablePetState {
     pub schema_version: u32,
     pub life: LifeSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vita: Option<VitaState>,
     pub position: PersistedPetPosition,
 }
 
@@ -30,6 +32,11 @@ impl PortablePetState {
             });
         }
         self.life.validate()?;
+        if let Some(vita) = &self.vita
+            && !vita.is_valid()
+        {
+            return Err(StorageError::InvalidVitaState);
+        }
         let normalized = self.position.normalized;
         if !normalized.x.is_finite()
             || !normalized.y.is_finite()
@@ -93,6 +100,8 @@ pub enum StorageError {
     UnsupportedSchema { found: u32, expected: u32 },
     #[error("portable state contains an invalid normalized position")]
     InvalidPosition,
+    #[error("portable state contains an invalid VITA mind")]
+    InvalidVitaState,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +255,7 @@ mod tests {
         let state = PortablePetState {
             schema_version: PORTABLE_STATE_SCHEMA_VERSION,
             life: life.snapshot(),
+            vita: None,
             position: PersistedPetPosition::default(),
         };
         store.save_state(&state).unwrap();
@@ -260,6 +270,7 @@ mod tests {
         let state = PortablePetState {
             schema_version: PORTABLE_STATE_SCHEMA_VERSION,
             life: life.snapshot(),
+            vita: None,
             position: PersistedPetPosition {
                 monitor: None,
                 normalized: crate::NormalizedDesktopPoint { x: 1.2, y: 0.5 },
@@ -279,6 +290,7 @@ mod tests {
         let state = PortablePetState {
             schema_version: PORTABLE_STATE_SCHEMA_VERSION,
             life: life.snapshot(),
+            vita: None,
             position: PersistedPetPosition::default(),
         };
         store.save_state(&state).unwrap();

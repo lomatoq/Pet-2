@@ -618,6 +618,75 @@ impl Default for VitaState {
     }
 }
 
+impl VitaState {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let appraisal = [
+            self.appraisal.novelty,
+            self.appraisal.expectedness,
+            self.appraisal.controllability,
+            self.appraisal.goal_congruence,
+            self.appraisal.social_relevance,
+            self.appraisal.agency,
+            self.appraisal.certainty,
+            self.appraisal.threat,
+        ];
+        let mood = [
+            self.mood.baseline_valence,
+            self.mood.baseline_arousal,
+            self.mood.social_openness,
+            self.mood.confidence,
+            self.mood.fatigue,
+        ];
+        self.schema_version == VITA_STATE_SCHEMA_VERSION
+            && self.elapsed_seconds.is_finite()
+            && self.attention.position.is_none_or(Vec2::is_finite)
+            && self.attention.confidence.is_finite()
+            && self.attention.commitment_remaining.is_finite()
+            && self.attention.habituation.is_finite()
+            && appraisal.into_iter().all(f32::is_finite)
+            && mood.into_iter().all(f32::is_finite)
+            && self.emotions.len() <= MAX_EMOTION_EPISODES
+            && self.emotions.iter().all(|episode| {
+                episode.intensity.is_finite() && episode.remaining_seconds.is_finite()
+            })
+            && self.self_model.previous_position.is_finite()
+            && self.self_model.previous_velocity.is_finite()
+            && [
+                self.self_model.prediction_error,
+                self.self_model.agency,
+                self.self_model.uncertainty,
+                self.self_model.body_schema_confidence,
+                self.self_model.calibration_urge,
+                self.self_model.external_force_likelihood,
+            ]
+            .into_iter()
+            .all(f32::is_finite)
+            && self.self_model.action_models.iter().all(|model| {
+                model.mean_delta_position.is_finite()
+                    && model.mean_delta_velocity.is_finite()
+                    && model.contact_probability.is_finite()
+                    && model.confidence.is_finite()
+            })
+            && self.influence.weights.len() == INFLUENCE_STRATEGY_COUNT
+            && self
+                .influence
+                .weights
+                .iter()
+                .flatten()
+                .all(|weight| weight.is_finite() && weight.abs() <= 1.501)
+            && self.influence.cooldown_seconds.is_finite()
+            && self.favorite_places.len() <= MAX_FAVORITE_PLACES
+            && self.favorite_places.iter().all(|place| {
+                place.relative_position.is_finite()
+                    && place.hue.is_none_or(f32::is_finite)
+                    && place.comfort_value.is_finite()
+                    && place.play_value.is_finite()
+                    && place.safety_value.is_finite()
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VitaMind {
     pub state: VitaState,

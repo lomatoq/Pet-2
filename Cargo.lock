@@ -1488,6 +1488,7 @@ dependencies = [
  "lifecore",
  "pet_audio",
  "pet_body",
+ "pet_perception",
  "pollster",
  "serde_json",
  "winit",
