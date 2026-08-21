@@ -1,30 +1,100 @@
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec2};
+use glam::{Vec2, Vec3};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::{MeshVertex, ProceduralMesh};
+use crate::ProceduralMesh;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Globals {
-    view_projection: [[f32; 4]; 4],
-    time_arousal_blink_glow: [f32; 4],
+    viewport_time: [f32; 4],
+    body_shape: [f32; 4],
+    face_shape: [f32; 4],
+    appendages: [f32; 4],
+    primary_hsv: [f32; 4],
+    secondary_hsv: [f32; 4],
+    glow_hsv: [f32; 4],
+    gaze_pupil: [f32; 4],
+    lids_brows: [f32; 4],
+    brow_mouth: [f32; 4],
+    mouth_voice: [f32; 4],
+    motion_a: [f32; 4],
+    motion_b: [f32; 4],
     pattern: [f32; 4],
+    occlusion: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcclusionMode {
+    Front,
+    PeekFromLeft,
+    PeekFromRight,
+    PeekFromTop,
+    BehindSurface,
+}
+
+impl OcclusionMode {
+    const fn shader_value(self) -> f32 {
+        match self {
+            Self::Front => 0.0,
+            Self::PeekFromLeft => 1.0,
+            Self::PeekFromRight => 2.0,
+            Self::PeekFromTop => 3.0,
+            Self::BehindSurface => 4.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderParameters {
     pub time: f32,
     pub arousal: f32,
-    pub blink: f32,
     pub glow: f32,
+    pub body_length: f32,
+    pub body_width: f32,
+    pub body_roundness: f32,
+    pub head_ratio: f32,
+    pub eye_size: f32,
+    pub eye_spacing: f32,
+    pub pupil_ratio: f32,
+    pub softness: f32,
+    pub tail_length: f32,
+    pub tail_thickness: f32,
+    pub ear_fin_size: f32,
+    pub primary_hsv: Vec3,
+    pub secondary_hsv: Vec3,
+    pub glow_hsv: Vec3,
+    pub gaze: Vec2,
+    pub vergence: f32,
+    pub pupil_size: f32,
+    pub blink_left: f32,
+    pub blink_right: f32,
+    pub squint: f32,
+    pub brow_raise: f32,
+    pub brow_tension: f32,
+    pub brow_asymmetry: f32,
+    pub mouth_open: f32,
+    pub mouth_curve: f32,
+    pub mouth_tension: f32,
+    pub cheek_glow: f32,
+    pub audio_envelope: f32,
+    pub purr: f32,
+    pub squash: Vec2,
+    pub tilt: f32,
+    pub head_lag: Vec2,
+    pub tail_lag: Vec2,
+    pub breath: f32,
+    pub compression: f32,
     pub pattern_scale: f32,
     pub pattern_contrast: f32,
     pub pattern_seed: u64,
+    pub occlusion_mode: OcclusionMode,
+    pub occlusion_edge: f32,
+    pub occlusion_softness: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,30 +122,9 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count: u32,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
-    depth: wgpu::TextureView,
-    mesh_view: MeshView,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MeshView {
-    center: Vec2,
-    half_extent: Vec2,
-}
-
-impl MeshView {
-    fn from_mesh(mesh: &ProceduralMesh) -> Self {
-        let minimum = mesh.minimum.truncate();
-        let maximum = mesh.maximum.truncate();
-        Self {
-            center: (minimum + maximum) * 0.5,
-            half_extent: ((maximum - minimum) * 0.5 * 1.14).max(Vec2::splat(0.05)),
-        }
-    }
+    organism_scale: f32,
 }
 
 impl Renderer {
@@ -95,11 +144,8 @@ impl Renderer {
             .await?;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Pet 2 graphics device"),
+                label: Some("Pet 2 morphic graphics device"),
                 required_features: wgpu::Features::empty(),
-                // The overlay may briefly inherit a large physical extent while Windows
-                // applies a per-monitor DPI transition. The portable renderer still uses
-                // conservative default WebGPU limits, whose 2D texture cap accommodates it.
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
@@ -147,25 +193,14 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("procedural pet vertices"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("procedural pet indices"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let mesh_view = MeshView::from_mesh(mesh);
-        let globals = globals_for(&config, RenderParameters::default(), mesh_view);
+        let globals = globals_for(&config, RenderParameters::default(), organism_scale(mesh));
         let globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("pet render globals"),
+            label: Some("morphic pet globals"),
             contents: bytemuck::bytes_of(&globals),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pet globals layout"),
+            label: Some("morphic pet globals layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -178,7 +213,7 @@ impl Renderer {
             }],
         });
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pet globals"),
+            label: Some("morphic pet globals"),
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -186,34 +221,29 @@ impl Renderer {
             }],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("procedural pet shader"),
+            label: Some("morphic procedural pet shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("pet.wgsl").into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pet pipeline layout"),
+            label: Some("morphic pet pipeline layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("procedural pet pipeline"),
+            label: Some("morphic pet pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vertex_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[MeshVertex::buffer_layout()],
+                buffers: &[],
             },
             primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -228,20 +258,15 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        let depth = create_depth(&device, &config);
         Ok(Self {
             surface,
             device,
             queue,
             config,
             pipeline,
-            vertex_buffer,
-            index_buffer,
-            index_count: mesh.indices.len() as u32,
             globals_buffer,
             globals_bind_group,
-            depth,
-            mesh_view,
+            organism_scale: organism_scale(mesh),
         })
     }
 
@@ -252,33 +277,21 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        self.depth = create_depth(&self.device, &self.config);
     }
 
     pub fn replace_mesh(&mut self, mesh: &ProceduralMesh) {
-        self.vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("procedural pet vertices"),
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        self.index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("procedural pet indices"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-        self.index_count = mesh.indices.len() as u32;
-        self.mesh_view = MeshView::from_mesh(mesh);
+        self.organism_scale = organism_scale(mesh);
     }
 
     pub fn render(&mut self, parameters: RenderParameters) -> RenderOutcome {
         self.queue.write_buffer(
             &self.globals_buffer,
             0,
-            bytemuck::bytes_of(&globals_for(&self.config, parameters, self.mesh_view)),
+            bytemuck::bytes_of(&globals_for(
+                &self.config,
+                parameters,
+                self.organism_scale,
+            )),
         );
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -295,11 +308,11 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pet render encoder"),
+                label: Some("morphic pet render encoder"),
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("transparent pet pass"),
+                label: Some("transparent morphic pet pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -309,22 +322,13 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            pass.draw(0..3, 0..1);
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
@@ -337,66 +341,138 @@ impl Default for RenderParameters {
         Self {
             time: 0.0,
             arousal: 0.3,
-            blink: 0.0,
             glow: 0.2,
+            body_length: 1.0,
+            body_width: 0.72,
+            body_roundness: 0.8,
+            head_ratio: 0.50,
+            eye_size: 0.16,
+            eye_spacing: 0.30,
+            pupil_ratio: 0.52,
+            softness: 0.7,
+            tail_length: 0.8,
+            tail_thickness: 0.10,
+            ear_fin_size: 0.18,
+            primary_hsv: Vec3::new(0.52, 0.58, 0.86),
+            secondary_hsv: Vec3::new(0.62, 0.42, 0.92),
+            glow_hsv: Vec3::new(0.12, 0.62, 1.0),
+            gaze: Vec2::ZERO,
+            vergence: 0.0,
+            pupil_size: 0.52,
+            blink_left: 0.0,
+            blink_right: 0.0,
+            squint: 0.0,
+            brow_raise: 0.0,
+            brow_tension: 0.0,
+            brow_asymmetry: 0.0,
+            mouth_open: 0.0,
+            mouth_curve: 0.1,
+            mouth_tension: 0.0,
+            cheek_glow: 0.0,
+            audio_envelope: 0.0,
+            purr: 0.0,
+            squash: Vec2::ONE,
+            tilt: 0.0,
+            head_lag: Vec2::ZERO,
+            tail_lag: Vec2::ZERO,
+            breath: 0.5,
+            compression: 0.0,
             pattern_scale: 2.0,
-            pattern_contrast: 0.5,
+            pattern_contrast: 0.35,
             pattern_seed: 0,
+            occlusion_mode: OcclusionMode::Front,
+            occlusion_edge: 0.0,
+            occlusion_softness: 0.02,
         }
     }
+}
+
+fn organism_scale(mesh: &ProceduralMesh) -> f32 {
+    let extent = mesh.maximum - mesh.minimum;
+    (extent.x.max(extent.y) * 0.72).clamp(0.78, 1.35)
 }
 
 fn globals_for(
     config: &wgpu::SurfaceConfiguration,
     parameters: RenderParameters,
-    mesh_view: MeshView,
+    organism_scale: f32,
 ) -> Globals {
     let aspect = config.width as f32 / config.height.max(1) as f32;
-    let half_height = mesh_view
-        .half_extent
-        .y
-        .max(mesh_view.half_extent.x / aspect.max(0.01));
-    let half_width = half_height * aspect;
-    let projection = Mat4::orthographic_rh(
-        mesh_view.center.x - half_width,
-        mesh_view.center.x + half_width,
-        mesh_view.center.y - half_height,
-        mesh_view.center.y + half_height,
-        -3.0,
-        3.0,
-    );
     Globals {
-        view_projection: projection.to_cols_array_2d(),
-        time_arousal_blink_glow: [
+        viewport_time: [
+            aspect,
             parameters.time,
             parameters.arousal.clamp(0.0, 1.0),
-            parameters.blink.clamp(0.0, 1.0),
             parameters.glow.clamp(0.0, 1.0),
+        ],
+        body_shape: [
+            parameters.body_width.clamp(0.35, 1.2),
+            parameters.body_length.clamp(0.55, 1.5),
+            parameters.body_roundness.clamp(0.2, 1.0),
+            parameters.head_ratio.clamp(0.28, 0.78),
+        ],
+        face_shape: [
+            parameters.eye_size.clamp(0.06, 0.30),
+            parameters.eye_spacing.clamp(0.14, 0.52),
+            parameters.pupil_ratio.clamp(0.20, 0.88),
+            parameters.softness.clamp(0.0, 1.0),
+        ],
+        appendages: [
+            parameters.tail_length.clamp(0.2, 1.8),
+            parameters.tail_thickness.clamp(0.025, 0.24),
+            parameters.ear_fin_size.clamp(0.0, 0.42),
+            organism_scale,
+        ],
+        primary_hsv: parameters.primary_hsv.extend(1.0).to_array(),
+        secondary_hsv: parameters.secondary_hsv.extend(1.0).to_array(),
+        glow_hsv: parameters.glow_hsv.extend(1.0).to_array(),
+        gaze_pupil: [
+            parameters.gaze.x.clamp(-1.0, 1.0),
+            parameters.gaze.y.clamp(-1.0, 1.0),
+            parameters.vergence.clamp(0.0, 0.2),
+            parameters.pupil_size.clamp(0.15, 0.95),
+        ],
+        lids_brows: [
+            parameters.blink_left.clamp(0.0, 1.0),
+            parameters.blink_right.clamp(0.0, 1.0),
+            parameters.squint.clamp(0.0, 1.0),
+            parameters.brow_raise.clamp(-1.0, 1.0),
+        ],
+        brow_mouth: [
+            parameters.brow_tension.clamp(0.0, 1.0),
+            parameters.brow_asymmetry.clamp(-1.0, 1.0),
+            parameters.mouth_open.clamp(0.0, 1.0),
+            parameters.mouth_curve.clamp(-1.0, 1.0),
+        ],
+        mouth_voice: [
+            parameters.mouth_tension.clamp(0.0, 1.0),
+            parameters.cheek_glow.clamp(0.0, 1.0),
+            parameters.audio_envelope.clamp(0.0, 1.0),
+            parameters.purr.clamp(0.0, 1.0),
+        ],
+        motion_a: [
+            parameters.squash.x.clamp(0.55, 1.65),
+            parameters.squash.y.clamp(0.55, 1.65),
+            parameters.tilt.clamp(-0.65, 0.65),
+            parameters.head_lag.x.clamp(-0.18, 0.18),
+        ],
+        motion_b: [
+            parameters.head_lag.y.clamp(-0.18, 0.18),
+            parameters.tail_lag.x.clamp(-0.35, 0.35),
+            parameters.tail_lag.y.clamp(-0.35, 0.35),
+            parameters.breath.clamp(0.0, 1.0),
         ],
         pattern: [
             parameters.pattern_scale.clamp(0.2, 12.0),
             parameters.pattern_contrast.clamp(0.0, 1.0),
             parameters.pattern_seed as u32 as f32 / u32::MAX as f32 * 17.0,
+            parameters.compression.clamp(-0.2, 0.6),
+        ],
+        occlusion: [
+            parameters.occlusion_mode.shader_value(),
+            parameters.occlusion_edge.clamp(-1.0, 1.0),
+            parameters.occlusion_softness.clamp(0.001, 0.18),
             0.0,
         ],
     }
-}
-
-fn create_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
-    device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("pet depth texture"),
-            size: wgpu::Extent3d {
-                width: config.width.max(1),
-                height: config.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth24Plus,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        })
-        .create_view(&wgpu::TextureViewDescriptor::default())
 }

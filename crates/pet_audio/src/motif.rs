@@ -3,6 +3,7 @@ use std::sync::Arc;
 use lifecore::{Syllable, VocalMotif, VocalRequest, VoiceGenome};
 
 use crate::{
+    AudioVisualBridge, AudioVisualFeedback,
     envelope::amplitude_envelope,
     filter::{Resonator, soft_limit},
     oscillator::{NoiseSource, Oscillator},
@@ -127,6 +128,7 @@ impl VoiceCommand {
 
 pub struct SynthVoice {
     commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
+    feedback: Arc<AudioVisualBridge>,
     sample_rate: f32,
     current: Option<VoiceCommand>,
     syllable_index: usize,
@@ -142,8 +144,18 @@ pub struct SynthVoice {
 impl SynthVoice {
     #[must_use]
     pub fn new(commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>, sample_rate: u32) -> Self {
+        Self::with_feedback(commands, sample_rate, Arc::new(AudioVisualBridge::default()))
+    }
+
+    #[must_use]
+    pub fn with_feedback(
+        commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
+        sample_rate: u32,
+        feedback: Arc<AudioVisualBridge>,
+    ) -> Self {
         Self {
             commands,
+            feedback,
             sample_rate: sample_rate.max(1) as f32,
             current: None,
             syllable_index: 0,
@@ -160,17 +172,20 @@ impl SynthVoice {
     pub fn next_stereo_frame(&mut self) -> [f32; 2] {
         if self.current.is_none() {
             let Some(command) = self.commands.pop() else {
+                self.feedback.clear();
                 return [0.0; 2];
             };
             self.start_command(command);
         }
         if self.gap_frames_remaining > 0 {
             self.gap_frames_remaining -= 1;
+            self.publish_feedback(0.0, 0.0, 0.0, 0.0);
             return [0.0; 2];
         }
         let command = self.current.expect("command is active");
         if self.syllable_index >= usize::from(command.syllable_count) {
             self.current = None;
+            self.feedback.clear();
             return self.next_stereo_frame();
         }
         let syllable = command.syllables[self.syllable_index];
@@ -189,6 +204,7 @@ impl SynthVoice {
             if self.syllable_index < usize::from(command.syllable_count) {
                 self.configure_formants(command.syllables[self.syllable_index]);
             }
+            self.publish_feedback(0.0, 0.0, 0.0, 0.0);
             return [0.0; 2];
         }
 
@@ -217,8 +233,10 @@ impl SynthVoice {
         let voiced = self
             .oscillator
             .sample(frequency, self.sample_rate, command.harmonic_mix);
-        let noise = self.noise.sample(command.brightness)
-            * (command.breathiness + syllable.noisiness * 0.65 + command.stress * 0.12);
+        let noisiness =
+            (command.breathiness + syllable.noisiness * 0.65 + command.stress * 0.12)
+                .clamp(0.0, 1.0);
+        let noise = self.noise.sample(command.brightness) * noisiness;
         let impulse = if self.click_pending {
             self.click_pending = false;
             (command.click_amount + syllable.click) * 0.45
@@ -239,6 +257,13 @@ impl SynthVoice {
             release_frames,
         );
         self.frame_in_syllable += 1;
+
+        self.publish_feedback(
+            envelope,
+            syllable.mouth_open,
+            frequency / command.base_pitch_hz.max(1.0),
+            noisiness,
+        );
 
         let source = (voiced * (1.0 - command.breathiness * 0.4) + noise + impulse)
             * envelope
@@ -270,6 +295,7 @@ impl SynthVoice {
         if command.syllable_count > 0 {
             self.configure_formants(command.syllables[0]);
         }
+        self.publish_feedback(0.0, 0.0, 1.0, command.breathiness);
     }
 
     fn configure_formants(&mut self, syllable: PreparedSyllable) {
@@ -283,6 +309,29 @@ impl SynthVoice {
                 * (0.86 + openness * 0.28);
             formant.configure(frequency, 110.0 + index as f32 * 90.0, self.sample_rate);
         }
+    }
+
+    fn publish_feedback(
+        &self,
+        envelope: f32,
+        mouth_open: f32,
+        pitch_normalized: f32,
+        noisiness: f32,
+    ) {
+        let Some(command) = self.current else {
+            self.feedback.clear();
+            return;
+        };
+        self.feedback.publish(AudioVisualFeedback {
+            active: true,
+            motif_id: command.motif_id,
+            syllable_index: self.syllable_index.min(u8::MAX as usize) as u8,
+            envelope: envelope.clamp(0.0, 1.0),
+            mouth_open: mouth_open.clamp(0.0, 1.0),
+            pitch_normalized: pitch_normalized.clamp(0.25, 4.0),
+            noisiness: noisiness.clamp(0.0, 1.0),
+            purr: if command.purr { 1.0 } else { 0.0 },
+        });
     }
 }
 

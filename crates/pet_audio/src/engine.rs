@@ -9,7 +9,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use lifecore::{VocalMotif, VocalRequest, VoiceGenome};
 use thiserror::Error;
 
-use crate::{COMMAND_CAPACITY, SpscRing, SynthVoice, VoiceCommand};
+use crate::{
+    AudioVisualBridge, AudioVisualFeedback, COMMAND_CAPACITY, SpscRing, SynthVoice, VoiceCommand,
+    global_visual_bridge,
+};
 
 const ERROR_CAPACITY: usize = 8;
 
@@ -93,6 +96,7 @@ pub struct AudioEngine {
     selected: SelectedOutputConfig,
     commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
     errors: Arc<SpscRing<AudioRuntimeEvent, ERROR_CAPACITY>>,
+    feedback: Arc<AudioVisualBridge>,
 }
 
 impl AudioEngine {
@@ -111,13 +115,18 @@ impl AudioEngine {
         };
         let commands = Arc::new(SpscRing::new());
         let errors = Arc::new(SpscRing::new());
+        let feedback = global_visual_bridge();
         let errors_for_callback = Arc::clone(&errors);
         let error_callback = move |_error: cpal::StreamError| {
             let _ = errors_for_callback.push(AudioRuntimeEvent::StreamError);
         };
         let stream = match selected.sample_format {
             RuntimeSampleFormat::F32 => {
-                let mut synth = SynthVoice::new(Arc::clone(&commands), selected.sample_rate);
+                let mut synth = SynthVoice::with_feedback(
+                    Arc::clone(&commands),
+                    selected.sample_rate,
+                    Arc::clone(&feedback),
+                );
                 let channels = usize::from(selected.channels);
                 device.build_output_stream(
                     &config,
@@ -127,7 +136,11 @@ impl AudioEngine {
                 )?
             }
             RuntimeSampleFormat::I16 => {
-                let mut synth = SynthVoice::new(Arc::clone(&commands), selected.sample_rate);
+                let mut synth = SynthVoice::with_feedback(
+                    Arc::clone(&commands),
+                    selected.sample_rate,
+                    Arc::clone(&feedback),
+                );
                 let channels = usize::from(selected.channels);
                 device.build_output_stream(
                     &config,
@@ -137,7 +150,11 @@ impl AudioEngine {
                 )?
             }
             RuntimeSampleFormat::U16 => {
-                let mut synth = SynthVoice::new(Arc::clone(&commands), selected.sample_rate);
+                let mut synth = SynthVoice::with_feedback(
+                    Arc::clone(&commands),
+                    selected.sample_rate,
+                    Arc::clone(&feedback),
+                );
                 let channels = usize::from(selected.channels);
                 device.build_output_stream(
                     &config,
@@ -153,6 +170,7 @@ impl AudioEngine {
             selected,
             commands,
             errors,
+            feedback,
         })
     }
 
@@ -170,6 +188,11 @@ impl AudioEngine {
     #[must_use]
     pub fn selected_config(&self) -> SelectedOutputConfig {
         self.selected
+    }
+
+    #[must_use]
+    pub fn visual_feedback(&self) -> AudioVisualFeedback {
+        self.feedback.snapshot()
     }
 
     pub fn poll_runtime_event(&self) -> Option<AudioRuntimeEvent> {
