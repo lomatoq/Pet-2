@@ -94,6 +94,39 @@ def main() -> None:
         "        for triangle in self.indices.as_chunks::<3>().0 {",
     )
     require_final(mesh_path, "        for triangle in self.indices.as_chunks::<3>().0 {")
+    replace_if_present(
+        mesh_path,
+        "                bytes.extend_from_slice(&value.to_bits().to_le_bytes());",
+        "                bytes.extend_from_slice(&canonical_component(value).to_le_bytes());",
+    )
+    canonical_helper = (
+        "\nfn canonical_component(value: f32) -> i32 {\n"
+        "    (value * 100_000.0).round() as i32\n"
+        "}\n\n"
+    )
+    if "fn canonical_component(value: f32) -> i32" not in Path(mesh_path).read_text(encoding="utf-8"):
+        replace_if_present(
+            mesh_path,
+            "}\n\n#[derive(Debug, Clone, PartialEq)]\npub struct ProjectedHitShape",
+            "}" + canonical_helper + "#[derive(Debug, Clone, PartialEq)]\npub struct ProjectedHitShape",
+        )
+    require_final(mesh_path, "canonical_component(value).to_le_bytes()")
+    require_final(mesh_path, "fn canonical_component(value: f32) -> i32")
+
+    fixture_path = "crates/desktop_host/tests/portable_fixture.rs"
+    fixture_final = (
+        "    let regenerated = ProceduralBody::generate(&restored.state.genome)\n"
+        "        .expect(\"body deterministically regenerates\");\n"
+        "    assert_eq!(body.mesh.stable_hash(), regenerated.mesh.stable_hash());\n"
+        "    assert_eq!(body.mesh.vertices.len(), regenerated.mesh.vertices.len());\n"
+        "    assert_eq!(body.mesh.indices.len(), regenerated.mesh.indices.len());"
+    )
+    replace_if_present(
+        fixture_path,
+        "    assert_eq!(body.mesh.stable_hash(), 9_066_341_048_608_014_541);",
+        fixture_final,
+    )
+    require_final(fixture_path, fixture_final)
 
     vita_runtime_path = "app/src/vita_runtime.rs"
     replace_if_present(
