@@ -705,8 +705,10 @@ mod tests {
         runtime.note_key_activity(1.0);
         runtime.note_key_activity(1.1);
         runtime.note_scroll(0.7);
-        let mut sensors = SensorFrame::default();
-        sensors.timestamp = 1.2;
+        let mut sensors = SensorFrame {
+            timestamp: 1.2,
+            ..SensorFrame::default()
+        };
         let frame = runtime.update(&sensors, &BodyFeedback::default(), 1.0 / 60.0);
         let json = serde_json::to_string(&frame).unwrap();
         assert!(!json.contains("key_code"));
