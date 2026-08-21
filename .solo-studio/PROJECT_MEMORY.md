@@ -27,22 +27,31 @@ Current branch: `codex/pet2-vita-embodied-iteration`
 - Added procedural orbital brows, mouth crease/open mouth/tongue rendering, cheek glow, and emotional articulation.
 - Added lock-free procedural-audio feedback for mouth envelope, syllable openness, pitch, noise, and purr response.
 - Added synthetic occlusion modes so the body can peek from window edges without fragile foreign-window z-order tricks.
+- Added privacy-preserving pointer, typing-rhythm, click, scroll, moving-window and visual-feature perception contracts.
+- Added attention, appraisal, emotion episodes, predictive self-model, agency, favorite places and bounded influence learning.
 - Kept the portable LifeCore, Windows/macOS host boundary, saved identity, memories, habits, voice motifs, and genome intact.
 
 ## Current architecture truth
 
-- `lifecore` owns needs, affect, learning, action arbitration, memory, development, and portable identity.
+- `lifecore` owns needs, affect, learning, action arbitration, memory, development, VITA mind, and portable identity.
 - `pet_body` owns the morphic visual field, embodied face/soft-body runtime, locomotion, hit testing, and rendering.
 - `pet_audio` owns procedural sound and publishes only lock-free derived visual feedback; no audio samples are persisted.
+- `pet_perception` owns transient derived input rhythm, gesture, window ecology and salience; it never receives typed content.
 - `desktop_host` owns platform APIs, coordinates, overlay behavior, and persistence paths.
 - `wgpu` continues to use WGSL on D3D12/Metal with no platform-specific shader fork.
 
-## Active implementation sequence
+## Validation state
 
-1. Make the morphic body, face, and audio feedback compile and pass Windows/macOS CI.
-2. Add perception features for pointer gestures, typing/click/scroll rhythm, window motion, luminance, color, and visual salience.
-3. Add attention/appraisal/emotion composition, predictive self-model and agency estimation.
-4. Add bounded personalized influence strategies with focus-mode and privacy constraints.
+- Windows and macOS both compile through `lifecore`, `pet_audio`, `pet_perception` and into the app target.
+- The first two strict-Clippy findings were isolated test-initializer issues and are corrected on the branch.
+- Cross-platform validation continues on a user-authored head commit so Windows/macOS jobs run without bot-commit approval gating.
+
+## Remaining implementation sequence
+
+1. Clear any remaining strict-Clippy/test/package failures on Windows and macOS.
+2. Add the concrete opt-in desktop luminance/color sampler behind the existing visual-feature contract.
+3. Add best-effort UI/control geometry without collecting labels or text.
+4. Validate visual quality and runtime behavior on a real Windows desktop and Apple Silicon Mac.
 5. Add optional microphone/camera/semantic providers without making LifeCore dependent on them.
 
 ## Active risks
