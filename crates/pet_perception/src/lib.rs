@@ -705,7 +705,7 @@ mod tests {
         runtime.note_key_activity(1.0);
         runtime.note_key_activity(1.1);
         runtime.note_scroll(0.7);
-        let mut sensors = SensorFrame {
+        let sensors = SensorFrame {
             timestamp: 1.2,
             ..SensorFrame::default()
         };
