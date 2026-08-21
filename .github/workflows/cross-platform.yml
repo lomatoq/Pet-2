@@ -6,58 +6,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: cross-platform-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  materialize-source:
-    if: ${{ github.event_name == 'pull_request' && github.actor != 'github-actions[bot]' }}
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: codex/pet2-vita-embodied-iteration
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Apply final idempotent source wiring
-        shell: pwsh
-        run: |
-          python .github/scripts/fix_vita_ci.py
-          python .github/scripts/materialize_visual_input.py
-          python .github/scripts/finish_visual_input.py
-          cargo fmt --all
-      - name: Commit materialized source
-        shell: pwsh
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- `
-            crates/pet_perception/src/lib.rs `
-            crates/lifecore/src/actions.rs `
-            crates/lifecore/src/vita.rs `
-            crates/pet_body/src/embodiment.rs `
-            crates/pet_body/src/mesh.rs `
-            crates/desktop_host/Cargo.toml `
-            crates/desktop_host/src/contract.rs `
-            crates/desktop_host/src/sensors.rs `
-            crates/desktop_host/src/platform/windows.rs `
-            crates/desktop_host/tests/portable_fixture.rs `
-            app/src/vita_runtime.rs `
-            app/src/main.rs
-          git diff --cached --quiet
-          if ($LASTEXITCODE -ne 0) {
-            git commit -m "feat: finish VITA visual wiring [vita-materialized]"
-            git push origin HEAD:codex/pet2-vita-embodied-iteration
-          }
-
   windows-x64:
-    needs: materialize-source
-    if: ${{ always() && (needs.materialize-source.result == 'success' || needs.materialize-source.result == 'skipped') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,8 +33,6 @@ jobs:
           path: dist/Pet2-windows-x64.zip
 
   macos-arm64:
-    needs: materialize-source
-    if: ${{ always() && (needs.materialize-source.result == 'success' || needs.materialize-source.result == 'skipped') }}
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: '13.0'
