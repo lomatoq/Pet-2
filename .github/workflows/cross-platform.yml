@@ -9,13 +9,11 @@ permissions:
   contents: write
 
 jobs:
-  materialize-vita:
+  materialize-vita-runtime:
     if: >-
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.ref == 'codex/pet2-vita-embodied-iteration') ||
-      (github.event_name == 'push' &&
-       github.ref == 'refs/heads/codex/pet2-vita-embodied-iteration' &&
-       !contains(github.event.head_commit.message, '[vita-materialized-a]'))
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/pet2-vita-embodied-iteration' &&
+      !contains(github.event.head_commit.message, '[vita-materialized-b]')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,42 +24,39 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
-      - name: Materialize VITA core and perception
+      - name: Materialize VITA runtime integration
         shell: pwsh
-        run: python .github/scripts/materialize_vita_stage_a.py
-      - name: Format and validate generated sources
+        run: python .github/scripts/materialize_vita_stage_b.py
+      - name: Format and validate integrated runtime
         shell: pwsh
         run: |
           cargo fmt --all
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
-      - name: Commit validated generated sources
+      - name: Commit only validated runtime files
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -- `
-            Cargo.toml `
             Cargo.lock `
-            crates/lifecore/src/lib.rs `
-            crates/lifecore/src/vita.rs `
-            crates/pet_perception/Cargo.toml `
-            crates/pet_perception/src/lib.rs `
-            crates/pet_audio/src/motif.rs `
-            crates/pet_body/src/embodiment.rs `
-            crates/pet_body/src/lib.rs `
-            crates/pet_body/src/renderer.rs
+            app/Cargo.toml `
+            app/src/main.rs `
+            app/src/vita_runtime.rs `
+            crates/desktop_host/src/storage.rs `
+            crates/lifecore/src/vita.rs
           if (git diff --cached --quiet) {
             exit 0
           }
-          git commit -m "feat: add VITA perception self-model and influence [vita-materialized-a]"
+          git commit -m "feat: integrate VITA into desktop runtime and persistence [vita-materialized-b]"
           git push origin HEAD:codex/pet2-vita-embodied-iteration
 
   windows-x64:
-    needs: materialize-vita
+    needs: materialize-vita-runtime
     if: >-
       always() &&
-      (needs.materialize-vita.result == 'success' || needs.materialize-vita.result == 'skipped')
+      (needs.materialize-vita-runtime.result == 'success' ||
+       needs.materialize-vita-runtime.result == 'skipped')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,10 +78,11 @@ jobs:
           path: dist/Pet2-windows-x64.zip
 
   macos-arm64:
-    needs: materialize-vita
+    needs: materialize-vita-runtime
     if: >-
       always() &&
-      (needs.materialize-vita.result == 'success' || needs.materialize-vita.result == 'skipped')
+      (needs.materialize-vita-runtime.result == 'success' ||
+       needs.materialize-vita-runtime.result == 'skipped')
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: '13.0'
