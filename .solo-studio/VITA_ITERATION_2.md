@@ -34,6 +34,15 @@ VITA invariants:
 7. Versioned migration from snapshot schema v1 to v2 without losing identity,
    attachment, memories, habits, or vocal motifs.
 
+## Materialized implementation
+
+The branch now contains the morphic renderer, embodied face and soft-body runtime,
+lock-free audio articulation, privacy-preserving perception runtime, VITA attention,
+appraisal, emotion episodes, predictive self-model, agency estimation, favorite-place
+learning, bounded influence policy, desktop-loop integration, headless simulation, and
+portable optional VITA state. The remaining gate is validated cross-platform build,
+tests, packaging, and hands-on visual tuning.
+
 ## Privacy boundary
 
 No key codes, typed characters, screenshots, camera frames, microphone recordings,
