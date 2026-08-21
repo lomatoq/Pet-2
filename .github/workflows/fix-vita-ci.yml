@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   fix-and-validate:
-    if: ${{ !contains(github.event.head_commit.message, '[vita-ci-fixed]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[vita-ci-report]') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,10 +25,10 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
-      - name: Apply idempotent fixes
+      - name: Apply idempotent source fixes
         shell: pwsh
         run: python .github/scripts/fix_vita_ci.py
-      - name: Format
+      - name: Format source
         shell: pwsh
         run: cargo fmt --all
       - name: Commit source fixes
@@ -41,12 +41,40 @@ jobs:
             crates/lifecore/src/vita.rs `
             app/src/vita_runtime.rs `
             app/src/main.rs
-          if (-not (git diff --cached --quiet)) {
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
             git commit -m "fix: apply VITA runtime corrections [vita-ci-fixed]"
             git push origin HEAD:codex/pet2-vita-embodied-iteration
           }
-      - name: Validate corrected source
+      - name: Validate and capture report
         shell: pwsh
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+          $ErrorActionPreference = "Continue"
+          $report = ".solo-studio/VITA_CI_REPORT.txt"
+          "VITA CI report" | Set-Content $report
+          "Commit: $(git rev-parse HEAD)" | Add-Content $report
+          "Generated: $(Get-Date -Format o)" | Add-Content $report
+          "" | Add-Content $report
+          "== cargo clippy --workspace --all-targets -- -D warnings ==" | Add-Content $report
+          cargo clippy --workspace --all-targets -- -D warnings *>&1 | Tee-Object -FilePath $report -Append
+          $clippyExit = $LASTEXITCODE
+          "" | Add-Content $report
+          "CLIPPY_EXIT=$clippyExit" | Add-Content $report
+          $testExit = -1
+          if ($clippyExit -eq 0) {
+            "" | Add-Content $report
+            "== cargo test --workspace ==" | Add-Content $report
+            cargo test --workspace *>&1 | Tee-Object -FilePath $report -Append
+            $testExit = $LASTEXITCODE
+          }
+          "" | Add-Content $report
+          "TEST_EXIT=$testExit" | Add-Content $report
+          "RESULT=$(if ($clippyExit -eq 0 -and $testExit -eq 0) { 'PASS' } else { 'FAIL' })" | Add-Content $report
+      - name: Commit validation report
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- .solo-studio/VITA_CI_REPORT.txt
+          git commit -m "ci: publish VITA validation report [vita-ci-report]"
+          git push origin HEAD:codex/pet2-vita-embodied-iteration
