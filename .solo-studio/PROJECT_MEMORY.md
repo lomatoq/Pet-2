@@ -44,13 +44,15 @@ Current branch: `codex/pet2-vita-embodied-iteration`
 
 - The complete pre-sampler VITA slice passed strict Clippy, all workspace tests, headless simulation, release build and packaging on Windows x64 and Apple Silicon macOS.
 - Procedural-mesh continuity is validated semantically across current Rust toolchains rather than by brittle raw floating-point bits.
-- Windows visual perception is now being materialized as a 5 Hz bounded pixel-grid sampler for luminance, local luminance, contrast, colorfulness, warmth, dominant hue, motion, edge density and sudden change.
+- Windows visual perception is materialized as a 5 Hz bounded pixel-grid sampler for luminance, local luminance, contrast, colorfulness, warmth, dominant hue, motion, edge density and sudden change.
+- Visual features feed the VITA salience/appraisal loop and the embodied pupil response.
 - Pixel samples are reduced immediately to scalar features and are never saved, logged, exported or sent to LifeCore as an image.
 - macOS and fallback hosts retain capability-based `None` until a permission-aware native sampler is implemented.
+- This checkpoint triggers strict cross-platform validation of the materialized sampler and the macOS no-op path.
 
 ## Remaining implementation sequence
 
-1. Validate the Windows visual sampler and its macOS no-op contract in cross-platform CI.
+1. Clear any visual-sampler compile/test issues on Windows and macOS.
 2. Add best-effort UI/control geometry without collecting labels or text.
 3. Add opt-in microphone-derived RMS/voice-activity/prosody features without retaining audio.
 4. Validate visual quality and runtime behavior on a real Windows desktop and Apple Silicon Mac.
