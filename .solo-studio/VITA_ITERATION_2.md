@@ -43,6 +43,10 @@ learning, bounded influence policy, desktop-loop integration, headless simulatio
 portable optional VITA state. Cross-platform validation is driven from the branch and
 publishes a reproducible source-level report for each correction pass.
 
+The strict-Clippy corrections for the gaze default, body-feedback test construction,
+and mesh triangle iteration are materialized. This user-authored checkpoint exists to
+validate the corrected sources on both Windows x64 and Apple Silicon macOS.
+
 ## Privacy boundary
 
 No key codes, typed characters, screenshots, camera frames, microphone recordings,
