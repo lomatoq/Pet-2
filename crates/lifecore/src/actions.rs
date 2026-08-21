@@ -493,6 +493,7 @@ pub struct SurfaceRect {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SensorFrame {
     pub timestamp: f64,
     pub screen_size: Vec2,
@@ -517,6 +518,8 @@ pub struct SensorFrame {
     pub day_phase: DayPhase,
     pub audio_rms: Option<f32>,
     pub voice_activity: Option<f32>,
+    pub mean_luminance: Option<f32>,
+    pub local_luminance: Option<f32>,
     pub user_presence: Option<f32>,
     pub user_availability: Option<f32>,
 }
@@ -547,6 +550,8 @@ impl Default for SensorFrame {
             day_phase: DayPhase::Day,
             audio_rms: None,
             voice_activity: None,
+            mean_luminance: None,
+            local_luminance: None,
             user_presence: None,
             user_availability: None,
         }

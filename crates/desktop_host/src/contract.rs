@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
+use glam::Vec2;
 use thiserror::Error;
 use winit::window::Window;
 
-use crate::{DesktopSnapshot, DisplayTopology, PlatformCapabilities};
+use crate::{DesktopSnapshot, DesktopVisualSample, DisplayTopology, PlatformCapabilities};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformKind {
@@ -27,6 +28,13 @@ pub trait PlatformBackend {
     fn capabilities(&self) -> PlatformCapabilities;
     fn initialize(&mut self, window: &Window) -> Result<(), HostError>;
     fn poll_desktop(&mut self, topology: &DisplayTopology) -> DesktopSnapshot;
+    fn poll_visual_features(
+        &mut self,
+        _topology: &DisplayTopology,
+        _pet_position: Vec2,
+    ) -> Option<DesktopVisualSample> {
+        None
+    }
     fn apply_overlay_policy(&mut self, window: &Window) -> Result<(), HostError>;
     fn set_cursor_hittest(&mut self, window: &Window, enabled: bool) -> Result<(), HostError> {
         window.set_cursor_hittest(enabled).map_err(|error| {
