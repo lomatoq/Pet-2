@@ -29,6 +29,7 @@ jobs:
         run: |
           python .github/scripts/fix_vita_ci.py
           python .github/scripts/materialize_visual_input.py
+          python .github/scripts/finish_visual_input.py
           cargo fmt --all
       - name: Commit materialized source
         shell: pwsh
