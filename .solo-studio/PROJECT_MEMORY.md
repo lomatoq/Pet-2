@@ -37,28 +37,28 @@ Current branch: `codex/pet2-vita-embodied-iteration`
 - `pet_body` owns the morphic visual field, embodied face/soft-body runtime, locomotion, hit testing, and rendering.
 - `pet_audio` owns procedural sound and publishes only lock-free derived visual feedback; no audio samples are persisted.
 - `pet_perception` owns transient derived input rhythm, gesture, window ecology and salience; it never receives typed content.
-- `desktop_host` owns platform APIs, coordinates, overlay behavior, and persistence paths.
+- `desktop_host` owns platform APIs, coordinates, overlay behavior, visual sampling, and persistence paths.
 - `wgpu` continues to use WGSL on D3D12/Metal with no platform-specific shader fork.
 
 ## Validation state
 
-- Windows and macOS both compile through `lifecore`, `pet_audio`, `pet_perception`, `pet_body` and into the app target.
-- Strict-Clippy corrections for test construction, gaze defaults and triangle iteration are materialized.
-- Unused visual-sampler forwarding and cached-output bridge state were removed instead of being hidden behind lint exceptions.
-- The visual-feature contract remains in `pet_perception` and will be reconnected only with a concrete sensor provider.
-- Cross-platform validation continues on a user-authored head commit so Windows/macOS jobs run without bot-commit approval gating.
+- The complete pre-sampler VITA slice passed strict Clippy, all workspace tests, headless simulation, release build and packaging on Windows x64 and Apple Silicon macOS.
+- Procedural-mesh continuity is validated semantically across current Rust toolchains rather than by brittle raw floating-point bits.
+- Windows visual perception is now being materialized as a 5 Hz bounded pixel-grid sampler for luminance, local luminance, contrast, colorfulness, warmth, dominant hue, motion, edge density and sudden change.
+- Pixel samples are reduced immediately to scalar features and are never saved, logged, exported or sent to LifeCore as an image.
+- macOS and fallback hosts retain capability-based `None` until a permission-aware native sampler is implemented.
 
 ## Remaining implementation sequence
 
-1. Clear any remaining strict-Clippy/test/package failures on Windows and macOS.
-2. Add the concrete opt-in desktop luminance/color sampler behind the existing visual-feature contract.
-3. Add best-effort UI/control geometry without collecting labels or text.
+1. Validate the Windows visual sampler and its macOS no-op contract in cross-platform CI.
+2. Add best-effort UI/control geometry without collecting labels or text.
+3. Add opt-in microphone-derived RMS/voice-activity/prosody features without retaining audio.
 4. Validate visual quality and runtime behavior on a real Windows desktop and Apple Silicon Mac.
-5. Add optional microphone/camera/semantic providers without making LifeCore dependent on them.
+5. Add optional camera/semantic providers without making LifeCore dependent on them.
 
 ## Active risks
 
 - The implicit shader must stay readable and performant on low-power integrated GPUs.
 - Interactive macOS overlay/Metal/CoreAudio behavior still requires Apple Silicon runtime validation.
-- Global typing rhythm and visual-feature providers require explicit capability/permission handling and must never persist raw content.
+- Global input rhythm and visual-feature providers require explicit capability/permission handling and must never persist raw content.
 - Learned influence must remain playful and inspectable rather than deceptive, coercive, or disruptive.
