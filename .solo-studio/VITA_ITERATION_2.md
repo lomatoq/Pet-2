@@ -44,8 +44,10 @@ portable optional VITA state. Cross-platform validation is driven from the branc
 publishes a reproducible source-level report for each correction pass.
 
 The strict-Clippy corrections for the gaze default, body-feedback test construction,
-and mesh triangle iteration are materialized. This user-authored checkpoint exists to
-validate the corrected sources on both Windows x64 and Apple Silicon macOS.
+and mesh triangle iteration are materialized. Procedural-mesh fingerprints now
+canonicalize tiny floating-point differences instead of treating a Rust toolchain math
+implementation change as identity drift. The fixture still verifies deterministic
+regeneration, topology, genome identity, memories, habits, and voice motifs.
 
 ## Privacy boundary
 
