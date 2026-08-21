@@ -4,21 +4,16 @@ use lifecore::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GazeMode {
+    #[default]
     TrackWorldTarget,
     DirectViewer,
     Scan,
     AvoidEyeContact,
     SideEye,
     Sleep,
-}
-
-impl Default for GazeMode {
-    fn default() -> Self {
-        Self::TrackWorldTarget
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -520,9 +515,11 @@ mod tests {
     fn embodiment_stays_finite_and_volume_bounded() {
         let genome = Genome::from_seed(42);
         let mut runtime = EmbodiedRuntime::new(genome.identity_seed);
-        let mut feedback = BodyFeedback::default();
-        feedback.velocity = Vec2::new(0.8, -0.2);
-        feedback.acceleration = Vec2::new(0.4, 0.1);
+        let feedback = BodyFeedback {
+            velocity: Vec2::new(0.8, -0.2),
+            acceleration: Vec2::new(0.4, 0.1),
+            ..BodyFeedback::default()
+        };
         let sensors = SensorFrame::default();
         for _ in 0..10_000 {
             runtime.update(
