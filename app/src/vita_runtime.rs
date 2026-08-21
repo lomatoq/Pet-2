@@ -2,7 +2,7 @@ use lifecore::{
     BodyFeedback, BodyIntent, FeedbackEvent, LifeState, SensorFrame, VitaMind, VitaOutput,
     VitaPerceptFrame, VitaState,
 };
-use pet_perception::{PerceptionRuntime, VisualFeatureFrame};
+use pet_perception::PerceptionRuntime;
 
 /// Owns VITA's persistent mind and its transient privacy-preserving perception state.
 /// Raw device events are reduced to timestamps or scalar features before entering here.
@@ -10,7 +10,6 @@ pub struct VitaRuntime {
     mind: VitaMind,
     perception: PerceptionRuntime,
     percept: VitaPerceptFrame,
-    last_output: Option<VitaOutput>,
 }
 
 impl VitaRuntime {
@@ -23,7 +22,6 @@ impl VitaRuntime {
             ),
             perception: PerceptionRuntime::default(),
             percept: VitaPerceptFrame::default(),
-            last_output: None,
         }
     }
 
@@ -44,11 +42,8 @@ impl VitaRuntime {
         base_intent: &BodyIntent,
         dt: f32,
     ) -> VitaOutput {
-        let output = self
-            .mind
-            .tick(&self.percept, sensors, life, body, base_intent, dt);
-        self.last_output = Some(output.clone());
-        output
+        self.mind
+            .tick(&self.percept, sensors, life, body, base_intent, dt)
     }
 
     pub fn apply_feedback(&mut self, event: &FeedbackEvent) {
@@ -72,10 +67,6 @@ impl VitaRuntime {
         self.perception.note_scroll(normalized_delta);
     }
 
-    pub fn set_visual_features(&mut self, frame: VisualFeatureFrame) {
-        self.perception.set_visual_features(frame);
-    }
-
     #[must_use]
     pub fn snapshot(&self) -> VitaState {
         self.mind.snapshot()
@@ -89,11 +80,6 @@ impl VitaRuntime {
     #[must_use]
     pub fn percept(&self) -> &VitaPerceptFrame {
         &self.percept
-    }
-
-    #[must_use]
-    pub fn last_output(&self) -> Option<&VitaOutput> {
-        self.last_output.as_ref()
     }
 }
 
