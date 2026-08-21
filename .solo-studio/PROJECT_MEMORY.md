@@ -42,8 +42,10 @@ Current branch: `codex/pet2-vita-embodied-iteration`
 
 ## Validation state
 
-- Windows and macOS both compile through `lifecore`, `pet_audio`, `pet_perception` and into the app target.
-- The first two strict-Clippy findings were isolated test-initializer issues and are corrected on the branch.
+- Windows and macOS both compile through `lifecore`, `pet_audio`, `pet_perception`, `pet_body` and into the app target.
+- Strict-Clippy corrections for test construction, gaze defaults and triangle iteration are materialized.
+- Unused visual-sampler forwarding and cached-output bridge state were removed instead of being hidden behind lint exceptions.
+- The visual-feature contract remains in `pet_perception` and will be reconnected only with a concrete sensor provider.
 - Cross-platform validation continues on a user-authored head commit so Windows/macOS jobs run without bot-commit approval gating.
 
 ## Remaining implementation sequence
