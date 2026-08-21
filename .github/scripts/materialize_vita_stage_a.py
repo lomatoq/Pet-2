@@ -42,8 +42,41 @@ rust-version.workspace = true
 glam.workspace = true
 lifecore = { path = "../lifecore" }
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 """,
         encoding="utf-8",
+    )
+
+    vita = ROOT / "crates/lifecore/src/vita.rs"
+    replace_once(
+        vita,
+        """#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = \"snake_case\")]
+pub enum InfluenceMode {
+    Off,
+    Gentle,
+    Playful,
+    Experimental,
+}
+
+impl Default for InfluenceMode {
+    fn default() -> Self {
+        Self::Playful
+    }
+}
+""",
+        """#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = \"snake_case\")]
+pub enum InfluenceMode {
+    Off,
+    Gentle,
+    #[default]
+    Playful,
+    Experimental,
+}
+""",
     )
 
     replace_once(
