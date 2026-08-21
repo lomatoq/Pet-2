@@ -49,6 +49,10 @@ canonicalize tiny floating-point differences instead of treating a Rust toolchai
 implementation change as identity drift. The fixture still verifies deterministic
 regeneration, topology, genome identity, memories, habits, and voice motifs.
 
+The Windows visual host sampler is materialized. This checkpoint triggers the final
+wiring pass that connects its scalar features to `SensorFrame`, `pet_perception`, VITA
+appraisal, and embodied pupil adaptation.
+
 ## Privacy boundary
 
 No key codes, typed characters, screenshots, camera frames, microphone recordings,
