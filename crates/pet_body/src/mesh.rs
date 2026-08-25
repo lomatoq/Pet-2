@@ -160,7 +160,7 @@ impl ProceduralMesh {
         if !extent.is_finite() || extent.min_element() <= 0.0 {
             return Err(MeshError::NonPositiveBounds);
         }
-        for triangle in self.indices.chunks_exact(3) {
+        for triangle in self.indices.as_chunks::<3>().0 {
             let a = Vec3::from_array(self.vertices[triangle[0] as usize].position);
             let b = Vec3::from_array(self.vertices[triangle[1] as usize].position);
             let c = Vec3::from_array(self.vertices[triangle[2] as usize].position);
@@ -194,7 +194,7 @@ impl ProceduralMesh {
                 .chain(vertex.color)
                 .chain(std::iter::once(vertex.part))
             {
-                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+                bytes.extend_from_slice(&canonical_component(value).to_le_bytes());
             }
         }
         for index in &self.indices {
@@ -202,6 +202,9 @@ impl ProceduralMesh {
         }
         stable_hash_bytes(&bytes)
     }
+}
+fn canonical_component(value: f32) -> i32 {
+    (value * 100_000.0).round() as i32
 }
 
 #[derive(Debug, Clone, PartialEq)]

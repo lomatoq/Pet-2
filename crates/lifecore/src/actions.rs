@@ -114,7 +114,7 @@ impl ActionId {
                 5.0,
                 2.0,
                 0.70,
-                ActionConditions::cursor(false),
+                ActionConditions::cursor_near(false),
                 relief(0.0, 0.12, 0.04, 0.08, 0.0, 0.0, 0.0, 0.03),
                 0.05,
             ),
@@ -214,7 +214,7 @@ impl ActionId {
                 12.0,
                 4.0,
                 0.70,
-                ActionConditions::cursor(false),
+                ActionConditions::cursor_chase(),
                 relief(0.0, 0.08, 0.30, 0.12, 0.0, 0.0, 0.05, 0.10),
                 0.0,
             ),
@@ -332,7 +332,6 @@ impl ActionId {
                 | Self::BringProceduralOrb
                 | Self::Chirp
                 | Self::MimicClickRhythm
-                | Self::SelfPlay
                 | Self::HideAndSeek
                 | Self::FrustratedRetreat
         )
@@ -376,6 +375,10 @@ pub struct ActionDefinition {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ActionConditions {
     pub needs_cursor: bool,
+    #[serde(default)]
+    pub needs_cursor_proximity: bool,
+    #[serde(default)]
+    pub needs_cursor_engagement: bool,
     pub needs_user_available: bool,
     pub needs_surface: bool,
     pub threat_only: bool,
@@ -388,6 +391,8 @@ impl ActionConditions {
     const fn quiet() -> Self {
         Self {
             needs_cursor: false,
+            needs_cursor_proximity: false,
+            needs_cursor_engagement: false,
             needs_user_available: false,
             needs_surface: false,
             threat_only: false,
@@ -402,6 +407,20 @@ impl ActionConditions {
             needs_cursor: true,
             allowed_in_focus_mode: focus_allowed,
             ..Self::quiet()
+        }
+    }
+
+    const fn cursor_chase() -> Self {
+        Self {
+            needs_cursor_engagement: true,
+            ..Self::cursor(false)
+        }
+    }
+
+    const fn cursor_near(focus_allowed: bool) -> Self {
+        Self {
+            needs_cursor_proximity: true,
+            ..Self::cursor(focus_allowed)
         }
     }
 
@@ -493,6 +512,7 @@ pub struct SurfaceRect {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SensorFrame {
     pub timestamp: f64,
     pub screen_size: Vec2,
@@ -517,6 +537,8 @@ pub struct SensorFrame {
     pub day_phase: DayPhase,
     pub audio_rms: Option<f32>,
     pub voice_activity: Option<f32>,
+    pub mean_luminance: Option<f32>,
+    pub local_luminance: Option<f32>,
     pub user_presence: Option<f32>,
     pub user_availability: Option<f32>,
 }
@@ -547,6 +569,8 @@ impl Default for SensorFrame {
             day_phase: DayPhase::Day,
             audio_rms: None,
             voice_activity: None,
+            mean_luminance: None,
+            local_luminance: None,
             user_presence: None,
             user_availability: None,
         }
@@ -667,16 +691,17 @@ impl ExpressionState {
     #[must_use]
     pub fn from_readouts(readouts: [f32; EXPRESSION_READOUT_COUNT], affect: AffectState) -> Self {
         Self {
-            blink_left: unit(readouts[0] * 0.5 + 0.5),
-            blink_right: unit(readouts[1] * 0.5 + 0.5),
-            squint: unit(readouts[2] * 0.5 + affect.stress * 0.5),
-            pupil_size: unit(0.45 + affect.arousal * 0.35 - affect.stress * 0.12),
+            blink_left: positive_readout(readouts[0], 0.72),
+            blink_right: positive_readout(readouts[1], 0.72),
+            squint: positive_readout(readouts[2], 0.30),
+            // Pupils are an arousal/intensity channel, not a valence meter.
+            pupil_size: unit(0.46 + affect.arousal * 0.42),
             pupil_focus: unit(readouts[4] * 0.5 + 0.5),
             brow_raise: signed(readouts[5] + affect.arousal * 0.2),
-            brow_tension: unit(readouts[6] * 0.5 + affect.stress * 0.6),
-            mouth_open: unit(readouts[7] * 0.5 + affect.arousal * 0.25),
+            brow_tension: positive_readout(readouts[6], 0.20),
+            mouth_open: unit(positive_readout(readouts[7], 0.30) + affect.arousal * 0.08),
             mouth_curve: signed(readouts[8] + affect.valence * 0.55),
-            mouth_tension: unit(readouts[9] * 0.5 + affect.frustration * 0.45),
+            mouth_tension: positive_readout(readouts[9], 0.20),
             cheek_glow: unit(readouts[10] * 0.35 + affect.attachment * 0.65),
             body_glow: unit(0.15 + readouts[11] * 0.25 + affect.arousal * 0.35),
         }
@@ -699,12 +724,47 @@ pub struct BodyIntent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VocalRequest {
     pub motif_id: u64,
+    /// Ephemeral rendition identity. It varies timbre/noise/room details while
+    /// reward credit remains attached only to the stable learned motif.
+    #[serde(default)]
+    pub performance_seed: u64,
     pub gain: f32,
     pub pan: f32,
     pub pitch_scale: f32,
     pub tempo_scale: f32,
     pub stress: f32,
     pub purr: bool,
+}
+
+/// The semantic reason the mind wants to vocalize.
+///
+/// The desktop host only reports the interaction. `LifeCore` remains the sole
+/// owner of repertoire choice, anti-repetition, and outcome credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VocalTrigger {
+    /// A vocal action selected by the normal action arbitrator.
+    Action(ActionId),
+    /// A short, responsive sound after direct material contact.
+    Touch,
+}
+
+impl VocalTrigger {
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        match self {
+            Self::Action(action) => action.is_vocal(),
+            Self::Touch => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn expects_response(self) -> bool {
+        matches!(
+            self,
+            Self::Action(ActionId::Chirp | ActionId::MimicClickRhythm)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -892,6 +952,65 @@ fn unit(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
 }
 
+fn positive_readout(value: f32, threshold: f32) -> f32 {
+    unit((value - threshold) / (1.0 - threshold).max(0.001))
+}
+
 fn signed(value: f32) -> f32 {
     value.clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neutral_readouts_do_not_half_activate_face_intensities() {
+        let expression =
+            ExpressionState::from_readouts([0.0; EXPRESSION_READOUT_COUNT], AffectState::default());
+        assert_eq!(expression.blink_left, 0.0);
+        assert_eq!(expression.blink_right, 0.0);
+        assert_eq!(expression.squint, 0.0);
+        assert_eq!(expression.brow_tension, 0.0);
+        assert_eq!(expression.mouth_tension, 0.0);
+    }
+
+    #[test]
+    fn strong_positive_readouts_still_drive_face_intensities() {
+        let expression =
+            ExpressionState::from_readouts([1.0; EXPRESSION_READOUT_COUNT], AffectState::default());
+        assert_eq!(expression.blink_left, 1.0);
+        assert_eq!(expression.blink_right, 1.0);
+        assert_eq!(expression.squint, 1.0);
+        assert_eq!(expression.brow_tension, 1.0);
+        assert_eq!(expression.mouth_tension, 1.0);
+    }
+
+    #[test]
+    fn pupil_readout_tracks_arousal_instead_of_emotional_valence() {
+        let pleasant = ExpressionState::from_readouts(
+            [0.0; EXPRESSION_READOUT_COUNT],
+            AffectState {
+                valence: 1.0,
+                arousal: 0.8,
+                ..AffectState::default()
+            },
+        );
+        let unpleasant = ExpressionState::from_readouts(
+            [0.0; EXPRESSION_READOUT_COUNT],
+            AffectState {
+                valence: -1.0,
+                arousal: 0.8,
+                stress: 1.0,
+                ..AffectState::default()
+            },
+        );
+        assert_eq!(pleasant.pupil_size, unpleasant.pupil_size);
+        assert!(pleasant.pupil_size > ExpressionState::default().pupil_size);
+    }
+
+    #[test]
+    fn solitary_play_is_not_an_attention_bid() {
+        assert!(!ActionId::SelfPlay.is_attention_strategy());
+    }
 }

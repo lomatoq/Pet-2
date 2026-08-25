@@ -25,10 +25,45 @@ pub struct DesktopSnapshot {
     pub timestamp: f64,
     pub topology_revision: u64,
     pub cursor: Option<PhysicalDesktopPoint>,
+    /// Physical primary-button state sampled independently of overlay events.
+    /// `None` means the platform cannot provide a global button state.
+    pub primary_button_down: Option<bool>,
     pub idle_seconds: Option<f32>,
     pub active_application: Option<ApplicationInfo>,
     pub active_window: Option<RectI>,
     pub visible_surfaces: Vec<DesktopSurface>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DesktopVisualSample {
+    pub mean_luminance: f32,
+    pub local_luminance: f32,
+    pub contrast: f32,
+    pub colorfulness: f32,
+    pub warmth: f32,
+    pub dominant_hue: f32,
+    pub motion_energy: f32,
+    pub edge_density: f32,
+    pub sudden_change: f32,
+}
+
+impl DesktopVisualSample {
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        [
+            self.mean_luminance,
+            self.local_luminance,
+            self.contrast,
+            self.colorfulness,
+            self.warmth,
+            self.dominant_hue,
+            self.motion_energy,
+            self.edge_density,
+            self.sudden_change,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+    }
 }
 
 impl DesktopSnapshot {
@@ -38,6 +73,7 @@ impl DesktopSnapshot {
             timestamp,
             topology_revision,
             cursor: None,
+            primary_button_down: None,
             idle_seconds: None,
             active_application: None,
             active_window: None,
@@ -145,6 +181,8 @@ impl SensorNormalizer {
             day_phase: day_phase(time_of_day_01),
             audio_rms: None,
             voice_activity: None,
+            mean_luminance: None,
+            local_luminance: None,
             user_presence: snapshot
                 .idle_seconds
                 .map(|idle| if idle < 180.0 { 1.0 } else { 0.0 }),

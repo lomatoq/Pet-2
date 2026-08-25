@@ -178,7 +178,9 @@ impl VoiceGenome {
         ];
         normalize_mix(&mut harmonic_mix);
         Self {
-            base_pitch_hz: range(rng, 150.0, 430.0),
+            // New identities start in the common audible cat-call / small-dog
+            // whine band. Higher syllable contours still reach excited squeaks.
+            base_pitch_hz: range(rng, 340.0, 620.0),
             pitch_range_octaves: range(rng, 0.55, 1.65),
             harmonic_mix,
             breathiness: range(rng, 0.02, 0.42),
@@ -193,7 +195,7 @@ impl VoiceGenome {
             attack_ms: range(rng, 6.0, 48.0),
             release_ms: range(rng, 30.0, 150.0),
             click_amount: range(rng, 0.0, 0.28),
-            purr_rate: range(rng, 17.0, 36.0),
+            purr_rate: range(rng, 25.0, 30.0),
             phrase_speed: range(rng, 0.75, 1.35),
             maximum_loudness: range(rng, 0.14, 0.34),
             voice_seed: rng.next_u64(),
@@ -201,7 +203,7 @@ impl VoiceGenome {
     }
 
     pub(crate) fn clamp_all(&mut self) {
-        self.base_pitch_hz = self.base_pitch_hz.clamp(100.0, 620.0);
+        self.base_pitch_hz = self.base_pitch_hz.clamp(220.0, 800.0);
         self.pitch_range_octaves = self.pitch_range_octaves.clamp(0.3, 2.0);
         for harmonic in &mut self.harmonic_mix {
             *harmonic = harmonic.max(0.0);
@@ -219,7 +221,7 @@ impl VoiceGenome {
         self.attack_ms = self.attack_ms.clamp(2.0, 120.0);
         self.release_ms = self.release_ms.clamp(15.0, 300.0);
         self.click_amount = unit(self.click_amount);
-        self.purr_rate = self.purr_rate.clamp(10.0, 55.0);
+        self.purr_rate = self.purr_rate.clamp(20.0, 38.0);
         self.phrase_speed = self.phrase_speed.clamp(0.5, 1.8);
         self.maximum_loudness = self.maximum_loudness.clamp(0.05, 0.5);
     }

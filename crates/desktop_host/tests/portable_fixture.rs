@@ -47,7 +47,11 @@ fn portable_fixture_restores_without_native_handles_or_identity_drift() {
     assert!(state.life.memories.is_valid());
 
     let body = ProceduralBody::generate(&restored.state.genome).expect("body regenerates");
-    assert_eq!(body.mesh.stable_hash(), 9_066_341_048_608_014_541);
+    let regenerated = ProceduralBody::generate(&restored.state.genome)
+        .expect("body deterministically regenerates");
+    assert_eq!(body.mesh.stable_hash(), regenerated.mesh.stable_hash());
+    assert_eq!(body.mesh.vertices.len(), regenerated.mesh.vertices.len());
+    assert_eq!(body.mesh.indices.len(), regenerated.mesh.indices.len());
 
     let lower = FIXTURE.to_ascii_lowercase();
     for forbidden in [

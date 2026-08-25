@@ -5,8 +5,8 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use lifecore::{LifeError, LifeSnapshot};
-use serde::{Deserialize, Serialize};
+use lifecore::{LifeError, LifeSnapshot, VitaState};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -18,6 +18,8 @@ pub const PORTABLE_STATE_SCHEMA_VERSION: u32 = 1;
 pub struct PortablePetState {
     pub schema_version: u32,
     pub life: LifeSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vita: Option<VitaState>,
     pub position: PersistedPetPosition,
 }
 
@@ -30,6 +32,11 @@ impl PortablePetState {
             });
         }
         self.life.validate()?;
+        if let Some(vita) = &self.vita
+            && !vita.is_valid()
+        {
+            return Err(StorageError::InvalidVitaState);
+        }
         let normalized = self.position.normalized;
         if !normalized.x.is_finite()
             || !normalized.y.is_finite()
@@ -75,6 +82,9 @@ pub struct StoragePaths {
     pub root: PathBuf,
     pub state: PathBuf,
     pub profile: PathBuf,
+    pub liquid_tuning: PathBuf,
+    pub liquid_tuning_status: PathBuf,
+    pub morph_brain: PathBuf,
     pub events: PathBuf,
     pub backup: PathBuf,
 }
@@ -93,6 +103,8 @@ pub enum StorageError {
     UnsupportedSchema { found: u32, expected: u32 },
     #[error("portable state contains an invalid normalized position")]
     InvalidPosition,
+    #[error("portable state contains an invalid VITA mind")]
+    InvalidVitaState,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +126,9 @@ impl StateStore {
             paths: StoragePaths {
                 state: root.join("state.json"),
                 profile: root.join("profile.json"),
+                liquid_tuning: root.join("liquid-tuning.json"),
+                liquid_tuning_status: root.join("liquid-tuning-applied.json"),
+                morph_brain: root.join("morph-brain.json"),
                 events: root.join("events.jsonl"),
                 backup: root.join("backups").join("state.previous.json"),
                 root,
@@ -178,6 +193,86 @@ impl StateStore {
         )
     }
 
+    pub fn load_liquid_tuning<T: DeserializeOwned>(&self) -> Result<Option<T>, StorageError> {
+        if !self.paths.liquid_tuning.exists() {
+            return Ok(None);
+        }
+        serde_json::from_reader(BufReader::new(File::open(&self.paths.liquid_tuning)?))
+            .map(Some)
+            .map_err(StorageError::from)
+    }
+
+    pub fn save_liquid_tuning<T: Serialize>(&self, profile: &T) -> Result<(), StorageError> {
+        atomic_json(
+            &self.paths.liquid_tuning,
+            &self
+                .paths
+                .root
+                .join("backups")
+                .join("liquid-tuning.previous.json"),
+            profile,
+        )
+    }
+
+    pub fn load_liquid_tuning_status<T: DeserializeOwned>(
+        &self,
+    ) -> Result<Option<T>, StorageError> {
+        if !self.paths.liquid_tuning_status.exists() {
+            return Ok(None);
+        }
+        serde_json::from_reader(BufReader::new(File::open(
+            &self.paths.liquid_tuning_status,
+        )?))
+        .map(Some)
+        .map_err(StorageError::from)
+    }
+
+    pub fn save_liquid_tuning_status<T: Serialize>(&self, status: &T) -> Result<(), StorageError> {
+        atomic_json(
+            &self.paths.liquid_tuning_status,
+            &self
+                .paths
+                .root
+                .join("backups")
+                .join("liquid-tuning-applied.previous.json"),
+            status,
+        )
+    }
+
+    pub fn load_morph_brain<T: DeserializeOwned>(&self) -> Result<Option<T>, StorageError> {
+        let backup = self
+            .paths
+            .root
+            .join("backups")
+            .join("morph-brain.previous.json");
+        if !self.paths.morph_brain.exists() {
+            return if backup.exists() {
+                read_json(&backup).map(Some)
+            } else {
+                Ok(None)
+            };
+        }
+        match read_json(&self.paths.morph_brain) {
+            Ok(state) => Ok(Some(state)),
+            Err(primary_error) if backup.exists() => {
+                read_json(&backup).map(Some).map_err(|_| primary_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn save_morph_brain<T: Serialize>(&self, state: &T) -> Result<(), StorageError> {
+        atomic_json(
+            &self.paths.morph_brain,
+            &self
+                .paths
+                .root
+                .join("backups")
+                .join("morph-brain.previous.json"),
+            state,
+        )
+    }
+
     pub fn append_event(&self, event: &EventLogEntry) -> Result<(), StorageError> {
         fs::create_dir_all(&self.paths.root)?;
         let mut file = OpenOptions::new()
@@ -232,6 +327,10 @@ fn atomic_json<T: Serialize>(path: &Path, backup: &Path, value: &T) -> Result<()
     Ok(())
 }
 
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
+    serde_json::from_reader(BufReader::new(File::open(path)?)).map_err(StorageError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use lifecore::{Genome, LifeCore};
@@ -246,6 +345,7 @@ mod tests {
         let state = PortablePetState {
             schema_version: PORTABLE_STATE_SCHEMA_VERSION,
             life: life.snapshot(),
+            vita: None,
             position: PersistedPetPosition::default(),
         };
         store.save_state(&state).unwrap();
@@ -255,11 +355,71 @@ mod tests {
     }
 
     #[test]
+    fn liquid_tuning_roundtrip_is_atomic_and_keeps_previous_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let first = serde_json::json!({"schema_version": 1, "name": "first"});
+        let second = serde_json::json!({"schema_version": 1, "name": "second"});
+
+        store.save_liquid_tuning(&first).unwrap();
+        assert_eq!(
+            store
+                .load_liquid_tuning::<serde_json::Value>()
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        store.save_liquid_tuning(&second).unwrap();
+
+        assert_eq!(
+            store
+                .load_liquid_tuning::<serde_json::Value>()
+                .unwrap()
+                .unwrap(),
+            second
+        );
+        let backup: serde_json::Value = serde_json::from_reader(BufReader::new(
+            File::open(
+                directory
+                    .path()
+                    .join("backups")
+                    .join("liquid-tuning.previous.json"),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(backup, first);
+    }
+
+    #[test]
+    fn liquid_tuning_status_roundtrip_is_separate_from_the_authored_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let profile = serde_json::json!({"profile_revision": 7});
+        let status = serde_json::json!({"profile_revision": 7, "applied": true});
+
+        store.save_liquid_tuning(&profile).unwrap();
+        store.save_liquid_tuning_status(&status).unwrap();
+
+        assert_eq!(
+            store
+                .load_liquid_tuning_status::<serde_json::Value>()
+                .unwrap(),
+            Some(status)
+        );
+        assert_eq!(
+            store.load_liquid_tuning::<serde_json::Value>().unwrap(),
+            Some(profile)
+        );
+    }
+
+    #[test]
     fn rejects_non_finite_or_out_of_range_position() {
         let life = LifeCore::new(Genome::from_seed(3), 3);
         let state = PortablePetState {
             schema_version: PORTABLE_STATE_SCHEMA_VERSION,
             life: life.snapshot(),
+            vita: None,
             position: PersistedPetPosition {
                 monitor: None,
                 normalized: crate::NormalizedDesktopPoint { x: 1.2, y: 0.5 },
@@ -279,11 +439,32 @@ mod tests {
         let state = PortablePetState {
             schema_version: PORTABLE_STATE_SCHEMA_VERSION,
             life: life.snapshot(),
+            vita: None,
             position: PersistedPetPosition::default(),
         };
         store.save_state(&state).unwrap();
         store.save_state(&state).unwrap();
         std::fs::write(&store.paths.state, b"{broken").unwrap();
         assert_eq!(store.load_state().unwrap(), Some(state));
+    }
+
+    #[test]
+    fn corrupt_morph_primary_recovers_previous_learning_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let first = serde_json::json!({"schema": 1, "weights": [0.1, 0.2]});
+        let second = serde_json::json!({"schema": 1, "weights": [0.3, 0.4]});
+
+        store.save_morph_brain(&first).unwrap();
+        store.save_morph_brain(&second).unwrap();
+        std::fs::write(&store.paths.morph_brain, b"{broken").unwrap();
+
+        assert_eq!(
+            store
+                .load_morph_brain::<serde_json::Value>()
+                .unwrap()
+                .unwrap(),
+            first
+        );
     }
 }

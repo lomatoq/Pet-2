@@ -9,6 +9,7 @@ mod tests {
     fn request(motif_id: u64) -> VocalRequest {
         VocalRequest {
             motif_id,
+            performance_seed: 0x00A1_1D10,
             gain: 0.25,
             pan: 0.0,
             pitch_scale: 1.0,
@@ -44,6 +45,15 @@ mod tests {
         };
         assert!(samples.iter().all(|sample| sample.is_finite()));
         assert!(samples.iter().all(|sample| sample.abs() <= 0.86));
+        let peak = samples
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0_f32, f32::max);
+        let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
+            / samples.len().max(1) as f32)
+            .sqrt();
+        assert!((0.15..=0.75).contains(&peak), "peak={peak}");
+        assert!(rms >= 0.025, "rms={rms}");
     }
 
     #[test]
@@ -114,5 +124,140 @@ mod tests {
             OfflineSampleFormat::I16,
         );
         assert_ne!(first_pcm, second_pcm);
+    }
+
+    #[test]
+    fn performance_seed_changes_rendition_without_changing_phrase_length() {
+        let genome = Genome::from_seed(13);
+        let motif = &generate_initial_motifs(&genome.voice)[0];
+        let first_request = request(motif.id);
+        let mut second_request = first_request.clone();
+        second_request.performance_seed ^= 0xDEAD_BEEF;
+        let first = render_motif(
+            &genome.voice,
+            motif,
+            &first_request,
+            48_000,
+            1,
+            OfflineSampleFormat::F32,
+        );
+        let second = render_motif(
+            &genome.voice,
+            motif,
+            &second_request,
+            48_000,
+            1,
+            OfflineSampleFormat::F32,
+        );
+        assert_eq!(first.sample_count(), second.sample_count());
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn gain_and_tempo_create_clear_bounded_performance_differences() {
+        let genome = Genome::from_seed(14);
+        let motif = &generate_initial_motifs(&genome.voice)[0];
+        let mut quiet = request(motif.id);
+        quiet.gain = 0.08;
+        let mut loud = quiet.clone();
+        loud.gain = 0.30;
+        let OfflinePcm::F32(quiet_pcm) = render_motif(
+            &genome.voice,
+            motif,
+            &quiet,
+            48_000,
+            1,
+            OfflineSampleFormat::F32,
+        ) else {
+            unreachable!()
+        };
+        let OfflinePcm::F32(loud_pcm) = render_motif(
+            &genome.voice,
+            motif,
+            &loud,
+            48_000,
+            1,
+            OfflineSampleFormat::F32,
+        ) else {
+            unreachable!()
+        };
+        let rms = |samples: &[f32]| {
+            (samples.iter().map(|sample| sample * sample).sum::<f32>()
+                / samples.len().max(1) as f32)
+                .sqrt()
+        };
+        assert!(rms(&loud_pcm) / rms(&quiet_pcm).max(0.000_001) >= 2.0);
+
+        let mut lingering = request(motif.id);
+        lingering.tempo_scale = 0.65;
+        let mut brisk = lingering.clone();
+        brisk.tempo_scale = 1.40;
+        let lingering_frames =
+            crate::VoiceCommand::prepare(&genome.voice, motif, &lingering).total_frames(48_000);
+        let brisk_frames =
+            crate::VoiceCommand::prepare(&genome.voice, motif, &brisk).total_frames(48_000);
+        assert!(lingering_frames as f32 / brisk_frames as f32 >= 1.8);
+    }
+
+    #[test]
+    fn organic_chain_is_declicked_dc_safe_and_not_high_frequency_noise() {
+        let genome = Genome::from_seed(15);
+        let motif = &generate_initial_motifs(&genome.voice)[0];
+        let OfflinePcm::F32(samples) = render_motif(
+            &genome.voice,
+            motif,
+            &request(motif.id),
+            48_000,
+            1,
+            OfflineSampleFormat::F32,
+        ) else {
+            unreachable!()
+        };
+        let mean = samples.iter().sum::<f32>() / samples.len().max(1) as f32;
+        let signal_energy = samples.iter().map(|sample| sample * sample).sum::<f32>();
+        let mut difference_energy = 0.0;
+        let mut maximum_step = 0.0_f32;
+        for pair in samples.windows(2) {
+            let step = pair[1] - pair[0];
+            difference_energy += step * step;
+            maximum_step = maximum_step.max(step.abs());
+        }
+        assert!(mean.abs() < 0.003, "dc mean={mean}");
+        assert!(maximum_step < 0.10, "maximum sample step={maximum_step}");
+        assert!(
+            difference_energy / signal_energy.max(0.000_001) < 0.32,
+            "excess high-frequency energy"
+        );
+        assert!(samples.first().is_some_and(|sample| sample.abs() < 0.000_1));
+        assert!(samples.last().is_some_and(|sample| sample.abs() < 0.005));
+    }
+
+    #[test]
+    fn roughness_and_mouth_resonance_are_audible_genome_dimensions() {
+        let genome = Genome::from_seed(16);
+        let motif = &generate_initial_motifs(&genome.voice)[0];
+        let mut smooth = genome.voice.clone();
+        smooth.roughness = 0.0;
+        smooth.mouth_resonance = 0.0;
+        let mut textured = smooth.clone();
+        textured.roughness = 0.8;
+        textured.mouth_resonance = 0.9;
+        let smooth_pcm = render_motif(
+            &smooth,
+            motif,
+            &request(motif.id),
+            48_000,
+            1,
+            OfflineSampleFormat::I16,
+        );
+        let textured_pcm = render_motif(
+            &textured,
+            motif,
+            &request(motif.id),
+            48_000,
+            1,
+            OfflineSampleFormat::I16,
+        );
+        assert_ne!(smooth_pcm, textured_pcm);
     }
 }

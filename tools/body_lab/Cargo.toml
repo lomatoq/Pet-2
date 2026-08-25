@@ -1,0 +1,23 @@
+[package]
+name = "body_lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+desktop_host = { path = "../../crates/desktop_host" }
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+glam.workspace = true
+lifecore = { path = "../../crates/lifecore" }
+pet_body = { path = "../../crates/pet_body" }
+pet_audio = { path = "../../crates/pet_audio" }
+pollster.workspace = true
+serde_json.workspace = true
+winit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

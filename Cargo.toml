@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "crates/desktop_host", "crates/lifecore", "crates/pet_audio", "crates/pet_body"]
+members = ["app", "crates/desktop_host", "crates/lifecore", "crates/morph_brain", "crates/pet_audio", "crates/pet_body", "crates/pet_perception", "tools/body_lab"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,9 @@ repository = "https://github.com/lomatoq/Pet-2"
 bytemuck = { version = "1.23", features = ["derive"] }
 cpal = "=0.15.3"
 directories = "=6.0.0"
+egui = "=0.33.3"
+egui-wgpu = { version = "=0.33.3", default-features = false }
+egui-winit = { version = "=0.33.3", default-features = false }
 glam = { version = "0.30", features = ["bytemuck", "serde"] }
 naga = { version = "27", features = ["wgsl-in"] }
 pollster = "0.4"

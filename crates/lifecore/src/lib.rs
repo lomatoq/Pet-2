@@ -13,6 +13,7 @@ mod genome;
 mod memory;
 mod microbrain;
 mod persistence;
+mod vita;
 
 use std::{array, collections::VecDeque};
 
@@ -30,9 +31,15 @@ pub use genome::*;
 pub use memory::*;
 pub use microbrain::*;
 pub use persistence::*;
+pub use vita::*;
 
 pub const LIFECORE_HZ: f32 = 20.0;
 const RECENT_ACTION_CAPACITY: usize = 16;
+const MAX_IGNORED_ATTEMPTS: u32 = 8;
+const RECENT_VOCAL_CAPACITY: usize = 4;
+const EXACT_VOCAL_REPEAT_WINDOW: usize = 3;
+const MAX_VOCAL_FAMILY_SIZE: usize = 4;
+const VOCAL_CONTEXT_WEIGHT_LIMIT: f32 = 1.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FeedbackEvent {
@@ -119,6 +126,11 @@ impl LifeCore {
 
     pub fn tick(&mut self, sensors: &SensorFrame, body: &BodyFeedback, dt: f32) -> LifeOutput {
         let dt = finite_dt(dt);
+        // Older snapshots could accumulate hundreds of implicit "ignores" because
+        // solitary play was misclassified as a bid for user attention. Treat this
+        // value as a bounded recent streak so a repaired companion can recover
+        // without discarding the rest of its learned state.
+        self.state.ignored_attempts = self.state.ignored_attempts.min(MAX_IGNORED_ATTEMPTS);
         self.state.tick_count = self.state.tick_count.saturating_add(1);
         self.state.elapsed_seconds += f64::from(dt);
         self.state.action_elapsed_seconds += dt;
@@ -128,6 +140,7 @@ impl LifeCore {
             *cooldown = (*cooldown - dt).max(0.0);
         }
         self.resolve_expired_attention(dt);
+        self.resolve_expired_vocal_credit(dt);
 
         let previous_cost = self.state.drives.homeostatic_cost();
         self.state.drives.update(
@@ -166,7 +179,11 @@ impl LifeCore {
         let expression = ExpressionState::from_readouts(readouts.expressions, self.state.affect);
         let body_intent = body_intent_for(self.state.current_action, sensors, body, expression);
         let vocal_request = if switched && self.state.current_action.is_vocal() {
-            self.select_vocal_request(sensors, &context)
+            self.select_vocal_request(
+                VocalTrigger::Action(self.state.current_action),
+                sensors,
+                &context,
+            )
         } else {
             None
         };
@@ -210,7 +227,11 @@ impl LifeCore {
                 self.state.successful_interactions.saturating_add(1);
             self.state.ignored_attempts = self.state.ignored_attempts.saturating_sub(1);
         } else if reward < 0.0 {
-            self.state.ignored_attempts = self.state.ignored_attempts.saturating_add(1);
+            self.state.ignored_attempts = self
+                .state
+                .ignored_attempts
+                .saturating_add(1)
+                .min(MAX_IGNORED_ATTEMPTS);
         }
         if matches!(
             event,
@@ -218,7 +239,7 @@ impl LifeCore {
         ) {
             self.state.attention_budget.current = 0.0;
         }
-        self.update_selected_motif_reward(reward);
+        self.apply_vocal_feedback(reward);
         let outcome = outcome_for_reward(reward);
         self.memories.record(EventRecord {
             timestamp: self.state.elapsed_seconds,
@@ -241,7 +262,9 @@ impl LifeCore {
     pub fn consolidate_sleep(&mut self) {
         self.memories.consolidate();
         self.brain.consolidate();
+        self.repair_vocal_repertoire();
         let mut created = 0;
+        let mut mutated_families = Vec::new();
         let candidates: Vec<_> = self
             .state
             .vocal_motifs
@@ -250,7 +273,11 @@ impl LifeCore {
             .cloned()
             .collect();
         for parent in candidates {
-            if created == 2 || random_unit(&mut self.rng) > 0.42 {
+            if created == 2 {
+                break;
+            }
+            let family = motif_family_id(&self.state.vocal_motifs, parent.id);
+            if mutated_families.contains(&family) || random_unit(&mut self.rng) > 0.42 {
                 continue;
             }
             let child = mutate_motif(&parent, self.rng.next_u64());
@@ -261,15 +288,11 @@ impl LifeCore {
                 .all(|existing| motif_distance(existing, &child) > 0.025);
             if distinct {
                 self.state.vocal_motifs.push(child);
+                mutated_families.push(family);
                 created += 1;
             }
         }
-        if self.state.vocal_motifs.len() > 24 {
-            self.state
-                .vocal_motifs
-                .sort_by(|left, right| motif_value(right).total_cmp(&motif_value(left)));
-            self.state.vocal_motifs.truncate(24);
-        }
+        self.repair_vocal_repertoire();
     }
 
     pub fn trigger_metamorphosis(&mut self) -> DevelopmentResult {
@@ -306,14 +329,16 @@ impl LifeCore {
         let mut rng = ChaCha8Rng::from_seed(snapshot.rng.seed);
         rng.set_stream(snapshot.rng.stream);
         rng.set_word_pos(snapshot.rng.word_position);
-        Ok(Self {
+        let mut restored = Self {
             state: snapshot.state,
             brain: snapshot.brain,
             habits: snapshot.habits,
             memories: snapshot.memories,
             rng,
             rng_seed: snapshot.rng.seed,
-        })
+        };
+        restored.repair_vocal_repertoire();
+        Ok(restored)
     }
 
     pub fn set_focus_mode(&mut self, enabled: bool) {
@@ -331,6 +356,103 @@ impl LifeCore {
         self.state.successful_interactions = 0;
         self.state.recent_reward = 0.0;
         self.state.vocal_motifs = generate_initial_motifs(&self.state.genome.voice);
+        self.state.selected_motif_id = None;
+        self.state.recent_vocalizations.clear();
+        self.state.pending_vocal_credit = None;
+        self.state.pending_vocal_delivery = None;
+    }
+
+    /// Ask the mind for an interaction sound without bypassing its learned
+    /// repertoire. Hosts should call this after applying the interaction event
+    /// that caused the response, then enqueue the returned request.
+    pub fn request_vocalization(
+        &mut self,
+        trigger: VocalTrigger,
+        sensors: &SensorFrame,
+    ) -> Option<VocalRequest> {
+        if !trigger.is_supported() {
+            return None;
+        }
+        let context = ContextualBandit::context(
+            sensors,
+            &self.state.drives,
+            &self.state.affect,
+            self.state.ignored_attempts,
+            self.state.successful_interactions,
+        );
+        self.select_vocal_request(trigger, sensors, &context)
+    }
+
+    /// Confirm that the callback began rendering this exact performance.
+    /// Repertoire recency, use count, and response credit begin here rather than
+    /// when a request merely enters a host-side queue.
+    pub fn confirm_vocal_request_heard(&mut self, request_id: u64) -> bool {
+        if self
+            .state
+            .pending_vocal_delivery
+            .as_ref()
+            .is_none_or(|pending| pending.request_id != request_id)
+        {
+            return false;
+        }
+        let delivery = self
+            .state
+            .pending_vocal_delivery
+            .take()
+            .expect("matching vocal delivery exists");
+        for motif in &mut self.state.vocal_motifs {
+            motif.novelty = (motif.novelty + (1.0 - motif.novelty) * 0.035).clamp(0.0, 1.0);
+        }
+        let Some(motif) = self
+            .state
+            .vocal_motifs
+            .iter_mut()
+            .find(|motif| motif.id == delivery.motif_id)
+        else {
+            return false;
+        };
+        motif.use_count = motif.use_count.saturating_add(1);
+        motif.novelty *= 0.62;
+        self.state.selected_motif_id = Some(delivery.motif_id);
+        if self.state.recent_vocalizations.len() == RECENT_VOCAL_CAPACITY {
+            self.state.recent_vocalizations.pop_front();
+        }
+        self.state
+            .recent_vocalizations
+            .push_back(RecentVocalization {
+                motif_id: delivery.motif_id,
+                family_id: delivery.family_id,
+            });
+        self.state.pending_vocal_credit = Some(PendingVocalCredit {
+            motif_id: delivery.motif_id,
+            context: delivery.context,
+            elapsed_seconds: 0.0,
+            response_window_seconds: delivery.response_window_seconds,
+            penalize_if_ignored: delivery.penalize_if_ignored,
+        });
+        true
+    }
+
+    /// Cancel a queued performance that never reached the callback. Since no
+    /// learning state is committed before `confirm_vocal_request_heard`, this is
+    /// a lossless discard rather than a fragile rollback.
+    pub fn cancel_vocal_request(&mut self, request_id: u64) {
+        if self
+            .state
+            .pending_vocal_delivery
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.state.pending_vocal_delivery = None;
+        }
+    }
+
+    /// Audio queues and streams are process-owned. A restored mind keeps learned
+    /// history, but must never retain delivery or feedback windows from a stream
+    /// that no longer exists.
+    pub fn reset_vocal_delivery_session(&mut self) {
+        self.state.pending_vocal_delivery = None;
+        self.state.pending_vocal_credit = None;
     }
 
     #[must_use]
@@ -353,6 +475,11 @@ impl LifeCore {
         array::from_fn(|index| {
             let action = ActionId::ALL[index];
             let definition = action.definition();
+            if action == self.state.current_action
+                && self.state.action_elapsed_seconds >= definition.maximum_duration
+            {
+                return -100.0;
+            }
             if self.state.focus_mode && !action.is_focus_allowed() {
                 return -100.0;
             }
@@ -415,6 +542,15 @@ impl LifeCore {
         context: &ContextVector,
     ) -> bool {
         let current = self.state.current_action;
+        // A captured pointer is a physical manipulation session, not a request
+        // to replace the navigation controller on the same tick. Switching from
+        // e.g. Sleep/Wander to Hover here produced a large bounded acceleration
+        // exactly on mouse-down, which looked like an input hitch even though the
+        // frame itself stayed on budget. Feedback and affect are still processed;
+        // arbitration resumes normally after release.
+        if sensors.pet_dragged {
+            return false;
+        }
         let current_definition = current.definition();
         let direct_interaction =
             sensors.pointer_pressed || sensors.pet_touched || sensors.pet_dragged;
@@ -464,47 +600,134 @@ impl LifeCore {
 
     fn select_vocal_request(
         &mut self,
+        trigger: VocalTrigger,
         sensors: &SensorFrame,
         context: &ContextVector,
     ) -> Option<VocalRequest> {
-        if self.state.vocal_motifs.is_empty() {
+        if !trigger.is_supported()
+            || self.state.vocal_motifs.is_empty()
+            || self.state.pending_vocal_delivery.is_some()
+        {
             return None;
         }
         let attachment = self.state.affect.attachment;
+        let families: Vec<_> = self
+            .state
+            .vocal_motifs
+            .iter()
+            .map(|motif| motif_family_id(&self.state.vocal_motifs, motif.id))
+            .collect();
+        let recent_exact: Vec<_> = self
+            .state
+            .recent_vocalizations
+            .iter()
+            .rev()
+            .take(EXACT_VOCAL_REPEAT_WINDOW)
+            .map(|recent| recent.motif_id)
+            .collect();
+        let last_family = self
+            .state
+            .recent_vocalizations
+            .back()
+            .map(|recent| recent.family_id);
+        let has_alternative_family = last_family.is_some_and(|last| {
+            self.state
+                .vocal_motifs
+                .iter()
+                .zip(&families)
+                .any(|(motif, family)| *family != last && !recent_exact.contains(&motif.id))
+        });
+        let mean_use = self
+            .state
+            .vocal_motifs
+            .iter()
+            .map(|motif| motif.use_count as f32)
+            .sum::<f32>()
+            / self.state.vocal_motifs.len().max(1) as f32;
         let mut scores = [f32::NEG_INFINITY; 24];
         for (index, motif) in self.state.vocal_motifs.iter().take(24).enumerate() {
-            let contextual = motif
-                .context_weights
+            if recent_exact.contains(&motif.id)
+                || (has_alternative_family && Some(families[index]) == last_family)
+            {
+                scores[index] = -100.0;
+                continue;
+            }
+            let contextual = motif_context_prediction(motif, context);
+            let family_recency = self
+                .state
+                .recent_vocalizations
                 .iter()
-                .zip(context)
-                .map(|(weight, value)| weight * value)
+                .rev()
+                .enumerate()
+                .filter(|(_, recent)| recent.family_id == families[index])
+                .map(|(age, _)| 0.32 / (age + 1) as f32)
                 .sum::<f32>();
-            scores[index] = motif.expected_reward * (0.65 + attachment * 0.55)
-                + motif.novelty * (1.0 - attachment) * 0.28
-                + contextual * 0.22
-                - motif.use_count as f32 * 0.003;
+            let overuse = ((motif.use_count as f32 - mean_use) / (mean_use + 4.0)).max(0.0);
+            scores[index] = motif.expected_reward * (0.34 + attachment * 0.22)
+                + motif.novelty * (0.22 + (1.0 - attachment) * 0.12)
+                + contextual * 0.38
+                + motif_style_score(motif, trigger, self.state.affect) * 0.72
+                - family_recency
+                - overuse * 0.12;
         }
         let chosen = sample_index_softmax(
             &scores[..self.state.vocal_motifs.len().min(24)],
-            0.32 + (1.0 - attachment) * 0.42,
+            0.34 + (1.0 - attachment) * 0.32,
             &mut self.rng,
         );
-        let motif = &mut self.state.vocal_motifs[chosen];
-        motif.use_count = motif.use_count.saturating_add(1);
-        motif.novelty *= 0.92;
-        self.state.selected_motif_id = Some(motif.id);
+        let performance_seed = self.rng.next_u64();
+        // Pitch is identity-sensitive, so it only drifts subtly. Loudness and
+        // phrase length may vary much more: those are the clearest organic
+        // differences between two utterances of the same learned call.
+        let performance_pitch = 1.0 + (random_unit(&mut self.rng) * 2.0 - 1.0) * 0.040;
+        let gain_shape = (random_unit(&mut self.rng) + random_unit(&mut self.rng)) * 0.5;
+        let duration_shape = (random_unit(&mut self.rng) + random_unit(&mut self.rng)) * 0.5;
+        let performance_gain = 0.58 + gain_shape * (1.04 - 0.58);
+        let performance_duration = 0.72 + duration_shape * (1.45 - 0.72);
+        let performance_tempo = performance_duration.recip();
+        let family_id = families[chosen];
+        let motif_id = self.state.vocal_motifs[chosen].id;
+        let response_window_seconds = if trigger.expects_response() {
+            4.5 + self.state.genome.temperament.persistence * 4.5
+        } else {
+            3.0
+        };
+        self.state.pending_vocal_delivery = Some(PendingVocalDelivery {
+            request_id: performance_seed,
+            motif_id,
+            family_id,
+            context: *context,
+            response_window_seconds,
+            penalize_if_ignored: trigger.expects_response(),
+        });
         let affect = self.state.affect;
         let fatigue = self.state.drives.sleep;
+        let (style_pitch, style_tempo, style_gain, purr) = match trigger {
+            VocalTrigger::Action(ActionId::Purr) => (0.86, 0.82, 0.74, true),
+            VocalTrigger::Action(ActionId::MimicClickRhythm) => (1.02, 1.12, 0.90, false),
+            VocalTrigger::Action(ActionId::Chirp) => (1.08, 1.06, 1.0, false),
+            VocalTrigger::Action(_) => (1.0, 1.0, 0.88, false),
+            VocalTrigger::Touch => (0.98, 1.02, 0.90, false),
+        };
         Some(VocalRequest {
-            motif_id: motif.id,
+            motif_id,
+            performance_seed,
             gain: self.state.genome.voice.maximum_loudness
+                * style_gain
                 * (1.0 - affect.stress * 0.45)
-                * (1.0 - fatigue * 0.25),
+                * (1.0 - fatigue * 0.25)
+                * performance_gain,
             pan: (sensors.cursor_position.x * 2.0 - 1.0).clamp(-0.8, 0.8),
-            pitch_scale: (1.0 + affect.arousal * 0.12 - fatigue * 0.10).clamp(0.75, 1.30),
-            tempo_scale: (1.0 + affect.arousal * 0.18 - fatigue * 0.20).clamp(0.65, 1.4),
+            pitch_scale: (style_pitch
+                * (1.0 + affect.arousal * 0.12 - fatigue * 0.10)
+                * performance_pitch)
+                .clamp(0.70, 1.38),
+            tempo_scale: (style_tempo
+                * (1.0 + affect.arousal * 0.18 - fatigue * 0.20)
+                * performance_tempo)
+                .clamp(0.62, 1.48),
             stress: affect.stress,
-            purr: self.state.current_action == ActionId::Purr,
+            purr,
         })
     }
 
@@ -519,10 +742,14 @@ impl LifeCore {
         let pending = self.state.pending_attention.take().expect("pending exists");
         self.habits.update(pending.action, &pending.context, -0.25);
         self.brain.apply_reward(-0.25);
-        self.state.ignored_attempts = self.state.ignored_attempts.saturating_add(1);
+        self.state.ignored_attempts = self
+            .state
+            .ignored_attempts
+            .saturating_add(1)
+            .min(MAX_IGNORED_ATTEMPTS);
         self.state.recent_reward = -0.25;
         self.state.action_cooldowns[pending.action.index()] += pending.action.definition().cooldown
-            * (0.5 + self.state.ignored_attempts as f32 * 0.25);
+            * (0.5 + self.state.ignored_attempts.min(5) as f32 * 0.25);
         self.memories.record(EventRecord {
             timestamp: self.state.elapsed_seconds,
             context: pending.context,
@@ -533,21 +760,146 @@ impl LifeCore {
         });
     }
 
-    fn update_selected_motif_reward(&mut self, reward: f32) {
-        let Some(selected) = self.state.selected_motif_id else {
+    fn resolve_expired_vocal_credit(&mut self, dt: f32) {
+        let Some(pending) = &mut self.state.pending_vocal_credit else {
             return;
         };
+        pending.elapsed_seconds += dt;
+        if pending.elapsed_seconds < pending.response_window_seconds {
+            return;
+        }
+        let expired = self
+            .state
+            .pending_vocal_credit
+            .take()
+            .expect("pending vocal credit exists");
+        if expired.penalize_if_ignored {
+            self.update_vocal_motif_from_credit(&expired, -0.18);
+        }
+    }
+
+    fn apply_vocal_feedback(&mut self, reward: f32) {
+        if reward.abs() <= f32::EPSILON {
+            return;
+        }
+        let Some(pending) = self.state.pending_vocal_credit.take() else {
+            return;
+        };
+        self.update_vocal_motif_from_credit(&pending, reward);
+    }
+
+    fn update_vocal_motif_from_credit(&mut self, credit: &PendingVocalCredit, reward: f32) {
         if let Some(motif) = self
             .state
             .vocal_motifs
             .iter_mut()
-            .find(|motif| motif.id == selected)
+            .find(|motif| motif.id == credit.motif_id)
         {
-            motif.expected_reward += (reward - motif.expected_reward) * 0.18;
+            let reward = reward.clamp(-1.0, 1.0);
+            motif.expected_reward += (reward - motif.expected_reward) * 0.10;
             motif.expected_reward = motif.expected_reward.clamp(-1.0, 1.0);
+            let prediction = motif_context_prediction(motif, &credit.context);
+            let error = reward - prediction;
+            let learning_rate =
+                0.018 + self.state.genome.temperament.adaptability.clamp(0.0, 1.0) * 0.032;
+            for (weight, value) in motif.context_weights.iter_mut().zip(&credit.context) {
+                *weight = (*weight + learning_rate * error * value)
+                    .clamp(-VOCAL_CONTEXT_WEIGHT_LIMIT, VOCAL_CONTEXT_WEIGHT_LIMIT);
+            }
             if reward > 0.2 {
                 motif.success_count = motif.success_count.saturating_add(1);
+                motif.novelty = (motif.novelty + 0.06).min(1.0);
             }
+        }
+    }
+
+    fn repair_vocal_repertoire(&mut self) {
+        let canonical = generate_initial_motifs(&self.state.genome.voice);
+        for motif in canonical {
+            let family_present =
+                self.state.vocal_motifs.iter().any(|existing| {
+                    motif_family_id(&self.state.vocal_motifs, existing.id) == motif.id
+                });
+            if !family_present
+                && self
+                    .state
+                    .vocal_motifs
+                    .iter()
+                    .all(|existing| existing.id != motif.id)
+            {
+                self.state.vocal_motifs.push(motif);
+            }
+        }
+
+        let mut family_counts = std::collections::HashMap::<u64, usize>::new();
+        for motif in &self.state.vocal_motifs {
+            *family_counts
+                .entry(motif_family_id(&self.state.vocal_motifs, motif.id))
+                .or_default() += 1;
+        }
+        let needs_prune = self.state.vocal_motifs.len() > 24
+            || family_counts
+                .values()
+                .any(|count| *count > MAX_VOCAL_FAMILY_SIZE);
+        if !needs_prune {
+            return;
+        }
+
+        let all = self.state.vocal_motifs.clone();
+        let mut ranked = all.clone();
+        ranked.sort_by(|left, right| motif_value(right).total_cmp(&motif_value(left)));
+        let mut kept = Vec::with_capacity(24);
+        let mut kept_ids = std::collections::HashSet::new();
+        let mut kept_families = std::collections::HashMap::<u64, usize>::new();
+
+        // First reserve the strongest member of every extant voice family.
+        for motif in &ranked {
+            let family = motif_family_id(&all, motif.id);
+            if kept_families.contains_key(&family) || kept.len() == 24 {
+                continue;
+            }
+            kept.push(motif.clone());
+            kept_ids.insert(motif.id);
+            kept_families.insert(family, 1);
+        }
+        // Then spend the remaining capacity on successful variants, with a hard
+        // family cap so one rewarded parent can never erase the whole vocabulary.
+        for motif in ranked {
+            if kept.len() == 24 || kept_ids.contains(&motif.id) {
+                continue;
+            }
+            let family = motif_family_id(&all, motif.id);
+            let count = kept_families.entry(family).or_default();
+            if *count >= MAX_VOCAL_FAMILY_SIZE {
+                continue;
+            }
+            *count += 1;
+            kept_ids.insert(motif.id);
+            kept.push(motif);
+        }
+        self.state.vocal_motifs = kept;
+        if self
+            .state
+            .selected_motif_id
+            .is_some_and(|id| !kept_ids.contains(&id))
+        {
+            self.state.selected_motif_id = None;
+        }
+        if self
+            .state
+            .pending_vocal_credit
+            .as_ref()
+            .is_some_and(|pending| !kept_ids.contains(&pending.motif_id))
+        {
+            self.state.pending_vocal_credit = None;
+        }
+        if self
+            .state
+            .pending_vocal_delivery
+            .as_ref()
+            .is_some_and(|pending| !kept_ids.contains(&pending.motif_id))
+        {
+            self.state.pending_vocal_delivery = None;
         }
     }
 
@@ -641,6 +993,12 @@ fn conditions_met(
     if conditions.needs_cursor && !sensors.cursor_position.is_finite() {
         return false;
     }
+    if conditions.needs_cursor_proximity && sensors.cursor_distance_to_pet > 0.28 {
+        return false;
+    }
+    if conditions.needs_cursor_engagement && !cursor_engaged(sensors) {
+        return false;
+    }
     if conditions.needs_user_available
         && sensors.user_availability.unwrap_or({
             if sensors.user_idle_seconds < 120.0 {
@@ -672,6 +1030,12 @@ fn conditions_met(
         return false;
     }
     true
+}
+
+fn cursor_engaged(sensors: &SensorFrame) -> bool {
+    let close_contact = sensors.cursor_distance_to_pet < 0.12
+        && (sensors.pointer_down || sensors.pointer_pressed || sensors.pet_hovered);
+    close_contact || sensors.pet_touched || sensors.pet_dragged
 }
 
 fn temperament_bias(action: ActionId, state: &LifeState) -> f32 {
@@ -755,12 +1119,19 @@ fn body_intent_for(
 ) -> BodyIntent {
     let surface = sensors.visible_surfaces.first();
     let (locomotion, target_position, pose, interaction_target, speed) = match action {
-        ActionId::ApproachCursor | ActionId::InvitePetting => (
+        ActionId::ApproachCursor => (
             LocomotionMode::Arrive,
             sensors.cursor_position,
             PoseIntent::Curious,
             Some(InteractionTarget::Cursor),
-            0.42,
+            0.14,
+        ),
+        ActionId::InvitePetting => (
+            LocomotionMode::Hover,
+            body.world_position,
+            PoseIntent::Curious,
+            Some(InteractionTarget::User),
+            0.06,
         ),
         ActionId::RetreatFromCursor | ActionId::FrustratedRetreat => {
             let away = (body.world_position - sensors.cursor_position).normalize_or_zero();
@@ -772,12 +1143,19 @@ fn body_intent_for(
                 0.58,
             )
         }
-        ActionId::PlayCursorChase | ActionId::InviteCursorChase => (
+        ActionId::InviteCursorChase => (
+            LocomotionMode::Hover,
+            body.world_position,
+            PoseIntent::Playful,
+            Some(InteractionTarget::Cursor),
+            0.06,
+        ),
+        ActionId::PlayCursorChase => (
             LocomotionMode::Orbit,
             sensors.cursor_position,
             PoseIntent::Playful,
             Some(InteractionTarget::Cursor),
-            0.72,
+            0.20,
         ),
         ActionId::LandOnWindow => (
             LocomotionMode::Landing,
@@ -817,19 +1195,26 @@ fn body_intent_for(
             None,
             0.0,
         ),
+        ActionId::SelfPlay => (
+            LocomotionMode::Wander,
+            deterministic_wander_target(action, sensors.timestamp),
+            PoseIntent::Playful,
+            None,
+            0.08,
+        ),
         ActionId::ExploreScreen | ActionId::HideAndSeek => (
             LocomotionMode::Wander,
             deterministic_wander_target(action, sensors.timestamp),
             PoseIntent::Curious,
             None,
-            0.48,
+            0.11,
         ),
         ActionId::BringProceduralOrb => (
-            LocomotionMode::Seek,
-            sensors.cursor_position.lerp(Vec2::splat(0.5), 0.35),
+            LocomotionMode::Hover,
+            body.world_position,
             PoseIntent::Playful,
             Some(InteractionTarget::ProceduralOrb),
-            0.55,
+            0.06,
         ),
         ActionId::HappyDisplay => (
             LocomotionMode::Hover,
@@ -861,10 +1246,14 @@ fn body_intent_for(
 }
 
 fn deterministic_wander_target(action: ActionId, timestamp: f64) -> Vec2 {
-    let phase = (timestamp as f32 * 0.07 + action.index() as f32 * 1.618).rem_euclid(6.0);
+    // Exploration is a behavior bout, not a continuously moving waypoint. Holding a
+    // target gives the body time to arrive, observe, and visibly choose again instead
+    // of tracing a screen-wide Lissajous curve from corner to corner.
+    let bout = (timestamp.max(0.0) / 6.0).floor() as f32;
+    let phase = (bout * 1.987 + action.index() as f32 * 1.618).rem_euclid(std::f32::consts::TAU);
     Vec2::new(
-        0.5 + phase.sin() * 0.42,
-        0.5 + (phase * 0.73 + 1.1).cos() * 0.38,
+        0.5 + phase.sin() * 0.26,
+        0.52 + (phase * 0.73 + 1.1).cos() * 0.20,
     )
 }
 
@@ -898,8 +1287,72 @@ fn salience(reward: f32, attachment: f32, outcome: Outcome) -> f32 {
     .clamp(0.0, 1.0)
 }
 
+fn motif_family_id(motifs: &[VocalMotif], motif_id: u64) -> u64 {
+    let mut current = motif_id;
+    for _ in 0..=motifs.len() {
+        let Some(motif) = motifs.iter().find(|motif| motif.id == current) else {
+            return current;
+        };
+        let Some(parent) = motif.parent_id else {
+            return current;
+        };
+        if parent == current {
+            return current;
+        }
+        current = parent;
+    }
+    current
+}
+
+fn motif_context_prediction(motif: &VocalMotif, context: &ContextVector) -> f32 {
+    motif
+        .context_weights
+        .iter()
+        .zip(context)
+        .map(|(weight, value)| weight * value)
+        .sum::<f32>()
+        .clamp(-1.0, 1.0)
+}
+
+fn motif_style_score(motif: &VocalMotif, trigger: VocalTrigger, affect: AffectState) -> f32 {
+    let count = motif.syllables.len().max(1) as f32;
+    let mean =
+        |sample: fn(&Syllable) -> f32| motif.syllables.iter().map(sample).sum::<f32>() / count;
+    let signature = [
+        ((mean(|syllable| syllable.pitch_peak) - 0.45) / 1.75).clamp(0.0, 1.0),
+        (mean(|syllable| syllable.duration_ms) / 520.0).clamp(0.0, 1.0),
+        (mean(|syllable| syllable.gap_after_ms) / 280.0).clamp(0.0, 1.0),
+        mean(|syllable| syllable.click).clamp(0.0, 1.0),
+        mean(|syllable| syllable.noisiness).clamp(0.0, 1.0),
+        ((motif.syllables.len() as f32 - 1.0) / 5.0).clamp(0.0, 1.0),
+        (0.5 + mean(|syllable| syllable.pitch_end - syllable.pitch_start) * 0.35).clamp(0.0, 1.0),
+    ];
+    let mut target = match trigger {
+        VocalTrigger::Action(ActionId::Purr) => [0.20, 0.72, 0.18, 0.05, 0.16, 0.78, 0.42],
+        VocalTrigger::Action(ActionId::MimicClickRhythm) => {
+            [0.55, 0.30, 0.56, 0.82, 0.30, 0.68, 0.50]
+        }
+        VocalTrigger::Action(ActionId::Chirp) => [0.72, 0.28, 0.20, 0.20, 0.24, 0.38, 0.74],
+        VocalTrigger::Action(_) => [0.50; 7],
+        VocalTrigger::Touch => [0.44, 0.34, 0.16, 0.12, 0.18, 0.34, 0.62],
+    };
+    target[0] = (target[0] + affect.arousal * 0.10).clamp(0.0, 1.0);
+    target[4] = (target[4] + affect.stress * 0.28).clamp(0.0, 1.0);
+    target[6] = (target[6] + affect.valence * 0.16).clamp(0.0, 1.0);
+    let weights = [1.0, 0.82, 0.48, 0.72, 0.62, 0.42, 0.68];
+    let weighted_distance = signature
+        .iter()
+        .zip(target)
+        .zip(weights)
+        .map(|((value, target), weight)| (value - target).powi(2) * weight)
+        .sum::<f32>()
+        / weights.iter().sum::<f32>();
+    (1.0 - weighted_distance.sqrt() * 1.55).clamp(-1.0, 1.0)
+}
+
 fn motif_value(motif: &VocalMotif) -> f32 {
-    motif.expected_reward * 0.7 + motif.novelty * 0.2 + motif.success_count as f32 * 0.01
+    let credited_successes = motif.success_count.min(motif.use_count) as f32;
+    motif.expected_reward * 0.7 + motif.novelty * 0.2 + credited_successes * 0.01
 }
 
 fn motif_distance(left: &VocalMotif, right: &VocalMotif) -> f32 {
@@ -997,6 +1450,196 @@ mod tests {
     }
 
     #[test]
+    fn exploration_target_is_stable_and_center_bounded_for_each_bout() {
+        let first = deterministic_wander_target(ActionId::ExploreScreen, 12.1);
+        let same_bout = deterministic_wander_target(ActionId::ExploreScreen, 17.9);
+        let next_bout = deterministic_wander_target(ActionId::ExploreScreen, 18.1);
+        assert_eq!(first, same_bout);
+        assert_ne!(first, next_bout);
+        for target in [first, next_bout] {
+            assert!((0.24..=0.76).contains(&target.x));
+            assert!((0.32..=0.72).contains(&target.y));
+        }
+    }
+
+    #[test]
+    fn self_play_is_a_bounded_autonomous_movement_bout() {
+        let intent = body_intent_for(
+            ActionId::SelfPlay,
+            &SensorFrame {
+                timestamp: 12.1,
+                ..SensorFrame::default()
+            },
+            &BodyFeedback::default(),
+            ExpressionState::default(),
+        );
+        assert_eq!(intent.locomotion, LocomotionMode::Wander);
+        assert!(intent.desired_speed <= 0.08);
+        assert!((0.24..=0.76).contains(&intent.target_position.x));
+        assert!((0.32..=0.72).contains(&intent.target_position.y));
+        assert_eq!(intent.interaction_target, None);
+    }
+
+    #[test]
+    fn expired_current_action_is_removed_from_candidate_scores() {
+        let mut core = LifeCore::new(Genome::from_seed(44), 44);
+        core.state.current_action = ActionId::IdleHover;
+        core.state.action_elapsed_seconds = ActionId::IdleHover.definition().maximum_duration;
+        let scores = core.score_actions(
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            &[0.0; CONTEXT_SIZE],
+            &[0.0; ACTION_COUNT],
+        );
+        assert_eq!(scores[ActionId::IdleHover.index()], -100.0);
+    }
+
+    #[test]
+    fn captured_material_drag_cannot_replace_navigation_action_mid_press() {
+        let mut core = LifeCore::new(Genome::from_seed(46), 46);
+        core.state.current_action = ActionId::SelfPlay;
+        core.state.action_elapsed_seconds = ActionId::SelfPlay.definition().maximum_duration + 1.0;
+        let mut scores = [0.0; ACTION_COUNT];
+        scores[ActionId::WakeUp.index()] = 10.0;
+        let sensors = SensorFrame {
+            pointer_down: true,
+            pointer_pressed: true,
+            pet_touched: true,
+            pet_dragged: true,
+            ..SensorFrame::default()
+        };
+
+        let switched = core.maybe_switch_action(
+            ActionId::WakeUp,
+            &scores,
+            &sensors,
+            &BodyFeedback::default(),
+            &[0.0; CONTEXT_SIZE],
+        );
+
+        assert!(!switched);
+        assert_eq!(core.state.current_action, ActionId::SelfPlay);
+    }
+
+    #[test]
+    fn legacy_ignore_streak_is_repaired_and_stays_bounded() {
+        let mut core = LifeCore::new(Genome::from_seed(45), 45);
+        core.state.ignored_attempts = 558;
+        core.tick(
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            1.0 / LIFECORE_HZ,
+        );
+        assert_eq!(core.state.ignored_attempts, MAX_IGNORED_ATTEMPTS);
+
+        for _ in 0..32 {
+            core.apply_feedback(FeedbackEvent::Ignored);
+        }
+        assert_eq!(core.state.ignored_attempts, MAX_IGNORED_ATTEMPTS);
+    }
+
+    #[test]
+    fn passive_cursor_does_not_start_cursor_chase() {
+        let core = LifeCore::new(Genome::from_seed(41), 41);
+        let sensors = SensorFrame {
+            cursor_position: Vec2::new(0.8, 0.2),
+            cursor_distance_to_pet: 0.42,
+            cursor_velocity: Vec2::new(0.9, 0.0),
+            ..SensorFrame::default()
+        };
+        let conditions = ActionId::PlayCursorChase.definition().required_conditions;
+        assert!(!conditions_met(
+            conditions,
+            &core.state,
+            &sensors,
+            &BodyFeedback::default()
+        ));
+    }
+
+    #[test]
+    fn direct_pet_contact_allows_cursor_chase() {
+        let core = LifeCore::new(Genome::from_seed(42), 42);
+        let sensors = SensorFrame {
+            cursor_distance_to_pet: 0.06,
+            pointer_down: true,
+            pet_hovered: true,
+            ..SensorFrame::default()
+        };
+        let conditions = ActionId::PlayCursorChase.definition().required_conditions;
+        assert!(conditions_met(
+            conditions,
+            &core.state,
+            &sensors,
+            &BodyFeedback::default()
+        ));
+    }
+
+    #[test]
+    fn cursor_approach_requires_a_local_affordance() {
+        let core = LifeCore::new(Genome::from_seed(43), 43);
+        let conditions = ActionId::ApproachCursor.definition().required_conditions;
+        let distant = SensorFrame {
+            cursor_distance_to_pet: 0.65,
+            ..SensorFrame::default()
+        };
+        let nearby = SensorFrame {
+            cursor_distance_to_pet: 0.18,
+            ..SensorFrame::default()
+        };
+        let body = BodyFeedback::default();
+        assert!(!conditions_met(conditions, &core.state, &distant, &body));
+        assert!(conditions_met(conditions, &core.state, &nearby, &body));
+    }
+
+    #[test]
+    fn cursor_chase_invitation_stays_put_until_the_user_engages() {
+        let body = BodyFeedback {
+            world_position: Vec2::new(0.38, 0.56),
+            ..BodyFeedback::default()
+        };
+        let intent = body_intent_for(
+            ActionId::InviteCursorChase,
+            &SensorFrame::default(),
+            &body,
+            ExpressionState::default(),
+        );
+        assert_eq!(intent.locomotion, LocomotionMode::Hover);
+        assert_eq!(intent.target_position, body.world_position);
+        assert!(intent.desired_speed <= 0.06);
+    }
+
+    #[test]
+    fn social_bids_signal_in_place_instead_of_crossing_the_desktop() {
+        let body = BodyFeedback {
+            world_position: Vec2::new(0.38, 0.56),
+            ..BodyFeedback::default()
+        };
+        for action in [ActionId::InvitePetting, ActionId::BringProceduralOrb] {
+            let intent = body_intent_for(
+                action,
+                &SensorFrame::default(),
+                &body,
+                ExpressionState::default(),
+            );
+            assert_eq!(intent.locomotion, LocomotionMode::Hover);
+            assert_eq!(intent.target_position, body.world_position);
+            assert!(intent.desired_speed <= 0.06);
+        }
+    }
+
+    #[test]
+    fn active_cursor_chase_uses_overlay_safe_speed() {
+        let intent = body_intent_for(
+            ActionId::PlayCursorChase,
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            ExpressionState::default(),
+        );
+        assert_eq!(intent.locomotion, LocomotionMode::Orbit);
+        assert!(intent.desired_speed <= 0.20);
+    }
+
+    #[test]
     fn focus_mode_blocks_intrusive_actions() {
         let mut core = LifeCore::new(Genome::from_seed(5), 9);
         core.set_focus_mode(true);
@@ -1015,6 +1658,338 @@ mod tests {
             budget.recover(1.0 / LIFECORE_HZ);
         }
         assert!(budget.current > 0.99);
+    }
+
+    #[test]
+    fn interaction_voice_has_a_hard_anti_repeat_window() {
+        let mut core = LifeCore::new(Genome::from_seed(51), 91);
+        let sensors = SensorFrame::default();
+        let mut heard = Vec::<(u64, u64)>::new();
+        for _ in 0..32 {
+            let request = core
+                .request_vocalization(VocalTrigger::Touch, &sensors)
+                .expect("touch has a voice");
+            assert!(core.confirm_vocal_request_heard(request.performance_seed));
+            let family = motif_family_id(&core.state.vocal_motifs, request.motif_id);
+            assert!(
+                !heard
+                    .iter()
+                    .rev()
+                    .take(EXACT_VOCAL_REPEAT_WINDOW)
+                    .any(|(motif, _)| *motif == request.motif_id),
+                "motif repeated inside anti-repeat window"
+            );
+            if let Some((_, previous_family)) = heard.last() {
+                assert_ne!(
+                    family, *previous_family,
+                    "voice family repeated back-to-back"
+                );
+            }
+            heard.push((request.motif_id, family));
+        }
+        let unique = heard
+            .iter()
+            .map(|(motif, _)| *motif)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(unique >= 4, "only {unique} distinct motifs were heard");
+    }
+
+    #[test]
+    fn vocal_feedback_is_finite_contextual_and_consumed_once() {
+        let mut core = LifeCore::new(Genome::from_seed(52), 92);
+        let sensors = SensorFrame {
+            user_activity_rate: 0.72,
+            cursor_distance_to_pet: 0.08,
+            ..SensorFrame::default()
+        };
+        let request = core
+            .request_vocalization(VocalTrigger::Touch, &sensors)
+            .expect("touch has a voice");
+        assert!(core.confirm_vocal_request_heard(request.performance_seed));
+        let credit = core
+            .state
+            .pending_vocal_credit
+            .clone()
+            .expect("delivered request has pending credit");
+        let before = core
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .cloned()
+            .expect("selected motif exists");
+        let prediction_before = motif_context_prediction(&before, &credit.context);
+
+        core.apply_feedback(FeedbackEvent::Reward(0.8));
+        let after_once = core
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .cloned()
+            .expect("selected motif exists");
+        assert!(after_once.expected_reward > before.expected_reward);
+        assert!(motif_context_prediction(&after_once, &credit.context) > prediction_before);
+        assert_eq!(after_once.success_count, before.success_count + 1);
+        assert!(core.state.pending_vocal_credit.is_none());
+
+        core.apply_feedback(FeedbackEvent::Reward(0.8));
+        let after_unrelated = core
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .expect("selected motif exists");
+        assert_eq!(
+            after_unrelated, &after_once,
+            "stale sound received a second reward"
+        );
+    }
+
+    #[test]
+    fn ignored_attention_voice_gets_one_bounded_negative_update() {
+        let mut core = LifeCore::new(Genome::from_seed(53), 93);
+        let request = core
+            .request_vocalization(
+                VocalTrigger::Action(ActionId::Chirp),
+                &SensorFrame::default(),
+            )
+            .expect("chirp has a voice");
+        assert!(core.confirm_vocal_request_heard(request.performance_seed));
+        let before = core
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .map(|motif| motif.expected_reward)
+            .unwrap();
+        core.resolve_expired_vocal_credit(30.0);
+        let after = core
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .map(|motif| motif.expected_reward)
+            .unwrap();
+        assert!(after < before);
+        assert!(after >= -1.0);
+        assert!(core.state.pending_vocal_credit.is_none());
+    }
+
+    #[test]
+    fn failed_audio_delivery_cannot_train_a_motif() {
+        let mut core = LifeCore::new(Genome::from_seed(54), 94);
+        let request = core
+            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .expect("touch has a voice");
+        let before = core
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .cloned()
+            .unwrap();
+        core.cancel_vocal_request(request.performance_seed);
+        core.apply_feedback(FeedbackEvent::Reward(1.0));
+        let after = core
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .unwrap();
+        assert_eq!(after, &before);
+        assert!(core.state.recent_vocalizations.is_empty());
+        assert!(core.state.pending_vocal_delivery.is_none());
+    }
+
+    #[test]
+    fn queued_vocal_is_reversible_and_requires_exact_heard_ack() {
+        let mut core = LifeCore::new(Genome::from_seed(540), 940);
+        core.state.vocal_motifs[0].novelty = 0.2;
+        let before_motifs = core.state.vocal_motifs.clone();
+        let before_recent = core.state.recent_vocalizations.clone();
+        let request = core
+            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .expect("touch selects a queued performance");
+
+        assert_eq!(core.state.vocal_motifs, before_motifs);
+        assert_eq!(core.state.recent_vocalizations, before_recent);
+        assert!(core.state.pending_vocal_credit.is_none());
+        assert!(
+            core.request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+                .is_none()
+        );
+        assert!(!core.confirm_vocal_request_heard(request.performance_seed ^ 1));
+        core.cancel_vocal_request(request.performance_seed ^ 1);
+        assert!(core.state.pending_vocal_delivery.is_some());
+
+        core.cancel_vocal_request(request.performance_seed);
+        assert!(core.state.pending_vocal_delivery.is_none());
+        assert_eq!(core.state.vocal_motifs, before_motifs);
+        assert_eq!(core.state.recent_vocalizations, before_recent);
+        assert!(
+            core.request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rejected_fifth_vocal_preserves_full_anti_repeat_history() {
+        let mut core = LifeCore::new(Genome::from_seed(541), 941);
+        for _ in 0..RECENT_VOCAL_CAPACITY {
+            let request = core
+                .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+                .unwrap();
+            assert!(core.confirm_vocal_request_heard(request.performance_seed));
+        }
+        let before = core.state.recent_vocalizations.clone();
+        let rejected = core
+            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .unwrap();
+        core.cancel_vocal_request(rejected.performance_seed);
+        assert_eq!(core.state.recent_vocalizations, before);
+    }
+
+    #[test]
+    fn new_audio_session_drops_only_process_owned_vocal_state() {
+        let mut core = LifeCore::new(Genome::from_seed(542), 942);
+        let heard = core
+            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .unwrap();
+        assert!(core.confirm_vocal_request_heard(heard.performance_seed));
+        let history = core.state.recent_vocalizations.clone();
+        let queued = core
+            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .unwrap();
+        assert_eq!(
+            core.state
+                .pending_vocal_delivery
+                .as_ref()
+                .map(|pending| pending.request_id),
+            Some(queued.performance_seed)
+        );
+        assert!(core.state.pending_vocal_credit.is_some());
+
+        core.reset_vocal_delivery_session();
+
+        assert!(core.state.pending_vocal_delivery.is_none());
+        assert!(core.state.pending_vocal_credit.is_none());
+        assert_eq!(core.state.recent_vocalizations, history);
+    }
+
+    #[test]
+    fn sleep_consolidation_repairs_and_caps_a_monoculture() {
+        let mut core = LifeCore::new(Genome::from_seed(55), 95);
+        let mut root = core.state.vocal_motifs[0].clone();
+        root.expected_reward = 0.9;
+        root.use_count = 20;
+        root.success_count = 20;
+        let mut collapsed = vec![root.clone()];
+        for seed in 1..24 {
+            let mut child = mutate_motif(&root, seed);
+            child.expected_reward = 0.9;
+            child.use_count = 20;
+            child.success_count = 20;
+            collapsed.push(child);
+        }
+        core.state.vocal_motifs = collapsed;
+        core.consolidate_sleep();
+
+        let mut family_counts = std::collections::HashMap::<u64, usize>::new();
+        for motif in &core.state.vocal_motifs {
+            *family_counts
+                .entry(motif_family_id(&core.state.vocal_motifs, motif.id))
+                .or_default() += 1;
+        }
+        assert!(
+            family_counts.len() >= 8,
+            "canonical voice families were not restored"
+        );
+        assert!(
+            family_counts
+                .values()
+                .all(|count| *count <= MAX_VOCAL_FAMILY_SIZE)
+        );
+        assert!(core.state.vocal_motifs.len() <= 24);
+    }
+
+    #[test]
+    fn old_schema_one_snapshot_defaults_new_vocal_runtime_state() {
+        let core = LifeCore::new(Genome::from_seed(56), 96);
+        let snapshot = core.snapshot();
+        let current_json = serde_json::to_string(&snapshot.state).unwrap();
+        let legacy_json = current_json
+            .replace("\"recent_vocalizations\":[],", "")
+            .replace("\"pending_vocal_credit\":null,", "")
+            .replace("\"pending_vocal_delivery\":null,", "");
+        assert_ne!(legacy_json, current_json);
+        let legacy_state = serde_json::from_str(&legacy_json).unwrap();
+        let legacy = LifeSnapshot {
+            state: legacy_state,
+            ..snapshot
+        };
+        let restored = LifeCore::restore(legacy).unwrap();
+        assert!(restored.state.recent_vocalizations.is_empty());
+        assert!(restored.state.pending_vocal_credit.is_none());
+        assert!(restored.state.pending_vocal_delivery.is_none());
+        assert_eq!(restored.snapshot().schema_version, 1);
+    }
+
+    #[test]
+    fn vocal_action_styles_have_distinct_bounded_prosody() {
+        let genome = Genome::from_seed(57);
+        let mut chirp_core = LifeCore::new(genome.clone(), 97);
+        let mut purr_core = LifeCore::new(genome, 97);
+        let chirp = chirp_core
+            .request_vocalization(
+                VocalTrigger::Action(ActionId::Chirp),
+                &SensorFrame::default(),
+            )
+            .unwrap();
+        let purr = purr_core
+            .request_vocalization(
+                VocalTrigger::Action(ActionId::Purr),
+                &SensorFrame::default(),
+            )
+            .unwrap();
+        assert!(!chirp.purr);
+        assert!(purr.purr);
+        assert!(purr.pitch_scale + 0.12 < chirp.pitch_scale);
+        for value in [
+            chirp.pitch_scale,
+            chirp.tempo_scale,
+            purr.pitch_scale,
+            purr.tempo_scale,
+        ] {
+            assert!(value.is_finite() && (0.6..=1.5).contains(&value));
+        }
+    }
+
+    #[test]
+    fn repeated_context_has_audible_but_bounded_rendition_variation() {
+        let mut core = LifeCore::new(Genome::from_seed(58), 98);
+        let sensors = SensorFrame::default();
+        let mut minimum_gain = f32::INFINITY;
+        let mut maximum_gain = 0.0_f32;
+        let mut minimum_tempo = f32::INFINITY;
+        let mut maximum_tempo = 0.0_f32;
+        let mut seeds = std::collections::HashSet::new();
+        for _ in 0..96 {
+            let request = core
+                .request_vocalization(VocalTrigger::Touch, &sensors)
+                .expect("touch has a voice");
+            assert!(request.gain.is_finite() && (0.01..=0.5).contains(&request.gain));
+            assert!(request.tempo_scale.is_finite() && (0.5..=1.6).contains(&request.tempo_scale));
+            minimum_gain = minimum_gain.min(request.gain);
+            maximum_gain = maximum_gain.max(request.gain);
+            minimum_tempo = minimum_tempo.min(request.tempo_scale);
+            maximum_tempo = maximum_tempo.max(request.tempo_scale);
+            assert!(seeds.insert(request.performance_seed));
+            assert!(core.confirm_vocal_request_heard(request.performance_seed));
+        }
+        assert!(maximum_gain / minimum_gain >= 1.35);
+        assert!(maximum_tempo / minimum_tempo >= 1.35);
     }
 
     #[test]
