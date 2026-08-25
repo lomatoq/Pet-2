@@ -4,7 +4,21 @@ use glam::Vec2;
 use thiserror::Error;
 use winit::window::Window;
 
-use crate::{DesktopSnapshot, DesktopVisualSample, DisplayTopology, PlatformCapabilities};
+use crate::{DesktopSnapshot, DesktopVisualSample, DisplayTopology, PlatformCapabilities, RectI};
+
+/// An owned, top-down BGRA8 snapshot produced off the realtime/render thread.
+#[derive(Debug, Clone)]
+pub struct DesktopBackgroundFrame {
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+    pub bgra8: Vec<u8>,
+    pub physical_rect: RectI,
+    pub sequence: u64,
+    pub timestamp: f64,
+    pub mean_luminance: f32,
+    pub contrast: f32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformKind {
@@ -33,6 +47,9 @@ pub trait PlatformBackend {
         _topology: &DisplayTopology,
         _pet_position: Vec2,
     ) -> Option<DesktopVisualSample> {
+        None
+    }
+    fn capture_overlay_background(&mut self, _window: &Window) -> Option<DesktopBackgroundFrame> {
         None
     }
     fn apply_overlay_policy(&mut self, window: &Window) -> Result<(), HostError>;

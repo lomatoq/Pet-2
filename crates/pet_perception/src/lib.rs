@@ -215,7 +215,7 @@ impl PerceptionRuntime {
                 );
             }
             let local = visual.local_luminance;
-            if local < 0.18 || local > 0.82 {
+            if !(0.18..=0.82).contains(&local) {
                 events.push(
                     StimulusEvent {
                         kind: if local < 0.18 {
@@ -343,7 +343,7 @@ impl PerceptionRuntime {
         for sample in &self.cursor_history {
             let delta = sample.position - center;
             let radius = delta.length();
-            if radius < 0.025 || radius > 0.35 {
+            if !(0.025..=0.35).contains(&radius) {
                 continue;
             }
             let angle = delta.y.atan2(delta.x);

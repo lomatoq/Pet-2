@@ -88,6 +88,7 @@ in-window debug controls never install global keyboard hooks:
 
 - `Cmd/Win + Alt + F`: toggle focus mode.
 - `Cmd/Win + Alt + M`: trigger bounded metamorphosis.
+- `Cmd/Win + Alt + B`: cycle Morphic, Fusion, Morph Shadow, Morph Fusion, and Classic brain modes.
 - `Cmd/Win + Alt + R`: apply positive debug reward.
 - `Cmd/Win + Alt + N`: apply negative debug reward.
 - `Cmd/Win + Alt + D`: append a debug snapshot to `events.jsonl`.

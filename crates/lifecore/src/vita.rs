@@ -4,8 +4,8 @@ use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ACTION_COUNT, ActionId, BodyFeedback, BodyIntent, FeedbackEvent, InteractionTarget, LifeState,
-    LocomotionMode, PoseIntent, SensorFrame,
+    ACTION_COUNT, ActionId, BodyFeedback, BodyIntent, ExpressionState, FeedbackEvent,
+    InteractionTarget, LifeState, LocomotionMode, PoseIntent, SensorFrame,
 };
 
 pub const VITA_STATE_SCHEMA_VERSION: u32 = 1;
@@ -224,6 +224,143 @@ pub enum EmotionKind {
     Boredom,
     Shyness,
     Pride,
+}
+
+/// A legible, stylized face target for each VITA emotion.
+///
+/// These targets deliberately coordinate several cues instead of asking any one
+/// feature to carry the whole emotion. Mouth curvature owns valence, brow shape
+/// and eyelid tension disambiguate it, and pupil size follows emotional arousal
+/// rather than positive/negative valence.
+#[must_use]
+pub fn expression_target_for_emotion(kind: EmotionKind) -> ExpressionState {
+    let mut target = ExpressionState::default();
+    match kind {
+        EmotionKind::Curiosity => {
+            target.pupil_size = 0.68;
+            target.pupil_focus = 0.94;
+            target.brow_raise = 0.42;
+            target.brow_tension = 0.08;
+            target.mouth_curve = 0.18;
+            target.mouth_tension = 0.08;
+            target.cheek_glow = 0.12;
+            target.body_glow = 0.58;
+        }
+        EmotionKind::Delight => {
+            target.squint = 0.38;
+            target.pupil_size = 0.76;
+            target.pupil_focus = 0.84;
+            target.brow_raise = 0.24;
+            target.mouth_curve = 0.96;
+            target.mouth_tension = 0.08;
+            target.cheek_glow = 0.92;
+            target.body_glow = 0.94;
+        }
+        EmotionKind::Affection => {
+            target.squint = 0.28;
+            target.pupil_size = 0.66;
+            target.pupil_focus = 0.96;
+            target.brow_raise = 0.18;
+            target.mouth_curve = 0.66;
+            target.mouth_tension = 0.04;
+            target.cheek_glow = 1.0;
+            target.body_glow = 0.78;
+        }
+        EmotionKind::Contentment => {
+            target.squint = 0.32;
+            target.pupil_size = 0.52;
+            target.pupil_focus = 0.58;
+            target.brow_raise = -0.10;
+            target.mouth_curve = 0.48;
+            target.cheek_glow = 0.42;
+            target.body_glow = 0.46;
+        }
+        EmotionKind::Surprise => {
+            target.pupil_size = 0.88;
+            target.pupil_focus = 0.92;
+            target.brow_raise = 1.0;
+            target.brow_tension = 0.06;
+            target.mouth_curve = 0.04;
+            target.mouth_tension = 0.20;
+            target.body_glow = 0.92;
+        }
+        EmotionKind::Alarm => {
+            target.squint = 0.10;
+            target.pupil_size = 0.90;
+            target.pupil_focus = 0.98;
+            target.brow_raise = 0.70;
+            target.brow_tension = 0.68;
+            target.mouth_curve = -0.42;
+            target.mouth_tension = 0.62;
+            target.body_glow = 0.88;
+        }
+        EmotionKind::Fear => {
+            target.squint = 0.05;
+            target.pupil_size = 0.92;
+            target.pupil_focus = 0.96;
+            target.brow_raise = 0.52;
+            target.brow_tension = 0.86;
+            target.mouth_curve = -0.82;
+            target.mouth_tension = 0.58;
+            target.body_glow = 0.80;
+        }
+        EmotionKind::Frustration => {
+            target.squint = 0.72;
+            target.pupil_size = 0.70;
+            target.pupil_focus = 0.90;
+            target.brow_raise = -0.52;
+            target.brow_tension = 1.0;
+            target.mouth_curve = -0.62;
+            target.mouth_tension = 1.0;
+            target.body_glow = 0.72;
+        }
+        EmotionKind::Boredom => {
+            target.squint = 0.48;
+            target.pupil_size = 0.40;
+            target.pupil_focus = 0.18;
+            target.brow_raise = -0.46;
+            target.brow_tension = 0.04;
+            target.mouth_curve = -0.22;
+            target.mouth_tension = 0.04;
+            target.body_glow = 0.24;
+        }
+        EmotionKind::Shyness => {
+            target.squint = 0.24;
+            target.pupil_size = 0.58;
+            target.pupil_focus = 0.20;
+            target.brow_raise = 0.24;
+            target.brow_tension = 0.22;
+            target.mouth_curve = 0.22;
+            target.mouth_tension = 0.20;
+            target.cheek_glow = 0.94;
+            target.body_glow = 0.48;
+        }
+        EmotionKind::Pride => {
+            target.squint = 0.24;
+            target.pupil_size = 0.62;
+            target.pupil_focus = 0.78;
+            target.brow_raise = 0.28;
+            target.brow_tension = 0.06;
+            target.mouth_curve = 0.70;
+            target.mouth_tension = 0.18;
+            target.cheek_glow = 0.30;
+            target.body_glow = 0.82;
+        }
+    }
+    target
+}
+
+/// Blends a VITA emotion into an existing neural/affective expression while
+/// preserving procedural blinks and audio-owned mouth opening.
+pub fn apply_emotion_to_expression(
+    expression: &mut ExpressionState,
+    kind: EmotionKind,
+    intensity: f32,
+) {
+    // Square-root response keeps medium episodes readable without flattening
+    // the intensity range of strong emotional moments.
+    let amount = intensity.clamp(0.0, 1.0).sqrt();
+    blend_expression_toward(expression, expression_target_for_emotion(kind), amount);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -728,7 +865,26 @@ impl VitaOutput {
         if let Some(target) = &self.interaction_override {
             intent.interaction_target = Some(target.clone());
         }
+        if let Some(emotion) = self.dominant_emotion {
+            apply_emotion_to_expression(&mut intent.expression, emotion.kind, emotion.intensity);
+        }
     }
+}
+
+fn blend_expression_toward(current: &mut ExpressionState, target: ExpressionState, amount: f32) {
+    let amount = amount.clamp(0.0, 1.0);
+    let blend = |from: f32, to: f32| from + (to - from) * amount;
+    // Blinks and mouth opening remain procedural/audio-owned. Emotional intent
+    // controls the surrounding shape so the face never mimes a failed voice.
+    current.squint = blend(current.squint, target.squint).clamp(0.0, 1.0);
+    current.pupil_size = blend(current.pupil_size, target.pupil_size).clamp(0.0, 1.0);
+    current.pupil_focus = blend(current.pupil_focus, target.pupil_focus).clamp(0.0, 1.0);
+    current.brow_raise = blend(current.brow_raise, target.brow_raise).clamp(-1.0, 1.0);
+    current.brow_tension = blend(current.brow_tension, target.brow_tension).clamp(0.0, 1.0);
+    current.mouth_curve = blend(current.mouth_curve, target.mouth_curve).clamp(-1.0, 1.0);
+    current.mouth_tension = blend(current.mouth_tension, target.mouth_tension).clamp(0.0, 1.0);
+    current.cheek_glow = blend(current.cheek_glow, target.cheek_glow).clamp(0.0, 1.0);
+    current.body_glow = blend(current.body_glow, target.body_glow).clamp(0.0, 1.0);
 }
 
 impl VitaMind {
@@ -1455,5 +1611,66 @@ mod tests {
         let bytes = serde_json::to_vec(&mind.snapshot()).unwrap();
         let decoded: VitaState = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, mind.snapshot());
+    }
+
+    #[test]
+    fn emotion_targets_use_coordinated_and_distinct_face_cues() {
+        let delight = expression_target_for_emotion(EmotionKind::Delight);
+        let fear = expression_target_for_emotion(EmotionKind::Fear);
+        let frustration = expression_target_for_emotion(EmotionKind::Frustration);
+        let boredom = expression_target_for_emotion(EmotionKind::Boredom);
+
+        assert!(delight.mouth_curve > 0.8);
+        assert!(delight.squint > 0.3);
+        assert!(delight.cheek_glow > 0.8);
+        assert!(fear.mouth_curve < -0.7);
+        assert!(fear.brow_raise > 0.4 && fear.brow_tension > 0.8);
+        assert!(frustration.brow_raise < -0.4 && frustration.squint > 0.6);
+        assert!(fear.pupil_size > boredom.pupil_size + 0.4);
+    }
+
+    #[test]
+    fn dominant_emotion_amplifies_expression_without_claiming_blinks_or_voice() {
+        let mut intent = BodyIntent {
+            locomotion: LocomotionMode::Hover,
+            target_position: Vec2::splat(0.5),
+            target_surface: None,
+            desired_speed: 0.0,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Neutral,
+            expression: ExpressionState {
+                blink_left: 0.31,
+                blink_right: 0.62,
+                mouth_open: 0.47,
+                ..ExpressionState::default()
+            },
+            interaction_target: None,
+        };
+        VitaOutput {
+            attention: AttentionState::default(),
+            appraisal: AppraisalState::default(),
+            dominant_emotion: Some(EmotionEpisode {
+                kind: EmotionKind::Delight,
+                intensity: 1.0,
+                remaining_seconds: 1.0,
+                cause: StimulusKind::User,
+            }),
+            influence: None,
+            self_check: false,
+            gaze_target: None,
+            direct_viewer_gaze: false,
+            pose_override: None,
+            locomotion_override: None,
+            target_override: None,
+            interaction_override: None,
+        }
+        .apply_to_intent(&mut intent);
+
+        assert_eq!(intent.expression.blink_left, 0.31);
+        assert_eq!(intent.expression.blink_right, 0.62);
+        assert_eq!(intent.expression.mouth_open, 0.47);
+        assert!(intent.expression.mouth_curve > 0.9);
+        assert!(intent.expression.cheek_glow > 0.9);
     }
 }

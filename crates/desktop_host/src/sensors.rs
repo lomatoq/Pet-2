@@ -25,6 +25,9 @@ pub struct DesktopSnapshot {
     pub timestamp: f64,
     pub topology_revision: u64,
     pub cursor: Option<PhysicalDesktopPoint>,
+    /// Physical primary-button state sampled independently of overlay events.
+    /// `None` means the platform cannot provide a global button state.
+    pub primary_button_down: Option<bool>,
     pub idle_seconds: Option<f32>,
     pub active_application: Option<ApplicationInfo>,
     pub active_window: Option<RectI>,
@@ -70,6 +73,7 @@ impl DesktopSnapshot {
             timestamp,
             topology_revision,
             cursor: None,
+            primary_button_down: None,
             idle_seconds: None,
             active_application: None,
             active_window: None,

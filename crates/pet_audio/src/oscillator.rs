@@ -4,19 +4,38 @@ pub struct Oscillator {
 }
 
 impl Oscillator {
+    pub fn set_phase(&mut self, phase: f32) {
+        self.phase = phase.rem_euclid(1.0);
+    }
+
     pub fn sample(&mut self, frequency_hz: f32, sample_rate: f32, harmonic_mix: [f32; 4]) -> f32 {
         let increment = (frequency_hz / sample_rate.max(1.0)).clamp(0.0, 0.45);
         self.phase = (self.phase + increment).fract();
         let angle = self.phase * std::f32::consts::TAU;
         let sine = angle.sin();
-        let triangle = 1.0 - 4.0 * (self.phase - 0.5).abs();
+        let triangle = band_limited_triangle(angle, increment);
         let pulse = band_limited_pulse(self.phase, increment, 0.42);
-        let second = (angle * 2.0).sin();
+        let second = if increment * 2.0 < 0.45 {
+            (angle * 2.0).sin()
+        } else {
+            0.0
+        };
         sine * harmonic_mix[0]
             + triangle * harmonic_mix[1]
             + pulse * harmonic_mix[2]
             + second * harmonic_mix[3]
     }
+}
+
+fn band_limited_triangle(angle: f32, increment: f32) -> f32 {
+    let mut output = 0.0;
+    for (partial, sign) in [(1.0, 1.0), (3.0, -1.0), (5.0, 1.0), (7.0, -1.0)] {
+        if increment * partial >= 0.45 {
+            break;
+        }
+        output += sign * (angle * partial).sin() / (partial * partial);
+    }
+    output * (8.0 / (std::f32::consts::PI * std::f32::consts::PI))
 }
 
 #[derive(Debug, Clone, Copy)]

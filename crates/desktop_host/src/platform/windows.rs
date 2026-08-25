@@ -2,7 +2,9 @@ use std::{
     ffi::c_void,
     mem::size_of,
     path::{Path, PathBuf},
-    time::Instant,
+    sync::mpsc::{self, Receiver, Sender},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use directories::ProjectDirs;
@@ -13,14 +15,19 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT},
     Graphics::{
         Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
-        Gdi::{GetDC, GetPixel, HDC, ReleaseDC},
+        Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+            DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetPixel, HALFTONE, HBITMAP, HDC,
+            HGDIOBJ, NOMIRRORBITMAP, ReleaseDC, SRCCOPY, SelectObject, SetStretchBltMode,
+            StretchBlt,
+        },
     },
     System::{
         SystemInformation::GetTickCount64,
         Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW},
     },
     UI::{
-        Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+        Input::KeyboardAndMouse::{GetAsyncKeyState, GetLastInputInfo, LASTINPUTINFO, VK_LBUTTON},
         WindowsAndMessaging::{
             EnumWindows, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
             GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible,
@@ -33,14 +40,21 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes};
 
 use crate::{
-    ApplicationInfo, DesktopSnapshot, DesktopSurface, DesktopVisualSample, DisplayTopology,
-    HostError, PhysicalDesktopPoint, PlatformBackend, PlatformCapabilities, PlatformKind, RectI,
+    ApplicationInfo, DesktopBackgroundFrame, DesktopSnapshot, DesktopSurface, DesktopVisualSample,
+    DisplayTopology, HostError, PhysicalDesktopPoint, PlatformBackend, PlatformCapabilities,
+    PlatformKind, RectI,
 };
 
 pub struct WindowsBackend {
     started: Instant,
     overlay_hwnd: Option<HWND>,
-    previous_visual: Vec<[f32; 3]>,
+    cursor_hittest_enabled: Option<bool>,
+    visual_worker: Option<VisualSampleWorker>,
+    background_worker: Option<GdiBackgroundWorker>,
+    cached_surfaces: Vec<DesktopSurface>,
+    last_window_enumeration: Instant,
+    cached_foreground_hwnd: HWND,
+    cached_active_application: Option<ApplicationInfo>,
 }
 
 pub(crate) fn prepare_overlay_window_attributes(attributes: WindowAttributes) -> WindowAttributes {
@@ -54,7 +68,13 @@ impl Default for WindowsBackend {
         Self {
             started: Instant::now(),
             overlay_hwnd: None,
-            previous_visual: Vec::with_capacity(64),
+            cursor_hittest_enabled: None,
+            visual_worker: None,
+            background_worker: None,
+            cached_surfaces: Vec::with_capacity(32),
+            last_window_enumeration: Instant::now() - Duration::from_secs(1),
+            cached_foreground_hwnd: std::ptr::null_mut(),
+            cached_active_application: None,
         }
     }
 }
@@ -88,6 +108,15 @@ impl PlatformBackend for WindowsBackend {
             return Err(HostError::WindowHandle("expected a Win32 HWND".into()));
         };
         self.overlay_hwnd = Some(handle.hwnd.get() as HWND);
+        // A virtual-desktop-sized transparent host must start click-through. The
+        // liquid hit-test enables input only while the pointer is over the Pet or
+        // an already captured drag is active.
+        window.set_cursor_hittest(false).map_err(|error| {
+            HostError::Platform(format!("could not initialize cursor hit testing: {error}"))
+        })?;
+        self.cursor_hittest_enabled = Some(false);
+        self.visual_worker = Some(VisualSampleWorker::new());
+        self.background_worker = Some(GdiBackgroundWorker::new(self.started));
         Ok(())
     }
 
@@ -96,25 +125,36 @@ impl PlatformBackend for WindowsBackend {
         let cursor = cursor_position();
         let idle_seconds = idle_seconds();
         let active_window = window_bounds(foreground);
-        let active_application = application_for_window(foreground);
-        let mut context = EnumerationContext {
-            overlay: self.overlay_hwnd,
-            surfaces: Vec::with_capacity(32),
+        let active_application = if foreground == self.cached_foreground_hwnd {
+            self.cached_active_application.clone()
+        } else {
+            self.cached_foreground_hwnd = foreground;
+            self.cached_active_application = application_for_window(foreground);
+            self.cached_active_application.clone()
         };
-        unsafe {
-            EnumWindows(
-                Some(enum_window),
-                &mut context as *mut EnumerationContext as LPARAM,
-            );
+        if self.last_window_enumeration.elapsed() >= Duration::from_millis(100) {
+            let mut context = EnumerationContext {
+                overlay: self.overlay_hwnd,
+                surfaces: Vec::with_capacity(32),
+            };
+            unsafe {
+                EnumWindows(
+                    Some(enum_window),
+                    &mut context as *mut EnumerationContext as LPARAM,
+                );
+            }
+            self.cached_surfaces = context.surfaces;
+            self.last_window_enumeration = Instant::now();
         }
         DesktopSnapshot {
             timestamp: self.started.elapsed().as_secs_f64(),
             topology_revision: _topology.revision,
             cursor,
+            primary_button_down: Some(unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } < 0),
             idle_seconds,
             active_application,
             active_window,
-            visible_surfaces: context.surfaces,
+            visible_surfaces: self.cached_surfaces.clone(),
         }
     }
 
@@ -123,7 +163,13 @@ impl PlatformBackend for WindowsBackend {
         topology: &DisplayTopology,
         pet_position: Vec2,
     ) -> Option<DesktopVisualSample> {
-        sample_desktop_visual(topology, pet_position, &mut self.previous_visual)
+        self.visual_worker
+            .as_mut()?
+            .submit_and_poll(topology, pet_position)
+    }
+
+    fn capture_overlay_background(&mut self, window: &Window) -> Option<DesktopBackgroundFrame> {
+        self.background_worker.as_mut()?.submit_and_poll(window)
     }
 
     fn apply_overlay_policy(&mut self, _window: &Window) -> Result<(), HostError> {
@@ -151,10 +197,392 @@ impl PlatformBackend for WindowsBackend {
         Ok(())
     }
 
+    fn set_cursor_hittest(&mut self, window: &Window, enabled: bool) -> Result<(), HostError> {
+        // `set_cursor_hittest` changes native window state. Reapplying it at the
+        // 60 Hz sensor cadence on a full-desktop HWND causes an avoidable DWM/input
+        // hitch exactly when a press begins. Only native state transitions belong
+        // here; steady hover/drag samples are free.
+        if self.cursor_hittest_enabled == Some(enabled) {
+            return Ok(());
+        }
+        window.set_cursor_hittest(enabled).map_err(|error| {
+            HostError::Platform(format!("could not update cursor hit testing: {error}"))
+        })?;
+        self.cursor_hittest_enabled = Some(enabled);
+        Ok(())
+    }
+
     fn app_data_directory(&self) -> Result<PathBuf, HostError> {
         ProjectDirs::from("io", "lomatoq", "Pet 2")
             .map(|dirs| dirs.data_local_dir().to_path_buf())
             .ok_or(HostError::AppDataUnavailable)
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(mut worker) = self.visual_worker.take() {
+            worker.shutdown();
+        }
+        if let Some(mut worker) = self.background_worker.take() {
+            worker.shutdown();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VisualSampleRequest {
+    topology: DisplayTopology,
+    pet_position: Vec2,
+}
+
+struct VisualSampleWorker {
+    request_tx: Option<Sender<VisualSampleRequest>>,
+    sample_rx: Receiver<DesktopVisualSample>,
+    join: Option<JoinHandle<()>>,
+    latest: Option<DesktopVisualSample>,
+}
+
+impl VisualSampleWorker {
+    fn new() -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<VisualSampleRequest>();
+        let (sample_tx, sample_rx) = mpsc::channel::<DesktopVisualSample>();
+        let join = thread::Builder::new()
+            .name("pet2-visual-sample".into())
+            .spawn(move || visual_sample_loop(&request_rx, &sample_tx))
+            .ok();
+        Self {
+            request_tx: Some(request_tx),
+            sample_rx,
+            join,
+            latest: None,
+        }
+    }
+
+    fn submit_and_poll(
+        &mut self,
+        topology: &DisplayTopology,
+        pet_position: Vec2,
+    ) -> Option<DesktopVisualSample> {
+        if let Some(sample) = self.sample_rx.try_iter().last() {
+            self.latest = Some(sample);
+        }
+        let _ = self.request_tx.as_ref().map(|sender| {
+            sender.send(VisualSampleRequest {
+                topology: topology.clone(),
+                pet_position,
+            })
+        });
+        if let Some(sample) = self.sample_rx.try_iter().last() {
+            self.latest = Some(sample);
+        }
+        self.latest
+    }
+
+    fn shutdown(&mut self) {
+        self.request_tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for VisualSampleWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn visual_sample_loop(
+    requests: &Receiver<VisualSampleRequest>,
+    samples: &Sender<DesktopVisualSample>,
+) {
+    let mut previous = Vec::with_capacity(64);
+    while let Ok(mut request) = requests.recv() {
+        for newer in requests.try_iter() {
+            request = newer;
+        }
+        let Some(sample) =
+            sample_desktop_visual(&request.topology, request.pet_position, &mut previous)
+        else {
+            continue;
+        };
+        if samples.send(sample).is_err() {
+            break;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaptureRequest {
+    physical_rect: RectI,
+    width: u32,
+    height: u32,
+}
+
+struct GdiBackgroundWorker {
+    request_tx: Option<Sender<CaptureRequest>>,
+    frame_rx: Receiver<DesktopBackgroundFrame>,
+    join: Option<JoinHandle<()>>,
+    last_submit: Instant,
+}
+
+impl GdiBackgroundWorker {
+    fn new(started: Instant) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<CaptureRequest>();
+        let (frame_tx, frame_rx) = mpsc::channel::<DesktopBackgroundFrame>();
+        let join = thread::Builder::new()
+            .name("pet2-desktop-capture".into())
+            .spawn(move || background_capture_loop(started, &request_rx, &frame_tx))
+            .ok();
+        Self {
+            request_tx: Some(request_tx),
+            frame_rx,
+            join,
+            last_submit: Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+    fn submit_and_poll(&mut self, window: &Window) -> Option<DesktopBackgroundFrame> {
+        let mut latest = self.frame_rx.try_iter().last();
+        if self.last_submit.elapsed() >= Duration::from_secs_f64(1.0 / 24.0) {
+            let position = window.outer_position().ok()?;
+            let size = window.inner_size();
+            if size.width > 0 && size.height > 0 {
+                let request = CaptureRequest {
+                    physical_rect: RectI {
+                        minimum: PhysicalDesktopPoint {
+                            x: position.x,
+                            y: position.y,
+                        },
+                        maximum: PhysicalDesktopPoint {
+                            x: position.x.saturating_add(size.width as i32),
+                            y: position.y.saturating_add(size.height as i32),
+                        },
+                    },
+                    width: size.width.div_ceil(2),
+                    height: size.height.div_ceil(2),
+                };
+                if self
+                    .request_tx
+                    .as_ref()
+                    .is_some_and(|sender| sender.send(request).is_ok())
+                {
+                    self.last_submit = Instant::now();
+                }
+            }
+            latest = self.frame_rx.try_iter().last().or(latest);
+        }
+        latest
+    }
+
+    fn shutdown(&mut self) {
+        self.request_tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for GdiBackgroundWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn background_capture_loop(
+    started: Instant,
+    requests: &Receiver<CaptureRequest>,
+    frames: &Sender<DesktopBackgroundFrame>,
+) {
+    let mut capture: Option<GdiBackgroundCapture> = None;
+    let mut sequence = 0_u64;
+    while let Ok(mut request) = requests.recv() {
+        for newer in requests.try_iter() {
+            request = newer;
+        }
+        let resize = capture.as_ref().is_none_or(|capture| {
+            capture.width != request.width || capture.height != request.height
+        });
+        if resize {
+            capture = GdiBackgroundCapture::new(request.width, request.height);
+        }
+        let Some(capture) = capture.as_mut() else {
+            continue;
+        };
+        let Some(tight) = capture.capture(
+            request.physical_rect.minimum.x,
+            request.physical_rect.minimum.y,
+            request.physical_rect.width().max(1) as u32,
+            request.physical_rect.height().max(1) as u32,
+        ) else {
+            continue;
+        };
+        let tight_row = request.width as usize * 4;
+        let bytes_per_row = request.width.saturating_mul(4).div_ceil(256) * 256;
+        let mut bgra8 = vec![0_u8; bytes_per_row as usize * request.height as usize];
+        for row in 0..request.height as usize {
+            let source = &tight[row * tight_row..(row + 1) * tight_row];
+            let target =
+                &mut bgra8[row * bytes_per_row as usize..row * bytes_per_row as usize + tight_row];
+            target.copy_from_slice(source);
+        }
+        let (mean_luminance, contrast) =
+            background_luminance_stats(&bgra8, request.width, request.height, bytes_per_row);
+        sequence = sequence.wrapping_add(1);
+        if frames
+            .send(DesktopBackgroundFrame {
+                width: request.width,
+                height: request.height,
+                bytes_per_row,
+                bgra8,
+                physical_rect: request.physical_rect,
+                sequence,
+                timestamp: started.elapsed().as_secs_f64(),
+                mean_luminance,
+                contrast,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn background_luminance_stats(
+    bgra8: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+) -> (f32, f32) {
+    let stride = (width.min(height) / 24).max(1) as usize;
+    let mut sum = 0.0_f32;
+    let mut sum_squared = 0.0_f32;
+    let mut count = 0.0_f32;
+    for y in (0..height as usize).step_by(stride) {
+        for x in (0..width as usize).step_by(stride) {
+            let index = y * bytes_per_row as usize + x * 4;
+            let blue = bgra8[index] as f32 / 255.0;
+            let green = bgra8[index + 1] as f32 / 255.0;
+            let red = bgra8[index + 2] as f32 / 255.0;
+            let value = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+            sum += value;
+            sum_squared += value * value;
+            count += 1.0;
+        }
+    }
+    let mean = sum / count.max(1.0);
+    let contrast = (sum_squared / count.max(1.0) - mean * mean).max(0.0).sqrt();
+    (mean, contrast)
+}
+
+struct GdiBackgroundCapture {
+    screen_dc: HDC,
+    memory_dc: HDC,
+    bitmap: HBITMAP,
+    previous_bitmap: HGDIOBJ,
+    bits: *mut u8,
+    width: u32,
+    height: u32,
+}
+
+impl GdiBackgroundCapture {
+    fn new(width: u32, height: u32) -> Option<Self> {
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return None;
+        }
+        let screen_dc = unsafe { GetDC(std::ptr::null_mut()) };
+        if screen_dc.is_null() {
+            return None;
+        }
+        let memory_dc = unsafe { CreateCompatibleDC(screen_dc) };
+        if memory_dc.is_null() {
+            unsafe { ReleaseDC(std::ptr::null_mut(), screen_dc) };
+            return None;
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                // A negative height keeps the DIB top-down and avoids a CPU row flip.
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: width.saturating_mul(height).saturating_mul(4),
+                ..BITMAPINFOHEADER::default()
+            },
+            ..BITMAPINFO::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = unsafe {
+            CreateDIBSection(
+                screen_dc,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if bitmap.is_null() || bits.is_null() {
+            unsafe {
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return None;
+        }
+        let previous_bitmap = unsafe { SelectObject(memory_dc, bitmap) };
+        if previous_bitmap.is_null() || previous_bitmap.addr() == usize::MAX {
+            unsafe {
+                DeleteObject(bitmap);
+                DeleteDC(memory_dc);
+                ReleaseDC(std::ptr::null_mut(), screen_dc);
+            }
+            return None;
+        }
+        Some(Self {
+            screen_dc,
+            memory_dc,
+            bitmap,
+            previous_bitmap,
+            bits: bits.cast(),
+            width,
+            height,
+        })
+    }
+
+    fn capture(&mut self, x: i32, y: i32, source_width: u32, source_height: u32) -> Option<&[u8]> {
+        unsafe { SetStretchBltMode(self.memory_dc, HALFTONE) };
+        let copied = unsafe {
+            StretchBlt(
+                self.memory_dc,
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                self.screen_dc,
+                x,
+                y,
+                source_width as i32,
+                source_height as i32,
+                SRCCOPY | NOMIRRORBITMAP,
+            )
+        };
+        if copied == 0 {
+            return None;
+        }
+        let length = self.width as usize * self.height as usize * 4;
+        Some(unsafe { std::slice::from_raw_parts(self.bits, length) })
+    }
+}
+
+impl Drop for GdiBackgroundCapture {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.memory_dc, self.previous_bitmap);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.memory_dc);
+            ReleaseDC(std::ptr::null_mut(), self.screen_dc);
+        }
     }
 }
 

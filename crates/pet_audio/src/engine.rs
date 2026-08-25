@@ -10,8 +10,8 @@ use lifecore::{VocalMotif, VocalRequest, VoiceGenome};
 use thiserror::Error;
 
 use crate::{
-    AudioVisualBridge, AudioVisualFeedback, COMMAND_CAPACITY, SpscRing, SynthVoice, VoiceCommand,
-    global_visual_bridge,
+    AudioCallbackLevels, AudioVisualBridge, AudioVisualFeedback, COMMAND_CAPACITY, SpscRing,
+    SynthVoice, VoiceCommand, global_visual_bridge,
 };
 
 const ERROR_CAPACITY: usize = 8;
@@ -94,6 +94,7 @@ pub enum AudioError {
 pub struct AudioEngine {
     _stream: cpal::Stream,
     selected: SelectedOutputConfig,
+    device_name: String,
     commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
     errors: Arc<SpscRing<AudioRuntimeEvent, ERROR_CAPACITY>>,
     feedback: Arc<AudioVisualBridge>,
@@ -105,6 +106,9 @@ impl AudioEngine {
         let device = host
             .default_output_device()
             .ok_or(AudioError::NoOutputDevice)?;
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "unknown output device".into());
         let supported: Vec<_> = device.supported_output_configs()?.collect();
         let candidates: Vec<_> = supported.iter().filter_map(candidate_from_cpal).collect();
         let selected = choose_output_config(&candidates).ok_or(AudioError::NoSupportedConfig)?;
@@ -128,9 +132,12 @@ impl AudioEngine {
                     Arc::clone(&feedback),
                 );
                 let channels = usize::from(selected.channels);
+                let feedback_for_levels = Arc::clone(&feedback);
                 device.build_output_stream(
                     &config,
-                    move |output: &mut [f32], _| fill_f32(&mut synth, output, channels),
+                    move |output: &mut [f32], _| {
+                        fill_f32(&mut synth, output, channels, &feedback_for_levels);
+                    },
                     error_callback,
                     None,
                 )?
@@ -142,9 +149,12 @@ impl AudioEngine {
                     Arc::clone(&feedback),
                 );
                 let channels = usize::from(selected.channels);
+                let feedback_for_levels = Arc::clone(&feedback);
                 device.build_output_stream(
                     &config,
-                    move |output: &mut [i16], _| fill_i16(&mut synth, output, channels),
+                    move |output: &mut [i16], _| {
+                        fill_i16(&mut synth, output, channels, &feedback_for_levels);
+                    },
                     error_callback,
                     None,
                 )?
@@ -156,9 +166,12 @@ impl AudioEngine {
                     Arc::clone(&feedback),
                 );
                 let channels = usize::from(selected.channels);
+                let feedback_for_levels = Arc::clone(&feedback);
                 device.build_output_stream(
                     &config,
-                    move |output: &mut [u16], _| fill_u16(&mut synth, output, channels),
+                    move |output: &mut [u16], _| {
+                        fill_u16(&mut synth, output, channels, &feedback_for_levels);
+                    },
                     error_callback,
                     None,
                 )?
@@ -168,6 +181,7 @@ impl AudioEngine {
         Ok(Self {
             _stream: stream,
             selected,
+            device_name,
             commands,
             errors,
             feedback,
@@ -191,12 +205,30 @@ impl AudioEngine {
     }
 
     #[must_use]
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    #[must_use]
+    pub fn callback_levels(&self) -> AudioCallbackLevels {
+        self.feedback.levels()
+    }
+
+    pub fn clear_visual_feedback(&self) {
+        self.feedback.clear();
+    }
+
+    #[must_use]
     pub fn visual_feedback(&self) -> AudioVisualFeedback {
         self.feedback.snapshot()
     }
 
     pub fn poll_runtime_event(&self) -> Option<AudioRuntimeEvent> {
         self.errors.pop()
+    }
+
+    pub fn poll_started_request(&self) -> Option<u64> {
+        self.feedback.pop_started_request()
     }
 }
 
@@ -280,21 +312,75 @@ pub fn export_debug_wav(
     file.flush()
 }
 
-fn fill_f32(synth: &mut SynthVoice, output: &mut [f32], channels: usize) {
+fn fill_f32(
+    synth: &mut SynthVoice,
+    output: &mut [f32],
+    channels: usize,
+    feedback: &AudioVisualBridge,
+) {
+    let mut energy = 0.0;
+    let mut peak = 0.0_f32;
+    let mut count = 0.0_f32;
     for frame in output.chunks_mut(channels.max(1)) {
-        write_frame_slice(synth.next_stereo_frame(), frame, |sample| sample);
+        let stereo = synth.next_stereo_frame();
+        accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
+        write_frame_slice(stereo, frame, |sample| sample);
     }
+    feedback.publish_levels((energy / count.max(1.0)).sqrt(), peak);
 }
 
-fn fill_i16(synth: &mut SynthVoice, output: &mut [i16], channels: usize) {
+fn fill_i16(
+    synth: &mut SynthVoice,
+    output: &mut [i16],
+    channels: usize,
+    feedback: &AudioVisualBridge,
+) {
+    let mut energy = 0.0;
+    let mut peak = 0.0_f32;
+    let mut count = 0.0_f32;
     for frame in output.chunks_mut(channels.max(1)) {
-        write_frame_slice(synth.next_stereo_frame(), frame, to_i16);
+        let stereo = synth.next_stereo_frame();
+        accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
+        write_frame_slice(stereo, frame, to_i16);
     }
+    feedback.publish_levels((energy / count.max(1.0)).sqrt(), peak);
 }
 
-fn fill_u16(synth: &mut SynthVoice, output: &mut [u16], channels: usize) {
+fn fill_u16(
+    synth: &mut SynthVoice,
+    output: &mut [u16],
+    channels: usize,
+    feedback: &AudioVisualBridge,
+) {
+    let mut energy = 0.0;
+    let mut peak = 0.0_f32;
+    let mut count = 0.0_f32;
     for frame in output.chunks_mut(channels.max(1)) {
-        write_frame_slice(synth.next_stereo_frame(), frame, to_u16);
+        let stereo = synth.next_stereo_frame();
+        accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
+        write_frame_slice(stereo, frame, to_u16);
+    }
+    feedback.publish_levels((energy / count.max(1.0)).sqrt(), peak);
+}
+
+fn accumulate_levels(
+    stereo: [f32; 2],
+    channels: usize,
+    energy: &mut f32,
+    peak: &mut f32,
+    count: &mut f32,
+) {
+    if channels == 1 {
+        let sample = mono_downmix(stereo);
+        *energy += sample * sample;
+        *peak = (*peak).max(sample.abs());
+        *count += 1.0;
+        return;
+    }
+    for sample in stereo {
+        *energy += sample * sample;
+        *peak = (*peak).max(sample.abs());
+        *count += 1.0;
     }
 }
 
@@ -302,21 +388,29 @@ fn write_frame_slice<T: Copy>(stereo: [f32; 2], frame: &mut [T], convert: impl F
     if frame.is_empty() {
         return;
     }
-    frame[0] = convert(stereo[0]);
-    if frame.len() > 1 {
-        frame[1] = convert(stereo[1]);
+    if frame.len() == 1 {
+        frame[0] = convert(mono_downmix(stereo));
+        return;
     }
+    frame[0] = convert(stereo[0]);
+    frame[1] = convert(stereo[1]);
     for channel in frame.iter_mut().skip(2) {
         *channel = convert(0.0);
     }
 }
 
 fn write_frame_f32(stereo: [f32; 2], output: &mut Vec<f32>, channels: usize) {
-    output.push(stereo[0]);
-    if channels > 1 {
-        output.push(stereo[1]);
-        output.extend(std::iter::repeat_n(0.0, channels.saturating_sub(2)));
+    if channels == 1 {
+        output.push(mono_downmix(stereo));
+        return;
     }
+    output.push(stereo[0]);
+    output.push(stereo[1]);
+    output.extend(std::iter::repeat_n(0.0, channels.saturating_sub(2)));
+}
+
+fn mono_downmix(stereo: [f32; 2]) -> f32 {
+    (stereo[0] + stereo[1]) * std::f32::consts::FRAC_1_SQRT_2
 }
 
 fn candidate_from_cpal(config: &cpal::SupportedStreamConfigRange) -> Option<OutputConfigCandidate> {
@@ -340,4 +434,81 @@ fn to_i16(sample: f32) -> i16 {
 
 fn to_u16(sample: f32) -> u16 {
     ((sample.clamp(-1.0, 1.0) * 0.5 + 0.5) * f32::from(u16::MAX)).round() as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panned(source: f32, pan: f32) -> [f32; 2] {
+        [
+            source * ((1.0 - pan) * 0.5).sqrt(),
+            source * ((1.0 + pan) * 0.5).sqrt(),
+        ]
+    }
+
+    #[test]
+    fn mono_fold_down_is_symmetric_and_preserves_center_level() {
+        let source = 0.6;
+        let mut center = [0.0];
+        let mut left = [0.0];
+        let mut right = [0.0];
+        write_frame_slice(panned(source, 0.0), &mut center, |sample| sample);
+        write_frame_slice(panned(source, -0.8), &mut left, |sample| sample);
+        write_frame_slice(panned(source, 0.8), &mut right, |sample| sample);
+
+        assert!((center[0] - source).abs() < 0.000_001);
+        assert!((left[0] - right[0]).abs() < 0.000_001);
+        assert!(right[0] > source * 0.85);
+
+        let mut offline = Vec::new();
+        write_frame_f32(panned(source, 0.8), &mut offline, 1);
+        assert_eq!(offline, right);
+    }
+
+    #[test]
+    fn mono_callback_levels_measure_the_folded_output() {
+        let stereo = panned(0.6, 0.8);
+        let expected = mono_downmix(stereo);
+        let mut energy = 0.0;
+        let mut peak = 0.0;
+        let mut count = 0.0;
+        accumulate_levels(stereo, 1, &mut energy, &mut peak, &mut count);
+
+        assert_eq!(count, 1.0);
+        assert!((energy.sqrt() - expected.abs()).abs() < 0.000_001);
+        assert!((peak - expected.abs()).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn callback_start_event_is_durable_even_if_visual_clip_state_is_cleared() {
+        let genome = lifecore::Genome::from_seed(991);
+        let voice = genome.voice.clone();
+        let learned = lifecore::generate_initial_motifs(&voice);
+        let request = VocalRequest {
+            motif_id: learned[0].id,
+            performance_seed: 0x51A7_E001,
+            gain: 0.4,
+            pan: 0.0,
+            pitch_scale: 1.0,
+            tempo_scale: 1.0,
+            stress: 0.0,
+            purr: false,
+        };
+        let commands = Arc::new(SpscRing::new());
+        commands
+            .push(VoiceCommand::prepare(&voice, &learned[0], &request))
+            .unwrap();
+        let feedback = Arc::new(AudioVisualBridge::default());
+        let mut synth = SynthVoice::with_feedback(commands, 48_000, Arc::clone(&feedback));
+
+        let _ = synth.next_stereo_frame();
+        feedback.clear();
+
+        assert_eq!(
+            feedback.pop_started_request(),
+            Some(request.performance_seed)
+        );
+        assert_eq!(feedback.pop_started_request(), None);
+    }
 }

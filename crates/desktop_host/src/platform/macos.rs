@@ -123,6 +123,7 @@ impl PlatformBackend for MacOsBackend {
             timestamp: self.started.elapsed().as_secs_f64(),
             topology_revision: _topology.revision,
             cursor,
+            primary_button_down: None,
             idle_seconds: idle.is_finite().then_some(idle as f32),
             active_application,
             active_window,
