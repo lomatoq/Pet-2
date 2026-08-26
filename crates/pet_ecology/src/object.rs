@@ -1,7 +1,7 @@
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
-use crate::EcologyError;
+use crate::{EcologyError, MorselProfile};
 
 pub type ObjectId = u64;
 
@@ -51,6 +51,8 @@ pub struct WorldObject {
     pub wear: f32,
     pub home_slot: Option<u8>,
     pub last_interaction_seconds: f64,
+    #[serde(default)]
+    pub morsel_profile: Option<MorselProfile>,
 }
 
 impl WorldObject {
@@ -80,6 +82,33 @@ impl WorldObject {
             wear: 0.0,
             home_slot: Some(0),
             last_interaction_seconds: 0.0,
+            morsel_profile: None,
+        }
+    }
+
+    #[must_use]
+    pub fn morsel(id: ObjectId, position: Vec2, profile: MorselProfile) -> Self {
+        Self {
+            id: id.max(1),
+            kind: ObjectKind::Morsel,
+            lifecycle: ObjectLifecycle::Free,
+            position: position.clamp(Vec2::splat(0.025), Vec2::splat(0.975)),
+            velocity: Vec2::ZERO,
+            radius_px_at_reference: 17.0,
+            mass: 0.22,
+            restitution: 0.42,
+            linear_drag: 1.1,
+            hue: profile.hue,
+            saturation: profile.saturation,
+            value: profile.value,
+            glow: (0.56 + profile.stimulation * 0.36).clamp(0.0, 1.0),
+            familiarity: 0.0,
+            preference: 0.0,
+            novelty: profile.novelty,
+            wear: 0.0,
+            home_slot: None,
+            last_interaction_seconds: 0.0,
+            morsel_profile: Some(profile),
         }
     }
 
@@ -117,7 +146,14 @@ impl WorldObject {
             && (0.0..=1.0).contains(&self.wear)
             && self.home_slot.is_none_or(|slot| slot < 3)
             && self.last_interaction_seconds >= 0.0;
-        if finite && bounded {
+        let profile_valid = match self.kind {
+            ObjectKind::Orb => self.morsel_profile.is_none(),
+            ObjectKind::Morsel => self
+                .morsel_profile
+                .as_ref()
+                .is_some_and(MorselProfile::is_valid),
+        };
+        if finite && bounded && profile_valid {
             Ok(())
         } else {
             Err(EcologyError::InvalidObject)

@@ -61,6 +61,20 @@ const BODY_LAB_IRIS_CONTRAST: f32 = 0.261_587_14;
 const BODY_LAB_LIMBAL_STRENGTH: f32 = 0.507_179_1;
 const BODY_LAB_CORNEA_STRENGTH: f32 = 0.555_337_37;
 
+fn unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn blend_hsv_hue(base: Vec3, target_hue: f32, blend: f32) -> Vec3 {
+    let blend = unit(blend);
+    let delta = (target_hue.rem_euclid(1.0) - base.x + 0.5).rem_euclid(1.0) - 0.5;
+    Vec3::new((base.x + delta * blend).rem_euclid(1.0), base.y, base.z)
+}
+
 /// Screen-space bounds produced from the same filtered liquid instances that the
 /// renderer consumes. Coordinates are pixel offsets from the presented body center.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -69,6 +83,35 @@ pub struct LiquidVisualBounds {
     pub maximum: Vec2,
     pub main_minimum: Vec2,
     pub main_maximum: Vec2,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EcologyVisualEffect {
+    pub hue: f32,
+    pub color_blend: f32,
+    pub flow_boost: f32,
+    pub glow_boost: f32,
+    pub cohesion_bias: f32,
+    pub translucency_boost: f32,
+    pub contrast_reduction: f32,
+}
+
+impl EcologyVisualEffect {
+    #[must_use]
+    pub fn bounded(mut self) -> Self {
+        self.hue = if self.hue.is_finite() {
+            self.hue.rem_euclid(1.0)
+        } else {
+            0.0
+        };
+        self.color_blend = unit(self.color_blend).min(0.65);
+        self.flow_boost = unit(self.flow_boost);
+        self.glow_boost = unit(self.glow_boost);
+        self.cohesion_bias = unit(self.cohesion_bias);
+        self.translucency_boost = unit(self.translucency_boost).min(0.25);
+        self.contrast_reduction = unit(self.contrast_reduction).min(0.45);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +132,7 @@ pub struct ProceduralBody {
     presentation_offset: Vec2,
     occlusion_mode: OcclusionMode,
     occlusion_edge: f32,
+    ecology_visual_effect: EcologyVisualEffect,
 }
 
 impl ProceduralBody {
@@ -116,6 +160,7 @@ impl ProceduralBody {
             presentation_offset: Vec2::ZERO,
             occlusion_mode: OcclusionMode::Front,
             occlusion_edge: 0.0,
+            ecology_visual_effect: EcologyVisualEffect::default(),
         };
         body.apply_tuning_profile(tuning)
             .expect("the built-in liquid tuning profile is valid");
@@ -135,6 +180,10 @@ impl ProceduralBody {
 
     pub fn set_embodied_environment(&mut self, environment: &EmbodiedEnvironmentFrame) {
         self.embodiment.liquid.set_embodied_environment(environment);
+    }
+
+    pub fn set_ecology_visual_effect(&mut self, effect: EcologyVisualEffect) {
+        self.ecology_visual_effect = effect.bounded();
     }
 
     /// Compatibility update for headless callers that do not yet provide the full
@@ -182,9 +231,19 @@ impl ProceduralBody {
             .update(&self.graph, intent, affect.arousal, dt);
         self.expression
             .update(intent.expression, self.animation.blink, dt);
+        let mut effective_traits = self.visual_traits;
+        let effect = self.ecology_visual_effect;
+        effective_traits.flow_speed =
+            (effective_traits.flow_speed * (1.0 + effect.flow_boost * 0.75)).clamp(0.02, 2.0);
+        let cohesion_mix = effect.color_blend.max(effect.flow_boost) * 0.32;
+        effective_traits.droplet_cohesion = (effective_traits.droplet_cohesion
+            + (effect.cohesion_bias - effective_traits.droplet_cohesion) * cohesion_mix)
+            .clamp(0.0, 1.0);
+        effective_traits.translucency =
+            (effective_traits.translucency + effect.translucency_boost).clamp(0.0, 1.0);
         self.embodiment.update(
             &self.body_genome,
-            &self.visual_traits,
+            &effective_traits,
             visual_mind,
             intent,
             sensors,
@@ -481,6 +540,10 @@ impl ProceduralBody {
         } else {
             genome.body.glow_color_hsv
         };
+        let effect = self.ecology_visual_effect;
+        let primary_hsv = blend_hsv_hue(primary_hsv, effect.hue, effect.color_blend);
+        let secondary_hsv = blend_hsv_hue(secondary_hsv, effect.hue, effect.color_blend * 0.78);
+        let glow_hsv = blend_hsv_hue(glow_hsv, effect.hue, effect.color_blend);
         RenderParameters {
             render_mode: profile.render_mode,
             render_scale: profile.compositor.render_scale,
@@ -489,7 +552,9 @@ impl ProceduralBody {
             debug_view: DebugView::Material,
             time: self.animation.time,
             arousal,
-            glow: self.expression.current.body_glow * genome.body.bioluminescence,
+            glow: (self.expression.current.body_glow * genome.body.bioluminescence
+                + effect.glow_boost * 0.34)
+                .clamp(0.0, 1.0),
             body_length: genome.body.body_length * profile.analytic.body_length_scale,
             body_width: genome.body.body_width * profile.analytic.body_width_scale,
             body_roundness: (genome.body.body_roundness + profile.analytic.roundness_bias)
@@ -548,13 +613,15 @@ impl ProceduralBody {
             morph_mode4: pose.morph.mode4,
             morph_area_scale: pose.morph.area_scale,
             pattern_scale: genome.body.pattern_scale,
-            pattern_contrast: genome.body.pattern_contrast,
+            pattern_contrast: (genome.body.pattern_contrast * (1.0 - effect.contrast_reduction))
+                .max(0.18),
             pattern_seed: genome.body.pattern_seed,
             pulse: physiology.pulse,
-            shell_opacity: material.opacity,
+            shell_opacity: (material.opacity - effect.translucency_boost * 0.34).clamp(0.62, 1.0),
             inner_density: physiology.inner_density,
-            translucency: material.translucency,
-            core_glow: physiology.core_glow * material.emission,
+            translucency: (material.translucency + effect.translucency_boost).clamp(0.0, 1.0),
+            core_glow: (physiology.core_glow * material.emission + effect.glow_boost * 0.42)
+                .clamp(0.0, 2.0),
             halo: material.halo,
             iris_activity: physiology.iris_activity,
             eye_wetness: physiology.eye_wetness,
@@ -1075,5 +1142,31 @@ mod tests {
         );
         body.set_presentation_scale(f32::NAN);
         assert!((body.projection_scale() - baseline * 1.23).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn ecology_color_effect_is_temporary_bounded_and_keeps_genome_identity() {
+        let genome = Genome::from_seed(45);
+        let original_hsv = genome.body.primary_color_hsv;
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        let baseline = body.render_parameters(&genome, 0.4).primary_hsv;
+        body.set_ecology_visual_effect(EcologyVisualEffect {
+            hue: 0.82,
+            color_blend: 9.0,
+            flow_boost: 0.7,
+            glow_boost: 0.8,
+            cohesion_bias: 0.4,
+            translucency_boost: 0.2,
+            contrast_reduction: 0.9,
+        });
+        let affected = body.render_parameters(&genome, 0.4);
+        assert_ne!(affected.primary_hsv.x, baseline.x);
+        assert!(affected.pattern_contrast >= 0.18);
+        assert!(affected.translucency <= 1.0);
+        assert_eq!(genome.body.primary_color_hsv, original_hsv);
+
+        body.set_ecology_visual_effect(EcologyVisualEffect::default());
+        let restored = body.render_parameters(&genome, 0.4);
+        assert_eq!(restored.primary_hsv, baseline);
     }
 }

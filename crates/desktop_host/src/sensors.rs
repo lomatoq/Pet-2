@@ -47,6 +47,76 @@ pub struct DesktopVisualSample {
     pub sudden_change: f32,
 }
 
+pub const VISUAL_GRID_WIDTH: usize = 16;
+pub const VISUAL_GRID_HEIGHT: usize = 9;
+pub const VISUAL_GRID_CELLS: usize = VISUAL_GRID_WIDTH * VISUAL_GRID_HEIGHT;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VisualCell {
+    pub luminance: f32,
+    pub contrast: f32,
+    pub colorfulness: f32,
+    pub warmth: f32,
+    pub hue: f32,
+    pub motion: f32,
+    pub edge_density: f32,
+    pub sudden_change: f32,
+}
+
+impl VisualCell {
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        [
+            self.luminance,
+            self.contrast,
+            self.colorfulness,
+            self.warmth,
+            self.hue,
+            self.motion,
+            self.edge_density,
+            self.sudden_change,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DesktopVisualFrame {
+    pub summary: DesktopVisualSample,
+    pub cells: [VisualCell; VISUAL_GRID_CELLS],
+    pub sequence: u64,
+    pub timestamp: f64,
+}
+
+impl Default for DesktopVisualFrame {
+    fn default() -> Self {
+        Self {
+            summary: DesktopVisualSample::default(),
+            cells: [VisualCell::default(); VISUAL_GRID_CELLS],
+            sequence: 0,
+            timestamp: 0.0,
+        }
+    }
+}
+
+impl DesktopVisualFrame {
+    #[must_use]
+    pub fn cell_at(self, position: Vec2) -> VisualCell {
+        let column = (position.x.clamp(0.0, 0.999_999) * VISUAL_GRID_WIDTH as f32) as usize;
+        let row = (position.y.clamp(0.0, 0.999_999) * VISUAL_GRID_HEIGHT as f32) as usize;
+        self.cells[row * VISUAL_GRID_WIDTH + column]
+    }
+
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.summary.is_finite()
+            && self.cells.into_iter().all(VisualCell::is_finite)
+            && self.timestamp.is_finite()
+            && self.timestamp >= 0.0
+    }
+}
+
 impl DesktopVisualSample {
     #[must_use]
     pub fn is_finite(self) -> bool {

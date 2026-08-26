@@ -1,8 +1,10 @@
+use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     DenState, EcologyError, MAX_ACTIVE_MORSELS, MAX_OBJECTS, MetabolicState, MimesisLibrary,
-    ObjectId, ObjectKind, ObjectLifecycle, TasteProfile, WorldObject, canonical_orb_id,
+    MorselProfile, ObjectId, ObjectKind, ObjectLifecycle, TasteProfile, WorldObject,
+    canonical_orb_id,
 };
 
 pub const ECOLOGY_STATE_SCHEMA_VERSION: u32 = 1;
@@ -261,6 +263,50 @@ impl EcologyState {
             ));
         }
     }
+
+    pub fn spawn_morsel(
+        &mut self,
+        position: Vec2,
+        profile: MorselProfile,
+        timestamp: f64,
+    ) -> Option<ObjectId> {
+        if !position.is_finite()
+            || !profile.is_valid()
+            || !timestamp.is_finite()
+            || timestamp < 0.0
+            || self.objects.len() >= MAX_OBJECTS
+            || self
+                .objects
+                .iter()
+                .filter(|object| object.is_active_morsel())
+                .count()
+                >= MAX_ACTIVE_MORSELS
+        {
+            return None;
+        }
+        let mut id = self.next_object_id.max(1);
+        for _ in 0..MAX_OBJECTS {
+            if !self.objects.iter().any(|object| object.id == id) {
+                break;
+            }
+            id = super::object::splitmix64(id).max(1);
+        }
+        if self.objects.iter().any(|object| object.id == id) {
+            return None;
+        }
+        let mut morsel = WorldObject::morsel(id, position, profile);
+        morsel.last_interaction_seconds = timestamp;
+        self.objects.push(morsel);
+        self.next_object_id = super::object::splitmix64(id).max(1);
+        while self
+            .objects
+            .iter()
+            .any(|object| object.id == self.next_object_id)
+        {
+            self.next_object_id = super::object::splitmix64(self.next_object_id).max(1);
+        }
+        Some(id)
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +328,33 @@ mod tests {
         let mut state = EcologyState::new(42);
         state.objects[0].position.x = f32::NAN;
         assert_eq!(state.validate(), Err(EcologyError::InvalidObject));
+    }
+
+    #[test]
+    fn morsel_spawn_is_bounded_and_preserves_the_canonical_orb() {
+        let mut state = EcologyState::new(43);
+        let profile = MorselProfile {
+            hue: 0.2,
+            saturation: 0.8,
+            value: 0.9,
+            warmth: 0.6,
+            pulse_rate: 0.4,
+            stimulation: 0.5,
+            cohesion_bias: 0.7,
+            novelty: 0.8,
+        };
+        for index in 0..MAX_ACTIVE_MORSELS + 2 {
+            let result = state.spawn_morsel(Vec2::splat(0.4), profile.clone(), index as f64);
+            assert_eq!(result.is_some(), index < MAX_ACTIVE_MORSELS);
+        }
+        assert_eq!(
+            state
+                .objects
+                .iter()
+                .filter(|object| object.kind == ObjectKind::Orb)
+                .count(),
+            1
+        );
+        state.validate().unwrap();
     }
 }

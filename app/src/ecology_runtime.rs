@@ -1,10 +1,12 @@
 use desktop_host::{StateStore, StorageError};
 use glam::Vec2;
 use lifecore::{ActionId, BodyFeedback, BodyIntent, SensorFrame};
+use pet_body::EcologyVisualEffect;
 use pet_ecology::{
-    ContactSource, EcologyBehaviorFrame, EcologyOutput, EcologyState, EmbodiedEnvironmentFrame,
-    EpisodeDirector, ExternalContact, MAX_OBJECT_SPEED, ObjectCommand, ObjectId, ObjectKind,
-    ObjectLifecycle, ObjectPhysicsConfig, WindowAffordanceFrame, resolve_object_body_contact,
+    ActionSignature, ContactSource, EcologyBehaviorFrame, EcologyOutput, EcologyState,
+    EcologyVisualContext, EmbodiedEnvironmentFrame, EpisodeDirector, ExternalContact,
+    MAX_OBJECT_SPEED, MorselProfile, ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle,
+    ObjectPhysicsConfig, RhythmSignature, WindowAffordanceFrame, resolve_object_body_contact,
     step_object_with_windows,
 };
 
@@ -19,6 +21,12 @@ pub struct EcologyRuntime {
     last_pointer_seconds: f64,
     environment: EmbodiedEnvironmentFrame,
     orb_trapped_seconds: f32,
+    last_visual_context: EcologyVisualContext,
+    visual_target: Option<Vec2>,
+    visual_hue: f32,
+    visual_strength: f32,
+    shared_attention: bool,
+    click_rhythm: Option<RhythmSignature>,
 }
 
 impl EcologyRuntime {
@@ -44,6 +52,12 @@ impl EcologyRuntime {
             last_pointer_seconds: 0.0,
             environment: EmbodiedEnvironmentFrame::default(),
             orb_trapped_seconds: 0.0,
+            last_visual_context: EcologyVisualContext::default(),
+            visual_target: None,
+            visual_hue: 0.0,
+            visual_strength: 0.0,
+            shared_attention: false,
+            click_rhythm: None,
         })
     }
 
@@ -84,9 +98,15 @@ impl EcologyRuntime {
                 .map(|contact| (contact.relative_velocity_px.length() / 1_200.0).clamp(0.0, 1.0))
                 .fold(0.0_f32, f32::max),
             orb_trapped: self.environment.orb_trapped,
+            visual_target: self.visual_target,
+            visual_hue: self.visual_hue,
+            visual_strength: self.visual_strength,
+            shared_attention: self.shared_attention,
+            click_rhythm: self.click_rhythm,
             timestamp: sensors.timestamp,
         };
         let output = self.director.tick(&mut self.state, frame, brain_intent, dt);
+        self.last_visual_context = output.visual_context;
         self.apply_object_commands(&output, dt);
         output
     }
@@ -175,6 +195,73 @@ impl EcologyRuntime {
     #[must_use]
     pub const fn environment(&self) -> &EmbodiedEnvironmentFrame {
         &self.environment
+    }
+
+    pub fn spawn_morsel(
+        &mut self,
+        position: Vec2,
+        profile: MorselProfile,
+        timestamp: f64,
+    ) -> Option<ObjectId> {
+        self.state.spawn_morsel(position, profile, timestamp)
+    }
+
+    pub fn set_visual_attention(
+        &mut self,
+        target: Option<Vec2>,
+        hue: f32,
+        strength: f32,
+        explicit: bool,
+    ) {
+        self.visual_target = target.filter(|position| position.is_finite());
+        self.visual_hue = if hue.is_finite() {
+            hue.rem_euclid(1.0)
+        } else {
+            0.0
+        };
+        self.visual_strength = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.shared_attention = explicit && self.visual_target.is_some();
+    }
+
+    pub fn set_click_rhythm(&mut self, rhythm: Option<RhythmSignature>) {
+        self.click_rhythm = rhythm;
+    }
+
+    pub fn learn_signature(
+        &mut self,
+        signature: ActionSignature,
+        timestamp: f64,
+    ) -> Result<(u64, bool), pet_ecology::EcologyError> {
+        self.state.skills.observe(signature, timestamp)
+    }
+
+    #[must_use]
+    pub fn visual_effect(&self) -> EcologyVisualEffect {
+        let mut effect = EcologyVisualEffect::default();
+        if let Some(food) = &self.state.metabolism.active_effect {
+            let strength = self.state.metabolism.digestion.clamp(0.0, 1.0);
+            effect.hue = food.hue;
+            effect.color_blend = strength * 0.35;
+            effect.flow_boost = food.stimulation * strength;
+            effect.glow_boost = (0.30 + food.stimulation * 0.55) * strength;
+            effect.cohesion_bias = food.cohesion_bias;
+            effect.translucency_boost = food.warmth * strength * 0.12;
+        }
+        let context_blend = self
+            .last_visual_context
+            .chromatic_blend
+            .max(self.last_visual_context.camouflage_blend)
+            .clamp(0.0, 0.65);
+        if context_blend > effect.color_blend {
+            effect.hue = self.last_visual_context.chromatic_hue;
+            effect.color_blend = context_blend;
+        }
+        effect.contrast_reduction = self.last_visual_context.camouflage_blend * 0.45;
+        effect.bounded()
     }
 
     fn apply_object_commands(&mut self, output: &EcologyOutput, dt: f32) {
@@ -281,13 +368,15 @@ impl EcologyRuntime {
                     }
                 }
                 ObjectCommand::Consume { object_id } => {
-                    if let Some(object) =
-                        self.state.objects.iter_mut().find(|object| {
-                            object.id == object_id && object.kind == ObjectKind::Morsel
-                        })
-                    {
-                        object.lifecycle = ObjectLifecycle::Consumed;
-                        object.velocity = Vec2::ZERO;
+                    if let Some(index) = self.state.objects.iter().position(|object| {
+                        object.id == object_id && object.kind == ObjectKind::Morsel
+                    }) {
+                        self.state.objects.remove(index);
+                        for slot in &mut self.state.den.slots {
+                            if *slot == Some(object_id) {
+                                *slot = None;
+                            }
+                        }
                     }
                 }
                 ObjectCommand::Store { .. } => {}

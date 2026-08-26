@@ -6,6 +6,9 @@ fn ecology_json_roundtrip_preserves_den_slots_and_has_no_active_episode() {
     let orb_id = state.objects[0].id;
     state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
     state.den.slots[0] = Some(orb_id);
+    state.taste.hue_bins[3] = 0.42;
+    state.taste.warmth_preference = -0.18;
+    state.taste.confidence = 0.37;
     let json = serde_json::to_string_pretty(&state).unwrap();
     assert!(!json.contains("active_episode"));
     assert!(!json.contains("phase_elapsed_seconds"));

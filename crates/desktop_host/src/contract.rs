@@ -4,7 +4,7 @@ use glam::Vec2;
 use thiserror::Error;
 use winit::window::Window;
 
-use crate::{DesktopSnapshot, DesktopVisualSample, DisplayTopology, PlatformCapabilities, RectI};
+use crate::{DesktopSnapshot, DesktopVisualFrame, DisplayTopology, PlatformCapabilities, RectI};
 
 /// An owned, top-down BGRA8 snapshot produced off the realtime/render thread.
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ pub trait PlatformBackend {
         &mut self,
         _topology: &DisplayTopology,
         _pet_position: Vec2,
-    ) -> Option<DesktopVisualSample> {
+    ) -> Option<DesktopVisualFrame> {
         None
     }
     fn capture_overlay_background(&mut self, _window: &Window) -> Option<DesktopBackgroundFrame> {

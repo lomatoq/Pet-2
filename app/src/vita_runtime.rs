@@ -6,8 +6,10 @@ use lifecore::{
     SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame, VitaState, apply_emotion_to_expression,
 };
 use morph_brain::{MorphAttention, MorphCommand, MorphOutput};
-use pet_ecology::WindowAffordanceFrame;
-use pet_perception::PerceptionRuntime;
+use pet_ecology::{RhythmSignature, WindowAffordanceFrame};
+use pet_perception::{
+    PerceptionRuntime, SpatialVisualFrame, VisualAttentionTarget, VisualFeatureFrame,
+};
 
 /// Selects the single high-level behavior policy. Physics, rendering and audio
 /// remain locally authoritative in both modes; the mode only changes which
@@ -265,6 +267,30 @@ pub struct VitaRuntime {
 }
 
 impl VitaRuntime {
+    pub fn set_visual_features(
+        &mut self,
+        summary: VisualFeatureFrame,
+        spatial: SpatialVisualFrame,
+    ) {
+        self.perception.set_visual_features(summary);
+        self.perception.set_spatial_visual(spatial);
+    }
+
+    pub fn cue_shared_attention(&mut self, position: Vec2, duration_seconds: f32) {
+        self.perception
+            .cue_shared_attention(position, duration_seconds);
+    }
+
+    #[must_use]
+    pub const fn visual_attention_target(&self) -> Option<VisualAttentionTarget> {
+        self.perception.visual_attention_target()
+    }
+
+    #[must_use]
+    pub fn recent_click_rhythm(&self) -> Option<RhythmSignature> {
+        self.perception.recent_click_rhythm()
+    }
+
     #[must_use]
     pub fn new(identity_seed: u64, restored: Option<VitaState>) -> Self {
         Self {

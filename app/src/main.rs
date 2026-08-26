@@ -21,7 +21,7 @@ use std::{
 };
 
 use desktop_host::{
-    DesktopVisualSample, DisplayTopology, EventLogEntry, MonitorId, MonitorInfo,
+    DesktopVisualFrame, DisplayTopology, EventLogEntry, MonitorId, MonitorInfo,
     PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition, PhysicalDesktopPoint, PlatformBackend,
     PointerState, PortablePetState, RectI, SensorNormalizer, StateStore, create_platform_backend,
     prepare_overlay_window_attributes,
@@ -39,6 +39,8 @@ use pet_body::{
     EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile, ProceduralBody,
     RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
+use pet_ecology::{ActionSignature, MorselProfile};
+use pet_perception::{SpatialVisualCell, SpatialVisualFrame, VisualFeatureFrame};
 use vita_runtime::{BrainMode, VitaRuntime};
 use winit::{
     application::ApplicationHandler,
@@ -917,6 +919,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             dt.min(1.0 / 30.0),
         );
         body.set_embodied_environment(ecology.environment());
+        body.set_ecology_visual_effect(ecology.visual_effect());
         body.embodied_update(
             &output.body_intent,
             &sensors,
@@ -1025,6 +1028,66 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     Ok(())
 }
 
+struct TeachRecorder {
+    active: bool,
+    started_seconds: f64,
+    last_timestamp: f64,
+    points: Vec<Vec2>,
+}
+
+impl Default for TeachRecorder {
+    fn default() -> Self {
+        Self {
+            active: false,
+            started_seconds: 0.0,
+            last_timestamp: 0.0,
+            points: Vec::with_capacity(720),
+        }
+    }
+}
+
+impl TeachRecorder {
+    fn start(&mut self, position: Vec2, timestamp: f64) {
+        self.active = true;
+        self.started_seconds = timestamp.max(0.0);
+        self.last_timestamp = self.started_seconds;
+        self.points.clear();
+        if position.is_finite() {
+            self.points.push(position.clamp(Vec2::ZERO, Vec2::ONE));
+        }
+    }
+
+    fn observe(&mut self, position: Vec2, timestamp: f64) -> Option<ActionSignature> {
+        if !self.active || !position.is_finite() || !timestamp.is_finite() {
+            return None;
+        }
+        if timestamp > self.last_timestamp && self.points.len() < 720 {
+            let point = position.clamp(Vec2::ZERO, Vec2::ONE);
+            if self
+                .points
+                .last()
+                .is_none_or(|previous| previous.distance(point) >= 0.000_5)
+            {
+                self.points.push(point);
+            }
+            self.last_timestamp = timestamp;
+        }
+        if timestamp - self.started_seconds >= 6.0 {
+            return self.finish(timestamp);
+        }
+        None
+    }
+
+    fn finish(&mut self, timestamp: f64) -> Option<ActionSignature> {
+        if !self.active {
+            return None;
+        }
+        self.active = false;
+        let duration = (timestamp - self.started_seconds).clamp(0.05, 6.0) as f32;
+        ActionSignature::from_trace(&self.points, duration)
+    }
+}
+
 struct PetRuntime {
     window: Arc<Window>,
     renderer: Renderer,
@@ -1064,7 +1127,7 @@ struct PetRuntime {
     life_accumulator: f32,
     sensor_accumulator: f32,
     visual_poll_accumulator: f32,
-    last_visual_sample: Option<DesktopVisualSample>,
+    last_visual_sample: Option<DesktopVisualFrame>,
     save_accumulator: f32,
     tuning_poll_accumulator: f32,
     tuning_last_modified: Option<SystemTime>,
@@ -1090,6 +1153,7 @@ struct PetRuntime {
     last_debug: Option<DebugState>,
     last_vita: Option<VitaOutput>,
     last_morph: MorphOutput,
+    teach: TeachRecorder,
     physics_timings: TimingWindow,
     render_timings: TimingWindow,
     frame_gap_timings: TimingWindow,
@@ -1298,10 +1362,12 @@ impl PetApplication {
                 );
             }
             if let Some(sample) = runtime.last_visual_sample {
-                runtime.sensors.mean_luminance = Some(sample.mean_luminance);
-                runtime.sensors.local_luminance = Some(sample.local_luminance);
-                runtime.background_luminance = sample.mean_luminance;
-                runtime.background_contrast = sample.contrast;
+                runtime.sensors.mean_luminance = Some(sample.summary.mean_luminance);
+                runtime.sensors.local_luminance = Some(sample.summary.local_luminance);
+                runtime.background_luminance = sample.summary.mean_luminance;
+                runtime.background_contrast = sample.summary.contrast;
+                let (summary, spatial) = perception_visual_frames(sample);
+                runtime.vita.set_visual_features(summary, spatial);
             } else {
                 runtime.sensors.mean_luminance = Some(0.5);
                 runtime.sensors.local_luminance = Some(0.5);
@@ -1311,6 +1377,34 @@ impl PetApplication {
                 &runtime.body.simulation.feedback,
                 observation_dt,
             );
+            let click_rhythm = runtime.vita.recent_click_rhythm();
+            runtime.sensors.recent_click_rhythm =
+                click_rhythm.map_or([0.0; 8], |rhythm| rhythm.intervals);
+            runtime.ecology.set_click_rhythm(click_rhythm);
+            let visual_target = runtime.vita.visual_attention_target();
+            let visual_hue = visual_target
+                .and_then(|target| {
+                    runtime
+                        .last_visual_sample
+                        .map(|frame| frame.cell_at(target.position).hue)
+                })
+                .unwrap_or(0.0);
+            runtime.ecology.set_visual_attention(
+                visual_target.map(|target| target.position),
+                visual_hue,
+                visual_target.map_or(0.0, |target| target.score),
+                visual_target.is_some_and(|target| target.explicit),
+            );
+            if let Some(signature) = runtime
+                .teach
+                .observe(runtime.sensors.cursor_position, runtime.sensors.timestamp)
+                && runtime
+                    .ecology
+                    .learn_signature(signature, runtime.sensors.timestamp.max(0.0))
+                    .is_ok()
+            {
+                runtime.save_accumulator = 30.0;
+            }
             runtime.pointer.pressed = false;
             runtime.pointer.released = false;
             runtime.pointer.pet_touched = false;
@@ -1361,6 +1455,13 @@ impl PetApplication {
             runtime
                 .body
                 .set_embodied_environment(runtime.ecology.environment());
+            let mut ecology_effect = runtime.ecology.visual_effect();
+            if runtime.teach.active {
+                ecology_effect.hue = 0.78;
+                ecology_effect.color_blend = ecology_effect.color_blend.max(0.08);
+                ecology_effect.glow_boost = ecology_effect.glow_boost.max(0.24);
+            }
+            runtime.body.set_ecology_visual_effect(ecology_effect);
             let previous_screen_center = runtime.screen_body_center;
             apply_screen_domain(
                 &mut runtime.body,
@@ -1839,6 +1940,7 @@ impl ApplicationHandler for PetApplication {
             last_debug: None,
             last_vita: None,
             last_morph,
+            teach: TeachRecorder::default(),
             physics_timings: TimingWindow::default(),
             render_timings: TimingWindow::default(),
             frame_gap_timings: TimingWindow::default(),
@@ -1933,6 +2035,21 @@ impl ApplicationHandler for PetApplication {
                 if runtime.modifiers.super_key() && runtime.modifiers.alt_key() {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyF) => {
+                            let cursor = runtime.sensors.cursor_position;
+                            let profile = morsel_profile_from_visual(
+                                runtime.last_visual_sample.as_ref(),
+                                cursor,
+                                runtime.life.state.genome.body.primary_color_hsv.x,
+                            );
+                            if runtime
+                                .ecology
+                                .spawn_morsel(cursor, profile, runtime.sensors.timestamp.max(0.0))
+                                .is_some()
+                            {
+                                runtime.save_accumulator = 30.0;
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::KeyP) => {
                             let enabled = !runtime.life.state.focus_mode;
                             apply_shared_feedback(
                                 runtime,
@@ -1943,6 +2060,28 @@ impl ApplicationHandler for PetApplication {
                                 },
                             );
                             runtime.save_accumulator = 30.0;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyL) => {
+                            runtime
+                                .vita
+                                .cue_shared_attention(runtime.sensors.cursor_position, 3.0);
+                        }
+                        PhysicalKey::Code(KeyCode::KeyT) => {
+                            let timestamp = runtime.sensors.timestamp.max(0.0);
+                            if runtime.teach.active {
+                                if let Some(signature) = runtime.teach.finish(timestamp)
+                                    && runtime
+                                        .ecology
+                                        .learn_signature(signature, timestamp)
+                                        .is_ok()
+                                {
+                                    runtime.save_accumulator = 30.0;
+                                }
+                            } else {
+                                runtime
+                                    .teach
+                                    .start(runtime.sensors.cursor_position, timestamp);
+                            }
                         }
                         PhysicalKey::Code(KeyCode::KeyM) => {
                             runtime.life.trigger_metamorphosis();
@@ -2262,6 +2401,62 @@ fn voice_visual_state(audio: &AudioManager) -> VoiceVisualState {
         pitch_normalized: feedback.pitch_normalized,
         noisiness: feedback.noisiness,
         purr: feedback.purr,
+    }
+}
+
+fn perception_visual_frames(frame: DesktopVisualFrame) -> (VisualFeatureFrame, SpatialVisualFrame) {
+    let summary = frame.summary;
+    (
+        VisualFeatureFrame {
+            mean_luminance: summary.mean_luminance,
+            local_luminance: summary.local_luminance,
+            contrast: summary.contrast,
+            colorfulness: summary.colorfulness,
+            warmth: summary.warmth,
+            dominant_hue: summary.dominant_hue,
+            motion_energy: summary.motion_energy,
+            edge_density: summary.edge_density,
+            sudden_change: summary.sudden_change,
+        },
+        SpatialVisualFrame {
+            cells: std::array::from_fn(|index| {
+                let cell = frame.cells[index];
+                SpatialVisualCell {
+                    luminance: cell.luminance,
+                    contrast: cell.contrast,
+                    colorfulness: cell.colorfulness,
+                    warmth: cell.warmth,
+                    hue: cell.hue,
+                    motion: cell.motion,
+                    edge_density: cell.edge_density,
+                    sudden_change: cell.sudden_change,
+                }
+            }),
+            sequence: frame.sequence,
+            timestamp: frame.timestamp,
+        },
+    )
+}
+
+fn morsel_profile_from_visual(
+    frame: Option<&DesktopVisualFrame>,
+    position: Vec2,
+    fallback_hue: f32,
+) -> MorselProfile {
+    let cell = frame.map(|frame| frame.cell_at(position));
+    MorselProfile {
+        hue: cell.map_or(fallback_hue.rem_euclid(1.0), |cell| cell.hue),
+        saturation: cell.map_or(0.68, |cell| 0.42 + cell.colorfulness * 0.50),
+        value: cell.map_or(0.88, |cell| 0.55 + cell.luminance * 0.40),
+        warmth: cell.map_or(0.5, |cell| cell.warmth),
+        pulse_rate: cell.map_or(0.38, |cell| 0.25 + cell.motion * 0.65),
+        stimulation: cell.map_or(0.44, |cell| {
+            0.20 + cell.motion * 0.42 + cell.sudden_change * 0.30
+        }),
+        cohesion_bias: cell.map_or(0.62, |cell| 0.45 + cell.contrast * 0.35),
+        novelty: cell.map_or(0.72, |cell| {
+            0.52 + cell.sudden_change * 0.34 + cell.colorfulness * 0.12
+        }),
     }
 }
 
@@ -2887,6 +3082,26 @@ mod tests {
     use pet_body::{BodyRenderMode, MaterialVariant};
 
     use super::*;
+
+    #[test]
+    fn teach_recorder_is_explicit_bounded_and_stores_only_a_signature() {
+        let mut recorder = TeachRecorder::default();
+        assert!(recorder.observe(Vec2::ZERO, 0.0).is_none());
+        recorder.start(Vec2::splat(0.5), 1.0);
+        for index in 1..=720 {
+            let phase = index as f32 / 719.0 * std::f32::consts::TAU;
+            let point = Vec2::splat(0.5) + Vec2::new(phase.sin(), phase.sin() * phase.cos()) * 0.2;
+            let _ = recorder.observe(point, 1.0 + index as f64 / 120.0);
+        }
+        let signature = recorder.finish(7.0).or_else(|| {
+            recorder.start(Vec2::splat(0.5), 1.0);
+            recorder.observe(Vec2::new(0.7, 0.5), 7.0)
+        });
+        assert!(signature.is_some());
+        assert!(!recorder.active);
+        assert!(recorder.points.len() <= 720);
+        assert!(signature.unwrap().is_valid());
+    }
 
     #[test]
     fn audio_owner_starts_without_blocking_its_caller() {

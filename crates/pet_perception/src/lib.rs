@@ -4,6 +4,10 @@
 //! stores typed characters, key codes, screenshots, microphone recordings, window
 //! text, accessibility names, clipboard contents, or document content.
 
+mod visual_grid;
+
+pub use visual_grid::*;
+
 use std::collections::{BTreeMap, VecDeque};
 
 use glam::Vec2;
@@ -11,7 +15,9 @@ use lifecore::{
     BodyFeedback, PointerGesturePercept, Rect, SensorFrame, StimulusEvent, StimulusKind,
     VitaPerceptFrame, stable_hash_bytes,
 };
-use pet_ecology::{NormalizedRect, WindowAffordance, WindowAffordanceFrame, WindowId};
+use pet_ecology::{
+    NormalizedRect, RhythmSignature, WindowAffordance, WindowAffordanceFrame, WindowId,
+};
 use serde::{Deserialize, Serialize};
 
 const CURSOR_HISTORY_SECONDS: f64 = 2.4;
@@ -84,6 +90,8 @@ pub struct PerceptionRuntime {
     visual_age: f32,
     previous_visual: Option<VisualFeatureFrame>,
     window_affordances: WindowAffordanceFrame,
+    spatial_visual: Option<SpatialVisualFrame>,
+    spatial_attention: SpatialAttentionRuntime,
 }
 
 impl Default for PerceptionRuntime {
@@ -101,6 +109,8 @@ impl Default for PerceptionRuntime {
             visual_age: f32::INFINITY,
             previous_visual: None,
             window_affordances: WindowAffordanceFrame::default(),
+            spatial_visual: None,
+            spatial_attention: SpatialAttentionRuntime::default(),
         }
     }
 }
@@ -129,6 +139,37 @@ impl PerceptionRuntime {
         self.previous_visual = self.visual;
         self.visual = Some(frame);
         self.visual_age = 0.0;
+    }
+
+    pub fn set_spatial_visual(&mut self, frame: SpatialVisualFrame) {
+        self.spatial_visual = Some(frame.bounded());
+        self.visual_age = 0.0;
+    }
+
+    pub fn cue_shared_attention(&mut self, position: Vec2, duration_seconds: f32) {
+        self.spatial_attention.cue(position, duration_seconds);
+    }
+
+    #[must_use]
+    pub const fn visual_attention_target(&self) -> Option<VisualAttentionTarget> {
+        self.spatial_attention.target()
+    }
+
+    #[must_use]
+    pub fn recent_click_rhythm(&self) -> Option<RhythmSignature> {
+        let count = self.click_activity.len().min(9);
+        if count < 2 {
+            return None;
+        }
+        let mut onsets = [0.0_f64; 9];
+        for (target, onset) in onsets.iter_mut().zip(
+            self.click_activity
+                .iter()
+                .skip(self.click_activity.len() - count),
+        ) {
+            *target = *onset;
+        }
+        RhythmSignature::from_onsets(&onsets[..count])
     }
 
     #[must_use]
@@ -161,6 +202,12 @@ impl PerceptionRuntime {
         self.scroll_velocity *= (-dt * 5.5).exp();
         self.scroll_burst *= (-dt * 2.2).exp();
         self.visual_age += dt;
+        self.spatial_attention.update(
+            self.spatial_visual
+                .as_ref()
+                .filter(|_| self.visual_age < 2.5),
+            dt,
+        );
 
         let pointer = self.pointer_gestures(body.world_position, sensors);
         let typing_rate_hz = event_rate(&self.keyboard_activity, timestamp, 2.0).clamp(0.0, 24.0);
@@ -206,6 +253,24 @@ impl PerceptionRuntime {
             );
         }
         events.extend(ecology.events.iter().copied());
+        if let Some(target) = self.spatial_attention.target() {
+            let kind = match target.kind {
+                VisualRegionKind::Bright => StimulusKind::BrightArea,
+                VisualRegionKind::Dark => StimulusKind::DarkArea,
+                _ => StimulusKind::VisualChange,
+            };
+            events.push(
+                StimulusEvent {
+                    kind,
+                    position: Some(target.position),
+                    intensity: target.score,
+                    novelty: if target.explicit { 1.0 } else { target.score },
+                    threat: 0.0,
+                    social_relevance: if target.explicit { 0.72 } else { 0.0 },
+                }
+                .bounded(),
+            );
+        }
         if let Some(visual) = visual {
             if visual.sudden_change > 0.10 || visual.motion_energy > 0.18 {
                 events.push(

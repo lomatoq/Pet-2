@@ -227,6 +227,105 @@ impl TasteProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FoodUtility {
+    pub reserve_need: f32,
+    pub learned_taste: f32,
+    pub safe_novelty: f32,
+    pub state_match: f32,
+    pub satiation_cost: f32,
+    pub repetition_cost: f32,
+    pub threat_cost: f32,
+    pub total: f32,
+}
+
+#[must_use]
+pub fn evaluate_food_utility(
+    metabolism: &MetabolicState,
+    taste: &TasteProfile,
+    morsel: &MorselProfile,
+    threat: f32,
+) -> FoodUtility {
+    if !morsel.is_valid() {
+        return FoodUtility {
+            total: -1.0,
+            ..FoodUtility::default()
+        };
+    }
+    let reserve_need = ((0.78 - metabolism.reserve) / 0.43).clamp(0.0, 1.0) * 0.42;
+    let learned_taste = taste.value(morsel) * (0.18 + taste.confidence * 0.24);
+    let safe_novelty = morsel.novelty * 0.18 * (1.0 - threat.clamp(0.0, 1.0));
+    let state_match = morsel.stimulation * (1.0 - metabolism.satiation) * 0.12;
+    let satiation_cost = metabolism.satiation * 0.46;
+    let repetition_cost = metabolism.active_effect.as_ref().map_or(0.0, |effect| {
+        let hue_distance = (effect.hue - morsel.hue)
+            .abs()
+            .min(1.0 - (effect.hue - morsel.hue).abs());
+        (1.0 - hue_distance / 0.16).clamp(0.0, 1.0) * 0.34
+    });
+    let threat_cost = threat.clamp(0.0, 1.0) * 0.62;
+    let total = (reserve_need + learned_taste + safe_novelty + state_match
+        - satiation_cost
+        - repetition_cost
+        - threat_cost)
+        .clamp(-1.0, 1.0);
+    FoodUtility {
+        reserve_need,
+        learned_taste,
+        safe_novelty,
+        state_match,
+        satiation_cost,
+        repetition_cost,
+        threat_cost,
+        total,
+    }
+}
+
 fn bounded_lerp(current: f32, target: f32, amount: f32) -> f32 {
     (current + (target - current) * amount.clamp(0.0, 1.0)).clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn morsel(hue: f32) -> MorselProfile {
+        MorselProfile {
+            hue,
+            saturation: 0.8,
+            value: 0.9,
+            warmth: 0.6,
+            pulse_rate: 0.4,
+            stimulation: 0.5,
+            cohesion_bias: 0.7,
+            novelty: 0.8,
+        }
+    }
+
+    #[test]
+    fn reserve_need_raises_utility_but_never_crosses_the_floor() {
+        let taste = TasteProfile::default();
+        let mut low = MetabolicState {
+            reserve: METABOLIC_RESERVE_FLOOR,
+            ..MetabolicState::default()
+        };
+        let high = MetabolicState::default();
+        assert!(
+            evaluate_food_utility(&low, &taste, &morsel(0.2), 0.0).total
+                > evaluate_food_utility(&high, &taste, &morsel(0.2), 0.0).total
+        );
+        low.apply_offline_seconds(14.0 * 86_400.0);
+        assert!(low.reserve >= METABOLIC_RESERVE_FLOOR);
+    }
+
+    #[test]
+    fn repeated_flavor_is_less_useful_while_effect_is_active() {
+        let taste = TasteProfile::default();
+        let mut metabolism = MetabolicState::default();
+        let profile = morsel(0.2);
+        let before = evaluate_food_utility(&metabolism, &taste, &profile, 0.0).total;
+        metabolism.consume(&profile);
+        let repeated = evaluate_food_utility(&metabolism, &taste, &profile, 0.0).total;
+        assert!(repeated < before);
+    }
 }

@@ -40,9 +40,10 @@ use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes};
 
 use crate::{
-    ApplicationInfo, DesktopBackgroundFrame, DesktopSnapshot, DesktopSurface, DesktopVisualSample,
-    DisplayTopology, HostError, PhysicalDesktopPoint, PlatformBackend, PlatformCapabilities,
-    PlatformKind, RectI,
+    ApplicationInfo, DesktopBackgroundFrame, DesktopSnapshot, DesktopSurface, DesktopVisualFrame,
+    DesktopVisualSample, DisplayTopology, HostError, PhysicalDesktopPoint, PlatformBackend,
+    PlatformCapabilities, PlatformKind, RectI, VISUAL_GRID_CELLS, VISUAL_GRID_HEIGHT,
+    VISUAL_GRID_WIDTH, VisualCell,
 };
 
 pub struct WindowsBackend {
@@ -162,7 +163,7 @@ impl PlatformBackend for WindowsBackend {
         &mut self,
         topology: &DisplayTopology,
         pet_position: Vec2,
-    ) -> Option<DesktopVisualSample> {
+    ) -> Option<DesktopVisualFrame> {
         self.visual_worker
             .as_mut()?
             .submit_and_poll(topology, pet_position)
@@ -236,15 +237,15 @@ struct VisualSampleRequest {
 
 struct VisualSampleWorker {
     request_tx: Option<Sender<VisualSampleRequest>>,
-    sample_rx: Receiver<DesktopVisualSample>,
+    sample_rx: Receiver<DesktopVisualFrame>,
     join: Option<JoinHandle<()>>,
-    latest: Option<DesktopVisualSample>,
+    latest: Option<DesktopVisualFrame>,
 }
 
 impl VisualSampleWorker {
     fn new() -> Self {
         let (request_tx, request_rx) = mpsc::channel::<VisualSampleRequest>();
-        let (sample_tx, sample_rx) = mpsc::channel::<DesktopVisualSample>();
+        let (sample_tx, sample_rx) = mpsc::channel::<DesktopVisualFrame>();
         let join = thread::Builder::new()
             .name("pet2-visual-sample".into())
             .spawn(move || visual_sample_loop(&request_rx, &sample_tx))
@@ -261,7 +262,7 @@ impl VisualSampleWorker {
         &mut self,
         topology: &DisplayTopology,
         pet_position: Vec2,
-    ) -> Option<DesktopVisualSample> {
+    ) -> Option<DesktopVisualFrame> {
         if let Some(sample) = self.sample_rx.try_iter().last() {
             self.latest = Some(sample);
         }
@@ -293,16 +294,23 @@ impl Drop for VisualSampleWorker {
 
 fn visual_sample_loop(
     requests: &Receiver<VisualSampleRequest>,
-    samples: &Sender<DesktopVisualSample>,
+    samples: &Sender<DesktopVisualFrame>,
 ) {
     let mut previous = Vec::with_capacity(64);
+    let started = Instant::now();
+    let mut sequence = 0_u64;
     while let Ok(mut request) = requests.recv() {
         for newer in requests.try_iter() {
             request = newer;
         }
-        let Some(sample) =
-            sample_desktop_visual(&request.topology, request.pet_position, &mut previous)
-        else {
+        sequence = sequence.saturating_add(1);
+        let Some(sample) = sample_desktop_visual(
+            &request.topology,
+            request.pet_position,
+            &mut previous,
+            sequence,
+            started.elapsed().as_secs_f64(),
+        ) else {
             continue;
         };
         if samples.send(sample).is_err() {
@@ -590,127 +598,122 @@ fn sample_desktop_visual(
     topology: &DisplayTopology,
     pet_position: Vec2,
     previous: &mut Vec<[f32; 3]>,
-) -> Option<DesktopVisualSample> {
+    sequence: u64,
+    timestamp: f64,
+) -> Option<DesktopVisualFrame> {
     let virtual_bounds = topology.virtual_physical_bounds;
     if !virtual_bounds.is_valid() {
         return None;
     }
-    let foreground = unsafe { GetForegroundWindow() };
-    let global_bounds = window_bounds(foreground)
-        .and_then(|bounds| intersect_rect(bounds, virtual_bounds))
-        .unwrap_or(virtual_bounds);
-    let pet_center = PhysicalDesktopPoint {
-        x: virtual_bounds.minimum.x
-            + (pet_position.x.clamp(0.0, 1.0) * virtual_bounds.width() as f32).round() as i32,
-        y: virtual_bounds.minimum.y
-            + (pet_position.y.clamp(0.0, 1.0) * virtual_bounds.height() as f32).round() as i32,
-    };
-    let local_bounds = intersect_rect(
-        RectI {
-            minimum: PhysicalDesktopPoint {
-                x: pet_center.x - 96,
-                y: pet_center.y - 96,
-            },
-            maximum: PhysicalDesktopPoint {
-                x: pet_center.x + 97,
-                y: pet_center.y + 97,
-            },
-        },
-        virtual_bounds,
-    )
-    .unwrap_or(global_bounds);
-
     let device_context = unsafe { GetDC(std::ptr::null_mut()) };
     if device_context.is_null() {
         return None;
     }
-    let mut samples = Vec::with_capacity(60);
-    sample_grid(device_context, global_bounds, 7, 5, &mut samples);
-    let global_count = samples.len();
-    sample_grid(device_context, local_bounds, 5, 5, &mut samples);
+    let sampled = sample_visual_cells(device_context, virtual_bounds, previous);
     unsafe {
         ReleaseDC(std::ptr::null_mut(), device_context);
     }
-    if global_count == 0 || samples.len() == global_count {
-        return None;
-    }
-
+    let (cells, means) = sampled?;
     let (mean_luminance, contrast, colorfulness, warmth, dominant_hue, edge_density) =
-        summarize_samples(&samples[..global_count]);
-    let local_luminance = samples[global_count..]
+        summarize_samples(&means);
+    let motion_energy = cells.iter().map(|cell| cell.motion).sum::<f32>() / cells.len() as f32;
+    let sudden_change = cells
         .iter()
-        .map(|sample| luminance(*sample))
-        .sum::<f32>()
-        / (samples.len() - global_count) as f32;
-    let motion_energy = if previous.len() == samples.len() {
-        samples
-            .iter()
-            .zip(previous.iter())
-            .map(|(current, old)| {
-                ((current[0] - old[0]).abs()
-                    + (current[1] - old[1]).abs()
-                    + (current[2] - old[2]).abs())
-                    / 3.0
-            })
-            .sum::<f32>()
-            / samples.len() as f32
-    } else {
-        0.0
-    };
-    let previous_mean = if previous.is_empty() {
-        mean_luminance
-    } else {
-        previous
-            .iter()
-            .map(|sample| luminance(*sample))
-            .sum::<f32>()
-            / previous.len() as f32
-    };
-    let sudden_change =
-        ((mean_luminance - previous_mean).abs() * 1.8 + motion_energy * 1.25).clamp(0.0, 1.0);
-    *previous = samples;
-
-    let sample = DesktopVisualSample {
+        .map(|cell| cell.sudden_change)
+        .fold(0.0_f32, f32::max);
+    let column = (pet_position.x.clamp(0.0, 0.999_999) * VISUAL_GRID_WIDTH as f32) as usize;
+    let row = (pet_position.y.clamp(0.0, 0.999_999) * VISUAL_GRID_HEIGHT as f32) as usize;
+    let summary = DesktopVisualSample {
         mean_luminance,
-        local_luminance,
+        local_luminance: cells[row * VISUAL_GRID_WIDTH + column].luminance,
         contrast,
         colorfulness,
         warmth,
         dominant_hue,
-        motion_energy: (motion_energy * 2.6).clamp(0.0, 1.0),
+        motion_energy,
         edge_density,
         sudden_change,
     };
-    sample.is_finite().then_some(sample)
+    *previous = means;
+    let frame = DesktopVisualFrame {
+        summary,
+        cells,
+        sequence,
+        timestamp,
+    };
+    frame.is_finite().then_some(frame)
 }
 
-fn sample_grid(
+fn sample_visual_cells(
     device_context: HDC,
     bounds: RectI,
-    columns: i32,
-    rows: i32,
-    output: &mut Vec<[f32; 3]>,
-) {
-    if !bounds.is_valid() || columns <= 0 || rows <= 0 {
-        return;
+    previous: &[[f32; 3]],
+) -> Option<([VisualCell; VISUAL_GRID_CELLS], Vec<[f32; 3]>)> {
+    if !bounds.is_valid() {
+        return None;
     }
-    for row in 0..rows {
-        for column in 0..columns {
-            let x = bounds.minimum.x
-                + (((column as f32 + 0.5) / columns as f32) * bounds.width() as f32).round() as i32;
-            let y = bounds.minimum.y
-                + (((row as f32 + 0.5) / rows as f32) * bounds.height() as f32).round() as i32;
-            let color = unsafe { GetPixel(device_context, x, y) };
-            if color == u32::MAX {
-                continue;
+    let mut cells = [VisualCell::default(); VISUAL_GRID_CELLS];
+    let mut means = Vec::with_capacity(VISUAL_GRID_CELLS);
+    for row in 0..VISUAL_GRID_HEIGHT {
+        for column in 0..VISUAL_GRID_WIDTH {
+            let mut samples = [[0.0_f32; 3]; 4];
+            let mut count = 0_usize;
+            for (offset_x, offset_y) in [
+                (0.25_f32, 0.25_f32),
+                (0.75, 0.25),
+                (0.25, 0.75),
+                (0.75, 0.75),
+            ] {
+                let normalized_x = (column as f32 + offset_x) / VISUAL_GRID_WIDTH as f32;
+                let normalized_y = (row as f32 + offset_y) / VISUAL_GRID_HEIGHT as f32;
+                let x = bounds.minimum.x + (normalized_x * bounds.width() as f32).round() as i32;
+                let y = bounds.minimum.y + (normalized_y * bounds.height() as f32).round() as i32;
+                let color = unsafe { GetPixel(device_context, x, y) };
+                if color != u32::MAX {
+                    samples[count] = [
+                        (color & 0xff) as f32 / 255.0,
+                        ((color >> 8) & 0xff) as f32 / 255.0,
+                        ((color >> 16) & 0xff) as f32 / 255.0,
+                    ];
+                    count += 1;
+                }
             }
-            output.push([
-                (color & 0xff) as f32 / 255.0,
-                ((color >> 8) & 0xff) as f32 / 255.0,
-                ((color >> 16) & 0xff) as f32 / 255.0,
-            ]);
+            if count == 0 {
+                return None;
+            }
+            let valid_samples = &samples[..count];
+            let mut mean_rgb = [0.0_f32; 3];
+            for sample in valid_samples {
+                for channel in 0..3 {
+                    mean_rgb[channel] += sample[channel] / count as f32;
+                }
+            }
+            let (luma, contrast, colorfulness, warmth, hue, edge_density) =
+                summarize_samples(valid_samples);
+            let index = row * VISUAL_GRID_WIDTH + column;
+            let motion = previous.get(index).map_or(0.0, |old| {
+                (((mean_rgb[0] - old[0]).abs()
+                    + (mean_rgb[1] - old[1]).abs()
+                    + (mean_rgb[2] - old[2]).abs())
+                    / 3.0
+                    * 2.6)
+                    .clamp(0.0, 1.0)
+            });
+            let previous_luma = previous.get(index).map_or(luma, |old| luminance(*old));
+            cells[index] = VisualCell {
+                luminance: luma,
+                contrast,
+                colorfulness,
+                warmth,
+                hue,
+                motion,
+                edge_density,
+                sudden_change: ((luma - previous_luma).abs() * 1.8 + motion * 1.25).clamp(0.0, 1.0),
+            };
+            means.push(mean_rgb);
         }
     }
+    Some((cells, means))
 }
 
 fn summarize_samples(samples: &[[f32; 3]]) -> (f32, f32, f32, f32, f32, f32) {
@@ -798,20 +801,6 @@ fn hue_and_saturation(sample: [f32; 3]) -> (f32, f32) {
         (sample[0] - sample[1]) / delta + 4.0
     } / 6.0;
     (hue.rem_euclid(1.0), (delta / maximum).clamp(0.0, 1.0))
-}
-
-fn intersect_rect(left: RectI, right: RectI) -> Option<RectI> {
-    let intersection = RectI {
-        minimum: PhysicalDesktopPoint {
-            x: left.minimum.x.max(right.minimum.x),
-            y: left.minimum.y.max(right.minimum.y),
-        },
-        maximum: PhysicalDesktopPoint {
-            x: left.maximum.x.min(right.maximum.x),
-            y: left.maximum.y.min(right.maximum.y),
-        },
-    };
-    intersection.is_valid().then_some(intersection)
 }
 
 struct EnumerationContext {
