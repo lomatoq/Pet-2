@@ -39,7 +39,7 @@ use pet_body::{
     EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile, ProceduralBody,
     RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
-use pet_ecology::{ActionSignature, EcologyVocalTrigger, MorselProfile};
+use pet_ecology::{ActionSignature, EcologyVocalTrigger, EpisodeGoal, MorselProfile};
 use pet_perception::{SpatialVisualCell, SpatialVisualFrame, VisualFeatureFrame};
 use vita_runtime::{BrainMode, VitaRuntime};
 use winit::{
@@ -1613,6 +1613,38 @@ impl PetApplication {
                 let desktop_timing = runtime.desktop_poll_timings.percentiles();
                 let camera_timing = runtime.camera_timings.percentiles();
                 let background_timing = runtime.background_timings.percentiles();
+                let ecology_debug = runtime.ecology.debug();
+                let ecology_scores = ecology_debug.scores[..ecology_debug.score_count]
+                    .iter()
+                    .map(|score| {
+                        serde_json::json!({
+                            "goal": score.goal.map(|goal| format!("{goal:?}")),
+                            "score": score.score,
+                            "eligible": score.eligible,
+                            "reason": format!("{:?}", score.reason),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let active_ecology = runtime.ecology.active_episode();
+                let active_skill_id = active_ecology
+                    .filter(|episode| {
+                        matches!(
+                            episode.goal,
+                            EpisodeGoal::PracticeSkill | EpisodeGoal::PerformSkill
+                        )
+                    })
+                    .and_then(|episode| episode.object_id);
+                let active_skill = active_skill_id.and_then(|skill_id| {
+                    runtime
+                        .ecology
+                        .state()
+                        .skills
+                        .skills
+                        .iter()
+                        .find(|skill| skill.id == skill_id)
+                });
+                let ecology_visual = runtime.ecology.visual_context();
+                let saliency_target = runtime.vita.visual_attention_target();
                 let liquid_debug = serde_json::json!({
                     "particles": liquid.particle_count,
                     "components": liquid.component_count,
@@ -1709,6 +1741,27 @@ impl PetApplication {
                     "typing_rate_hz": runtime.vita.percept().typing_rate_hz,
                     "scroll_velocity": runtime.vita.percept().scroll_velocity,
                     "window_pressure": runtime.vita.percept().window_pressure,
+                    "ecology": {
+                        "active_goal": ecology_debug.active_goal.map(|goal| format!("{goal:?}")),
+                        "phase": ecology_debug.active_phase.map(|phase| format!("{phase:?}")),
+                        "reason": format!("{:?}", ecology_debug.selected_reason),
+                        "candidate_scores": ecology_scores,
+                        "escape_confidence": active_ecology
+                            .filter(|episode| episode.goal == EpisodeGoal::EscapePressure)
+                            .map(|episode| episode.prediction_confidence),
+                        "help_requested": runtime.ecology.last_vocal_trigger()
+                            == Some(EcologyVocalTrigger::NeedHelp),
+                        "saliency_target": saliency_target.map(|target| target.position.to_array()),
+                        "chromatic_blend": ecology_visual.chromatic_blend,
+                        "camouflage_blend": ecology_visual.camouflage_blend,
+                        "active_skill": active_skill_id,
+                        "skill_competence": active_skill.map(|skill| skill.competence),
+                        "skill_uncertainty": active_skill.map(|skill| skill.uncertainty),
+                        "motor_error": runtime.ecology.last_motor_error(),
+                        "object_physics_us": runtime.ecology.object_physics_microseconds(),
+                        "episode_tick_us": runtime.ecology.episode_tick_microseconds(),
+                        "visual_grid_age_ms": runtime.vita.visual_age_seconds() * 1_000.0,
+                    },
                     "timings_ms": {
                         "physics": [physics_timing.p50, physics_timing.p95, physics_timing.p99],
                         "render": [render_timing.p50, render_timing.p95, render_timing.p99],
@@ -2309,6 +2362,14 @@ fn apply_shared_feedback(runtime: &mut PetRuntime, event: FeedbackEvent) {
     // Attribute a same-frame response to a performance the callback has already
     // started, even when the UI event arrives before the normal frame poll.
     synchronize_audio_learning(runtime);
+    if matches!(
+        event,
+        FeedbackEvent::Ignored | FeedbackEvent::PushedAway | FeedbackEvent::MuteOrHide
+    ) {
+        runtime
+            .ecology
+            .observe_explicit_refusal(runtime.sensors.timestamp);
+    }
     runtime.vita.apply_feedback(&event);
     runtime.morph.apply_feedback(&event);
     runtime.life.apply_feedback(event);
@@ -3171,6 +3232,28 @@ mod tests {
             result,
             AudioWorkerEvent::StartFailed { error } if error == "expected test failure"
         ));
+    }
+
+    #[test]
+    fn disabled_audio_rejects_ecology_voice_without_training_or_blocking() {
+        let mut manager = AudioManager::new(true);
+        let mut core = LifeCore::new(Genome::from_seed(711), 731);
+        let request = core
+            .request_vocalization(VocalTrigger::NeedHelp, &SensorFrame::default())
+            .unwrap();
+        let motif = core
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .unwrap()
+            .clone();
+        assert!(!manager.enqueue(&core.state.genome.voice, &motif, &request));
+        core.cancel_vocal_request(request.performance_seed);
+        assert!(core.state.pending_vocal_delivery.is_none());
+        assert_eq!(manager.state, AudioManagerState::Disabled);
+        assert_eq!(manager.accepted_requests, 0);
+        assert_eq!(manager.rejected_requests, 1);
     }
 
     #[test]

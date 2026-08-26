@@ -156,6 +156,11 @@ impl PerceptionRuntime {
     }
 
     #[must_use]
+    pub const fn visual_age_seconds(&self) -> f32 {
+        self.visual_age
+    }
+
+    #[must_use]
     pub fn recent_click_rhythm(&self) -> Option<RhythmSignature> {
         let count = self.click_activity.len().min(9);
         if count < 2 {
@@ -854,5 +859,35 @@ mod tests {
         assert!(!json.contains("character"));
         assert!(frame.typing_rate_hz > 0.0);
         assert!(frame.scroll_velocity > 0.0);
+    }
+
+    #[test]
+    fn unavailable_visual_sampling_expires_cleanly_to_capability_none() {
+        let mut runtime = PerceptionRuntime::default();
+        runtime.set_visual_features(VisualFeatureFrame {
+            mean_luminance: 0.9,
+            local_luminance: 0.95,
+            sudden_change: 0.8,
+            ..VisualFeatureFrame::default()
+        });
+        let mut grid = SpatialVisualFrame::default();
+        grid.cells[12].motion = 0.9;
+        runtime.set_spatial_visual(grid);
+        let mut sensors = SensorFrame::default();
+        let body = BodyFeedback::default();
+        let mut percept = VitaPerceptFrame::default();
+        for tick in 0..60 {
+            sensors.timestamp = tick as f64 * 0.05;
+            percept = runtime.update(&sensors, &body, 0.05);
+        }
+        assert_eq!(percept.mean_luminance, None);
+        assert_eq!(percept.local_luminance, None);
+        assert_eq!(runtime.visual_attention_target(), None);
+        assert!(
+            percept
+                .events
+                .iter()
+                .all(|event| event.kind != StimulusKind::VisualChange)
+        );
     }
 }

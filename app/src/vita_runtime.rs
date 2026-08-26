@@ -287,6 +287,11 @@ impl VitaRuntime {
     }
 
     #[must_use]
+    pub const fn visual_age_seconds(&self) -> f32 {
+        self.perception.visual_age_seconds()
+    }
+
+    #[must_use]
     pub fn recent_click_rhythm(&self) -> Option<RhythmSignature> {
         self.perception.recent_click_rhythm()
     }

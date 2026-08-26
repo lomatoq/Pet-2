@@ -1,13 +1,15 @@
+use std::time::Instant;
+
 use desktop_host::{StateStore, StorageError};
 use glam::Vec2;
 use lifecore::{ActionId, BodyFeedback, BodyIntent, SensorFrame};
 use pet_body::EcologyVisualEffect;
 use pet_ecology::{
-    ActionSignature, ContactSource, EcologyBehaviorFrame, EcologyOutput, EcologyState,
-    EcologyVisualContext, EmbodiedEnvironmentFrame, EpisodeDirector, ExternalContact,
-    MAX_OBJECT_SPEED, MorselProfile, ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle,
-    ObjectPhysicsConfig, RhythmSignature, WindowAffordanceFrame, resolve_object_body_contact,
-    step_object_with_windows,
+    ActionSignature, ActivityEpisode, ContactSource, EcologyBehaviorFrame, EcologyDecisionTrace,
+    EcologyOutcome, EcologyOutput, EcologyState, EcologyVisualContext, EcologyVocalTrigger,
+    EmbodiedEnvironmentFrame, EpisodeDirector, ExternalContact, MAX_OBJECT_SPEED, MorselProfile,
+    ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig, RhythmSignature,
+    WindowAffordanceFrame, resolve_object_body_contact, step_object_with_windows,
 };
 
 /// Application integration boundary for the portable habitat. Native input,
@@ -27,6 +29,11 @@ pub struct EcologyRuntime {
     visual_strength: f32,
     shared_attention: bool,
     click_rhythm: Option<RhythmSignature>,
+    last_debug: EcologyDecisionTrace,
+    last_vocal_trigger: Option<EcologyVocalTrigger>,
+    last_motor_error: Option<f32>,
+    episode_tick_microseconds: f64,
+    object_physics_microseconds: f64,
 }
 
 impl EcologyRuntime {
@@ -58,6 +65,11 @@ impl EcologyRuntime {
             visual_strength: 0.0,
             shared_attention: false,
             click_rhythm: None,
+            last_debug: EcologyDecisionTrace::default(),
+            last_vocal_trigger: None,
+            last_motor_error: None,
+            episode_tick_microseconds: 0.0,
+            object_physics_microseconds: 0.0,
         })
     }
 
@@ -105,8 +117,19 @@ impl EcologyRuntime {
             click_rhythm: self.click_rhythm,
             timestamp: sensors.timestamp,
         };
+        let started = Instant::now();
         let output = self.director.tick(&mut self.state, frame, brain_intent, dt);
+        self.episode_tick_microseconds = started.elapsed().as_secs_f64() * 1_000_000.0;
         self.last_visual_context = output.visual_context;
+        self.last_debug = output.debug.clone();
+        self.last_vocal_trigger = output.vocal_trigger;
+        self.last_motor_error = output.outcomes[..output.outcome_count]
+            .iter()
+            .find_map(|outcome| match outcome {
+                EcologyOutcome::SkillMotorError { error, .. } => Some(*error),
+                _ => None,
+            })
+            .or(self.last_motor_error);
         self.apply_object_commands(&output, dt);
         output
     }
@@ -118,6 +141,7 @@ impl EcologyRuntime {
         body: &BodyFeedback,
         dt: f32,
     ) {
+        let started = Instant::now();
         let config = ObjectPhysicsConfig {
             desktop_aspect,
             ..ObjectPhysicsConfig::default()
@@ -189,6 +213,7 @@ impl EcologyRuntime {
             0.0
         };
         self.environment.orb_trapped = self.orb_trapped_seconds >= 0.75;
+        self.object_physics_microseconds = started.elapsed().as_secs_f64() * 1_000_000.0;
         self.state.metabolism.advance(dt);
     }
 
@@ -229,6 +254,46 @@ impl EcologyRuntime {
 
     pub fn set_click_rhythm(&mut self, rhythm: Option<RhythmSignature>) {
         self.click_rhythm = rhythm;
+    }
+
+    #[must_use]
+    pub const fn debug(&self) -> &EcologyDecisionTrace {
+        &self.last_debug
+    }
+
+    #[must_use]
+    pub const fn active_episode(&self) -> Option<&ActivityEpisode> {
+        self.director.active_episode()
+    }
+
+    #[must_use]
+    pub const fn last_vocal_trigger(&self) -> Option<EcologyVocalTrigger> {
+        self.last_vocal_trigger
+    }
+
+    #[must_use]
+    pub const fn last_motor_error(&self) -> Option<f32> {
+        self.last_motor_error
+    }
+
+    #[must_use]
+    pub const fn visual_context(&self) -> EcologyVisualContext {
+        self.last_visual_context
+    }
+
+    #[must_use]
+    pub const fn episode_tick_microseconds(&self) -> f64 {
+        self.episode_tick_microseconds
+    }
+
+    #[must_use]
+    pub const fn object_physics_microseconds(&self) -> f64 {
+        self.object_physics_microseconds
+    }
+
+    pub fn observe_explicit_refusal(&mut self, timestamp: f64) -> bool {
+        self.director
+            .observe_explicit_refusal(&mut self.state, timestamp)
     }
 
     pub fn learn_signature(

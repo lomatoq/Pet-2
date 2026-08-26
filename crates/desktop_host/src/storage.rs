@@ -325,8 +325,7 @@ fn read_state(path: &Path) -> Result<PortablePetState, StorageError> {
 
 fn read_ecology_state(path: &Path) -> Result<EcologyState, StorageError> {
     let state: EcologyState = serde_json::from_reader(BufReader::new(File::open(path)?))?;
-    state.validate()?;
-    Ok(state)
+    Ok(EcologyState::restore(state)?)
 }
 
 fn atomic_json<T: Serialize>(path: &Path, backup: &Path, value: &T) -> Result<(), StorageError> {

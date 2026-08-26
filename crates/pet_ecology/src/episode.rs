@@ -285,6 +285,32 @@ impl EpisodeDirector {
         })
     }
 
+    /// Applies a user refusal to the current bid without touching attachment or
+    /// any learned social bond. The cooldown is a hard, non-learned constraint.
+    pub fn observe_explicit_refusal(&mut self, state: &mut EcologyState, timestamp: f64) -> bool {
+        let Some(_active) = self
+            .active
+            .filter(|episode| episode.goal == EpisodeGoal::OfferOrb)
+        else {
+            return false;
+        };
+        self.active = None;
+        self.orb_bid_cooldown = 45.0;
+        state.episode_stats.aborted[EpisodeGoal::OfferOrb.index()] =
+            state.episode_stats.aborted[EpisodeGoal::OfferOrb.index()].saturating_add(1);
+        if let Some(orb) = state
+            .objects
+            .iter_mut()
+            .find(|object| object.kind == ObjectKind::Orb)
+        {
+            orb.preference = (orb.preference - 0.004).clamp(-1.0, 1.0);
+            if timestamp.is_finite() && timestamp >= 0.0 {
+                orb.last_interaction_seconds = timestamp;
+            }
+        }
+        true
+    }
+
     /// Inactive Wave-0 seam. This function performs no heap allocation and
     /// returns the supplied intent unchanged, field for field.
     #[must_use]
@@ -1754,6 +1780,37 @@ mod tests {
             state.episode_stats.started[EpisodeGoal::InterceptOrb.index()],
             1
         );
+    }
+
+    #[test]
+    fn one_hundred_explicit_refusals_never_repeat_a_bid_inside_cooldown() {
+        let mut state = EcologyState::new(932);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::BringProceduralOrb);
+        for refusal in 0..100 {
+            frame.timestamp += 0.25;
+            let offered = director.tick(&mut state, frame, representative_intent(), 0.25);
+            assert_eq!(offered.debug.active_goal, Some(EpisodeGoal::OfferOrb));
+            assert!(director.observe_explicit_refusal(&mut state, frame.timestamp));
+            for _ in 0..179 {
+                frame.timestamp += 0.25;
+                let quiet = director.tick(&mut state, frame, representative_intent(), 0.25);
+                assert_ne!(
+                    quiet.debug.active_goal,
+                    Some(EpisodeGoal::OfferOrb),
+                    "refusal {refusal} repeated inside cooldown"
+                );
+            }
+        }
+        assert_eq!(
+            state.episode_stats.started[EpisodeGoal::OfferOrb.index()],
+            100
+        );
+        assert_eq!(
+            state.episode_stats.aborted[EpisodeGoal::OfferOrb.index()],
+            100
+        );
+        assert!(state.objects[0].preference >= 0.14);
     }
 
     #[test]

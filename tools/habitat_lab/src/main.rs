@@ -1,4 +1,4 @@
-use std::{env, error::Error, fmt::Write as _, fs, path::PathBuf};
+use std::{env, error::Error, fmt::Write as _, fs, path::PathBuf, time::Instant};
 
 use glam::Vec2;
 use lifecore::{
@@ -174,6 +174,8 @@ struct Lab {
     initial_taste_confidence: f32,
     initial_orb_familiarity: f32,
     initial_skill_competence: f32,
+    episode_timings_us: Vec<f64>,
+    object_physics_timings_us: Vec<f64>,
 }
 
 impl Lab {
@@ -225,6 +227,8 @@ impl Lab {
             initial_taste_confidence: 0.0,
             initial_orb_familiarity: orb_familiarity,
             initial_skill_competence: 0.0,
+            episode_timings_us: Vec::new(),
+            object_physics_timings_us: Vec::new(),
         }
     }
 
@@ -283,11 +287,17 @@ impl Lab {
             click_rhythm: self.click_rhythm,
             timestamp: self.timestamp,
         };
+        let episode_started = Instant::now();
         let output = self.director.tick(&mut self.state, frame, brain_intent, dt);
+        self.episode_timings_us
+            .push(episode_started.elapsed().as_secs_f64() * 1_000_000.0);
         self.record_output(tick, &output);
         self.apply_commands(&output, dt);
         self.advance_pet(&output.body_intent, dt);
+        let physics_started = Instant::now();
         self.advance_objects(dt);
+        self.object_physics_timings_us
+            .push(physics_started.elapsed().as_secs_f64() * 1_000_000.0);
         self.state.metabolism.advance(dt);
         self.timestamp += f64::from(dt);
         self.pet_trail.push(self.pet_position);
@@ -876,6 +886,8 @@ fn summary(lab: &Lab, arguments: &Arguments, encoded: &[u8]) -> Value {
         .first()
         .map_or(0.0, |skill| skill.competence);
     let passed = scenario_passed(lab, &arguments.scenario);
+    let episode_timing = timing_summary(&lab.episode_timings_us);
+    let physics_timing = timing_summary(&lab.object_physics_timings_us);
     json!({
         "scenario": arguments.scenario,
         "seed": arguments.seed,
@@ -893,6 +905,10 @@ fn summary(lab: &Lab, arguments: &Arguments, encoded: &[u8]) -> Value {
         "outcomes": lab.outcomes,
         "vocal_triggers": lab.vocal_triggers,
         "motor_error": lab.motor_error,
+        "measurements_us": {
+            "episode": episode_timing,
+            "object_physics": physics_timing,
+        },
         "learning_deltas": {
             "taste_confidence": lab.state.taste.confidence - lab.initial_taste_confidence,
             "orb_familiarity": lab.orb().familiarity - lab.initial_orb_familiarity,
@@ -923,6 +939,23 @@ fn summary(lab: &Lab, arguments: &Arguments, encoded: &[u8]) -> Value {
         "finite_and_bounded": lab.finite_and_bounded,
         "validation_error": lab.validation_error,
         "verdict": if passed { "pass" } else { "incomplete" },
+    })
+}
+
+fn timing_summary(samples: &[f64]) -> Value {
+    if samples.is_empty() {
+        return json!({ "p50": 0.0, "p95": 0.0, "max": 0.0 });
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let at = |fraction: f64| {
+        let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+        sorted[index]
+    };
+    json!({
+        "p50": at(0.50),
+        "p95": at(0.95),
+        "max": sorted[sorted.len() - 1],
     })
 }
 

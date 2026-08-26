@@ -151,7 +151,21 @@ impl EcologyState {
         self.clone()
     }
 
-    pub fn restore(snapshot: Self) -> Result<Self, EcologyError> {
+    pub fn restore(mut snapshot: Self) -> Result<Self, EcologyError> {
+        snapshot.validate()?;
+        snapshot.objects.retain(|object| {
+            object.kind == ObjectKind::Orb || object.lifecycle != ObjectLifecycle::Consumed
+        });
+        for object in &mut snapshot.objects {
+            if matches!(
+                object.lifecycle,
+                ObjectLifecycle::GrabbedByUser | ObjectLifecycle::CarriedByPet
+            ) {
+                object.lifecycle = ObjectLifecycle::Free;
+                object.velocity = glam::Vec2::ZERO;
+            }
+        }
+        snapshot.ensure_canonical_orb();
         snapshot.validate()?;
         Ok(snapshot)
     }
