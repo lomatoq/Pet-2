@@ -6,6 +6,7 @@ use lifecore::{
     SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame, VitaState, apply_emotion_to_expression,
 };
 use morph_brain::{MorphAttention, MorphCommand, MorphOutput};
+use pet_ecology::WindowAffordanceFrame;
 use pet_perception::PerceptionRuntime;
 
 /// Selects the single high-level behavior policy. Physics, rendering and audio
@@ -285,6 +286,11 @@ impl VitaRuntime {
 
     pub fn observe(&mut self, sensors: &SensorFrame, body: &BodyFeedback, dt: f32) {
         self.percept = self.perception.update(sensors, body, dt);
+    }
+
+    #[must_use]
+    pub const fn window_affordances(&self) -> &WindowAffordanceFrame {
+        self.perception.window_affordances()
     }
 
     #[must_use]

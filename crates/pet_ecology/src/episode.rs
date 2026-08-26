@@ -237,6 +237,11 @@ pub struct EcologyBehaviorFrame {
     pub user_activity: f32,
     pub focus_mode: bool,
     pub sleeping: bool,
+    pub window_pressure: f32,
+    pub window_escape_direction: Vec2,
+    pub nearest_window_edge: Option<Vec2>,
+    pub window_motion: f32,
+    pub orb_trapped: bool,
     pub timestamp: f64,
 }
 
@@ -319,11 +324,28 @@ impl EpisodeDirector {
         output.debug.focus_mode_filtered = frame.focus_mode;
         fill_candidate_trace(&mut output.debug, state, frame);
 
+        if frame.window_pressure >= 0.34
+            && self
+                .active
+                .is_some_and(|episode| episode.goal != EpisodeGoal::EscapePressure)
+            && let Some(interrupted) = self.active.take()
+        {
+            state.episode_stats.aborted[interrupted.goal.index()] =
+                state.episode_stats.aborted[interrupted.goal.index()].saturating_add(1);
+            push_outcome(
+                &mut output,
+                EcologyOutcome::EpisodeAborted(interrupted.goal, EpisodeReason::WindowPressure),
+            );
+        }
+
         if frame.focus_mode
             && self.active.is_some_and(|episode| {
                 !matches!(
                     episode.goal,
-                    EpisodeGoal::ReturnHome | EpisodeGoal::SleepInDen
+                    EpisodeGoal::ReturnHome
+                        | EpisodeGoal::SleepInDen
+                        | EpisodeGoal::EscapePressure
+                        | EpisodeGoal::RecoverAfterPressure
                 )
             })
             && let Some(interrupted) = self.active.take()
@@ -418,6 +440,13 @@ fn select_episode(
         .objects
         .iter()
         .find(|object| object.kind == ObjectKind::Orb)?;
+    if frame.window_pressure >= 0.22 {
+        return Some((
+            EpisodeGoal::EscapePressure,
+            EpisodeReason::WindowPressure,
+            None,
+        ));
+    }
     if frame.focus_mode {
         return (frame.pet_position.distance(state.den.anchor) > 0.045).then_some((
             EpisodeGoal::ReturnHome,
@@ -427,6 +456,13 @@ fn select_episode(
     }
     if frame.sleeping || frame.selected_action == ActionId::Sleep {
         return Some((EpisodeGoal::SleepInDen, EpisodeReason::ReturnToDen, None));
+    }
+    if frame.orb_trapped {
+        return Some((
+            EpisodeGoal::RetrieveOrb,
+            EpisodeReason::TrappedObject,
+            Some(orb.id),
+        ));
     }
     if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
         return Some((
@@ -455,6 +491,14 @@ fn select_episode(
             EpisodeReason::ObjectNovelty,
             Some(orb.id),
         )),
+        ActionId::LandOnWindow if frame.nearest_window_edge.is_some() => {
+            Some((EpisodeGoal::RideWindow, EpisodeReason::ObjectNovelty, None))
+        }
+        ActionId::ClingToWindowSide if frame.nearest_window_edge.is_some() => Some((
+            EpisodeGoal::InspectWindow,
+            EpisodeReason::ObjectNovelty,
+            None,
+        )),
         _ => None,
     }
 }
@@ -469,6 +513,18 @@ fn fill_candidate_trace(
         .iter()
         .find(|object| object.kind == ObjectKind::Orb);
     let candidates = [
+        (
+            EpisodeGoal::EscapePressure,
+            frame.window_pressure,
+            frame.window_pressure >= 0.22,
+            EpisodeReason::WindowPressure,
+        ),
+        (
+            EpisodeGoal::RetrieveOrb,
+            if frame.orb_trapped { 0.96 } else { 0.0 },
+            frame.orb_trapped,
+            EpisodeReason::TrappedObject,
+        ),
         (
             EpisodeGoal::ReturnHome,
             if frame.focus_mode { 1.0 } else { 0.0 },
@@ -512,6 +568,26 @@ fn fill_candidate_trace(
                 0.0
             },
             orb.is_some() && !frame.focus_mode,
+            EpisodeReason::ObjectNovelty,
+        ),
+        (
+            EpisodeGoal::RideWindow,
+            if frame.selected_action == ActionId::LandOnWindow {
+                0.74 + frame.window_motion * 0.12
+            } else {
+                0.0
+            },
+            frame.nearest_window_edge.is_some() && !frame.focus_mode,
+            EpisodeReason::ObjectNovelty,
+        ),
+        (
+            EpisodeGoal::InspectWindow,
+            if frame.selected_action == ActionId::ClingToWindowSide {
+                0.72
+            } else {
+                0.0
+            },
+            frame.nearest_window_edge.is_some() && !frame.focus_mode,
             EpisodeReason::ObjectNovelty,
         ),
     ];
@@ -704,6 +780,78 @@ fn drive_episode(
                 return EpisodeStep::Complete;
             }
         }
+        EpisodeGoal::RetrieveOrb if active.reason_code == EpisodeReason::TrappedObject => {
+            let Some(orb) = active
+                .object_id
+                .and_then(|id| state.objects.iter().find(|object| object.id == id))
+            else {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            };
+            if !frame.orb_trapped && active.elapsed_seconds > 0.10 {
+                return EpisodeStep::Complete;
+            }
+            output.body_intent.target_position = orb.position;
+            output.body_intent.gaze_target = Some(orb.position);
+            output.body_intent.pose = PoseIntent::Curious;
+            output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.36);
+            match active.phase {
+                EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.20 => {
+                    set_phase(active, EpisodePhase::Approach);
+                }
+                EpisodePhase::Approach if frame.pet_position.distance(orb.position) <= 0.07 => {
+                    set_phase(active, EpisodePhase::Manipulate);
+                }
+                EpisodePhase::Manipulate => {
+                    let direction = if frame.window_escape_direction.length_squared() > 1.0e-6 {
+                        frame.window_escape_direction.normalize()
+                    } else {
+                        (orb.position - frame.pet_position)
+                            .normalize_or_zero()
+                            .lerp(Vec2::X, 0.35)
+                            .normalize_or_zero()
+                    };
+                    let alternating = if active.attempts.is_multiple_of(2) {
+                        direction
+                    } else {
+                        Vec2::new(direction.y, -direction.x)
+                    };
+                    push_command(
+                        output,
+                        ObjectCommand::ApplyImpulse {
+                            object_id: orb.id,
+                            impulse: alternating * 0.16,
+                        },
+                    );
+                    active.attempts = active.attempts.saturating_add(1);
+                    set_phase(active, EpisodePhase::Retry);
+                }
+                EpisodePhase::Retry if active.phase_elapsed_seconds >= 0.60 => {
+                    if active.attempts < 2 {
+                        set_phase(active, EpisodePhase::Manipulate);
+                    } else if frame.user_activity > 0.02 {
+                        set_phase(active, EpisodePhase::AskForHelp);
+                        output.vocal_trigger = Some(EcologyVocalTrigger::Help);
+                    }
+                }
+                EpisodePhase::AskForHelp => {
+                    output.body_intent.gaze_target = if active.phase_elapsed_seconds % 0.9 < 0.45 {
+                        Some(orb.position)
+                    } else {
+                        Some(frame.cursor_position)
+                    };
+                }
+                _ => {}
+            }
+            output.body_intent.locomotion =
+                if matches!(active.phase, EpisodePhase::Approach | EpisodePhase::Orient) {
+                    LocomotionMode::Arrive
+                } else {
+                    LocomotionMode::Hover
+                };
+            if active.elapsed_seconds >= 5.0 {
+                return EpisodeStep::Abort(EpisodeReason::TimedOut);
+            }
+        }
         EpisodeGoal::RetrieveOrb => {
             let Some(orb_id) = active.object_id else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
@@ -726,6 +874,96 @@ fn drive_episode(
                 return EpisodeStep::Complete;
             }
         }
+        EpisodeGoal::EscapePressure => {
+            let escape = if frame.window_escape_direction.is_finite()
+                && frame.window_escape_direction.length_squared() > 1.0e-6
+            {
+                frame.window_escape_direction.normalize()
+            } else if frame.pet_velocity.length_squared() > 1.0e-6 {
+                -frame.pet_velocity.normalize()
+            } else {
+                Vec2::X
+            };
+            let target =
+                (frame.pet_position + escape * 0.18).clamp(Vec2::splat(0.025), Vec2::splat(0.975));
+            active.target_position = Some(target);
+            output.body_intent.target_position = target;
+            output.body_intent.gaze_target = frame.nearest_window_edge;
+            output.body_intent.locomotion = LocomotionMode::Seek;
+            output.body_intent.pose = PoseIntent::Compact;
+            output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.86);
+            if frame.window_pressure <= 0.12 && active.elapsed_seconds >= 0.10 {
+                state.episode_stats.completed[EpisodeGoal::EscapePressure.index()] =
+                    state.episode_stats.completed[EpisodeGoal::EscapePressure.index()]
+                        .saturating_add(1);
+                state.episode_stats.started[EpisodeGoal::RecoverAfterPressure.index()] =
+                    state.episode_stats.started[EpisodeGoal::RecoverAfterPressure.index()]
+                        .saturating_add(1);
+                push_outcome(
+                    output,
+                    EcologyOutcome::EpisodeCompleted(EpisodeGoal::EscapePressure),
+                );
+                push_outcome(
+                    output,
+                    EcologyOutcome::EpisodeStarted(EpisodeGoal::RecoverAfterPressure),
+                );
+                active.goal = EpisodeGoal::RecoverAfterPressure;
+                active.reason_code = EpisodeReason::WindowPressure;
+                set_phase(active, EpisodePhase::Recover);
+                active.commitment_remaining = commitment_for(EpisodeGoal::RecoverAfterPressure);
+            }
+        }
+        EpisodeGoal::RecoverAfterPressure => {
+            if frame.window_pressure >= 0.34 {
+                active.goal = EpisodeGoal::EscapePressure;
+                active.reason_code = EpisodeReason::WindowPressure;
+                set_phase(active, EpisodePhase::Orient);
+                active.commitment_remaining = commitment_for(EpisodeGoal::EscapePressure);
+            } else {
+                output.body_intent.target_position = frame.pet_position;
+                output.body_intent.locomotion = LocomotionMode::Hover;
+                output.body_intent.pose = PoseIntent::Neutral;
+                output.body_intent.desired_speed = output.body_intent.desired_speed.min(0.22);
+                if active.phase_elapsed_seconds >= 0.65 {
+                    return EpisodeStep::Complete;
+                }
+            }
+        }
+        EpisodeGoal::InspectWindow | EpisodeGoal::RideWindow => {
+            let Some(edge) = frame.nearest_window_edge else {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            };
+            active.target_position = Some(edge);
+            output.body_intent.target_position = edge;
+            output.body_intent.gaze_target = Some(edge);
+            output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.30);
+            let near_edge = frame.pet_position.distance(edge) <= 0.045;
+            if active.goal == EpisodeGoal::RideWindow {
+                output.body_intent.locomotion = if near_edge {
+                    LocomotionMode::Landing
+                } else {
+                    LocomotionMode::SurfaceApproach
+                };
+                output.body_intent.pose = PoseIntent::Landing;
+            } else {
+                output.body_intent.locomotion = if near_edge {
+                    LocomotionMode::EdgeCling
+                } else {
+                    LocomotionMode::Arrive
+                };
+                output.body_intent.pose = if near_edge {
+                    PoseIntent::Clinging
+                } else {
+                    PoseIntent::Curious
+                };
+            }
+            if near_edge && active.elapsed_seconds >= 1.2 {
+                return EpisodeStep::Complete;
+            }
+            if active.elapsed_seconds >= 4.5 {
+                return EpisodeStep::Abort(EpisodeReason::TimedOut);
+            }
+        }
         _ => return EpisodeStep::Abort(EpisodeReason::SafetyAbort),
     }
     active.commitment_remaining = active.commitment_remaining.max(dt);
@@ -743,6 +981,9 @@ fn commitment_for(goal: EpisodeGoal) -> f32 {
         EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay => 4.8,
         EpisodeGoal::CarryOrbHome | EpisodeGoal::RetrieveOrb => 8.0,
         EpisodeGoal::ReturnHome | EpisodeGoal::SleepInDen => 8.0,
+        EpisodeGoal::EscapePressure => 3.0,
+        EpisodeGoal::RecoverAfterPressure => 1.0,
+        EpisodeGoal::InspectWindow | EpisodeGoal::RideWindow => 4.5,
         _ => 3.0,
     }
 }
@@ -755,6 +996,9 @@ fn expected_outcome_for(goal: EpisodeGoal) -> ExpectedOutcome {
             ExpectedOutcome::ObjectReturnsHome
         }
         EpisodeGoal::RetrieveOrb => ExpectedOutcome::ObjectMoves,
+        EpisodeGoal::EscapePressure | EpisodeGoal::RecoverAfterPressure => {
+            ExpectedOutcome::PressureFalls
+        }
         _ => ExpectedOutcome::None,
     }
 }
@@ -834,6 +1078,11 @@ mod tests {
             user_activity: 0.5,
             focus_mode: false,
             sleeping: false,
+            window_pressure: 0.0,
+            window_escape_direction: Vec2::ZERO,
+            nearest_window_edge: None,
+            window_motion: 0.0,
+            orb_trapped: false,
             timestamp: 1.0,
         }
     }
@@ -929,5 +1178,100 @@ mod tests {
             .iter()
             .any(|command| matches!(command, ObjectCommand::Retrieve { object_id, .. } if *object_id == orb_id)));
         assert_eq!(output.debug.active_goal, Some(EpisodeGoal::RetrieveOrb));
+    }
+
+    #[test]
+    fn pressure_preempts_play_then_enters_bounded_recovery() {
+        let mut state = EcologyState::new(95);
+        let mut director = EpisodeDirector::default();
+        let _ = director.tick(
+            &mut state,
+            behavior_frame(ActionId::SelfPlay),
+            representative_intent(),
+            0.05,
+        );
+        let mut pressure = behavior_frame(ActionId::SelfPlay);
+        pressure.window_pressure = 0.75;
+        pressure.window_escape_direction = Vec2::NEG_X;
+        pressure.nearest_window_edge = Some(Vec2::new(0.55, 0.5));
+        let output = director.tick(&mut state, pressure, representative_intent(), 0.05);
+        assert_eq!(output.debug.active_goal, Some(EpisodeGoal::EscapePressure));
+        assert_eq!(output.body_intent.locomotion, LocomotionMode::Seek);
+        assert!(output.body_intent.target_position.x < pressure.pet_position.x);
+
+        pressure.window_pressure = 0.0;
+        let output = director.tick(&mut state, pressure, representative_intent(), 0.10);
+        assert_eq!(
+            output.debug.active_goal,
+            Some(EpisodeGoal::RecoverAfterPressure)
+        );
+        assert!(
+            output.outcomes[..output.outcome_count]
+                .iter()
+                .any(|outcome| {
+                    *outcome == EcologyOutcome::EpisodeCompleted(EpisodeGoal::EscapePressure)
+                })
+        );
+    }
+
+    #[test]
+    fn trapped_orb_requests_help_without_inventing_a_new_object() {
+        let mut state = EcologyState::new(96);
+        let orb_id = state.objects[0].id;
+        let orb_position = state.objects[0].position;
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.orb_trapped = true;
+        frame.pet_position = orb_position;
+        let mut director = EpisodeDirector::default();
+        let mut help_seen = false;
+        for _ in 0..16 {
+            let output = director.tick(&mut state, frame, representative_intent(), 0.20);
+            help_seen |= output.vocal_trigger == Some(EcologyVocalTrigger::Help);
+            if output.debug.active_phase == Some(EpisodePhase::AskForHelp) {
+                break;
+            }
+        }
+        assert_eq!(
+            director.active_episode().map(|episode| episode.goal),
+            Some(EpisodeGoal::RetrieveOrb)
+        );
+        assert_eq!(
+            director.active_episode().map(|episode| episode.phase),
+            Some(EpisodePhase::AskForHelp)
+        );
+        assert!(help_seen);
+        assert_eq!(state.objects.len(), 1);
+        assert_eq!(state.objects[0].id, orb_id);
+    }
+
+    #[test]
+    fn focus_mode_suppresses_a_trapped_orb_help_bid() {
+        let mut state = EcologyState::new(98);
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.orb_trapped = true;
+        frame.focus_mode = true;
+        frame.pet_position = Vec2::splat(0.5);
+        let mut director = EpisodeDirector::default();
+        let output = director.tick(&mut state, frame, representative_intent(), 0.20);
+        assert_eq!(output.debug.active_goal, Some(EpisodeGoal::ReturnHome));
+        assert_ne!(output.vocal_trigger, Some(EcologyVocalTrigger::Help));
+    }
+
+    #[test]
+    fn land_action_uses_the_shared_window_edge() {
+        let mut state = EcologyState::new(97);
+        let mut frame = behavior_frame(ActionId::LandOnWindow);
+        frame.nearest_window_edge = Some(Vec2::new(0.62, 0.44));
+        let mut director = EpisodeDirector::default();
+        let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(output.debug.active_goal, Some(EpisodeGoal::RideWindow));
+        assert_eq!(
+            output.body_intent.target_position,
+            frame.nearest_window_edge.unwrap()
+        );
+        assert_eq!(
+            output.body_intent.locomotion,
+            LocomotionMode::SurfaceApproach
+        );
     }
 }

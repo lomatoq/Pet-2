@@ -1687,6 +1687,7 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "lifecore",
+ "pet_ecology",
  "serde",
  "serde_json",
 ]

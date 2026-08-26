@@ -834,6 +834,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     let mut minimum_position = feedback.world_position;
     let mut maximum_position = feedback.world_position;
     let feedback_interval = (5.0 / dt).round().max(1.0) as u64;
+    let empty_window_affordances = pet_ecology::WindowAffordanceFrame::default();
     for tick in 0..tick_count {
         let time = tick as f32 * dt;
         sensors.timestamp = f64::from(time);
@@ -909,6 +910,13 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             &sensors,
             dt.min(1.0 / 30.0),
         );
+        ecology.fixed_update(
+            16.0 / 9.0,
+            &empty_window_affordances,
+            &body.simulation.feedback,
+            dt.min(1.0 / 30.0),
+        );
+        body.set_embodied_environment(ecology.environment());
         body.embodied_update(
             &output.body_intent,
             &sensors,
@@ -917,7 +925,6 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             VoiceVisualState::default(),
             dt.min(0.05),
         );
-        ecology.fixed_update(16.0 / 9.0, dt.min(1.0 / 30.0));
         let next_feedback = body.simulation.feedback.clone();
         let step_distance = next_feedback
             .world_position
@@ -1345,7 +1352,15 @@ impl PetApplication {
             );
             let bounds = runtime.topology.virtual_physical_bounds;
             let desktop_aspect = bounds.width() as f32 / bounds.height().max(1) as f32;
-            runtime.ecology.fixed_update(desktop_aspect, body_dt);
+            runtime.ecology.fixed_update(
+                desktop_aspect,
+                runtime.vita.window_affordances(),
+                &runtime.body.simulation.feedback,
+                body_dt,
+            );
+            runtime
+                .body
+                .set_embodied_environment(runtime.ecology.environment());
             let previous_screen_center = runtime.screen_body_center;
             apply_screen_domain(
                 &mut runtime.body,

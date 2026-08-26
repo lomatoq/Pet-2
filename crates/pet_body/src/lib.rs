@@ -50,6 +50,7 @@ use glam::{Vec2, Vec3};
 use lifecore::{
     AffectState, BodyFeedback, BodyGenome, BodyIntent, Genome, PoseIntent, SensorFrame,
 };
+use pet_ecology::EmbodiedEnvironmentFrame;
 
 const BODY_LAB_EYE_SIZE: f32 = 0.134_631_28;
 const BODY_LAB_EYE_SPACING: f32 = 0.341_251_4;
@@ -130,6 +131,10 @@ impl ProceduralBody {
     ) -> &BodyFeedback {
         self.simulation
             .fixed_update(&genome.body, intent, sensors, dt)
+    }
+
+    pub fn set_embodied_environment(&mut self, environment: &EmbodiedEnvironmentFrame) {
+        self.embodiment.liquid.set_embodied_environment(environment);
     }
 
     /// Compatibility update for headless callers that do not yet provide the full

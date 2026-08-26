@@ -9,8 +9,9 @@ use std::collections::{BTreeMap, VecDeque};
 use glam::Vec2;
 use lifecore::{
     BodyFeedback, PointerGesturePercept, Rect, SensorFrame, StimulusEvent, StimulusKind,
-    VitaPerceptFrame,
+    VitaPerceptFrame, stable_hash_bytes,
 };
+use pet_ecology::{NormalizedRect, WindowAffordance, WindowAffordanceFrame, WindowId};
 use serde::{Deserialize, Serialize};
 
 const CURSOR_HISTORY_SECONDS: f64 = 2.4;
@@ -82,6 +83,7 @@ pub struct PerceptionRuntime {
     visual: Option<VisualFeatureFrame>,
     visual_age: f32,
     previous_visual: Option<VisualFeatureFrame>,
+    window_affordances: WindowAffordanceFrame,
 }
 
 impl Default for PerceptionRuntime {
@@ -98,6 +100,7 @@ impl Default for PerceptionRuntime {
             visual: None,
             visual_age: f32::INFINITY,
             previous_visual: None,
+            window_affordances: WindowAffordanceFrame::default(),
         }
     }
 }
@@ -126,6 +129,11 @@ impl PerceptionRuntime {
         self.previous_visual = self.visual;
         self.visual = Some(frame);
         self.visual_age = 0.0;
+    }
+
+    #[must_use]
+    pub const fn window_affordances(&self) -> &WindowAffordanceFrame {
+        &self.window_affordances
     }
 
     #[must_use]
@@ -387,6 +395,7 @@ impl PerceptionRuntime {
         dt: f32,
     ) -> WindowEcology {
         let mut ecology = WindowEcology::default();
+        let mut affordances = WindowAffordanceFrame::default();
         for surface in &sensors.visible_surfaces {
             let id = surface.id.0.clone();
             let previous = self.surfaces.get(&id).cloned();
@@ -405,12 +414,15 @@ impl PerceptionRuntime {
             let age = previous
                 .as_ref()
                 .map_or(0.0, |history| history.age_seconds + dt);
-            let nearest = closest_point_on_rect(pet_position, surface.rect);
+            let (nearest, nearest_normal, inside_depth) =
+                closest_point_and_normal(pet_position, surface.rect);
             let distance = nearest.distance(pet_position);
             let direction_to_pet = (pet_position - center).normalize_or_zero();
             let approach_speed = velocity.dot(direction_to_pet).max(0.0);
             let motion = (velocity.length() * 0.30).clamp(0.0, 1.0);
-            let pressure = (approach_speed * 0.42 * (1.0 - distance * 4.0)).clamp(0.0, 1.0);
+            let overlap_pressure = (inside_depth * 18.0).clamp(0.0, 1.0);
+            let pressure =
+                (overlap_pressure + approach_speed * 0.42 * (1.0 - distance * 4.0)).clamp(0.0, 1.0);
             ecology.motion = ecology.motion.max(motion);
             ecology.pressure = ecology.pressure.max(pressure);
             if ecology.nearest_edge.is_none_or(|current| {
@@ -419,9 +431,10 @@ impl PerceptionRuntime {
                 ecology.nearest_edge = Some(nearest);
             }
             let is_new = previous.is_none();
+            let mut popup = 0.0;
             if is_new && age < 0.2 {
                 let area = rect_area(surface.rect);
-                let popup =
+                popup =
                     ((0.32 - area).max(0.0) * 2.2 + (1.0 - distance * 2.0) * 0.35).clamp(0.0, 1.0);
                 ecology.popup_salience = ecology.popup_salience.max(popup);
                 if popup > 0.12 {
@@ -438,6 +451,20 @@ impl PerceptionRuntime {
                     );
                 }
             }
+            affordances.push(WindowAffordance {
+                id: WindowId(stable_hash_bytes(surface.id.0.as_bytes()).max(1)),
+                bounds: NormalizedRect {
+                    minimum: surface.rect.minimum,
+                    maximum: surface.rect.maximum,
+                },
+                velocity,
+                nearest_edge_point: nearest,
+                nearest_edge_normal: nearest_normal,
+                overlap_pressure: pressure,
+                popup_pressure: popup,
+                motion_energy: motion,
+                is_visible: true,
+            });
             if motion > 0.08 || pressure > 0.08 {
                 ecology.events.push(
                     StimulusEvent {
@@ -466,6 +493,8 @@ impl PerceptionRuntime {
                 && history.rect.minimum.is_finite()
                 && history.rect.maximum.is_finite()
         });
+        affordances.finish();
+        self.window_affordances = affordances;
         ecology
     }
 
@@ -608,6 +637,26 @@ fn closest_point_on_rect(point: Vec2, rect: Rect) -> Vec2 {
     }
 }
 
+fn closest_point_and_normal(point: Vec2, rect: Rect) -> (Vec2, Vec2, f32) {
+    let nearest = closest_point_on_rect(point, rect);
+    let inside = point.cmpge(rect.minimum).all() && point.cmple(rect.maximum).all();
+    if inside {
+        let distances = [
+            (point.x - rect.minimum.x, Vec2::NEG_X),
+            (rect.maximum.x - point.x, Vec2::X),
+            (point.y - rect.minimum.y, Vec2::NEG_Y),
+            (rect.maximum.y - point.y, Vec2::Y),
+        ];
+        let (depth, normal) = distances
+            .into_iter()
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .unwrap_or((0.0, Vec2::Y));
+        (nearest, normal, depth.max(0.0))
+    } else {
+        (nearest, (point - nearest).normalize_or_zero(), 0.0)
+    }
+}
+
 fn rect_center(rect: Rect) -> Vec2 {
     (rect.minimum + rect.maximum) * 0.5
 }
@@ -697,6 +746,31 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == StimulusKind::MovingWindow)
         );
+        let affordances = runtime.window_affordances();
+        assert_eq!(affordances.count, 1);
+        assert!(affordances.windows[0].velocity.length() > 0.01);
+        assert!(affordances.windows[0].id.0 != 0);
+        assert!(affordances.windows[0].is_valid());
+    }
+
+    #[test]
+    fn window_affordance_exposes_geometry_but_not_native_identity() {
+        let mut runtime = PerceptionRuntime::default();
+        let sensors = SensorFrame {
+            timestamp: 1.0,
+            visible_surfaces: vec![SurfaceRect {
+                id: SurfaceId("window:0xDEADBEEF".into()),
+                rect: Rect {
+                    minimum: Vec2::new(0.4, 0.4),
+                    maximum: Vec2::new(0.7, 0.7),
+                },
+            }],
+            ..SensorFrame::default()
+        };
+        let _ = runtime.update(&sensors, &BodyFeedback::default(), 1.0 / 60.0);
+        let affordance = runtime.window_affordances().windows[0];
+        assert!(affordance.bounds.is_valid());
+        assert_ne!(affordance.id.0, 0xDEAD_BEEF);
     }
 
     #[test]

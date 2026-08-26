@@ -1,5 +1,6 @@
 use glam::Vec2;
 use lifecore::{BodyFeedback, SensorFrame};
+use pet_ecology::EmbodiedEnvironmentFrame;
 
 use super::{
     kernels::{wendland_c2_gradient, wendland_c2_kernel},
@@ -113,6 +114,56 @@ pub fn apply_interaction_forces(
                 .dot(-local_normal)
                 .max(0.0);
             particle.force += local_normal * collision.intensity * exposure * 9.0;
+        }
+    }
+}
+
+pub fn apply_external_contact_forces(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    body_origin: Vec2,
+    body_world_position: Vec2,
+    world_to_body_scale: Vec2,
+    environment: &EmbodiedEnvironmentFrame,
+    support_radius: f32,
+) {
+    let count = count.min(MAX_LIQUID_PARTICLES);
+    let support_radius = support_radius.max(KERNEL_RADIUS).max(1.0e-4);
+    for contact in
+        &environment.contacts[..environment.contact_count.min(environment.contacts.len())]
+    {
+        if !contact.point_world.is_finite()
+            || !contact.normal_world.is_finite()
+            || contact.normal_world.length_squared() <= 1.0e-8
+        {
+            continue;
+        }
+        let point_local =
+            body_origin + (contact.point_world - body_world_position) * world_to_body_scale;
+        let normal_local =
+            (contact.normal_world * world_to_body_scale.signum()).normalize_or_zero();
+        let impact = if contact.relative_velocity_px.is_finite() {
+            (contact.relative_velocity_px.length() / 1_200.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let penetration = if contact.penetration_px.is_finite() {
+            (contact.penetration_px / 96.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let intensity = if contact.intensity.is_finite() {
+            contact.intensity.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let acceleration = (intensity * 5.0 + impact * 4.0 + penetration * 3.0).clamp(0.0, 12.0);
+        for particle in &mut particles[..count] {
+            let distance = particle.position.distance(point_local);
+            let influence = (1.0 - distance / support_radius).clamp(0.0, 1.0);
+            if influence > 0.0 {
+                particle.force += normal_local * acceleration * influence * influence;
+            }
         }
     }
 }
@@ -326,7 +377,37 @@ fn step_critically_damped(
 
 #[cfg(test)]
 mod tests {
+    use pet_ecology::{ContactSource, ExternalContact};
+
     use super::*;
+
+    #[test]
+    fn external_contact_is_local_bounded_and_does_not_push_distant_material() {
+        let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+        particles[0].position = Vec2::ZERO;
+        particles[1].position = Vec2::new(0.8, 0.0);
+        let mut environment = EmbodiedEnvironmentFrame::default();
+        environment.push_contact(ExternalContact {
+            source: ContactSource::Window,
+            point_world: Vec2::splat(0.5),
+            normal_world: Vec2::X,
+            penetration_px: 24.0,
+            relative_velocity_px: Vec2::new(-360.0, 0.0),
+            intensity: 0.8,
+        });
+        apply_external_contact_forces(
+            &mut particles,
+            2,
+            Vec2::ZERO,
+            Vec2::splat(0.5),
+            Vec2::ONE,
+            &environment,
+            0.24,
+        );
+        assert!(particles[0].force.x > 0.0);
+        assert!(particles[0].force.length() <= 12.0 + 1.0e-5);
+        assert_eq!(particles[1].force, Vec2::ZERO);
+    }
 
     #[test]
     fn wendland_pointer_gradient_is_compact_smooth_and_peak_calibrated() {

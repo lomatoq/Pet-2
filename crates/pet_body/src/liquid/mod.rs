@@ -19,6 +19,7 @@ use std::{array, f32::consts::TAU};
 
 use glam::Vec2;
 use lifecore::{BodyFeedback, BodyGenome, BodyIntent, SensorFrame};
+use pet_ecology::EmbodiedEnvironmentFrame;
 
 use crate::{
     DerivedVisualTraits, DropletMotion, FaceTuning, MaterialVariant, ModalDeformation, PbfTuning,
@@ -26,7 +27,10 @@ use crate::{
 };
 
 use self::{
-    collisions::{GrabParameters, MaterialGrab, MaterialStressFrame, apply_interaction_forces},
+    collisions::{
+        GrabParameters, MaterialGrab, MaterialStressFrame, apply_external_contact_forces,
+        apply_interaction_forces,
+    },
     components::{ComponentSummary, assign_components},
     density::{calibrate_rest_density, mean_density_error, update_density_and_surface},
     face_frame::{FaceFrame, FaceFrameRuntime},
@@ -257,6 +261,7 @@ pub struct LiquidMorphRuntime {
     recovery_count: u64,
     seed: u64,
     tuning: PbfTuning,
+    environment: EmbodiedEnvironmentFrame,
 }
 
 #[allow(dead_code)]
@@ -321,6 +326,7 @@ impl LiquidMorphRuntime {
             recovery_count: 0,
             seed,
             tuning,
+            environment: EmbodiedEnvironmentFrame::default(),
         };
         runtime.snap_render_proxies();
         runtime
@@ -399,6 +405,10 @@ impl LiquidMorphRuntime {
                 None
             }
         });
+    }
+
+    pub fn set_embodied_environment(&mut self, environment: &EmbodiedEnvironmentFrame) {
+        self.environment = environment.clone();
     }
 
     /// Supplies the brain-authored target for the complete permanent face
@@ -557,6 +567,15 @@ impl LiquidMorphRuntime {
             self.components.main_component,
             self.components.main_com,
             dt,
+        );
+        apply_external_contact_forces(
+            &mut self.particles,
+            self.particle_count,
+            self.body_origin,
+            feedback.world_position,
+            motion.world_to_body_scale,
+            &self.environment,
+            grab_parameters.support_radius * 2.2,
         );
 
         for particle in &mut self.particles[..self.particle_count] {
@@ -813,6 +832,15 @@ impl LiquidMorphRuntime {
                 self.components.main_component,
                 self.components.main_com,
                 sub_dt,
+            );
+            apply_external_contact_forces(
+                &mut self.particles,
+                self.particle_count,
+                self.body_origin,
+                feedback.world_position,
+                motion.world_to_body_scale,
+                &self.environment,
+                grab_parameters.support_radius * 2.2,
             );
             apply_homeostatic_return(
                 &mut self.particles,

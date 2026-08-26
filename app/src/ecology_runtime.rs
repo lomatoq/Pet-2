@@ -2,8 +2,10 @@ use desktop_host::{StateStore, StorageError};
 use glam::Vec2;
 use lifecore::{ActionId, BodyFeedback, BodyIntent, SensorFrame};
 use pet_ecology::{
-    EcologyBehaviorFrame, EcologyOutput, EcologyState, EpisodeDirector, MAX_OBJECT_SPEED,
-    ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig, step_object,
+    ContactSource, EcologyBehaviorFrame, EcologyOutput, EcologyState, EmbodiedEnvironmentFrame,
+    EpisodeDirector, ExternalContact, MAX_OBJECT_SPEED, ObjectCommand, ObjectId, ObjectKind,
+    ObjectLifecycle, ObjectPhysicsConfig, WindowAffordanceFrame, resolve_object_body_contact,
+    step_object_with_windows,
 };
 
 /// Application integration boundary for the portable habitat. Native input,
@@ -15,6 +17,8 @@ pub struct EcologyRuntime {
     grabbed_object: Option<ObjectId>,
     last_pointer_position: Option<Vec2>,
     last_pointer_seconds: f64,
+    environment: EmbodiedEnvironmentFrame,
+    orb_trapped_seconds: f32,
 }
 
 impl EcologyRuntime {
@@ -38,6 +42,8 @@ impl EcologyRuntime {
             grabbed_object: None,
             last_pointer_position: None,
             last_pointer_seconds: 0.0,
+            environment: EmbodiedEnvironmentFrame::default(),
+            orb_trapped_seconds: 0.0,
         })
     }
 
@@ -60,6 +66,24 @@ impl EcologyRuntime {
             user_activity: sensors.user_activity_rate,
             focus_mode,
             sleeping: selected_action == ActionId::Sleep,
+            window_pressure: self.environment.pressure,
+            window_escape_direction: self.environment.escape_direction,
+            nearest_window_edge: self.environment.contacts[..self
+                .environment
+                .contact_count
+                .min(self.environment.contacts.len())]
+                .iter()
+                .find(|contact| contact.source == ContactSource::Window)
+                .map(|contact| contact.point_world),
+            window_motion: self.environment.contacts[..self
+                .environment
+                .contact_count
+                .min(self.environment.contacts.len())]
+                .iter()
+                .filter(|contact| contact.source == ContactSource::Window)
+                .map(|contact| (contact.relative_velocity_px.length() / 1_200.0).clamp(0.0, 1.0))
+                .fold(0.0_f32, f32::max),
+            orb_trapped: self.environment.orb_trapped,
             timestamp: sensors.timestamp,
         };
         let output = self.director.tick(&mut self.state, frame, brain_intent, dt);
@@ -67,15 +91,90 @@ impl EcologyRuntime {
         output
     }
 
-    pub fn fixed_update(&mut self, desktop_aspect: f32, dt: f32) {
+    pub fn fixed_update(
+        &mut self,
+        desktop_aspect: f32,
+        windows: &WindowAffordanceFrame,
+        body: &BodyFeedback,
+        dt: f32,
+    ) {
         let config = ObjectPhysicsConfig {
             desktop_aspect,
             ..ObjectPhysicsConfig::default()
         };
-        for object in &mut self.state.objects {
-            step_object(object, config, dt);
+        self.environment = EmbodiedEnvironmentFrame {
+            den_anchor: Some(self.state.den.anchor),
+            pressure: windows.pressure,
+            escape_direction: windows.escape_direction,
+            ..EmbodiedEnvironmentFrame::default()
+        };
+        let reference_height = config.reference_height_px.max(64.0);
+        let aspect = config.desktop_aspect.clamp(0.25, 8.0);
+        for window in windows.as_slice().iter().take(4) {
+            if window.overlap_pressure <= 0.01 {
+                continue;
+            }
+            self.environment.push_contact(ExternalContact {
+                source: ContactSource::Window,
+                point_world: window.nearest_edge_point,
+                normal_world: window.nearest_edge_normal,
+                penetration_px: window.overlap_pressure * 96.0,
+                relative_velocity_px: Vec2::new(window.velocity.x * aspect, window.velocity.y)
+                    * reference_height,
+                intensity: window
+                    .overlap_pressure
+                    .max(window.motion_energy)
+                    .clamp(0.0, 1.0),
+            });
         }
+        let mut orb_has_opposing_contacts = false;
+        for object in &mut self.state.objects {
+            let contacts_before = self.environment.contact_count;
+            step_object_with_windows(object, config, windows, dt, &mut self.environment);
+            let window_contact_count = self.environment.contacts[contacts_before
+                ..self
+                    .environment
+                    .contact_count
+                    .min(self.environment.contacts.len())]
+                .iter()
+                .filter(|contact| contact.source == ContactSource::Window)
+                .count();
+            orb_has_opposing_contacts |= object.kind == ObjectKind::Orb
+                && window_contact_count >= 2
+                && object.velocity.length() < 0.15;
+            resolve_object_body_contact(
+                object,
+                body.world_position,
+                body.velocity,
+                config,
+                &mut self.environment,
+            );
+        }
+        let trapped_now = orb_has_opposing_contacts
+            || self.state.objects.iter().any(|object| {
+                object.kind == ObjectKind::Orb
+                    && matches!(
+                        object.lifecycle,
+                        ObjectLifecycle::Free | ObjectLifecycle::Sleeping
+                    )
+                    && object.velocity.length() < 0.08
+                    && windows.as_slice().iter().any(|window| {
+                        object.position.cmpge(window.bounds.minimum).all()
+                            && object.position.cmple(window.bounds.maximum).all()
+                    })
+            });
+        self.orb_trapped_seconds = if trapped_now {
+            (self.orb_trapped_seconds + dt.max(0.0)).min(8.0)
+        } else {
+            0.0
+        };
+        self.environment.orb_trapped = self.orb_trapped_seconds >= 0.75;
         self.state.metabolism.advance(dt);
+    }
+
+    #[must_use]
+    pub const fn environment(&self) -> &EmbodiedEnvironmentFrame {
+        &self.environment
     }
 
     fn apply_object_commands(&mut self, output: &EcologyOutput, dt: f32) {
