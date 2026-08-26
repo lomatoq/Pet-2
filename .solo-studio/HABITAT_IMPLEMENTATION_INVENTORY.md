@@ -1,7 +1,7 @@
 # PET-2 Living Desktop Habitat — implementation inventory
 
-Date: 2026-08-26  
-Status: pre-production baseline  
+Date: 2026-08-26
+Status: pre-production baseline
 Plan: `PET2_LIVING_DESKTOP_HABITAT_CODEX_PLAN.md` supplied outside the repository
 
 ## Repository truth
@@ -198,4 +198,3 @@ After this inventory and ADR are created, create `codex/pet2-living-desktop-habi
 4. `app/src/ecology_runtime.rs` as the integration seam;
 5. a minimal deterministic Habitat Lab and headless smoke;
 6. regression tests proving inactive ecology changes no current behavior.
-

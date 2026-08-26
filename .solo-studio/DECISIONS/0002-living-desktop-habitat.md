@@ -100,4 +100,3 @@ Revisit this decision if the crate requires a second homeostasis/action authorit
 - `.solo-studio/VITA_ITERATION_2.md`
 - `PROJECT_REFERENCE.md`
 - `PET2_LIVING_DESKTOP_HABITAT_CODEX_PLAN.md` (external supplied plan)
-

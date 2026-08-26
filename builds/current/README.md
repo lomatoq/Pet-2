@@ -1,42 +1,44 @@
-# PET-2 current local build
+# PET-2 current independently accepted local build
 
-Published: `2026-08-25T12:23:38+02:00` after integrating the colleague's real
-Morph brain as a first-class, same-process part of Pet 2.
+Published: 2026-08-25
 
-Source baseline commit: `e1d06e0f6197e4563a6ba6f657a19a5f9863bad7` plus the
-reviewed working-tree implementation. Morph source is pinned to
-`3c6e27e3b55e4aff1d6c2c254713cdbd79099715` from
-`https://github.com/Thandorcat/morph`. The repository was intentionally not
-auto-committed because it contains user-owned work in progress.
+This directory intentionally remains the last independently reviewed Morph build. The living-desktop habitat candidate is ready for independent review but has not been promoted here, because the habitat implementation plan forbids replacing `builds/current` before that verdict.
 
-- `Pet 2.exe` — launches in the stable `Morphic` behavior mode by default.
-- `Pet 2 - Fusion.cmd` — launches the local LifeCore/VITA fusion.
-- `Pet 2 - Morph Shadow.cmd` — runs the real Morph network with zero visible authority.
-- `Pet 2 - Morph Fusion.cmd` — runs LifeCore, VITA and Morph through one bounded arbiter.
-- `Body Lab.exe` — tunes iris HSV, material, face, dynamics, shadow and presets.
+Current published executables:
 
-Runtime behavior mode: `Win+Alt+B` cycles
-`Morphic → Fusion → Morph Shadow → Morph Fusion → Classic`. Morph Fusion caps
-the colleague brain's continuous influence at an actual blend weight of `0.30`;
-it cannot directly replace discrete pose/locomotion, and local sleep, focus,
-drag, retreat and metamorphosis protections zero Morph overrides. The build contains no Node,
-sidecar, IPC or network dependency.
+- `Pet 2.exe` — default Morphic desktop PET.
+- `Pet 2 - Fusion.cmd` — LifeCore/VITA fusion.
+- `Pet 2 - Morph Shadow.cmd` — real Morph network with zero visible authority.
+- `Pet 2 - Morph Fusion.cmd` — bounded LifeCore/VITA/Morph arbiter.
+- `Body Lab.exe` — procedural body/material/physics authoring lab.
 
-Morph topology: `526` neurons, `17,475` synapses, `57` populations. Its learned
-state is saved separately and atomically as
-`%LOCALAPPDATA%\lomatoq\Pet 2\data\morph-brain.json`, with automatic recovery
-from `backups\morph-brain.previous.json`.
-
-Release validation: workspace formatting, `239` full-workspace tests plus `3`
-new post-review regressions passed (`3` deliberately ignored long production
-replays), and strict all-target/changed-crate Clippy passed. The
-optimized 10-second Morph Fusion smoke produced four distinct neural commands
-and five command switches; final Morph tick p50 was `0.344 ms`, p95 `0.382 ms`,
-and max `0.960 ms` per 50 ms decision tick. Morph Shadow separately confirmed zero
-Morph authority. The independent final regression re-review returned `CLEAN`,
-including a canonical-exe corrupt-primary/valid-backup recovery reproduction.
-
-Build SHA-256:
+Published SHA-256:
 
 - `Pet 2.exe`: `95ED3AF9BBAFA57327F84C075561809AE3CA6EADEA57882D8473A3918323CCE0`
 - `Body Lab.exe`: `A87853A223D287F80F7D537C38E3672A2798E9E0B60A660EE52EF13D94CCBF9C`
+
+## Living-habitat candidate
+
+Candidate package:
+
+```text
+..\..\dist\Pet2-windows-x64\
+..\..\dist\Pet2-windows-x64.zip
+```
+
+Candidate launch commands from the repository root:
+
+```powershell
+.\dist\Pet2-windows-x64\Pet2.exe
+.\dist\Pet2-windows-x64\BodyLab.exe
+.\dist\Pet2-windows-x64\HabitatLab.exe --scenario habitat_story_v1 --ticks 1600 --trace target\habitat.json --screenshot target\habitat.svg
+```
+
+Candidate SHA-256:
+
+- `Pet2.exe`: `07020247338812511FC5A8ECB2885D0D6BD3D75B7F1705CF70943A7D4BBA5BBD`
+- `BodyLab.exe`: `1C643C5A1460E2240C1939BC83A75A08F82BD678C2EB502A54C1B6636F3F3455`
+- `HabitatLab.exe`: `523AD983A874E2B3DE92665BD01323FED1411DDD1E535C235348BA64129EBD5E`
+- `Pet2-windows-x64.zip`: `61FC03A159DFB1BA53BBFA418F37280EFFA1280383D49E25F72026F9A6168816`
+
+Promotion requires the independent attacks in `.solo-studio/HABITAT_ACCEPTANCE_REPORT.md`, especially post-fix edge visual capture, production 1× renderer-delta measurement, and native Apple Silicon validation.

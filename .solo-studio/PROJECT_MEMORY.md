@@ -1,112 +1,110 @@
 # Project Memory — Pet 2
 
-Updated: 2026-08-25
-Current gate: first-class colleague Morph brain + bounded Morph Fusion under short release QA
-Current branch: `codex/pet2-vita-embodied-iteration`
+Updated: 2026-08-26
+
+Current gate: living-desktop habitat candidate ready for independent regression review
+
+Current branch: `codex/pet2-living-desktop-habitat`
+
+Base: `3504403462d37ce6e0199c12f83ee32ab6ba0a62`
+
+Packaged implementation checkpoint: `59ae70b`
 
 ## Product truth
 
-- Player promise: the same persistent procedural creature on Windows and macOS.
-- The organism stays offline-first, deterministic, portable, and bounded.
-- VITA invariants are autonomy, emergence, continuity, and individuality.
-- The visual body must expose internal state; green tests alone are not a visual gate.
+- Pet 2 is one persistent, offline-first, deterministic procedural creature for Windows and macOS.
+- The body, voice, behavior, habitat, memory, and learning remain generated locally; runtime has no network, model, sidecar, or recorded-asset dependency.
+- VITA invariants remain autonomy, emergence, continuity, individuality, inspectability, and non-coercive attention.
+- The habitat is a persistent world for causal behavior, not a collection of scripted animations.
+- Green tests are not a substitute for live visual, listening, cross-platform, or independent regression review.
 
 ## Current golden path
 
-- Launch: `cargo run -p pet2`.
-- Smart mode (default): `--brain-mode morphic`; local hybrid: `fusion`; real colleague comparison: `morph-shadow`; all-brain mode: `morph-fusion`; rollback: `classic`. `Win+Alt+B` cycles all five.
-- Packaged no-rebuild launchers: `Pet 2 - Fusion.cmd`, `Pet 2 - Morph Shadow.cmd`, and `Pet 2 - Morph Fusion.cmd` beside the same canonical executable.
-- Body Lab: `cargo run -p body_lab`.
-- Canonical gated executables: `C:\Users\nirrt\OneDrive\Документы\ChatGPT\Pet 2\builds\current\Pet 2.exe` and `C:\Users\nirrt\OneDrive\Документы\ChatGPT\Pet 2\builds\current\Body Lab.exe`; no differently named copied builds are authoritative.
-- Body Lab presets: first choice is the active-at-open `Authored current`; built-in `Moonlit Glass` supplies a visibly different but solver-safe alternative. User JSON presets live at `%LOCALAPPDATA%\lomatoq\Pet 2\data\liquid-presets\` and can be saved/loaded/renamed/deleted without a rebuild or touching active `liquid-tuning.json`.
-- `Apply this liquid to running Pet` hot-reloads an existing process. `Apply + launch desktop Pet` saves and verifies first, then resolves the sibling canonical executable with `builds/current`, `target/release`, and `target/debug` development fallbacks.
-- Headless: `cargo run -p pet2 -- --headless-smoke 10 --seed 42 --reset-pet --no-audio --data-dir target/smoke-state`.
-- Cross-platform state import/export remains schema-v1 compatible during the visual-body slice.
-- The legacy procedural mesh remains available for deterministic geometry and hit testing.
+- Development PET: `cargo run -p pet2`.
+- Headless smoke: `cargo run -p pet2 -- --headless-smoke 10 --seed 42 --reset-pet --no-audio --data-dir target/smoke-state`.
+- Habitat Lab: `cargo run -p habitat_lab -- --scenario habitat_story_v1 --ticks 1600 --trace target/habitat.json --screenshot target/habitat.svg`.
+- Candidate Windows package: `dist/Pet2-windows-x64/` and `dist/Pet2-windows-x64.zip`.
+- Published canonical binaries remain in `builds/current`. They were not replaced because the habitat plan requires an independent regression review first.
+- Brain modes remain `morphic` by default, plus `fusion`, `morph-shadow`, `morph-fusion`, and `classic`; `Win+Alt+B` cycles all five.
+- Habitat controls: `Win+Alt+F` food, `P` focus, `L` shared attention, `T` teach, `M` metamorphosis, `B` brain mode, `R/N` debug feedback, and `D` debug snapshot, all with `Win+Alt`.
 
-## VITA embodiment work now on the branch
+## Habitat implementation now on the branch
 
-- Replaced the visible primitive assembly with a continuous implicit morphic renderer.
-- Added soft-body squash/stretch, head and tail lag, anticipation, breathing, and compression.
-- Added target-readable gaze, saccades, fixation, direct-viewer gaze, vergence, microsaccades, and side-eye modes.
-- Added physical eyelid apertures, spontaneous blink, saccade blink, slow social blink, startle blink, and wink.
-- Added procedural orbital brows, mouth crease/open mouth/tongue rendering, cheek glow, and emotional articulation.
-- Added lock-free procedural-audio feedback for mouth envelope, syllable openness, pitch, noise, and purr response.
-- Added synthetic occlusion modes so the body can peek from window edges without fragile foreign-window z-order tricks.
-- Added privacy-preserving pointer, typing-rhythm, click, scroll, moving-window and visual-feature perception contracts.
-- Added attention, appraisal, emotion episodes, predictive self-model, agency, favorite places and bounded influence learning.
-- Kept the portable LifeCore, Windows/macOS host boundary, saved identity, memories, habits, voice motifs, and genome intact.
+- One canonical persistent orb with deterministic throw, swept boundary/window collision, local PET contact, bounded restitution/drag, familiarity, preference, novelty, wear, and normalized saved position.
+- A persistent den with edge-relative anchor, three validated slots, visits, familiarity, comfort, storage/retrieval, focus retreat, sleep return, and monitor/DPI remapping.
+- Edible-light morsels with bounded count, nutritional/light profiles, inspection, accept/refuse/store choice, taste memory, temporary metabolic effects, and non-coercive absence behavior.
+- Reduced window ecology with geometry, velocity, pressure, shared contact normals, local liquid response, escape/recovery, window riding, and trapped-object help.
+- A 16×9 reduced visual frame with salience, habituation, explicit shared-attention cues, chromatic echo, and bounded camouflage without text or raw-pixel persistence.
+- Bounded mimesis signatures for pointer paths and rhythms, near-duplicate merge, motor-error learning, figure-eight spatial transfer, and persistent skill competence without Morph topology changes.
+- A single `EpisodeDirector` composing multi-step Offer, Chase, Intercept, Solo Play, Carry Home, Retrieve, Return/Sleep, Escape/Recover, Window, Food, Shared Attention, Chromatic, Camouflage, Skill, and Rhythm episodes.
+- LifeCore still owns repertoire selection, anti-repeat, outcome credit, and audible acknowledgement. Ecology contributes only grounded semantic vocal triggers and reduced rhythm intervals.
+- Habitat Lab ships 18 deterministic scenarios with pause/step/speed controls, JSON traces, 16×9 SVG evidence, candidate scores, transitions, contacts, normals, paths, outcomes, timings, and privacy capabilities.
 
-## Current architecture truth
+## Architecture truth
 
-- `lifecore` owns needs, affect, learning, action arbitration, memory, development, VITA mind, and portable identity.
-- `pet_body` owns the morphic visual field, embodied face/soft-body runtime, locomotion, hit testing, and rendering.
-- `pet_audio` owns procedural sound and publishes only lock-free derived visual feedback; no audio samples are persisted. A dedicated process-owned thread owns device enumeration, stream lifetime, retry, enqueue, polling, and teardown, so cold audio startup never blocks the visible overlay or physics loop.
-- `pet_perception` owns transient derived input rhythm, gesture, window ecology and salience; it never receives typed content.
-- `desktop_host` owns platform APIs, coordinates, overlay behavior, visual sampling, and persistence paths.
-- `morph_brain` is the same-process Rust port of the colleague's pinned `Thandorcat/morph` neural core: exact `526`-neuron/`17,475`-synapse/`57`-population topology, LIF/delay/STD dynamics, readout, KC→MBON and operant learning. It consumes the same normalized Pet signals and cannot address physics/render/audio internals.
-- `wgpu` continues to use WGSL on D3D12/Metal with no platform-specific shader fork.
-- Liquid schema `16` defines one authoritative `120 Hz`/one-substep pipeline for every state: external fields → predicted positions → `6` XPBD density/containment iterations → commit corrected positions/reconstruct velocities → pair-symmetric numerical XSPH velocity filter → diagnostics/presentation.
-- The permanent bounded elliptical character field and compact filtered pointer potential act particle-wise. Component classification is diagnostics/presentation only; it cannot gate forces, damping, solver choice, or merge behavior.
-- Pointer input has no captured set, bond, velocity target, COM compensator, rigid chunk, pinch event, spray, or recoil. Physical idle budding, shape recovery, whole-component upright rotation, and dynamic bonds are outside the production solver.
-- Artistic viscosity is independent from the `0.01` numerical XSPH floor. Sparse anisotropic splats fall back to round shapes instead of velocity-aligned capsules.
-- Face presentation follows one immutable face-weight carrier through split/remerge; low confidence holds/eases the previous frame rather than reparenting to the largest component.
-- Neutral face X follows the permanent carrier-component symmetry center and semantic roll is exactly zero. Strong VITA attention adds one bounded whole-face offset/roll with hysteresis and per-fixation seeded variation; authored origin X remains an explicit bias.
-- Flight velocity now adds a deterministic whole-face translation/small roll presentation cue, including vertical travel, and returns to exact horizontal target after stop. It does not touch particles or create a controller switch.
-- Face tuning now has backward-compatible custom iris HSV override controls. The mouth cavity uses dark semi-transparent body jelly instead of a separate tongue/plastic color.
-- All five brow points preserve an eye-top-plus-stroke clearance in WGSL, including extreme tension/asymmetry.
-- Flight contributes continuous comoving-frame inertia and a `1.0…1.34` area-preserving reshape of the same permanent field; the same density/field gathers lagging mass after stop without a controller switch. Body Lab exposes this as `Flight plasticity`.
-- The full-silhouette shadow now uses an area-prefiltered `R16` mask plus normalized separable Gaussian passes, with preallocated half/quarter targets. Production `1×` resolves natively; Body Lab retains its true `2×` resolve. The old repeated-silhouette gather is gone.
-- LifeCore owns touch voice selection, anti-repeat, context learning, one-shot credit, performance variation, and monoculture repair. A unique performance ID joins LifeCore, the owner queue, callback feedback, acknowledgement, and rejection; nothing enters use/recency/credit state before it is audibly rendered, and restart clears process-owned windows only.
-- Organic voice DSP now uses one band-limited voice oscillator, a 190 Hz low cut, filtered breath, wider damped formants, DC blocking, a transparent soft knee, shorter reflections, and independently varied loudness/duration. The detuned pair and resonator output during gaps were removed as the electronic-hum sources. Audible calls are calibrated to cat/dog call ranges; purr cadence is amplitude modulation only.
-- Duplicate same-size startup resize events are no-ops, preventing a second allocation of the full virtual-desktop HDR/shadow targets.
-- Pointer physics remains `120 Hz`, while pointer/audio-only presentation stays `60 Hz`; only real flight enters `120 Hz` through `12/8 px/s` hysteresis. Predictive Win32 hit-test retention avoids press-time full-overlay style/cadence churn.
-- The active `liquid-tuning.json` and the authoring preset library have separate ownership. Preset deletion is restricted to safe filenames inside `data/liquid-presets`; applying advances from the current active revision to prevent hot-reload rollback.
+- `lifecore` owns needs, affect, action arbitration, memory, habits, development, VITA mind, identity, and procedural voice repertoire choice.
+- `morph_brain` remains the same-process pinned 526-neuron/17,475-synapse/57-population LIF network. Habitat work did not add neurons, synapses, populations, actions, Node, IPC, or a second homeostasis owner.
+- `pet_ecology` owns portable objects, den, food/taste, mimesis signatures, deterministic physics, episode selection, and ecology debug semantics.
+- `pet_body` owns liquid physics, procedural body/face/material, ecology object rendering, local external-contact response, hit-shape projection, and presentation.
+- `pet_audio` owns procedural synthesis and device-independent callbacks. No microphone or audio samples are collected or persisted.
+- `pet_perception` owns reduced pointer, rhythm, window, and spatial-visual affordances; it never receives typed content or window titles.
+- `desktop_host` owns platform APIs, virtual-desktop coordinates, transparent overlay behavior, capability fallbacks, and crash-safe storage.
+- `app/src/ecology_runtime.rs` is the sole runtime seam combining brain intent with an episode and applying bounded object commands.
+- All ecology hot paths use fixed capacities: 8 objects, 8 external contacts, 32 windows, 144 visual cells, 16 learned skills, 32 path samples, and 16 speed samples.
+
+## Persistence and privacy truth
+
+- Portable organism state, Morph learning, liquid tuning, and ecology state have separate ownership and atomic previous snapshots.
+- Ecology schema 1 validates one canonical orb, unique object IDs, finite normalized values, maximum counts, den-slot uniqueness/lifecycle agreement, bounded taste/skill memories, and serialized RNG state.
+- Shutdown interrupts active episodes; restart repairs transient grabbed/carried/sleeping states without duplicating or losing the orb.
+- Persisted habitat data contains normalized geometry and reduced semantics only. It excludes native handles, process IDs, window titles, typed characters, key codes, clipboard content, raw pixels, screenshots, screen text, microphone buffers, device handles, and absolute paths.
+- Eleven final scenario artifacts pass the forbidden-field scan with zero matches.
 
 ## Validation state
 
-- Published canonical build passed the full workspace suite, all three optimized liquid acceptance replays, strict Clippy, release builds, and focused queued/heard/rejected voice, mono, naturalness, separable-shadow, native `1×`/Lab `2×`, texture-limit, halo-coverage, and resize-allocation tests. Independent audio and renderer verdicts are clean.
-- The complete pre-sampler VITA slice passed strict Clippy, all workspace tests, headless simulation, release build and packaging on Windows x64 and Apple Silicon macOS.
-- Procedural-mesh continuity is validated semantically across current Rust toolchains rather than by brittle raw floating-point bits.
-- Windows visual perception is materialized as a 5 Hz bounded pixel-grid sampler for luminance, local luminance, contrast, colorfulness, warmth, dominant hue, motion, edge density and sudden change.
-- Visual features feed the VITA salience/appraisal loop and the embodied pupil response.
-- Pixel samples are reduced immediately to scalar features and are never saved, logged, exported or sent to LifeCore as an image.
-- macOS and fallback hosts retain capability-based `None` until a permission-aware native sampler is implemented.
-- This checkpoint triggers strict cross-platform validation of the materialized sampler and the macOS no-op path.
-- The real Morph checkout at commit `3c6e27e3b55e4aff1d6c2c254713cdbd79099715` passes upstream acceptance `13/13`, desktop-adapter `15/15`, and health `25/25`. A JS golden neural trace matches the Rust engine for rates, voltages, adaptation, and short-term depression within `8e-4`.
-- Final post-review optimized 10-second Morph Fusion smoke measured p50 `0.344 ms`, p95 `0.382 ms`, max `0.960 ms` per 50 ms decision tick (about `0.7%` of one core averaged over real time); it produced four distinct commands and five switches. There is no Node, IPC, network, thread, model, or first-click initialization in the shipped path.
-- Independent regression re-review is clean: it reproduced corrupt-primary Morph recovery against the canonical exe, verified actual `≤0.30` continuous blending plus zero protected-state authority, and matched packaged/release SHA-256 `95ED3AF9BBAFA57327F84C075561809AE3CA6EADEA57882D8473A3918323CCE0`.
-- The previous v15 flight/pointer measurements (`11/96` lagging, `10/96` edge tear) are retained only as historical baselines; they do not pass the v16 rescue gate because long/high-frequency pulls, idle stability, face continuity, and capsule rendering were not covered.
-- v16 must pass: `10×120 s` idle stability; stationary, slow, long and `8 Hz` pointer replays; natural `8–16` particle tear/remerge; flight stop/recovery; face hitch/split continuity; sparse anisotropy fallback; and equivalent topology at `30/60/144 Hz` presentation.
-- No executable may replace `builds/current` until workspace tests, Clippy, release build, Body Lab + real desktop visual capture, and an independent regression review pass.
+- Formatting passes.
+- Strict workspace/all-target/all-feature Clippy passes with warnings denied.
+- Full workspace suite: 305 passed, 3 intentionally ignored long production replays, 0 failed.
+- All three ignored optimized liquid production replays pass independently: 10×120-second idle, 60-second adversarial pointer, and presentation-independent fixed-120 replay at 30/60/144 Hz.
+- All 18 Habitat Lab scenarios are deterministic, finite, bounded, and pass.
+- Final packaged 10-second headless smoke passes with one canonical object and ecology hash `8123284623903296375`.
+- Final packaged flagship passes with state hash `4913997946884220323`, transition hash `5335229718525845320`, 29 outcomes, and 53 transitions.
+- A fresh release 24-hour/345,600-tick simulation exits 0, writes all three state files, and validates ecology hash `12888705924936098925`.
+- The 24-hour run found and then verified the fix for stale den-slot ownership. Object exit/store commands now share one slot-clearing invariant.
+- The user-observed top-edge orb pin was reproduced from saved position `[0.36860466, 0.0]` and fixed with radius-aware feasible contact separation. Unit and 240-tick runtime replays pass.
+- Flagship EpisodeDirector p95 is 0.1 µs; object physics p95 is 0.4 µs.
+- Conservative peak working set during the 24-hour release run is 18.43 MiB against the <150 MB target.
+- Final three-run Morph p95 median is 368.2 µs versus the 382.0 µs published baseline, a 3.61% improvement and within the +10% no-regression budget.
+- Candidate Pet size is 6,582,784 bytes, +3.4685%; Body Lab is +0.0993%; new Habitat Lab is 583,680 bytes.
+- Windows release/package/smoke gates pass. A macOS cross-build from Windows is blocked by unavailable `libclang.dll` for `coreaudio-sys`; no macOS runtime claim is made.
 
-## Remaining implementation sequence
+## Visual evidence
 
-1. Collect user visual/listening feedback from the canonical Pet and Body Lab; tune authored shadow and voice character without changing the stable solver or delivery lifecycle.
-2. Validate the same attention, overlay, material, and CoreAudio behavior on real Apple Silicon hardware.
-3. Add best-effort UI/control geometry without collecting labels or text.
-4. Add opt-in microphone-derived RMS/voice-activity/prosody features without retaining audio.
-5. Add optional camera/semantic providers without making LifeCore dependent on them.
+- Deterministic SVG/JSON pairs exist for the flagship story, orb offer/play, den store/restart/retrieve, window squeeze/escape, morsel acceptance, shared attention, skill transfer, window bounce, and trapped help.
+- The flagship and window-bounce SVGs were rasterized and inspected for safe gaps, labels, paths, contact normals, candidate panels, timeline readability, clipping, and privacy disclosure.
+- A live Windows capture verified the transparent always-on-top overlay and procedural PET/material, and exposed the top-edge orb pin.
+- The exact post-fix replay passes automatically, but the second live capture was stopped by the user's Escape. Do not claim post-fix live visual confirmation until an independent reviewer repeats it.
 
-## Brain infrastructure fusion direction
+## Candidate package hashes
 
-- The accepted direction is now implemented as a first-class same-process component:
-  local `LifeCore + VITA`, real colleague `MorphBrain`, shadow/fusion modes, one final
-  behavioral authority, and a local embodied safety kernel.
-- `pet_body`, the presentation mapping, liquid/material renderer, procedural audio,
-  desktop host, privacy reduction, and portable organism envelope remain ours.
-- Morph emits only semantic command rates, attention, affect, confidence and turn;
-  it may not control particles, face geometry, shader/material parameters, native
-  handles, raw private input, or realtime audio samples.
-- Full map, gaps, state ownership, gates, and the first executable slice are recorded
-  in `BRAIN_SUBSYSTEMS_FUSION_PLAN.md`.
-- The comparison has five lanes: `Classic`, `Morphic`, `Fusion`, `Morph Shadow` (real Morph runs at zero authority), and `Morph Fusion`. Morph continuous attention/appraisal/gaze/target influence is actually blended by authority capped at `0.30`; it cannot directly replace discrete pose/locomotion, and the local protected kernel zeros Morph first.
-- All five use the same 20 Hz boundary, body, audio, save and renderer. Morph learning persists atomically in `morph-brain.json` and falls back to `backups/morph-brain.previous.json` if the primary is missing or corrupt; user feedback is applied to LifeCore, VITA and Morph together. Shared LifeCore drives remain the sole homeostasis owner.
+- `Pet2.exe`: `07020247338812511FC5A8ECB2885D0D6BD3D75B7F1705CF70943A7D4BBA5BBD`
+- `BodyLab.exe`: `1C643C5A1460E2240C1939BC83A75A08F82BD678C2EB502A54C1B6636F3F3455`
+- `HabitatLab.exe`: `523AD983A874E2B3DE92665BD01323FED1411DDD1E535C235348BA64129EBD5E`
+- `Pet2-windows-x64.zip`: `61FC03A159DFB1BA53BBFA418F37280EFFA1280383D49E25F72026F9A6168816`
+
+## Remaining review sequence
+
+1. Independently reproduce the fixed edge-pinning and den-slot attacks on the candidate.
+2. Measure candidate-versus-published ecology renderer p95 delta at production 1× and require <0.60 ms.
+3. Repeat white/black/busy-background and multi-monitor/DPI live captures after the edge fix.
+4. Run the full reviewer attack matrix in `.solo-studio/HABITAT_ACCEPTANCE_REPORT.md`.
+5. Build and validate overlay, Metal, CoreAudio, packaging, and persistence on real Apple Silicon hardware.
+6. Only after those independent gates pass, promote the candidate binaries and launchers into `builds/current` and update its published hashes.
 
 ## Active risks
 
-- Windows visual QA is complete for neutral centering, extreme brow clearance, whole-face attention, click/release continuity, flight plasticity, and a continuous shadow penumbra in Body Lab. Cold audio ownership and repertoire acknowledgement have focused automated coverage; subjective sound character remains a user-listening gate in the canonical build.
-- The implicit shader must stay readable and performant on low-power integrated GPUs.
-- Interactive macOS overlay/Metal/CoreAudio behavior still requires Apple Silicon runtime validation.
-- Global input rhythm and visual-feature providers require explicit capability/permission handling and must never persist raw content.
-- Learned influence must remain playful and inspectable rather than deceptive, coercive, or disruptive.
+- The ecology render delta is instrumented but not isolated against the published binary.
+- Post-fix live Windows visual confirmation is pending because the user stopped the recapture with Escape.
+- Interactive macOS behavior and packaging still require Apple Silicon validation.
+- Subjective voice character and causal-story readability remain human-observation gates.
+- New perception providers must preserve immediate reduction and never persist raw private content.
