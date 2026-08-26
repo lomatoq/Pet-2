@@ -1,0 +1,12 @@
+[package]
+name = "habitat_lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam.workspace = true
+lifecore = { path = "../../crates/lifecore" }
+pet_ecology = { path = "../../crates/pet_ecology" }
+serde_json.workspace = true
