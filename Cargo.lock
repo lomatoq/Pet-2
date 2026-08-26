@@ -472,6 +472,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "pet_body",
+ "pet_ecology",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -1619,6 +1620,7 @@ dependencies = [
  "morph_brain",
  "pet_audio",
  "pet_body",
+ "pet_ecology",
  "pet_perception",
  "pollster",
  "serde_json",
@@ -1652,6 +1654,20 @@ dependencies = [
  "wgpu",
  "wgpu-types",
  "winit",
+]
+
+[[package]]
+name = "pet_ecology"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "lifecore",
+ "rand",
+ "rand_chacha",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

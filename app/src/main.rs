@@ -4,6 +4,7 @@
 )]
 #![recursion_limit = "512"]
 
+mod ecology_runtime;
 mod vita_runtime;
 
 use std::{
@@ -25,6 +26,7 @@ use desktop_host::{
     PointerState, PortablePetState, RectI, SensorNormalizer, StateStore, create_platform_backend,
     prepare_overlay_window_attributes,
 };
+use ecology_runtime::EcologyRuntime;
 use glam::Vec2;
 use lifecore::{
     ActionId, BodyIntent, CollisionEvent, DebugState, ExpressionState, FeedbackEvent, Genome,
@@ -234,6 +236,7 @@ struct PreparedState {
     position: PersistedPetPosition,
     vita: VitaRuntime,
     morph: MorphBrain,
+    ecology: EcologyRuntime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,6 +777,11 @@ fn prepare_state(
         store.load_morph_brain::<MorphBrainState>()?
     };
     let morph = MorphBrain::new(identity_seed, morph_state)?;
+    let ecology = EcologyRuntime::load_or_create(
+        store,
+        identity_seed,
+        arguments.reset_pet || imported_state,
+    )?;
     if arguments.reset_learning {
         life.reset_learning();
         vita.reset_learning(identity_seed);
@@ -788,6 +796,7 @@ fn prepare_state(
         position,
         vita,
         morph,
+        ecology,
     })
 }
 
@@ -798,6 +807,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         position,
         mut vita,
         mut morph,
+        mut ecology,
     } = prepare_state(&arguments, &store)?;
     let mut body = ProceduralBody::generate(&life.state.genome)?;
     let duration_seconds = arguments
@@ -872,6 +882,9 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             dt,
         );
         output.body_intent = resolved_intent;
+        output.body_intent = ecology
+            .resolve_intent(output.body_intent, life.state.focus_mode)
+            .body_intent;
         let visual_mind = visual_mind_input(
             &life,
             &sensors,
@@ -897,6 +910,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             VoiceVisualState::default(),
             dt.min(0.05),
         );
+        ecology.fixed_update(16.0 / 9.0, dt.min(1.0 / 30.0));
         let next_feedback = body.simulation.feedback.clone();
         let step_distance = next_feedback
             .world_position
@@ -936,6 +950,8 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     let morph_p95_us = percentile(&morph_tick_microseconds, 0.95);
     let morph_max_us = morph_tick_microseconds.last().copied().unwrap_or(0.0);
     let morph_state = morph.snapshot();
+    let ecology_state = ecology.snapshot();
+    let ecology_bytes = serde_json::to_vec(&ecology_state)?;
     let summary = serde_json::json!({
         "schema_version": portable.schema_version,
         "brain_mode": brain_mode.as_str(),
@@ -979,10 +995,16 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             "state_bytes": serde_json::to_vec(&morph_state)?.len(),
             "last": morph_output_json(morph.last_output()),
         },
+        "ecology": {
+            "schema_version": ecology_state.schema_version,
+            "object_count": ecology_state.objects.len(),
+            "state_hash": stable_hash_bytes(&ecology_bytes),
+        },
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
     store.save_state(&portable)?;
     store.save_morph_brain(&morph_state)?;
+    store.save_ecology_state(&ecology_state)?;
     if let Some(path) = &arguments.export_state {
         store.export_state(&portable, path)?;
     }
@@ -998,6 +1020,7 @@ struct PetRuntime {
     life: LifeCore,
     vita: VitaRuntime,
     morph: MorphBrain,
+    ecology: EcologyRuntime,
     brain_mode: BrainMode,
     body: ProceduralBody,
     audio: AudioManager,
@@ -1272,6 +1295,9 @@ impl PetApplication {
                 &runtime.sensors,
                 body_dt,
             );
+            let bounds = runtime.topology.virtual_physical_bounds;
+            let desktop_aspect = bounds.width() as f32 / bounds.height().max(1) as f32;
+            runtime.ecology.fixed_update(desktop_aspect, body_dt);
             let previous_screen_center = runtime.screen_body_center;
             apply_screen_domain(
                 &mut runtime.body,
@@ -1362,6 +1388,10 @@ impl PetApplication {
                 LIFE_DT,
             );
             output.body_intent = resolved_intent;
+            output.body_intent = runtime
+                .ecology
+                .resolve_intent(output.body_intent, runtime.life.state.focus_mode)
+                .body_intent;
             preserve_navigation_during_material_drag(
                 &runtime.intent,
                 &mut output.body_intent,
@@ -1685,6 +1715,7 @@ impl ApplicationHandler for PetApplication {
             life: prepared.life,
             vita: prepared.vita,
             morph: prepared.morph,
+            ecology: prepared.ecology,
             brain_mode: self.arguments.brain_mode,
             audio,
             pointer: PointerState::default(),
@@ -1998,6 +2029,7 @@ impl ApplicationHandler for PetApplication {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.platform.shutdown();
+            runtime.ecology.prepare_shutdown();
         }
         if let Some(runtime) = self.runtime.as_ref() {
             self.persist(runtime);
@@ -2030,6 +2062,9 @@ fn persist_runtime(store: &StateStore, export: Option<&PathBuf>, runtime: &PetRu
     }
     if let Err(error) = store.save_morph_brain(&runtime.morph.snapshot()) {
         eprintln!("could not save Morph brain state: {error}");
+    }
+    if let Err(error) = store.save_ecology_state(&runtime.ecology.snapshot()) {
+        eprintln!("could not save habitat ecology state: {error}");
     }
     if let Some(path) = export
         && let Err(error) = store.export_state(&portable, path)

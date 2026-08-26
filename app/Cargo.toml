@@ -13,6 +13,7 @@ lifecore = { path = "../crates/lifecore" }
 morph_brain = { path = "../crates/morph_brain" }
 pet_audio = { path = "../crates/pet_audio" }
 pet_body = { path = "../crates/pet_body" }
+pet_ecology = { path = "../crates/pet_ecology" }
 pet_perception = { path = "../crates/pet_perception" }
 pollster.workspace = true
 serde_json.workspace = true

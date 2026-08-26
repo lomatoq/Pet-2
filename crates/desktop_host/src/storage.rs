@@ -6,6 +6,7 @@ use std::{
 
 use directories::ProjectDirs;
 use lifecore::{LifeError, LifeSnapshot, VitaState};
+use pet_ecology::{EcologyError, EcologyState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -85,8 +86,10 @@ pub struct StoragePaths {
     pub liquid_tuning: PathBuf,
     pub liquid_tuning_status: PathBuf,
     pub morph_brain: PathBuf,
+    pub ecology_state: PathBuf,
     pub events: PathBuf,
     pub backup: PathBuf,
+    pub ecology_backup: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -105,6 +108,8 @@ pub enum StorageError {
     InvalidPosition,
     #[error("portable state contains an invalid VITA mind")]
     InvalidVitaState,
+    #[error(transparent)]
+    Ecology(#[from] EcologyError),
 }
 
 #[derive(Debug, Clone)]
@@ -129,8 +134,10 @@ impl StateStore {
                 liquid_tuning: root.join("liquid-tuning.json"),
                 liquid_tuning_status: root.join("liquid-tuning-applied.json"),
                 morph_brain: root.join("morph-brain.json"),
+                ecology_state: root.join("ecology-state.json"),
                 events: root.join("events.jsonl"),
                 backup: root.join("backups").join("state.previous.json"),
+                ecology_backup: root.join("backups").join("ecology-state.previous.json"),
                 root,
             },
         }
@@ -273,6 +280,30 @@ impl StateStore {
         )
     }
 
+    pub fn load_ecology_state(&self) -> Result<Option<EcologyState>, StorageError> {
+        if !self.paths.ecology_state.exists() {
+            return if self.paths.ecology_backup.exists() {
+                read_ecology_state(&self.paths.ecology_backup).map(Some)
+            } else {
+                Ok(None)
+            };
+        }
+        match read_ecology_state(&self.paths.ecology_state) {
+            Ok(state) => Ok(Some(state)),
+            Err(primary_error) if self.paths.ecology_backup.exists() => {
+                read_ecology_state(&self.paths.ecology_backup)
+                    .map(Some)
+                    .map_err(|_| primary_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn save_ecology_state(&self, state: &EcologyState) -> Result<(), StorageError> {
+        state.validate()?;
+        atomic_json(&self.paths.ecology_state, &self.paths.ecology_backup, state)
+    }
+
     pub fn append_event(&self, event: &EventLogEntry) -> Result<(), StorageError> {
         fs::create_dir_all(&self.paths.root)?;
         let mut file = OpenOptions::new()
@@ -288,6 +319,12 @@ impl StateStore {
 
 fn read_state(path: &Path) -> Result<PortablePetState, StorageError> {
     let state: PortablePetState = serde_json::from_reader(BufReader::new(File::open(path)?))?;
+    state.validate()?;
+    Ok(state)
+}
+
+fn read_ecology_state(path: &Path) -> Result<EcologyState, StorageError> {
+    let state: EcologyState = serde_json::from_reader(BufReader::new(File::open(path)?))?;
     state.validate()?;
     Ok(state)
 }
@@ -466,5 +503,22 @@ mod tests {
                 .unwrap(),
             first
         );
+    }
+
+    #[test]
+    fn ecology_roundtrip_is_separate_and_recovers_previous_valid_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let first = EcologyState::new(101);
+        let mut second = first.clone();
+        second.den.visits = 4;
+
+        store.save_ecology_state(&first).unwrap();
+        store.save_ecology_state(&second).unwrap();
+        assert_eq!(store.load_ecology_state().unwrap(), Some(second));
+        assert!(store.paths.ecology_backup.exists());
+
+        std::fs::write(&store.paths.ecology_state, b"{broken").unwrap();
+        assert_eq!(store.load_ecology_state().unwrap(), Some(first));
     }
 }
