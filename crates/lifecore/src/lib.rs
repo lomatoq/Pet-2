@@ -708,6 +708,16 @@ impl LifeCore {
             VocalTrigger::Action(ActionId::Chirp) => (1.08, 1.06, 1.0, false),
             VocalTrigger::Action(_) => (1.0, 1.0, 0.88, false),
             VocalTrigger::Touch => (0.98, 1.02, 0.90, false),
+            VocalTrigger::ToyOffer => (1.05, 0.96, 0.85, false),
+            VocalTrigger::CatchSuccess => (1.12, 1.18, 0.94, false),
+            VocalTrigger::MissAndRetry => (0.94, 0.92, 0.78, false),
+            VocalTrigger::NeedHelp => (1.08, 0.88, 0.88, false),
+            VocalTrigger::FoodInspect => (0.98, 0.92, 0.74, false),
+            VocalTrigger::FoodAccepted => (1.06, 1.05, 0.82, false),
+            VocalTrigger::FoodRefused => (0.90, 0.86, 0.68, false),
+            VocalTrigger::HomeReturn => (0.88, 0.78, 0.65, true),
+            VocalTrigger::SkillMastered => (1.15, 1.14, 0.92, false),
+            VocalTrigger::RhythmEcho => (1.02, 1.0, 0.90, false),
         };
         Some(VocalRequest {
             motif_id,
@@ -728,6 +738,17 @@ impl LifeCore {
                 .clamp(0.62, 1.48),
             stress: affect.stress,
             purr,
+            rhythm_intervals: if trigger == VocalTrigger::RhythmEcho {
+                sensors.recent_click_rhythm.map(|interval| {
+                    if interval.is_finite() && interval > 0.0 {
+                        interval.clamp(0.1, 4.0)
+                    } else {
+                        0.0
+                    }
+                })
+            } else {
+                [0.0; 8]
+            },
         })
     }
 
@@ -1335,6 +1356,16 @@ fn motif_style_score(motif: &VocalMotif, trigger: VocalTrigger, affect: AffectSt
         VocalTrigger::Action(ActionId::Chirp) => [0.72, 0.28, 0.20, 0.20, 0.24, 0.38, 0.74],
         VocalTrigger::Action(_) => [0.50; 7],
         VocalTrigger::Touch => [0.44, 0.34, 0.16, 0.12, 0.18, 0.34, 0.62],
+        VocalTrigger::ToyOffer => [0.64, 0.34, 0.30, 0.18, 0.18, 0.52, 0.68],
+        VocalTrigger::CatchSuccess => [0.78, 0.24, 0.18, 0.22, 0.18, 0.42, 0.78],
+        VocalTrigger::MissAndRetry => [0.46, 0.42, 0.34, 0.16, 0.28, 0.46, 0.42],
+        VocalTrigger::NeedHelp => [0.70, 0.46, 0.42, 0.12, 0.26, 0.54, 0.74],
+        VocalTrigger::FoodInspect => [0.52, 0.34, 0.26, 0.12, 0.18, 0.38, 0.58],
+        VocalTrigger::FoodAccepted => [0.62, 0.30, 0.20, 0.14, 0.14, 0.44, 0.70],
+        VocalTrigger::FoodRefused => [0.34, 0.44, 0.32, 0.08, 0.24, 0.34, 0.32],
+        VocalTrigger::HomeReturn => [0.24, 0.62, 0.22, 0.05, 0.12, 0.70, 0.40],
+        VocalTrigger::SkillMastered => [0.82, 0.26, 0.20, 0.24, 0.18, 0.56, 0.82],
+        VocalTrigger::RhythmEcho => [0.55, 0.30, 0.56, 0.82, 0.30, 0.68, 0.50],
     };
     target[0] = (target[0] + affect.arousal * 0.10).clamp(0.0, 1.0);
     target[4] = (target[4] + affect.stress * 0.28).clamp(0.0, 1.0);
@@ -1964,6 +1995,26 @@ mod tests {
         ] {
             assert!(value.is_finite() && (0.6..=1.5).contains(&value));
         }
+    }
+
+    #[test]
+    fn ecology_semantics_keep_repertoire_ownership_and_copy_only_reduced_rhythm() {
+        let mut core = LifeCore::new(Genome::from_seed(571), 971);
+        let sensors = SensorFrame {
+            recent_click_rhythm: [0.5, 1.0, 0.75, 1.75, 0.0, 0.0, 0.0, 0.0],
+            ..SensorFrame::default()
+        };
+        let request = core
+            .request_vocalization(VocalTrigger::RhythmEcho, &sensors)
+            .expect("LifeCore selects a learned motif");
+        assert!(
+            core.state
+                .vocal_motifs
+                .iter()
+                .any(|motif| motif.id == request.motif_id)
+        );
+        assert_eq!(request.rhythm_intervals, sensors.recent_click_rhythm);
+        assert!(request.performance_seed != 0);
     }
 
     #[test]

@@ -734,6 +734,11 @@ pub struct VocalRequest {
     pub tempo_scale: f32,
     pub stress: f32,
     pub purr: bool,
+    /// Optional normalized inter-onset intervals for a grounded rhythm echo.
+    /// Zero entries mean no authored interval; waveform ownership stays in
+    /// `pet_audio` and no raw input timing history is retained.
+    #[serde(default)]
+    pub rhythm_intervals: [f32; 8],
 }
 
 /// The semantic reason the mind wants to vocalize.
@@ -747,6 +752,16 @@ pub enum VocalTrigger {
     Action(ActionId),
     /// A short, responsive sound after direct material contact.
     Touch,
+    ToyOffer,
+    CatchSuccess,
+    MissAndRetry,
+    NeedHelp,
+    FoodInspect,
+    FoodAccepted,
+    FoodRefused,
+    HomeReturn,
+    SkillMastered,
+    RhythmEcho,
 }
 
 impl VocalTrigger {
@@ -754,7 +769,17 @@ impl VocalTrigger {
     pub const fn is_supported(self) -> bool {
         match self {
             Self::Action(action) => action.is_vocal(),
-            Self::Touch => true,
+            Self::Touch
+            | Self::ToyOffer
+            | Self::CatchSuccess
+            | Self::MissAndRetry
+            | Self::NeedHelp
+            | Self::FoodInspect
+            | Self::FoodAccepted
+            | Self::FoodRefused
+            | Self::HomeReturn
+            | Self::SkillMastered
+            | Self::RhythmEcho => true,
         }
     }
 
@@ -762,7 +787,7 @@ impl VocalTrigger {
     pub const fn expects_response(self) -> bool {
         matches!(
             self,
-            Self::Action(ActionId::Chirp | ActionId::MimicClickRhythm)
+            Self::Action(ActionId::Chirp | ActionId::MimicClickRhythm) | Self::ToyOffer
         )
     }
 }

@@ -16,6 +16,7 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            rhythm_intervals: [0.0; 8],
         }
     }
 

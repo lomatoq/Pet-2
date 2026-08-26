@@ -446,6 +446,7 @@ impl ApplicationHandler for BodyLab {
                         tempo_scale: duration_scale.recip(),
                         stress: 0.15,
                         purr: false,
+                        rhythm_intervals: [0.0; 8],
                     };
                     if let Err(error) = audio.enqueue(&self.genome.voice, motif, &request) {
                         runtime.audio_error = Some(error.to_string());

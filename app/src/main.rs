@@ -39,7 +39,7 @@ use pet_body::{
     EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile, ProceduralBody,
     RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
-use pet_ecology::{ActionSignature, MorselProfile};
+use pet_ecology::{ActionSignature, EcologyVocalTrigger, MorselProfile};
 use pet_perception::{SpatialVisualCell, SpatialVisualFrame, VisualFeatureFrame};
 use vita_runtime::{BrainMode, VitaRuntime};
 use winit::{
@@ -1552,17 +1552,16 @@ impl PetApplication {
                 LIFE_DT,
             );
             output.body_intent = resolved_intent;
-            output.body_intent = runtime
-                .ecology
-                .resolve_intent(
-                    output.body_intent,
-                    output.selected_action,
-                    &runtime.sensors,
-                    &runtime.body.simulation.feedback,
-                    runtime.life.state.focus_mode,
-                    LIFE_DT,
-                )
-                .body_intent;
+            let ecology_output = runtime.ecology.resolve_intent(
+                output.body_intent,
+                output.selected_action,
+                &runtime.sensors,
+                &runtime.body.simulation.feedback,
+                runtime.life.state.focus_mode,
+                LIFE_DT,
+            );
+            output.body_intent = ecology_output.body_intent;
+            let ecology_vocal_trigger = ecology_output.vocal_trigger;
             preserve_navigation_during_material_drag(
                 &runtime.intent,
                 &mut output.body_intent,
@@ -1579,7 +1578,12 @@ impl PetApplication {
                 runtime.save_accumulator = 30.0;
             }
             runtime.was_sleeping = sleeping;
-            if let Some(request) = output.vocal_request
+            if let Some(trigger) = ecology_vocal_trigger {
+                if let Some(request) = output.vocal_request.take() {
+                    runtime.life.cancel_vocal_request(request.performance_seed);
+                }
+                enqueue_ecology_voice(runtime, trigger);
+            } else if let Some(request) = output.vocal_request
                 && let Some(motif) = runtime
                     .life
                     .state
@@ -2390,6 +2394,39 @@ fn enqueue_touch_voice(runtime: &mut PetRuntime, now: Instant) {
     }
 }
 
+fn enqueue_ecology_voice(runtime: &mut PetRuntime, trigger: EcologyVocalTrigger) {
+    let trigger = match trigger {
+        EcologyVocalTrigger::ToyOffer => VocalTrigger::ToyOffer,
+        EcologyVocalTrigger::CatchSuccess => VocalTrigger::CatchSuccess,
+        EcologyVocalTrigger::MissAndRetry => VocalTrigger::MissAndRetry,
+        EcologyVocalTrigger::NeedHelp => VocalTrigger::NeedHelp,
+        EcologyVocalTrigger::FoodInspect => VocalTrigger::FoodInspect,
+        EcologyVocalTrigger::FoodAccepted => VocalTrigger::FoodAccepted,
+        EcologyVocalTrigger::FoodRefused => VocalTrigger::FoodRefused,
+        EcologyVocalTrigger::HomeReturn => VocalTrigger::HomeReturn,
+        EcologyVocalTrigger::SkillMastered => VocalTrigger::SkillMastered,
+        EcologyVocalTrigger::RhythmEcho => VocalTrigger::RhythmEcho,
+    };
+    let Some(request) = runtime.life.request_vocalization(trigger, &runtime.sensors) else {
+        return;
+    };
+    let Some(motif) = runtime
+        .life
+        .state
+        .vocal_motifs
+        .iter()
+        .find(|motif| motif.id == request.motif_id)
+        .cloned()
+    else {
+        runtime.life.cancel_vocal_request(request.performance_seed);
+        return;
+    };
+    let voice = runtime.life.state.genome.voice.clone();
+    if !runtime.audio.enqueue(&voice, &motif, &request) {
+        runtime.life.cancel_vocal_request(request.performance_seed);
+    }
+}
+
 fn voice_visual_state(audio: &AudioManager) -> VoiceVisualState {
     let feedback = audio.visual_feedback();
     VoiceVisualState {
@@ -3156,6 +3193,7 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            rhythm_intervals: [0.0; 8],
         };
         assert!(manager.enqueue(&voice, &first_motif, &first_request));
         assert!(matches!(

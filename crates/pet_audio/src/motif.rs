@@ -90,6 +90,28 @@ impl VoiceCommand {
         for (target, source) in syllables.iter_mut().zip(&motif.syllables) {
             *target = PreparedSyllable::from(source);
         }
+        let rhythm_interval_count = request
+            .rhythm_intervals
+            .iter()
+            .position(|interval| !interval.is_finite() || *interval <= 0.0)
+            .unwrap_or(request.rhythm_intervals.len())
+            .min(MAX_SYLLABLES.saturating_sub(1));
+        if rhythm_interval_count > 0 && !motif.syllables.is_empty() {
+            for (index, syllable) in syllables
+                .iter_mut()
+                .enumerate()
+                .take(rhythm_interval_count + 1)
+            {
+                *syllable = PreparedSyllable::from(&motif.syllables[index % motif.syllables.len()]);
+                syllable.duration_ms = syllable.duration_ms.clamp(55.0, 88.0);
+                if index < rhythm_interval_count {
+                    let onset_ms = 220.0 * request.rhythm_intervals[index].clamp(0.1, 4.0);
+                    syllable.gap_after_ms = (onset_ms - syllable.duration_ms).clamp(4.0, 792.0);
+                } else {
+                    syllable.gap_after_ms = 0.0;
+                }
+            }
+        }
         let performance_seed = request.performance_seed ^ motif.seed.rotate_left(17);
         let spectral_drift = seeded_signed(performance_seed ^ 0xA24B_AED4_963E_E407);
         let formant_drift = seeded_signed(performance_seed ^ 0x9FB2_1C65_1E98_DF25);
@@ -99,7 +121,11 @@ impl VoiceCommand {
             request_id: request.performance_seed,
             motif_id: motif.id,
             seed: splitmix64(performance_seed),
-            syllable_count: motif.syllables.len().min(MAX_SYLLABLES) as u8,
+            syllable_count: if rhythm_interval_count > 0 {
+                rhythm_interval_count.saturating_add(1) as u8
+            } else {
+                motif.syllables.len().min(MAX_SYLLABLES) as u8
+            },
             syllables,
             // Normal cat calls cluster around a few hundred hertz and carry
             // their strongest energy near 1-2 kHz. Very low legacy genomes
@@ -556,10 +582,54 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: true,
+            rhythm_intervals: [0.0; 8],
         };
         let command = VoiceCommand::prepare(&voice, &motif, &request);
         assert_eq!(command.base_pitch_hz, 320.0);
         assert_eq!(command.purr_rate, 24.0);
+    }
+
+    #[test]
+    fn grounded_rhythm_request_shapes_inter_onset_intervals() {
+        let voice = lifecore::Genome::from_seed(42).voice;
+        let motif = lifecore::generate_initial_motifs(&voice)
+            .into_iter()
+            .next()
+            .expect("generated motif");
+        let requested = [0.50, 1.00, 0.75, 1.75, 0.0, 0.0, 0.0, 0.0];
+        let request = VocalRequest {
+            performance_seed: 18,
+            motif_id: motif.id,
+            gain: 0.2,
+            pan: 0.0,
+            pitch_scale: 1.0,
+            tempo_scale: 1.0,
+            stress: 0.0,
+            purr: false,
+            rhythm_intervals: requested,
+        };
+        let command = VoiceCommand::prepare(&voice, &motif, &request);
+        assert_eq!(command.syllable_count, 5);
+        let actual = std::array::from_fn::<_, 4, _>(|index| {
+            (command.syllables[index].duration_ms + command.syllables[index].gap_after_ms) / 220.0
+        });
+        let mean_actual = actual.iter().sum::<f32>() / actual.len() as f32;
+        let covariance = actual
+            .iter()
+            .zip(requested)
+            .take(4)
+            .map(|(actual, requested)| (*actual - mean_actual) * (requested - 1.0))
+            .sum::<f32>();
+        let actual_energy = actual
+            .iter()
+            .map(|actual| (*actual - mean_actual).powi(2))
+            .sum::<f32>();
+        let requested_energy = requested[..4]
+            .iter()
+            .map(|requested| (*requested - 1.0).powi(2))
+            .sum::<f32>();
+        let correlation = covariance / (actual_energy * requested_energy).sqrt();
+        assert!(correlation >= 0.85, "correlation={correlation}");
     }
 
     #[test]

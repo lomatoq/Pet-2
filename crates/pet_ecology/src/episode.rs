@@ -191,14 +191,15 @@ pub struct EcologyVisualContext {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EcologyVocalTrigger {
-    Offer,
-    Help,
-    Retrieve,
+    ToyOffer,
+    CatchSuccess,
+    MissAndRetry,
+    NeedHelp,
     FoodInspect,
     FoodAccepted,
     FoodRefused,
-    SkillAttempt,
-    SkillSuccess,
+    HomeReturn,
+    SkillMastered,
     RhythmEcho,
 }
 
@@ -267,6 +268,7 @@ pub struct EpisodeDirector {
     active: Option<ActivityEpisode>,
     tick: u64,
     visual_episode_cooldown: f32,
+    orb_bid_cooldown: f32,
 }
 
 impl EpisodeDirector {
@@ -329,10 +331,14 @@ impl EpisodeDirector {
             0.0
         };
         self.visual_episode_cooldown = (self.visual_episode_cooldown - dt).max(0.0);
+        self.orb_bid_cooldown = (self.orb_bid_cooldown - dt).max(0.0);
         let mut frame = frame;
         if self.visual_episode_cooldown > 0.0 {
             frame.visual_strength = 0.0;
             frame.shared_attention = false;
+        }
+        if self.orb_bid_cooldown > 0.0 && frame.selected_action == ActionId::BringProceduralOrb {
+            frame.selected_action = ActionId::IdleHover;
         }
         let mut output = empty_output(brain_intent);
         output.debug.tick = self.tick;
@@ -415,6 +421,11 @@ impl EpisodeDirector {
         match step {
             EpisodeStep::Continue => self.active = Some(active),
             EpisodeStep::Complete => {
+                if active.goal == EpisodeGoal::CarryOrbHome
+                    && active.reason_code == EpisodeReason::TimedOut
+                {
+                    self.orb_bid_cooldown = 20.0;
+                }
                 active.phase = EpisodePhase::Complete;
                 state.episode_stats.completed[active.goal.index()] =
                     state.episode_stats.completed[active.goal.index()].saturating_add(1);
@@ -775,6 +786,7 @@ fn drive_episode(
             {
                 state.den.visits = state.den.visits.saturating_add(1);
                 state.den.familiarity = (state.den.familiarity + 0.006).clamp(0.0, 1.0);
+                output.vocal_trigger = Some(EcologyVocalTrigger::HomeReturn);
                 return EpisodeStep::Complete;
             }
             if active.goal == EpisodeGoal::SleepInDen
@@ -796,7 +808,7 @@ fn drive_episode(
             if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
                 active.phase = EpisodePhase::Celebrate;
                 output.body_intent.pose = PoseIntent::Display;
-                output.vocal_trigger = Some(EcologyVocalTrigger::Offer);
+                output.vocal_trigger = Some(EcologyVocalTrigger::ToyOffer);
                 return EpisodeStep::Complete;
             }
             match active.phase {
@@ -808,7 +820,7 @@ fn drive_episode(
                 }
                 EpisodePhase::Manipulate if active.phase_elapsed_seconds >= 0.35 => {
                     set_phase(active, EpisodePhase::WaitForUser);
-                    output.vocal_trigger = Some(EcologyVocalTrigger::Offer);
+                    output.vocal_trigger = Some(EcologyVocalTrigger::ToyOffer);
                 }
                 EpisodePhase::WaitForUser if active.phase_elapsed_seconds >= 5.5 => {
                     state.episode_stats.started[EpisodeGoal::CarryOrbHome.index()] =
@@ -864,6 +876,21 @@ fn drive_episode(
             };
             output.body_intent.pose = PoseIntent::Playful;
             output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.48);
+            if active.goal == EpisodeGoal::ChaseOrb
+                && orb.lifecycle == ObjectLifecycle::Free
+                && orb.velocity.length() >= 0.18
+                && active.attempts == 0
+            {
+                state.episode_stats.started[EpisodeGoal::InterceptOrb.index()] =
+                    state.episode_stats.started[EpisodeGoal::InterceptOrb.index()]
+                        .saturating_add(1);
+                active.goal = EpisodeGoal::InterceptOrb;
+                active.phase = EpisodePhase::Prepare;
+                active.phase_elapsed_seconds = 0.0;
+                active.commitment_remaining = commitment_for(EpisodeGoal::InterceptOrb);
+                active.expected_outcome = ExpectedOutcome::ObjectMoves;
+                return EpisodeStep::Continue;
+            }
             if frame.pet_position.distance(orb.position) <= 0.048
                 && orb.lifecycle != ObjectLifecycle::GrabbedByUser
             {
@@ -883,6 +910,90 @@ fn drive_episode(
             }
             if active.elapsed_seconds >= 4.5 || active.attempts >= 3 {
                 return EpisodeStep::Complete;
+            }
+        }
+        EpisodeGoal::InterceptOrb => {
+            let Some(orb) = active
+                .object_id
+                .and_then(|id| state.objects.iter().find(|object| object.id == id))
+            else {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            };
+            let orb_id = orb.id;
+            let orb_position = orb.position;
+            let orb_velocity = orb.velocity;
+            let catch_distance = frame.pet_position.distance(orb_position);
+            output.body_intent.gaze_target = Some(orb_position);
+            output.body_intent.pose = PoseIntent::Playful;
+            output.body_intent.locomotion = LocomotionMode::Seek;
+            output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.72);
+            match active.phase {
+                EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.12 => {
+                    set_phase(active, EpisodePhase::Prepare);
+                }
+                EpisodePhase::Prepare => {
+                    let lead_seconds =
+                        (0.10 + active.prediction_confidence * 0.20).clamp(0.10, 0.30);
+                    active.target_position = Some(
+                        (orb_position + orb_velocity * lead_seconds)
+                            .clamp(Vec2::splat(0.025), Vec2::splat(0.975)),
+                    );
+                    set_phase(active, EpisodePhase::Execute);
+                }
+                EpisodePhase::Execute => {
+                    let target = active.target_position.unwrap_or(orb_position);
+                    output.body_intent.target_position = target;
+                    if catch_distance <= 0.060 {
+                        push_command(
+                            output,
+                            ObjectCommand::ApplyImpulse {
+                                object_id: orb_id,
+                                impulse: frame.pet_velocity * 0.035 - orb_velocity * 0.020,
+                            },
+                        );
+                        push_outcome(output, EcologyOutcome::ObjectContact(orb_id));
+                        if let Some(orb) =
+                            state.objects.iter_mut().find(|object| object.id == orb_id)
+                        {
+                            orb.familiarity = (orb.familiarity + 0.018).clamp(0.0, 1.0);
+                            orb.preference = (orb.preference + 0.006).clamp(-1.0, 1.0);
+                        }
+                        output.body_intent.pose = PoseIntent::Display;
+                        output.vocal_trigger = Some(EcologyVocalTrigger::CatchSuccess);
+                        return EpisodeStep::Complete;
+                    }
+                    if frame.pet_position.distance(target) <= 0.048
+                        || active.phase_elapsed_seconds >= 1.15
+                    {
+                        active.attempts = active.attempts.saturating_add(1);
+                        active.prediction_confidence =
+                            (active.prediction_confidence + 0.14).clamp(0.0, 0.92);
+                        output.vocal_trigger = Some(EcologyVocalTrigger::MissAndRetry);
+                        set_phase(active, EpisodePhase::Retry);
+                    }
+                }
+                EpisodePhase::Retry if active.phase_elapsed_seconds >= 0.28 => {
+                    if active.attempts < 2 && orb_velocity.length() >= 0.08 {
+                        set_phase(active, EpisodePhase::Prepare);
+                    } else {
+                        active.goal = EpisodeGoal::RetrieveOrb;
+                        active.phase = EpisodePhase::Approach;
+                        active.phase_elapsed_seconds = 0.0;
+                        active.reason_code = EpisodeReason::UserEngaged;
+                        active.commitment_remaining = commitment_for(EpisodeGoal::RetrieveOrb);
+                    }
+                }
+                _ => {
+                    output.body_intent.target_position =
+                        active.target_position.unwrap_or(orb_position);
+                }
+            }
+            if active.elapsed_seconds >= 5.0 {
+                active.goal = EpisodeGoal::RetrieveOrb;
+                active.phase = EpisodePhase::Approach;
+                active.phase_elapsed_seconds = 0.0;
+                active.reason_code = EpisodeReason::TimedOut;
+                active.commitment_remaining = commitment_for(EpisodeGoal::RetrieveOrb);
             }
         }
         EpisodeGoal::CarryOrbHome => {
@@ -971,7 +1082,7 @@ fn drive_episode(
                         set_phase(active, EpisodePhase::Manipulate);
                     } else if frame.user_activity > 0.02 {
                         set_phase(active, EpisodePhase::AskForHelp);
-                        output.vocal_trigger = Some(EcologyVocalTrigger::Help);
+                        output.vocal_trigger = Some(EcologyVocalTrigger::NeedHelp);
                     }
                 }
                 EpisodePhase::AskForHelp => {
@@ -1308,9 +1419,6 @@ fn drive_episode(
                 .body_intent
                 .desired_speed
                 .max((0.24 + skill.competence * 0.24).clamp(0.24, 0.48));
-            if active.elapsed_seconds <= dt * 1.5 {
-                output.vocal_trigger = Some(EcologyVocalTrigger::SkillAttempt);
-            }
             if progress >= 1.0 && frame.pet_position.distance(target) <= 0.055 {
                 let error = ((frame.pet_position.distance(target) / 0.11) * 0.72
                     + (1.0 - skill.competence) * 0.28)
@@ -1324,7 +1432,7 @@ fn drive_episode(
                 }
                 push_outcome(output, EcologyOutcome::SkillMotorError { skill_id, error });
                 if error <= 0.30 {
-                    output.vocal_trigger = Some(EcologyVocalTrigger::SkillSuccess);
+                    output.vocal_trigger = Some(EcologyVocalTrigger::SkillMastered);
                 }
                 return EpisodeStep::Complete;
             }
@@ -1390,7 +1498,7 @@ fn set_phase(active: &mut ActivityEpisode, phase: EpisodePhase) {
 fn commitment_for(goal: EpisodeGoal) -> f32 {
     match goal {
         EpisodeGoal::OfferOrb => 6.5,
-        EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay => 4.8,
+        EpisodeGoal::ChaseOrb | EpisodeGoal::InterceptOrb | EpisodeGoal::SoloOrbPlay => 4.8,
         EpisodeGoal::CarryOrbHome | EpisodeGoal::RetrieveOrb => 8.0,
         EpisodeGoal::ReturnHome | EpisodeGoal::SleepInDen => 8.0,
         EpisodeGoal::EscapePressure => 3.0,
@@ -1601,6 +1709,7 @@ mod tests {
             }),
             tick: 0,
             visual_episode_cooldown: 0.0,
+            orb_bid_cooldown: 0.0,
         };
         let mut frame = behavior_frame(ActionId::BringProceduralOrb);
         frame.pet_position = state.den.anchor;
@@ -1609,6 +1718,42 @@ mod tests {
             .iter()
             .any(|command| matches!(command, ObjectCommand::Store { object_id, .. } if *object_id == orb_id)));
         assert!(director.active_episode().is_none());
+
+        let next = director.tick(
+            &mut state,
+            behavior_frame(ActionId::BringProceduralOrb),
+            representative_intent(),
+            0.05,
+        );
+        assert_eq!(next.debug.active_goal, None);
+        assert_eq!(next.debug.selected_reason, EpisodeReason::NoEligibleEpisode);
+    }
+
+    #[test]
+    fn moving_throw_enters_intercept_and_emits_one_grounded_retry() {
+        let mut state = EcologyState::new(931);
+        state.objects[0].position = Vec2::new(0.82, 0.22);
+        state.objects[0].velocity = Vec2::new(0.78, 0.12);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::PlayCursorChase);
+        frame.pet_position = Vec2::new(0.12, 0.82);
+        let first = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(first.debug.active_goal, Some(EpisodeGoal::InterceptOrb));
+        let mut retry_seen = false;
+        for step in 0..8 {
+            frame.timestamp += 0.25;
+            let output = director.tick(&mut state, frame, representative_intent(), 0.25);
+            retry_seen |= output.vocal_trigger == Some(EcologyVocalTrigger::MissAndRetry);
+            if retry_seen {
+                break;
+            }
+            assert!(step < 7, "intercept never evaluated its miss");
+        }
+        assert!(retry_seen);
+        assert_eq!(
+            state.episode_stats.started[EpisodeGoal::InterceptOrb.index()],
+            1
+        );
     }
 
     #[test]
@@ -1674,7 +1819,7 @@ mod tests {
         let mut help_seen = false;
         for _ in 0..16 {
             let output = director.tick(&mut state, frame, representative_intent(), 0.20);
-            help_seen |= output.vocal_trigger == Some(EcologyVocalTrigger::Help);
+            help_seen |= output.vocal_trigger == Some(EcologyVocalTrigger::NeedHelp);
             if output.debug.active_phase == Some(EpisodePhase::AskForHelp) {
                 break;
             }
@@ -1702,7 +1847,7 @@ mod tests {
         let mut director = EpisodeDirector::default();
         let output = director.tick(&mut state, frame, representative_intent(), 0.20);
         assert_eq!(output.debug.active_goal, Some(EpisodeGoal::ReturnHome));
-        assert_ne!(output.vocal_trigger, Some(EcologyVocalTrigger::Help));
+        assert_ne!(output.vocal_trigger, Some(EcologyVocalTrigger::NeedHelp));
     }
 
     #[test]
