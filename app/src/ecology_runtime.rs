@@ -164,6 +164,23 @@ impl EcologyRuntime {
                         object.velocity = Vec2::ZERO;
                     }
                 }
+                ObjectCommand::Retrieve { object_id, target } => {
+                    for slot in &mut self.state.den.slots {
+                        if *slot == Some(object_id) {
+                            *slot = None;
+                        }
+                    }
+                    if let Some(object) = self
+                        .state
+                        .objects
+                        .iter_mut()
+                        .find(|object| object.id == object_id)
+                    {
+                        object.lifecycle = ObjectLifecycle::Free;
+                        object.position = target.clamp(Vec2::ZERO, Vec2::ONE);
+                        object.velocity = Vec2::ZERO;
+                    }
+                }
                 ObjectCommand::Consume { object_id } => {
                     if let Some(object) =
                         self.state.objects.iter_mut().find(|object| {
@@ -358,6 +375,50 @@ mod tests {
         );
         assert!(!runtime.is_dragging_object());
         assert!(runtime.state.objects[0].velocity.length() <= MAX_OBJECT_SPEED + 1.0e-5);
+        runtime.state.validate().unwrap();
+    }
+
+    #[test]
+    fn retrieve_episode_clears_den_slot_without_losing_orb() {
+        use lifecore::{ExpressionState, LocomotionMode, PoseIntent};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 74, true).unwrap();
+        let orb_id = runtime.state.objects[0].id;
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
+        runtime.state.objects[0].position = runtime.state.den.anchor;
+        runtime.state.den.slots[0] = Some(orb_id);
+        let sensors = SensorFrame {
+            cursor_position: Vec2::new(0.5, 0.4),
+            ..SensorFrame::default()
+        };
+        let body = BodyFeedback {
+            world_position: runtime.state.den.anchor,
+            ..BodyFeedback::default()
+        };
+        let intent = BodyIntent {
+            locomotion: LocomotionMode::Hover,
+            target_position: body.world_position,
+            target_surface: None,
+            desired_speed: 0.0,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Neutral,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+        let _ = runtime.resolve_intent(
+            intent,
+            ActionId::BringProceduralOrb,
+            &sensors,
+            &body,
+            false,
+            0.05,
+        );
+        assert_eq!(runtime.state.den.slots, [None; 3]);
+        assert_eq!(runtime.state.objects.len(), 1);
+        assert_eq!(runtime.state.objects[0].lifecycle, ObjectLifecycle::Free);
         runtime.state.validate().unwrap();
     }
 }

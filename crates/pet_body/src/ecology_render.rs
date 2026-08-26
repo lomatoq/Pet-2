@@ -127,14 +127,17 @@ impl EcologyRenderer {
         count += 1;
 
         for object in &state.objects {
-            if count >= MAX_ECOLOGY_INSTANCES
-                || object.lifecycle == ObjectLifecycle::Consumed
-                || object.lifecycle == ObjectLifecycle::StoredInDen
-            {
+            if count >= MAX_ECOLOGY_INSTANCES || object.lifecycle == ObjectLifecycle::Consumed {
                 continue;
             }
-            let radius_y =
-                object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * 2.0;
+            let stored_scale = if object.lifecycle == ObjectLifecycle::StoredInDen {
+                0.62
+            } else {
+                1.0
+            };
+            let radius_y = object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX
+                * 2.0
+                * stored_scale;
             let rgb = hsv_to_rgb(object.hue, object.saturation, object.value);
             instances[count] = EcologyInstance {
                 center_radius: [
@@ -143,7 +146,16 @@ impl EcologyRenderer {
                     radius_y / aspect,
                     radius_y,
                 ],
-                color: [rgb.x, rgb.y, rgb.z, 0.96],
+                color: [
+                    rgb.x,
+                    rgb.y,
+                    rgb.z,
+                    if object.lifecycle == ObjectLifecycle::StoredInDen {
+                        0.74
+                    } else {
+                        0.96
+                    },
+                ],
                 material: [
                     if object.kind == ObjectKind::Orb {
                         0.0

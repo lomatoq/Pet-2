@@ -166,6 +166,10 @@ pub enum ObjectCommand {
         object_id: ObjectId,
         slot: u8,
     },
+    Retrieve {
+        object_id: ObjectId,
+        target: Vec2,
+    },
     Consume {
         object_id: ObjectId,
     },
@@ -433,7 +437,11 @@ fn select_episode(
     }
     match frame.selected_action {
         ActionId::BringProceduralOrb => Some((
-            EpisodeGoal::OfferOrb,
+            if orb.lifecycle == ObjectLifecycle::StoredInDen {
+                EpisodeGoal::RetrieveOrb
+            } else {
+                EpisodeGoal::OfferOrb
+            },
             EpisodeReason::BrainRequestedOrb,
             Some(orb.id),
         )),
@@ -519,7 +527,7 @@ fn fill_candidate_trace(
 }
 
 fn drive_episode(
-    state: &EcologyState,
+    state: &mut EcologyState,
     frame: EcologyBehaviorFrame,
     active: &mut ActivityEpisode,
     output: &mut EcologyOutput,
@@ -545,8 +553,20 @@ fn drive_episode(
             } else {
                 PoseIntent::Neutral
             };
-            if frame.pet_position.distance(state.den.anchor) <= 0.035 {
+            if active.goal == EpisodeGoal::ReturnHome
+                && frame.pet_position.distance(state.den.anchor) <= 0.035
+            {
+                state.den.visits = state.den.visits.saturating_add(1);
+                state.den.familiarity = (state.den.familiarity + 0.006).clamp(0.0, 1.0);
                 return EpisodeStep::Complete;
+            }
+            if active.goal == EpisodeGoal::SleepInDen
+                && frame.pet_position.distance(state.den.anchor) <= 0.04
+            {
+                state.den.comfort_value = (state.den.comfort_value + dt * 0.002).clamp(0.0, 1.0);
+                if !frame.sleeping && active.elapsed_seconds > 0.5 {
+                    return EpisodeStep::Complete;
+                }
             }
         }
         EpisodeGoal::OfferOrb => {
@@ -574,7 +594,14 @@ fn drive_episode(
                     output.vocal_trigger = Some(EcologyVocalTrigger::Offer);
                 }
                 EpisodePhase::WaitForUser if active.phase_elapsed_seconds >= 5.5 => {
-                    return EpisodeStep::Abort(EpisodeReason::TimedOut);
+                    state.episode_stats.started[EpisodeGoal::CarryOrbHome.index()] =
+                        state.episode_stats.started[EpisodeGoal::CarryOrbHome.index()]
+                            .saturating_add(1);
+                    active.goal = EpisodeGoal::CarryOrbHome;
+                    active.phase = EpisodePhase::ReturnHome;
+                    active.phase_elapsed_seconds = 0.0;
+                    active.commitment_remaining = commitment_for(EpisodeGoal::CarryOrbHome);
+                    active.reason_code = EpisodeReason::TimedOut;
                 }
                 _ => {}
             }
@@ -641,6 +668,64 @@ fn drive_episode(
                 return EpisodeStep::Complete;
             }
         }
+        EpisodeGoal::CarryOrbHome => {
+            let Some(orb_id) = active.object_id else {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            };
+            output.body_intent.target_position = state.den.anchor;
+            output.body_intent.gaze_target = Some(state.den.anchor);
+            output.body_intent.locomotion = LocomotionMode::Arrive;
+            output.body_intent.pose = PoseIntent::Compact;
+            output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.38);
+            push_command(
+                output,
+                ObjectCommand::MoveToward {
+                    object_id: orb_id,
+                    target: frame.pet_position,
+                    speed: 4.0,
+                },
+            );
+            if frame.pet_position.distance(state.den.anchor) <= 0.04 {
+                let slot = state
+                    .den
+                    .slots
+                    .iter()
+                    .position(Option::is_none)
+                    .unwrap_or(0) as u8;
+                push_command(
+                    output,
+                    ObjectCommand::Store {
+                        object_id: orb_id,
+                        slot,
+                    },
+                );
+                state.den.visits = state.den.visits.saturating_add(1);
+                state.den.familiarity = (state.den.familiarity + 0.012).clamp(0.0, 1.0);
+                return EpisodeStep::Complete;
+            }
+        }
+        EpisodeGoal::RetrieveOrb => {
+            let Some(orb_id) = active.object_id else {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            };
+            output.body_intent.target_position = state.den.anchor;
+            output.body_intent.gaze_target = Some(state.den.anchor);
+            output.body_intent.locomotion = LocomotionMode::Arrive;
+            output.body_intent.pose = PoseIntent::Curious;
+            output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.34);
+            if frame.pet_position.distance(state.den.anchor) <= 0.045 {
+                let direction = (frame.cursor_position - state.den.anchor).normalize_or_zero();
+                let target = (state.den.anchor + direction * 0.055).clamp(Vec2::ZERO, Vec2::ONE);
+                push_command(
+                    output,
+                    ObjectCommand::Retrieve {
+                        object_id: orb_id,
+                        target,
+                    },
+                );
+                return EpisodeStep::Complete;
+            }
+        }
         _ => return EpisodeStep::Abort(EpisodeReason::SafetyAbort),
     }
     active.commitment_remaining = active.commitment_remaining.max(dt);
@@ -656,6 +741,7 @@ fn commitment_for(goal: EpisodeGoal) -> f32 {
     match goal {
         EpisodeGoal::OfferOrb => 6.5,
         EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay => 4.8,
+        EpisodeGoal::CarryOrbHome | EpisodeGoal::RetrieveOrb => 8.0,
         EpisodeGoal::ReturnHome | EpisodeGoal::SleepInDen => 8.0,
         _ => 3.0,
     }
@@ -665,7 +751,10 @@ fn expected_outcome_for(goal: EpisodeGoal) -> ExpectedOutcome {
     match goal {
         EpisodeGoal::OfferOrb => ExpectedOutcome::UserTouchesObject,
         EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay => ExpectedOutcome::ObjectMoves,
-        EpisodeGoal::ReturnHome | EpisodeGoal::SleepInDen => ExpectedOutcome::ObjectReturnsHome,
+        EpisodeGoal::ReturnHome | EpisodeGoal::SleepInDen | EpisodeGoal::CarryOrbHome => {
+            ExpectedOutcome::ObjectReturnsHome
+        }
+        EpisodeGoal::RetrieveOrb => ExpectedOutcome::ObjectMoves,
         _ => ExpectedOutcome::None,
     }
 }
@@ -793,5 +882,52 @@ mod tests {
             state.episode_stats.aborted[EpisodeGoal::SoloOrbPlay.index()],
             1
         );
+    }
+
+    #[test]
+    fn carried_orb_is_stored_when_pet_reaches_den() {
+        let mut state = EcologyState::new(93);
+        let orb_id = state.objects[0].id;
+        let mut director = EpisodeDirector {
+            active: Some(ActivityEpisode {
+                id: 1,
+                goal: EpisodeGoal::CarryOrbHome,
+                phase: EpisodePhase::ReturnHome,
+                object_id: Some(orb_id),
+                target_position: Some(state.den.anchor),
+                reason_code: EpisodeReason::TimedOut,
+                elapsed_seconds: 1.0,
+                phase_elapsed_seconds: 1.0,
+                commitment_remaining: 3.0,
+                attempts: 0,
+                prediction_confidence: 0.5,
+                expected_outcome: ExpectedOutcome::ObjectReturnsHome,
+            }),
+            tick: 0,
+        };
+        let mut frame = behavior_frame(ActionId::BringProceduralOrb);
+        frame.pet_position = state.den.anchor;
+        let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert!(output.object_commands[..output.object_command_count]
+            .iter()
+            .any(|command| matches!(command, ObjectCommand::Store { object_id, .. } if *object_id == orb_id)));
+        assert!(director.active_episode().is_none());
+    }
+
+    #[test]
+    fn stored_orb_selects_retrieve_instead_of_offer() {
+        let mut state = EcologyState::new(94);
+        let orb_id = state.objects[0].id;
+        state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
+        state.objects[0].position = state.den.anchor;
+        state.den.slots[0] = Some(orb_id);
+        let mut frame = behavior_frame(ActionId::BringProceduralOrb);
+        frame.pet_position = state.den.anchor;
+        let mut director = EpisodeDirector::default();
+        let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert!(output.object_commands[..output.object_command_count]
+            .iter()
+            .any(|command| matches!(command, ObjectCommand::Retrieve { object_id, .. } if *object_id == orb_id)));
+        assert_eq!(output.debug.active_goal, Some(EpisodeGoal::RetrieveOrb));
     }
 }
