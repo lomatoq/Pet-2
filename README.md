@@ -5,10 +5,11 @@ simulation with thin Windows and macOS host adapters. The pet body and voice are
 generated from its genome at runtime; no model, texture, or recorded-audio assets
 are required.
 
-> Status: v0.1 vertical slice. The repository implements the portable LifeCore,
-> procedural body and voice, native overlay/sensor adapters, versioned persistence,
-> headless simulation, packaging, and Windows/macOS CI. Interactive macOS behavior
-> still needs hands-on validation on Apple Silicon hardware.
+> Status: v0.1 living-desktop habitat slice. The repository implements the portable
+> LifeCore, procedural body and voice, a persistent object ecology, multi-step
+> behavior episodes, native overlay/sensor adapters, versioned persistence,
+> deterministic Habitat Lab, packaging, and Windows/macOS CI. Interactive macOS
+> behavior still needs hands-on validation on Apple Silicon hardware.
 
 ## Supported targets
 
@@ -25,6 +26,7 @@ are required.
 cargo run -p pet2 -- --headless-smoke 10 --seed 42 --reset-pet --no-audio --data-dir target/smoke-state
 cargo test --workspace
 cargo run -p pet2
+cargo run -p habitat_lab -- --scenario habitat_story_v1 --ticks 1600 --trace target/habitat.json --screenshot target/habitat.svg
 ```
 
 The desktop runtime creates a small transparent always-on-top window, initializes
@@ -54,8 +56,11 @@ adapter identifiers, and absolute data paths are never serialized.
 crates/lifecore      deterministic state and snapshot contract
 crates/pet_body      procedural mesh, hit shape, and wgpu renderer
 crates/pet_audio     procedural voice and device-independent offline synthesis
+crates/pet_ecology   portable objects, den, metabolism, skills, physics, and episodes
+crates/pet_perception reduced window, gesture, rhythm, and 16x9 visual affordances
 crates/desktop_host  platform contract, sensors, coordinates, overlay, storage
 app                  desktop runtime and state import/export CLI
+tools/habitat_lab    deterministic ecology scenario runner and SVG/JSON evidence
 ```
 
 Build and package entry points live in `scripts/`. CI runs formatting, Clippy,
@@ -75,7 +80,7 @@ bash ./scripts/package_macos.sh
 The checked-in ICO and ICNS packaging assets are reproducible with
 `scripts/generate_icons.ps1`; they are not loaded by the organism at runtime.
 
-## LifeCore and interaction
+## Living habitat and interaction
 
 LifeCore runs at 20 Hz and combines eight homeostatic drives, continuous affect,
 a deterministic 64-neuron sparse CTRNN, bounded reward-modulated plasticity,
@@ -83,10 +88,20 @@ contextual action arbitration over 24 actions, episodic memory, attention budget
 sleep consolidation, habits, development, and bounded metamorphosis. Body physics
 runs at 120 Hz; rendering runs at 60 FPS while active and 15 FPS while sleeping.
 
-The overlay is click-through outside the projected procedural silhouette. These
-in-window debug controls never install global keyboard hooks:
+The habitat adds one canonical persistent orb, a den with storage, temporary
+edible light morsels, reduced spatial attention, window pressure/contact, and a
+bounded mimesis library. It persists separately in `ecology-state.json` with an
+atomic previous snapshot. It stores no pixels, typed text, audio, window titles,
+native handles, or OS object identifiers.
 
-- `Cmd/Win + Alt + F`: toggle focus mode.
+The overlay is click-through outside the projected procedural silhouette and
+interactive habitat objects. These in-window controls never install global
+keyboard hooks:
+
+- `Cmd/Win + Alt + F`: spawn one edible light morsel at the cursor.
+- `Cmd/Win + Alt + P`: toggle focus mode and route PET home.
+- `Cmd/Win + Alt + L`: cue shared attention at the cursor.
+- `Cmd/Win + Alt + T`: start/finish teaching a bounded pointer trajectory.
 - `Cmd/Win + Alt + M`: trigger bounded metamorphosis.
 - `Cmd/Win + Alt + B`: cycle Morphic, Fusion, Morph Shadow, Morph Fusion, and Classic brain modes.
 - `Cmd/Win + Alt + R`: apply positive debug reward.

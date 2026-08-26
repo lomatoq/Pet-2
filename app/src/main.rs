@@ -39,7 +39,9 @@ use pet_body::{
     EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile, ProceduralBody,
     RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
-use pet_ecology::{ActionSignature, EcologyVocalTrigger, EpisodeGoal, MorselProfile};
+use pet_ecology::{
+    ActionSignature, EcologyVocalTrigger, EpisodeGoal, EpisodePhase, MorselProfile, ObjectKind,
+};
 use pet_perception::{SpatialVisualCell, SpatialVisualFrame, VisualFeatureFrame};
 use vita_runtime::{BrainMode, VitaRuntime};
 use winit::{
@@ -1645,6 +1647,27 @@ impl PetApplication {
                 });
                 let ecology_visual = runtime.ecology.visual_context();
                 let saliency_target = runtime.vita.visual_attention_target();
+                let ecology_state = runtime.ecology.state();
+                let orb = ecology_state
+                    .objects
+                    .iter()
+                    .find(|object| object.kind == ObjectKind::Orb);
+                let ecology_environment = runtime.ecology.environment();
+                let ecology_contacts = ecology_environment.contacts[..ecology_environment
+                    .contact_count
+                    .min(ecology_environment.contacts.len())]
+                    .iter()
+                    .map(|contact| {
+                        serde_json::json!({
+                            "source": format!("{:?}", contact.source),
+                            "point": contact.point_world.to_array(),
+                            "normal": contact.normal_world.to_array(),
+                            "penetration_px": contact.penetration_px,
+                            "relative_velocity_px": contact.relative_velocity_px.to_array(),
+                            "intensity": contact.intensity,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 let liquid_debug = serde_json::json!({
                     "particles": liquid.particle_count,
                     "components": liquid.component_count,
@@ -1742,15 +1765,35 @@ impl PetApplication {
                     "scroll_velocity": runtime.vita.percept().scroll_velocity,
                     "window_pressure": runtime.vita.percept().window_pressure,
                     "ecology": {
+                        "ecology_schema": ecology_state.schema_version,
+                        "active_episode_id": active_ecology.map(|episode| episode.id),
                         "active_goal": ecology_debug.active_goal.map(|goal| format!("{goal:?}")),
                         "phase": ecology_debug.active_phase.map(|phase| format!("{phase:?}")),
                         "reason": format!("{:?}", ecology_debug.selected_reason),
+                        "phase_elapsed": active_ecology.map(|episode| episode.elapsed_seconds),
+                        "attempts": active_ecology.map(|episode| episode.attempts),
                         "candidate_scores": ecology_scores,
                         "escape_confidence": active_ecology
                             .filter(|episode| episode.goal == EpisodeGoal::EscapePressure)
                             .map(|episode| episode.prediction_confidence),
                         "help_requested": runtime.ecology.last_vocal_trigger()
-                            == Some(EcologyVocalTrigger::NeedHelp),
+                            == Some(EcologyVocalTrigger::NeedHelp)
+                            || active_ecology.is_some_and(|episode| {
+                                episode.goal == EpisodeGoal::RetrieveOrb
+                                    && episode.phase == EpisodePhase::AskForHelp
+                            }),
+                        "orb_state": orb.map(|object| format!("{:?}", object.lifecycle)),
+                        "orb_position": orb.map(|object| object.position.to_array()),
+                        "orb_velocity": orb.map(|object| object.velocity.to_array()),
+                        "orb_familiarity": orb.map(|object| object.familiarity),
+                        "orb_preference": orb.map(|object| object.preference),
+                        "den_anchor": ecology_state.den.anchor.to_array(),
+                        "den_slots": ecology_state.den.slots,
+                        "metabolic_reserve": ecology_state.metabolism.reserve,
+                        "satiation": ecology_state.metabolism.satiation,
+                        "active_food_effect": ecology_state.metabolism.active_effect,
+                        "window_pressure": ecology_environment.pressure,
+                        "external_contacts": ecology_contacts,
                         "saliency_target": saliency_target.map(|target| target.position.to_array()),
                         "chromatic_blend": ecology_visual.chromatic_blend,
                         "camouflage_blend": ecology_visual.camouflage_blend,

@@ -1055,8 +1055,40 @@ fn habitat_svg(lab: &Lab, arguments: &Arguments) -> String {
             minimum.y + size.y * 0.5 + window.velocity.y * 90.0,
         );
     }
+    let safe_gap = lab.orb().radius_px_at_reference * HEIGHT / 1_152.0;
+    let _ = writeln!(
+        svg,
+        r##"<rect x="{safe_gap:.1}" y="{safe_gap:.1}" width="{:.1}" height="{:.1}" fill="none" stroke="#9ca9c2" stroke-width="1" stroke-dasharray="5 9" opacity="0.45"/>"##,
+        WIDTH - safe_gap * 2.0,
+        HEIGHT - safe_gap * 2.0,
+    );
     svg.push_str(&trail_svg(&lab.object_trail, "#65ddff", WIDTH, HEIGHT));
     svg.push_str(&trail_svg(&lab.pet_trail, "#d6a8ff", WIDTH, HEIGHT));
+    svg.push_str(&trail_svg(&lab.execution_path, "#ffcf70", WIDTH, HEIGHT));
+    for contact in lab.contacts.iter().rev().take(12) {
+        let Some(point) = contact.get("point").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(normal) = contact.get("normal").and_then(Value::as_array) else {
+            continue;
+        };
+        let (Some(px), Some(py), Some(nx), Some(ny)) = (
+            point.first().and_then(Value::as_f64),
+            point.get(1).and_then(Value::as_f64),
+            normal.first().and_then(Value::as_f64),
+            normal.get(1).and_then(Value::as_f64),
+        ) else {
+            continue;
+        };
+        let x = px as f32 * WIDTH;
+        let y = py as f32 * HEIGHT;
+        let _ = writeln!(
+            svg,
+            r##"<line x1="{x:.1}" y1="{y:.1}" x2="{:.1}" y2="{:.1}" stroke="#ff8d70" stroke-width="3"/>"##,
+            x + nx as f32 * 34.0,
+            y + ny as f32 * 34.0,
+        );
+    }
     let den = lab.state.den.anchor * Vec2::new(WIDTH, HEIGHT);
     let _ = writeln!(
         svg,
@@ -1103,15 +1135,69 @@ fn habitat_svg(lab: &Lab, arguments: &Arguments) -> String {
     );
     let _ = writeln!(
         svg,
-        r##"<rect x="18" y="14" width="760" height="86" rx="12" fill="#090b11" opacity="0.82"/><text x="32" y="45" fill="#f4f7ff" font-family="Segoe UI, sans-serif" font-size="23">Habitat Lab · {} · {} ticks</text><text x="32" y="78" fill="#b9c5dc" font-family="Segoe UI, sans-serif" font-size="18">{} · contacts {} · outcomes {} · privacy reduced</text>"##,
+        r##"<rect x="18" y="14" width="760" height="112" rx="12" fill="#090b11" opacity="0.88"/><text x="32" y="45" fill="#f4f7ff" font-family="Segoe UI, sans-serif" font-size="23">Habitat Lab · {} · {} ticks</text><text x="32" y="78" fill="#b9c5dc" font-family="Segoe UI, sans-serif" font-size="18">{} · contacts {} · outcomes {}</text><text x="32" y="105" fill="#80d9b7" font-family="Segoe UI, sans-serif" font-size="15">privacy: 16x9 features · no pixels/text/audio/native ids</text>"##,
         arguments.scenario,
         arguments.ticks,
         active,
         lab.contacts.len(),
         lab.outcomes.len(),
     );
+    let mut scores = lab.last_scores.iter().collect::<Vec<_>>();
+    scores.sort_by(|left, right| {
+        let left = left.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let right = right.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        right.total_cmp(&left)
+    });
+    svg.push_str(
+        r##"<rect x="798" y="14" width="464" height="174" rx="12" fill="#090b11" opacity="0.88"/><text x="816" y="40" fill="#f4f7ff" font-family="Segoe UI, sans-serif" font-size="17">Decision evidence</text>"##,
+    );
+    for (index, score) in scores.into_iter().take(4).enumerate() {
+        let goal = score.get("goal").and_then(Value::as_str).unwrap_or("none");
+        let value = score.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let eligible = score
+            .get("eligible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let marker = if eligible { "●" } else { "○" };
+        let _ = writeln!(
+            svg,
+            r##"<text x="816" y="{}" fill="#b9c5dc" font-family="Segoe UI, sans-serif" font-size="14">{} {} · {:.3}</text>"##,
+            66 + index * 24,
+            marker,
+            svg_text(goal),
+            value,
+        );
+    }
+    let timeline = lab.transitions.iter().rev().take(3).collect::<Vec<_>>();
+    for (index, transition) in timeline.into_iter().rev().enumerate() {
+        let tick = transition.get("tick").and_then(Value::as_u64).unwrap_or(0);
+        let goal = transition
+            .get("goal")
+            .and_then(Value::as_str)
+            .unwrap_or("idle");
+        let phase = transition
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let _ = writeln!(
+            svg,
+            r##"<text x="1010" y="{}" fill="#8fa0be" font-family="Segoe UI, sans-serif" font-size="12">t{} {} / {}</text>"##,
+            66 + index * 24,
+            tick,
+            svg_text(goal),
+            svg_text(phase),
+        );
+    }
     svg.push_str("</svg>\n");
     svg
+}
+
+fn svg_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn trail_svg(points: &[Vec2], color: &str, width: f32, height: f32) -> String {
