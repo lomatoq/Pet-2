@@ -274,13 +274,22 @@ pub fn resolve_object_body_contact(
     if distance >= combined_radius {
         return false;
     }
-    let normal = if distance > 1.0e-6 {
+    let preferred_normal = if distance > 1.0e-6 {
         delta / distance
     } else {
         Vec2::X
     };
     let penetration = combined_radius - distance;
-    object_height_space = body_height_space + normal * (combined_radius + 1.0e-5);
+    let minimum = Vec2::splat(object_radius);
+    let maximum = Vec2::new(aspect - object_radius, 1.0 - object_radius);
+    let (resolved_position, normal) = feasible_body_contact_position(
+        body_height_space,
+        preferred_normal,
+        combined_radius + 1.0e-5,
+        minimum,
+        maximum,
+    );
+    object_height_space = resolved_position;
     let body_velocity_height_space = Vec2::new(body_velocity.x * aspect, body_velocity.y);
     let relative_velocity = object.velocity - body_velocity_height_space;
     let incoming = relative_velocity.dot(normal);
@@ -305,6 +314,63 @@ pub fn resolve_object_body_contact(
         intensity: (relative_velocity.length() * 0.45 + penetration * 12.0).clamp(0.0, 1.0),
     });
     true
+}
+
+/// Resolve a circle around the body without ever placing the object's center
+/// outside its radius-aware desktop bounds. Near a desktop edge the preferred
+/// contact normal may be impossible (for example, an orb caught above a pet at
+/// the top edge). In that case choose the closest deterministic feasible escape
+/// direction so the two contact solvers cannot pin the orb to the border.
+fn feasible_body_contact_position(
+    body_position: Vec2,
+    preferred_normal: Vec2,
+    separation: f32,
+    minimum: Vec2,
+    maximum: Vec2,
+) -> (Vec2, Vec2) {
+    let preferred_normal = preferred_normal.normalize_or_zero();
+    let preferred_normal = if preferred_normal == Vec2::ZERO {
+        Vec2::X
+    } else {
+        preferred_normal
+    };
+    let direct = body_position + preferred_normal * separation;
+    if direct.cmpge(minimum).all() && direct.cmple(maximum).all() {
+        return (direct, preferred_normal);
+    }
+
+    let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+    let directions = [
+        Vec2::X,
+        Vec2::Y,
+        Vec2::NEG_X,
+        Vec2::NEG_Y,
+        Vec2::new(diagonal, diagonal),
+        Vec2::new(-diagonal, diagonal),
+        Vec2::new(diagonal, -diagonal),
+        Vec2::new(-diagonal, -diagonal),
+    ];
+    let toward_center = ((minimum + maximum) * 0.5 - body_position).normalize_or_zero();
+    let mut best = None;
+    for direction in directions {
+        let candidate = body_position + direction * separation;
+        if !candidate.cmpge(minimum).all() || !candidate.cmple(maximum).all() {
+            continue;
+        }
+        let score = direction.dot(preferred_normal) * 2.0 + direction.dot(toward_center) * 0.35;
+        if best.is_none_or(|(_, _, best_score)| score > best_score) {
+            best = Some((candidate, direction, score));
+        }
+    }
+    if let Some((position, normal, _)) = best {
+        (position, normal)
+    } else {
+        let position = direct.clamp(minimum, maximum);
+        let normal = (position - body_position)
+            .try_normalize()
+            .unwrap_or(preferred_normal);
+        (position, normal)
+    }
 }
 
 fn point_in_rect(point: Vec2, minimum: Vec2, maximum: Vec2) -> bool {
@@ -501,6 +567,51 @@ mod tests {
         assert!(orb.position.is_finite());
         assert!(orb.velocity.x > 0.0);
         assert!(orb.velocity.length() <= MAX_OBJECT_SPEED + 1.0e-5);
+    }
+
+    #[test]
+    fn pet_contact_cannot_pin_orb_center_to_desktop_edge() {
+        let den = crate::DenState::for_seed(13);
+        let mut orb = WorldObject::canonical_orb(13, den.anchor);
+        let config = ObjectPhysicsConfig::default();
+        let object_radius = orb.radius_px_at_reference / config.reference_height_px;
+        let body_radius = config.pet_radius_px_at_reference / config.reference_height_px;
+        let body_position = Vec2::new(0.5, 0.01);
+        orb.position = Vec2::new(0.5, 0.0);
+        orb.velocity = Vec2::ZERO;
+        let mut environment = EmbodiedEnvironmentFrame::default();
+
+        assert!(resolve_object_body_contact(
+            &mut orb,
+            body_position,
+            Vec2::ZERO,
+            config,
+            &mut environment,
+        ));
+
+        let aspect = config.desktop_aspect;
+        let orb_height_space = Vec2::new(orb.position.x * aspect, orb.position.y);
+        let body_height_space = Vec2::new(body_position.x * aspect, body_position.y);
+        assert!(orb.position.y >= object_radius);
+        assert!(orb.position.y <= 1.0 - object_radius);
+        assert!(
+            orb_height_space.distance(body_height_space) >= object_radius + body_radius - 1.0e-5
+        );
+        assert!(orb.position.y > object_radius + 0.01);
+
+        for _ in 0..240 {
+            step_object(&mut orb, config, 1.0 / 120.0);
+            let _ = resolve_object_body_contact(
+                &mut orb,
+                body_position,
+                Vec2::ZERO,
+                config,
+                &mut environment,
+            );
+        }
+        assert!(orb.position.y > object_radius + 0.01);
+        assert!(orb.position.is_finite());
+        assert!(orb.velocity.is_finite());
     }
 
     #[test]

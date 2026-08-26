@@ -674,4 +674,28 @@ mod tests {
         assert_eq!(runtime.state.objects[0].lifecycle, ObjectLifecycle::Free);
         runtime.state.validate().unwrap();
     }
+
+    #[test]
+    fn fixed_update_releases_orb_pinned_between_pet_and_top_edge() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 75, true).unwrap();
+        runtime.state.objects[0].position = Vec2::new(0.5, 0.0);
+        runtime.state.objects[0].velocity = Vec2::ZERO;
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::Free;
+        let body = BodyFeedback {
+            world_position: Vec2::new(0.5, 0.01),
+            ..BodyFeedback::default()
+        };
+        let windows = WindowAffordanceFrame::default();
+
+        for _ in 0..240 {
+            runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+        }
+
+        let radius = runtime.state.objects[0].radius_px_at_reference
+            / ObjectPhysicsConfig::default().reference_height_px;
+        assert!(runtime.state.objects[0].position.y > radius + 0.01);
+        runtime.state.validate().unwrap();
+    }
 }
