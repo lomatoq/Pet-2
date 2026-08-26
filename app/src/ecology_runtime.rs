@@ -344,6 +344,7 @@ impl EcologyRuntime {
             match command {
                 ObjectCommand::None => {}
                 ObjectCommand::ApplyImpulse { object_id, impulse } => {
+                    self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
                         .objects
@@ -363,6 +364,7 @@ impl EcologyRuntime {
                     target,
                     speed,
                 } => {
+                    self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
                         .objects
@@ -386,6 +388,7 @@ impl EcologyRuntime {
                     object_id,
                     velocity,
                 } => {
+                    self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
                         .objects
@@ -402,25 +405,24 @@ impl EcologyRuntime {
                     }
                 }
                 ObjectCommand::Store { object_id, slot } if usize::from(slot) < 3 => {
-                    self.state.den.slots[usize::from(slot)] = Some(object_id);
-                    if let Some(object) = self
+                    let Some(object_index) = self
                         .state
                         .objects
-                        .iter_mut()
-                        .find(|object| object.id == object_id)
-                    {
-                        object.lifecycle = ObjectLifecycle::StoredInDen;
-                        object.home_slot = Some(slot);
-                        object.position = self.state.den.anchor;
-                        object.velocity = Vec2::ZERO;
-                    }
+                        .iter()
+                        .position(|object| object.id == object_id)
+                    else {
+                        continue;
+                    };
+                    self.clear_den_slot_references(object_id);
+                    self.state.den.slots[usize::from(slot)] = Some(object_id);
+                    let object = &mut self.state.objects[object_index];
+                    object.lifecycle = ObjectLifecycle::StoredInDen;
+                    object.home_slot = Some(slot);
+                    object.position = self.state.den.anchor;
+                    object.velocity = Vec2::ZERO;
                 }
                 ObjectCommand::Retrieve { object_id, target } => {
-                    for slot in &mut self.state.den.slots {
-                        if *slot == Some(object_id) {
-                            *slot = None;
-                        }
-                    }
+                    self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
                         .objects
@@ -445,6 +447,14 @@ impl EcologyRuntime {
                     }
                 }
                 ObjectCommand::Store { .. } => {}
+            }
+        }
+    }
+
+    fn clear_den_slot_references(&mut self, object_id: ObjectId) {
+        for slot in &mut self.state.den.slots {
+            if *slot == Some(object_id) {
+                *slot = None;
             }
         }
     }
@@ -672,6 +682,85 @@ mod tests {
         assert_eq!(runtime.state.den.slots, [None; 3]);
         assert_eq!(runtime.state.objects.len(), 1);
         assert_eq!(runtime.state.objects[0].lifecycle, ObjectLifecycle::Free);
+        runtime.state.validate().unwrap();
+    }
+
+    #[test]
+    fn object_commands_cannot_leave_stale_or_duplicate_den_slots() {
+        use lifecore::{ExpressionState, LocomotionMode, PoseIntent};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 76, true).unwrap();
+        let orb_id = runtime.state.objects[0].id;
+        let intent = BodyIntent {
+            locomotion: LocomotionMode::Hover,
+            target_position: Vec2::splat(0.5),
+            target_surface: None,
+            desired_speed: 0.0,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Neutral,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+
+        let apply = |runtime: &mut EcologyRuntime, command| {
+            let mut output = runtime.director.tick_passthrough(intent.clone(), false);
+            output.object_commands[0] = command;
+            output.object_command_count = 1;
+            runtime.apply_object_commands(&output, 0.05);
+        };
+        let restore_stored = |runtime: &mut EcologyRuntime| {
+            runtime.state.den.slots = [Some(orb_id), None, None];
+            runtime.state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
+            runtime.state.objects[0].position = runtime.state.den.anchor;
+            runtime.state.objects[0].velocity = Vec2::ZERO;
+        };
+
+        restore_stored(&mut runtime);
+        apply(
+            &mut runtime,
+            ObjectCommand::ApplyImpulse {
+                object_id: orb_id,
+                impulse: Vec2::X * 0.04,
+            },
+        );
+        assert_eq!(runtime.state.den.slots, [None; 3]);
+        runtime.state.validate().unwrap();
+
+        restore_stored(&mut runtime);
+        apply(
+            &mut runtime,
+            ObjectCommand::MoveToward {
+                object_id: orb_id,
+                target: Vec2::splat(0.6),
+                speed: 2.0,
+            },
+        );
+        assert_eq!(runtime.state.den.slots, [None; 3]);
+        runtime.state.validate().unwrap();
+
+        restore_stored(&mut runtime);
+        apply(
+            &mut runtime,
+            ObjectCommand::Release {
+                object_id: orb_id,
+                velocity: Vec2::Y * 0.05,
+            },
+        );
+        assert_eq!(runtime.state.den.slots, [None; 3]);
+        runtime.state.validate().unwrap();
+
+        restore_stored(&mut runtime);
+        apply(
+            &mut runtime,
+            ObjectCommand::Store {
+                object_id: orb_id,
+                slot: 2,
+            },
+        );
+        assert_eq!(runtime.state.den.slots, [None, None, Some(orb_id)]);
         runtime.state.validate().unwrap();
     }
 
