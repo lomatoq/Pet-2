@@ -1658,6 +1658,7 @@ dependencies = [
  "lifecore",
  "naga",
  "pet_audio",
+ "pet_ecology",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

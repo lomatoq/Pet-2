@@ -10,6 +10,7 @@ bytemuck.workspace = true
 glam.workspace = true
 lifecore = { path = "../lifecore" }
 pet_audio = { path = "../pet_audio" }
+pet_ecology = { path = "../pet_ecology" }
 serde.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true

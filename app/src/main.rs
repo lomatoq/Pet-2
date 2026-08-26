@@ -36,8 +36,8 @@ use lifecore::{
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
 use pet_audio::{AudioCallbackLevels, AudioEngine, AudioVisualFeedback, SelectedOutputConfig};
 use pet_body::{
-    LiquidTuningAcknowledgement, LiquidTuningProfile, ProceduralBody, RenderOutcome, Renderer,
-    VisualMindInput, VoiceVisualState,
+    EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile, ProceduralBody,
+    RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
 use vita_runtime::{BrainMode, VitaRuntime};
 use winit::{
@@ -883,7 +883,14 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         );
         output.body_intent = resolved_intent;
         output.body_intent = ecology
-            .resolve_intent(output.body_intent, life.state.focus_mode)
+            .resolve_intent(
+                output.body_intent,
+                output.selected_action,
+                &sensors,
+                &feedback,
+                life.state.focus_mode,
+                dt,
+            )
             .body_intent;
         let visual_mind = visual_mind_input(
             &life,
@@ -1014,6 +1021,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
 struct PetRuntime {
     window: Arc<Window>,
     renderer: Renderer,
+    ecology_renderer: EcologyRenderer,
     platform: Box<dyn PlatformBackend>,
     topology: DisplayTopology,
     normalizer: SensorNormalizer,
@@ -1178,6 +1186,33 @@ impl PetApplication {
                 desktop_size,
                 runtime.screen_velocity_px.length(),
             );
+            let desktop_aspect = desktop_size.x / desktop_size.y.max(1.0);
+            let cursor_normalized = snapshot.cursor.map(|cursor| {
+                let bounds = runtime.topology.virtual_physical_bounds;
+                Vec2::new(
+                    (cursor.x - bounds.minimum.x) as f32 / bounds.width().max(1) as f32,
+                    (cursor.y - bounds.minimum.y) as f32 / bounds.height().max(1) as f32,
+                )
+                .clamp(Vec2::ZERO, Vec2::ONE)
+            });
+            let ecology_hover_predictive = cursor_normalized.is_some_and(|cursor| {
+                runtime
+                    .ecology
+                    .hit_test(cursor, desktop_aspect, desktop_size.y, predictive_margin)
+            });
+            let ecology_hover_hysteresis = cursor_normalized.is_some_and(|cursor| {
+                runtime.ecology.hit_test(
+                    cursor,
+                    desktop_aspect,
+                    desktop_size.y,
+                    (predictive_margin + 12.0).min(72.0),
+                )
+            });
+            let ecology_hover_precise = cursor_normalized.is_some_and(|cursor| {
+                runtime
+                    .ecology
+                    .hit_test(cursor, desktop_aspect, desktop_size.y, 4.0)
+            });
             let hovered_predictive = snapshot.cursor.is_some_and(|cursor| {
                 hit_test_desktop_cursor(
                     &runtime.window,
@@ -1206,17 +1241,26 @@ impl PetApplication {
                 )
             });
             let primary_down = snapshot.primary_button_down.unwrap_or(runtime.pointer.down);
+            let pet_capture_active = runtime.pointer_tracker.captured;
             let petting_started = update_pointer_state(
                 &mut runtime.pointer,
                 &mut runtime.pointer_tracker,
                 primary_down,
-                hovered_liquid,
+                hovered_liquid && (!ecology_hover_precise || pet_capture_active),
             );
             let pet_dragged = runtime.pointer.pet_dragged;
+            let orb_touched = runtime.ecology.observe_pointer(
+                cursor_normalized,
+                primary_down,
+                !pet_dragged,
+                desktop_aspect,
+                desktop_size.y,
+                runtime.normalizer.monotonic_seconds(),
+            );
             let accepts_cursor = runtime.cursor_hittest_latch.resolve(
-                hovered_predictive,
-                hovered_hysteresis,
-                pet_dragged,
+                hovered_predictive || ecology_hover_predictive,
+                hovered_hysteresis || ecology_hover_hysteresis,
+                pet_dragged || runtime.ecology.is_dragging_object(),
             );
             let _ = runtime
                 .platform
@@ -1234,6 +1278,10 @@ impl PetApplication {
                 // learner the actual contact context instead of the prior poll.
                 apply_shared_feedback(runtime, FeedbackEvent::PettingStarted);
                 enqueue_touch_voice(runtime, now);
+            }
+            if orb_touched {
+                apply_shared_feedback(runtime, FeedbackEvent::PlayStarted);
+                runtime.save_accumulator = 30.0;
             }
             if runtime.visual_poll_accumulator >= VISUAL_SAMPLE_INTERVAL {
                 runtime.visual_poll_accumulator %= VISUAL_SAMPLE_INTERVAL;
@@ -1390,7 +1438,14 @@ impl PetApplication {
             output.body_intent = resolved_intent;
             output.body_intent = runtime
                 .ecology
-                .resolve_intent(output.body_intent, runtime.life.state.focus_mode)
+                .resolve_intent(
+                    output.body_intent,
+                    output.selected_action,
+                    &runtime.sensors,
+                    &runtime.body.simulation.feedback,
+                    runtime.life.state.focus_mode,
+                    LIFE_DT,
+                )
                 .body_intent;
             preserve_navigation_during_material_drag(
                 &runtime.intent,
@@ -1694,6 +1749,7 @@ impl ApplicationHandler for PetApplication {
         // remains transparent in the final compositor; only the refracted liquid
         // sees the screen-anchored checker.
         renderer.set_studio_material_backdrop(true);
+        let ecology_renderer = EcologyRenderer::new(renderer.device(), renderer.surface_format());
         // A hidden Win32 composition surface may never become presentable, which would
         // deadlock the old "show after Presented" startup path. At this point the GPU
         // surface, transparent clear color, pipeline, and mesh are all ready, so making
@@ -1706,6 +1762,7 @@ impl ApplicationHandler for PetApplication {
         self.runtime = Some(PetRuntime {
             window,
             renderer,
+            ecology_renderer,
             platform,
             topology,
             normalizer: SensorNormalizer::default(),
@@ -1961,7 +2018,24 @@ impl ApplicationHandler for PetApplication {
                 );
                 parameters.render_scale = PRODUCTION_RENDER_SCALE;
                 let render_started = Instant::now();
-                let render_outcome = runtime.renderer.render(parameters);
+                let bounds = runtime.topology.virtual_physical_bounds;
+                let desktop_aspect = bounds.width().max(1) as f32 / bounds.height().max(1) as f32;
+                let ecology_state = runtime.ecology.state();
+                let ecology_renderer = &mut runtime.ecology_renderer;
+                let ecology_time = runtime.normalizer.monotonic_seconds() as f32;
+                let render_outcome = runtime.renderer.render_with_overlay(
+                    parameters,
+                    |_device, queue, encoder, view| {
+                        ecology_renderer.render(
+                            queue,
+                            encoder,
+                            view,
+                            ecology_state,
+                            desktop_aspect,
+                            ecology_time,
+                        );
+                    },
+                );
                 runtime.render_microseconds = render_started.elapsed().as_secs_f64() * 1_000_000.0;
                 runtime
                     .render_timings

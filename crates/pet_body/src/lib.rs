@@ -3,6 +3,7 @@
 
 mod animation;
 mod droplets;
+mod ecology_render;
 mod embodiment;
 mod expression;
 mod graph;
@@ -20,6 +21,7 @@ pub use animation::{AnimationRuntime, JointState};
 pub use droplets::{
     DropletLifecycle, DropletMotion, DropletRenderState, DropletRuntime, DropletState, MAX_DROPLETS,
 };
+pub use ecology_render::EcologyRenderer;
 pub use embodiment::{EmbodiedPose, EmbodiedRuntime, GazeMode, VoiceVisualState};
 pub use expression::ExpressionRuntime;
 pub use graph::{BodyGraph, BodyNode, BodyPart};

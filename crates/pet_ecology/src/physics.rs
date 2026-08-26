@@ -84,10 +84,13 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
     } else {
         1_152.0
     };
-    let radius_y = (object.radius_px_at_reference / reference_height).clamp(0.001, 0.2);
-    let radius_x = radius_y / aspect;
-    let minimum = Vec2::new(radius_x, radius_y);
-    let maximum = Vec2::ONE - minimum;
+    let radius = (object.radius_px_at_reference / reference_height).clamp(0.001, 0.2);
+    // Solve in virtual-desktop-height units. Persistence stays normalized
+    // 0..1, but an X velocity of one now means the same physical distance as a
+    // Y velocity of one even on an ultrawide desktop.
+    let mut position = Vec2::new(object.position.x * aspect, object.position.y);
+    let minimum = Vec2::splat(radius);
+    let maximum = Vec2::new(aspect - radius, 1.0 - radius);
     let damping = (-object.linear_drag.max(0.0) * dt).exp();
     object.velocity *= damping;
     if object.velocity.length_squared() > MAX_OBJECT_SPEED * MAX_OBJECT_SPEED {
@@ -111,7 +114,7 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
                 maximum[axis]
             };
             if velocity.abs() > 1.0e-7 {
-                let time = (boundary - object.position[axis]) / velocity;
+                let time = (boundary - position[axis]) / velocity;
                 if time >= 0.0 && time <= remaining && time < hit_time {
                     hit_time = time;
                     hit_axis = Some(axis);
@@ -119,19 +122,20 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
             }
         }
         if let Some(axis) = hit_axis {
-            object.position += object.velocity * hit_time;
-            object.position = object.position.clamp(minimum, maximum);
+            position += object.velocity * hit_time;
+            position = position.clamp(minimum, maximum);
             object.velocity[axis] = -object.velocity[axis] * object.restitution;
             remaining -= hit_time;
             if hit_time <= 1.0e-7 {
                 remaining = (remaining - 1.0e-5).max(0.0);
             }
         } else {
-            object.position += object.velocity * remaining;
+            position += object.velocity * remaining;
             remaining = 0.0;
         }
     }
-    object.position = object.position.clamp(minimum, maximum);
+    position = position.clamp(minimum, maximum);
+    object.position = Vec2::new(position.x / aspect, position.y);
     if object.velocity.length_squared() < 1.0e-8 {
         object.velocity = Vec2::ZERO;
         object.lifecycle = ObjectLifecycle::Sleeping;
@@ -159,5 +163,27 @@ mod tests {
             assert!(orb.position.is_finite());
             assert!(orb.velocity.is_finite());
         }
+    }
+
+    #[test]
+    fn authored_speed_is_not_multiplied_by_ultrawide_width() {
+        let den = DenState::for_seed(8);
+        let mut horizontal = WorldObject::canonical_orb(8, den.anchor);
+        let mut vertical = horizontal.clone();
+        horizontal.position = Vec2::splat(0.5);
+        vertical.position = Vec2::splat(0.5);
+        horizontal.velocity = Vec2::new(0.1, 0.0);
+        vertical.velocity = Vec2::new(0.0, 0.1);
+        horizontal.linear_drag = 0.0;
+        vertical.linear_drag = 0.0;
+        let config = ObjectPhysicsConfig {
+            desktop_aspect: 32.0 / 9.0,
+            reference_height_px: 1_152.0,
+        };
+        step_object(&mut horizontal, config, 1.0 / 120.0);
+        step_object(&mut vertical, config, 1.0 / 120.0);
+        let horizontal_px = (horizontal.position.x - 0.5) * config.desktop_aspect * 1_152.0;
+        let vertical_px = (vertical.position.y - 0.5) * 1_152.0;
+        assert!((horizontal_px - vertical_px).abs() < 0.001);
     }
 }
