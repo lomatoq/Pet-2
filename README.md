@@ -171,7 +171,8 @@ portable import/export, reset, focus, audio, and isolated data-directory options
 - Windows uses Win32 cursor, idle, foreground process, visible-window geometry,
   tool-window/no-activate styles, and a Per-Monitor-V2 manifest.
 - macOS uses AppKit/Quartz cursor, idle and frontmost-application APIs, a floating
-  all-spaces `NSWindow`, and `LSUIElement=true`. It requests the standard Screen
+  all-spaces `NSWindow`, and a regular Dock presence so Pet 2 can be quit or
+  relaunched like any other application. It requests the standard Screen
   Recording consent once for reduced visual sensing; denial keeps the organism
   running with that capability disabled. No Accessibility permission is needed.
   Retina and mixed-scale Quartz coordinates are converted at the platform edge.
