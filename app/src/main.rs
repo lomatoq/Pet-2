@@ -4006,10 +4006,19 @@ fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningPro
     let reference = approved_production_liquid_tuning(profile.seed);
     let stale_body = profile.render_mode != BodyRenderMode::ParticlePbf;
     let stale_material = profile.material.variant != MaterialVariant::CinematicJelly;
-    let has_legacy_outer_glow = profile.material.halo == 0.09
+    let has_legacy_outer_glow = (profile.material.halo == 0.09
         && profile.compositor.shadow_feather == 64.0
         && profile.compositor.shadow_opacity == 0.31
-        && profile.compositor.shadow_color == [1.0, 1.0, 1.0];
+        && profile.compositor.shadow_color == [1.0, 1.0, 1.0])
+        || (profile.material.halo == 0.045
+            && profile.compositor.shadow_feather == 28.0
+            && profile.compositor.shadow_opacity == 0.12
+            && profile.compositor.shadow_color == [0.58, 0.62, 0.68]);
+    let has_legacy_cinematic_rim = profile.material.rim_strength == 4.0
+        && profile.material.rim_power == 5.5
+        && profile.material.narrow_rim_strength == 3.0
+        && profile.material.broad_rim_strength == 0.62
+        && profile.material.edge_light_width == 23.0;
     if stale_body {
         profile.render_mode = BodyRenderMode::ParticlePbf;
         profile.pbf = reference.pbf;
@@ -4025,6 +4034,13 @@ fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningPro
         profile.compositor.shadow_feather = reference.compositor.shadow_feather;
         profile.compositor.shadow_opacity = reference.compositor.shadow_opacity;
         profile.compositor.shadow_color = reference.compositor.shadow_color;
+    }
+    if has_legacy_cinematic_rim {
+        profile.material.rim_strength = reference.material.rim_strength;
+        profile.material.rim_power = reference.material.rim_power;
+        profile.material.narrow_rim_strength = reference.material.narrow_rim_strength;
+        profile.material.broad_rim_strength = reference.material.broad_rim_strength;
+        profile.material.edge_light_width = reference.material.edge_light_width;
     }
     profile
 }
@@ -4059,8 +4075,8 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.translucency = 0.84;
     profile.material.refraction = 2.4;
     profile.material.blur = 2.8;
-    profile.material.rim_strength = 4.0;
-    profile.material.rim_power = 5.5;
+    profile.material.rim_strength = 0.7;
+    profile.material.rim_power = 3.2;
     profile.material.broad_specular = 0.25;
     profile.material.broad_specular_power = 11.0;
     profile.material.tight_specular = 0.65;
@@ -4076,7 +4092,7 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.direct_scatter = 0.55;
     profile.material.transmission_hue_preservation = 0.25;
     profile.material.internal_flow = 0.12;
-    profile.material.halo = 0.045;
+    profile.material.halo = 0.01;
     profile.material.opacity = 0.6;
     profile.material.cinematic_smoothing = 0.07;
     profile.material.internal_orb_count = 6;
@@ -4089,10 +4105,10 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.studio_intensity = 1.5;
     profile.material.studio_base_roughness = 0.62;
     profile.material.studio_coat_roughness = 0.21;
-    profile.material.narrow_rim_strength = 3.0;
-    profile.material.broad_rim_strength = 0.62;
+    profile.material.narrow_rim_strength = 0.35;
+    profile.material.broad_rim_strength = 0.14;
     profile.material.rim_saturation = 1.15;
-    profile.material.edge_light_width = 23.0;
+    profile.material.edge_light_width = 6.0;
     profile.material.caustic_strength = 0.55;
     profile.material.caustic_scale = 2.0;
     profile.material.caustic_speed = 0.55;
@@ -4130,9 +4146,9 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.compositor.render_scale = 2;
     profile.compositor.shadow_horizontal_offset = 0.0;
     profile.compositor.shadow_vertical_offset = 0.0;
-    profile.compositor.shadow_feather = 28.0;
-    profile.compositor.shadow_opacity = 0.12;
-    profile.compositor.shadow_color = [0.58, 0.62, 0.68];
+    profile.compositor.shadow_feather = 10.0;
+    profile.compositor.shadow_opacity = 0.025;
+    profile.compositor.shadow_color = [0.42, 0.46, 0.52];
     profile.compositor.exposure = 1.0;
     profile
 }
@@ -5460,24 +5476,33 @@ mod tests {
         assert_eq!(applied.material.variant, MaterialVariant::CinematicJelly);
         assert_eq!(applied.material.primary_hsv, [0.0, 0.0, 0.0]);
         assert_eq!(applied.material.opacity, 0.6);
-        assert_eq!(applied.material.halo, 0.045);
-        assert_eq!(applied.compositor.shadow_feather, 28.0);
-        assert_eq!(applied.compositor.shadow_opacity, 0.12);
+        assert_eq!(applied.material.halo, 0.01);
+        assert_eq!(applied.material.rim_strength, 0.7);
+        assert_eq!(applied.material.narrow_rim_strength, 0.35);
+        assert_eq!(applied.material.broad_rim_strength, 0.14);
+        assert_eq!(applied.material.edge_light_width, 6.0);
+        assert_eq!(applied.compositor.shadow_feather, 10.0);
+        assert_eq!(applied.compositor.shadow_opacity, 0.025);
         assert_eq!(applied.pbf.flight_stretch, 1.9);
         assert_eq!(persisted, applied);
         assert_eq!(body.tuning_profile(), &applied);
     }
 
     #[test]
-    fn legacy_thick_outer_glow_is_softened_without_resetting_other_tuning() {
+    fn previous_release_thick_rim_is_softened_without_resetting_other_tuning() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
         let genome = lifecore::Genome::from_seed(0xB0D3);
         let mut legacy = approved_production_liquid_tuning(genome.identity_seed);
-        legacy.material.halo = 0.09;
-        legacy.compositor.shadow_feather = 64.0;
-        legacy.compositor.shadow_opacity = 0.31;
-        legacy.compositor.shadow_color = [1.0, 1.0, 1.0];
+        legacy.material.halo = 0.045;
+        legacy.material.rim_strength = 4.0;
+        legacy.material.rim_power = 5.5;
+        legacy.material.narrow_rim_strength = 3.0;
+        legacy.material.broad_rim_strength = 0.62;
+        legacy.material.edge_light_width = 23.0;
+        legacy.compositor.shadow_feather = 28.0;
+        legacy.compositor.shadow_opacity = 0.12;
+        legacy.compositor.shadow_color = [0.58, 0.62, 0.68];
         legacy.pbf.viscosity = 0.041;
         store.save_liquid_tuning(&legacy).unwrap();
         let mut body = ProceduralBody::generate(&genome).unwrap();
@@ -5486,10 +5511,15 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(applied.material.halo, 0.045);
-        assert_eq!(applied.compositor.shadow_feather, 28.0);
-        assert_eq!(applied.compositor.shadow_opacity, 0.12);
-        assert_eq!(applied.compositor.shadow_color, [0.58, 0.62, 0.68]);
+        assert_eq!(applied.material.halo, 0.01);
+        assert_eq!(applied.material.rim_strength, 0.7);
+        assert_eq!(applied.material.rim_power, 3.2);
+        assert_eq!(applied.material.narrow_rim_strength, 0.35);
+        assert_eq!(applied.material.broad_rim_strength, 0.14);
+        assert_eq!(applied.material.edge_light_width, 6.0);
+        assert_eq!(applied.compositor.shadow_feather, 10.0);
+        assert_eq!(applied.compositor.shadow_opacity, 0.025);
+        assert_eq!(applied.compositor.shadow_color, [0.42, 0.46, 0.52]);
         assert_eq!(applied.pbf.viscosity, 0.041);
         assert_eq!(body.tuning_profile(), &applied);
     }
