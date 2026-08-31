@@ -19,7 +19,10 @@ pub struct EcologyRuntime {
     director: EpisodeDirector,
     pointer_down: bool,
     grabbed_object: Option<ObjectId>,
-    last_pointer_position: Option<Vec2>,
+    grab_press_position: Option<Vec2>,
+    grab_offset: Vec2,
+    grab_active: bool,
+    drag_velocity: Vec2,
     last_pointer_seconds: f64,
     environment: EmbodiedEnvironmentFrame,
     orb_trapped_seconds: f32,
@@ -55,7 +58,10 @@ impl EcologyRuntime {
             director: EpisodeDirector::default(),
             pointer_down: false,
             grabbed_object: None,
-            last_pointer_position: None,
+            grab_press_position: None,
+            grab_offset: Vec2::ZERO,
+            grab_active: false,
+            drag_velocity: Vec2::ZERO,
             last_pointer_seconds: 0.0,
             environment: EmbodiedEnvironmentFrame::default(),
             orb_trapped_seconds: 0.0,
@@ -503,7 +509,7 @@ impl EcologyRuntime {
             && allow_new_capture
             && let Some(cursor) = cursor
         {
-            self.grabbed_object = self
+            let capture = self
                 .state
                 .objects
                 .iter()
@@ -518,64 +524,86 @@ impl EcologyRuntime {
                         .length()
                             <= (object.radius_px_at_reference + 5.0) / desktop_height_px.max(1.0)
                 })
-                .map(|object| object.id);
-            if let Some(object_id) = self.grabbed_object
-                && let Some(object) = self
-                    .state
-                    .objects
-                    .iter_mut()
-                    .find(|object| object.id == object_id)
-            {
-                object.lifecycle = ObjectLifecycle::GrabbedByUser;
-                object.velocity = Vec2::ZERO;
-                object.last_interaction_seconds = timestamp.max(0.0);
+                .map(|object| (object.id, object.position));
+            if let Some((object_id, object_position)) = capture {
+                self.grabbed_object = Some(object_id);
+                self.grab_press_position = Some(cursor);
+                self.grab_offset = object_position - cursor;
+                self.grab_active = false;
+                self.drag_velocity = Vec2::ZERO;
+                self.last_pointer_seconds = timestamp;
             }
         }
-        if let (Some(object_id), Some(cursor)) = (self.grabbed_object, cursor)
+
+        if down
+            && self.grabbed_object.is_some()
+            && let (Some(cursor), Some(press_position)) = (cursor, self.grab_press_position)
+        {
+            let drag_distance_px = Vec2::new(
+                (cursor.x - press_position.x) * aspect,
+                cursor.y - press_position.y,
+            )
+            .length()
+                * desktop_height_px.max(1.0);
+            if !self.grab_active && drag_distance_px >= 4.0 {
+                self.grab_active = true;
+            }
+        }
+
+        if self.grab_active
+            && let (Some(object_id), Some(cursor)) = (self.grabbed_object, cursor)
             && let Some(object) = self
                 .state
                 .objects
                 .iter_mut()
                 .find(|object| object.id == object_id)
         {
-            let clamped = cursor.clamp(Vec2::splat(0.001), Vec2::splat(0.999));
+            let radius_y =
+                (object.radius_px_at_reference / desktop_height_px.max(1.0)).clamp(0.001, 0.2);
+            let radius_x = radius_y / aspect;
+            let clamped = (cursor + self.grab_offset).clamp(
+                Vec2::new(radius_x, radius_y),
+                Vec2::new(1.0 - radius_x, 1.0 - radius_y),
+            );
             let dt = (timestamp - self.last_pointer_seconds).clamp(1.0 / 1_000.0, 0.1) as f32;
-            if let Some(previous) = self.last_pointer_position {
-                let height_velocity = Vec2::new(
-                    (clamped.x - previous.x) * aspect / dt,
-                    (clamped.y - previous.y) / dt,
-                );
-                let clamped_velocity =
-                    if height_velocity.length_squared() > MAX_OBJECT_SPEED * MAX_OBJECT_SPEED {
-                        height_velocity.normalize_or_zero() * MAX_OBJECT_SPEED
-                    } else {
-                        height_velocity
-                    };
-                object.velocity = object.velocity.lerp(clamped_velocity, 0.58);
-            }
-            object.position = clamped;
+            let follow = 1.0 - (-28.0 * dt).exp();
+            let previous_position = object.position;
+            object.position = previous_position.lerp(clamped, follow);
+            let height_velocity = Vec2::new(
+                (object.position.x - previous_position.x) * aspect / dt,
+                (object.position.y - previous_position.y) / dt,
+            )
+            .clamp_length_max(MAX_OBJECT_SPEED);
+            self.drag_velocity = self.drag_velocity.lerp(height_velocity, 0.58);
+            object.velocity = self.drag_velocity;
+            object.lifecycle = ObjectLifecycle::GrabbedByUser;
             object.last_interaction_seconds = timestamp.max(0.0);
         }
         let touched = pressed && self.grabbed_object.is_some();
         if released
-            && let Some(object_id) = self.grabbed_object.take()
+            && let Some(object_id) = self.grabbed_object
             && let Some(object) = self
                 .state
                 .objects
                 .iter_mut()
                 .find(|object| object.id == object_id)
+            && self.grab_active
         {
             object.lifecycle = ObjectLifecycle::Free;
-            if object.velocity.length_squared() > MAX_OBJECT_SPEED * MAX_OBJECT_SPEED {
-                object.velocity = object.velocity.normalize_or_zero() * MAX_OBJECT_SPEED;
-            }
+            object.velocity = self.drag_velocity.clamp_length_max(MAX_OBJECT_SPEED);
             object.familiarity = (object.familiarity + 0.015).clamp(0.0, 1.0);
             object.novelty = (object.novelty - 0.008).clamp(0.0, 1.0);
             object.wear = (object.wear + 0.001).clamp(0.0, 1.0);
         }
+        if released {
+            self.grabbed_object = None;
+            self.grab_press_position = None;
+            self.grab_offset = Vec2::ZERO;
+            self.grab_active = false;
+            self.drag_velocity = Vec2::ZERO;
+        }
         self.pointer_down = down;
-        if let Some(cursor) = cursor {
-            self.last_pointer_position = Some(cursor);
+        if cursor.is_some() {
             self.last_pointer_seconds = timestamp;
         }
         touched
@@ -638,6 +666,72 @@ mod tests {
         );
         assert!(!runtime.is_dragging_object());
         assert!(runtime.state.objects[0].velocity.length() <= MAX_OBJECT_SPEED + 1.0e-5);
+        runtime.state.validate().unwrap();
+    }
+
+    #[test]
+    fn click_capture_does_not_snap_or_cancel_existing_orb_motion() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 77, true).unwrap();
+        runtime.state.objects[0].position = Vec2::splat(0.5);
+        runtime.state.objects[0].velocity = Vec2::new(0.18, -0.07);
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::Free;
+        let radius = runtime.state.objects[0].radius_px_at_reference / 1_080.0;
+        let press = Vec2::new(0.5 + radius * 0.25 / (16.0 / 9.0), 0.5);
+        let position_before = runtime.state.objects[0].position;
+        let velocity_before = runtime.state.objects[0].velocity;
+
+        assert!(runtime.observe_pointer(Some(press), true, true, 16.0 / 9.0, 1_080.0, 1.0));
+        assert_eq!(runtime.state.objects[0].position, position_before);
+        assert_eq!(runtime.state.objects[0].velocity, velocity_before);
+        runtime.observe_pointer(Some(press), false, true, 16.0 / 9.0, 1_080.0, 1.03);
+
+        assert_eq!(runtime.state.objects[0].position, position_before);
+        assert_eq!(runtime.state.objects[0].velocity, velocity_before);
+        assert_eq!(runtime.state.objects[0].lifecycle, ObjectLifecycle::Free);
+    }
+
+    #[test]
+    fn pointer_drag_keeps_the_orb_center_inside_radius_aware_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 78, true).unwrap();
+        runtime.state.objects[0].position = Vec2::splat(0.5);
+        runtime.state.objects[0].velocity = Vec2::ZERO;
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::Free;
+        let aspect = 16.0 / 9.0;
+        let desktop_height = 1_080.0;
+        let radius = runtime.state.objects[0].radius_px_at_reference / desktop_height;
+
+        assert!(runtime.observe_pointer(
+            Some(Vec2::splat(0.5)),
+            true,
+            true,
+            aspect,
+            desktop_height,
+            1.0,
+        ));
+        runtime.observe_pointer(
+            Some(Vec2::new(0.5, 1.0)),
+            true,
+            true,
+            aspect,
+            desktop_height,
+            1.02,
+        );
+        runtime.observe_pointer(
+            Some(Vec2::new(0.5, 1.0)),
+            false,
+            true,
+            aspect,
+            desktop_height,
+            1.04,
+        );
+
+        assert!(runtime.state.objects[0].position.y <= 1.0 - radius + 1.0e-6);
+        assert!(runtime.state.objects[0].position.y >= radius - 1.0e-6);
+        assert!(runtime.state.objects[0].velocity.is_finite());
         runtime.state.validate().unwrap();
     }
 

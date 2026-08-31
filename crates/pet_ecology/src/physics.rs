@@ -3,6 +3,8 @@ use glam::Vec2;
 use crate::{MAX_OBJECT_SPEED, ObjectKind, ObjectLifecycle, WindowAffordanceFrame, WorldObject};
 
 pub const MAX_EXTERNAL_CONTACTS: usize = 8;
+const INVALID_BOUNDARY_RECOVERY_SPEED: f32 = 0.08;
+const EMBEDDED_WINDOW_MOTION_THRESHOLD_PX_PER_SECOND: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ContactSource {
@@ -94,6 +96,26 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
     let mut position = Vec2::new(object.position.x * aspect, object.position.y);
     let minimum = Vec2::splat(radius);
     let maximum = Vec2::new(aspect - radius, 1.0 - radius);
+
+    // Older builds could persist the object's center either directly on the
+    // desktop edge or exactly on the radius-aware boundary with zero velocity.
+    // Clamp invalid state before integrating and give any non-inward boundary
+    // state one small deterministic recovery velocity. A normal bounce already
+    // points inward, so it passes through untouched.
+    let persisted_position = position;
+    position = position.clamp(minimum, maximum);
+    for axis in 0..2 {
+        if persisted_position[axis] <= minimum[axis] + 1.0e-6 {
+            if object.velocity[axis] <= 0.0 {
+                object.velocity[axis] = (-object.velocity[axis] * object.restitution)
+                    .max(INVALID_BOUNDARY_RECOVERY_SPEED);
+            }
+        } else if persisted_position[axis] >= maximum[axis] - 1.0e-6 && object.velocity[axis] >= 0.0
+        {
+            object.velocity[axis] = -((object.velocity[axis] * object.restitution)
+                .max(INVALID_BOUNDARY_RECOVERY_SPEED));
+        }
+    }
     let damping = (-object.linear_drag.max(0.0) * dt).exp();
     object.velocity *= damping;
     if object.velocity.length_squared() > MAX_OBJECT_SPEED * MAX_OBJECT_SPEED {
@@ -171,6 +193,8 @@ pub fn step_object_with_windows(
         1_152.0
     };
     let radius = (object.radius_px_at_reference / reference_height).clamp(0.001, 0.2);
+    let desktop_minimum = Vec2::splat(radius);
+    let desktop_maximum = Vec2::new(aspect - radius, 1.0 - radius);
     let dt = if dt.is_finite() {
         dt.clamp(0.0, 1.0 / 30.0)
     } else {
@@ -190,12 +214,35 @@ pub fn step_object_with_windows(
             - Vec2::splat(radius);
         let maximum = Vec2::new(window.bounds.maximum.x * aspect, window.bounds.maximum.y)
             + Vec2::splat(radius);
+
+        // A maximized/fullscreen window can cover the complete feasible area
+        // for the object's center. It has no reachable exterior to resolve to,
+        // so treating it as a solid box can only expel the object to a desktop
+        // edge forever. Such a window remains useful to perception, but is not
+        // a physically solvable obstacle for this object.
+        if minimum.cmple(desktop_minimum).all() && maximum.cmpge(desktop_maximum).all() {
+            continue;
+        }
         let window_start_offset = window_velocity * dt;
         let relative_start = start + window_start_offset;
         let relative_delta = end - relative_start;
+        let embedded_at_frame_start = point_in_rect(relative_start, minimum, maximum);
+
+        // An object already embedded in a stationary window is not evidence of
+        // a collision: the app may have launched over a maximized window, or
+        // that window may occupy only one monitor in a larger virtual desktop.
+        // Expelling such an object picks the nearest screen edge and pins it
+        // there. Fresh outside-to-inside crossings still use the swept solver,
+        // while a genuinely moving window retains authority to push an object.
+        if embedded_at_frame_start
+            && window_velocity.length() * reference_height
+                < EMBEDDED_WINDOW_MOTION_THRESHOLD_PX_PER_SECOND
+        {
+            continue;
+        }
         let mut normal = Vec2::ZERO;
         let mut penetration = 0.0;
-        if point_in_rect(relative_start, minimum, maximum) {
+        if embedded_at_frame_start {
             let (resolved, overlap_normal, depth) =
                 resolve_inside_rect(relative_start, minimum, maximum);
             end = resolved;
@@ -241,7 +288,8 @@ pub fn step_object_with_windows(
             break;
         }
     }
-    object.position = Vec2::new((end.x / aspect).clamp(0.0, 1.0), end.y.clamp(0.0, 1.0));
+    end = end.clamp(desktop_minimum, desktop_maximum);
+    object.position = Vec2::new(end.x / aspect, end.y);
     if object.kind == ObjectKind::Orb {
         environment.orb_position = Some(object.position);
     }
@@ -610,6 +658,97 @@ mod tests {
             );
         }
         assert!(orb.position.y > object_radius + 0.01);
+        assert!(orb.position.is_finite());
+        assert!(orb.velocity.is_finite());
+    }
+
+    #[test]
+    fn fullscreen_window_cannot_expel_an_embedded_orb_to_the_desktop_edge() {
+        let den = DenState::for_seed(14);
+        let mut orb = WorldObject::canonical_orb(14, den.anchor);
+        orb.position = Vec2::splat(0.5);
+        orb.velocity = Vec2::new(0.08, -0.05);
+        orb.linear_drag = 0.0;
+        let config = ObjectPhysicsConfig::default();
+        let radius = orb.radius_px_at_reference / config.reference_height_px;
+        let mut windows = WindowAffordanceFrame::default();
+        windows.push(WindowAffordance {
+            id: WindowId(77),
+            bounds: NormalizedRect {
+                minimum: Vec2::ZERO,
+                maximum: Vec2::ONE,
+            },
+            is_visible: true,
+            ..WindowAffordance::default()
+        });
+        windows.finish();
+
+        for _ in 0..120 {
+            let mut environment = EmbodiedEnvironmentFrame::default();
+            step_object_with_windows(&mut orb, config, &windows, 1.0 / 120.0, &mut environment);
+            assert_eq!(environment.contact_count, 0);
+        }
+
+        assert!(orb.position.x > radius + 0.10);
+        assert!(orb.position.x < 1.0 - radius - 0.10);
+        assert!(orb.position.y > radius + 0.10);
+        assert!(orb.position.y < 1.0 - radius - 0.10);
+        assert!(orb.velocity.length() > 0.01);
+    }
+
+    #[test]
+    fn invalid_saved_edge_position_recovers_with_inward_motion() {
+        let den = DenState::for_seed(15);
+        let mut orb = WorldObject::canonical_orb(15, den.anchor);
+        let config = ObjectPhysicsConfig::default();
+        let radius = orb.radius_px_at_reference / config.reference_height_px;
+        orb.position = Vec2::new(0.37, 1.0 - radius);
+        orb.velocity = Vec2::ZERO;
+
+        for _ in 0..30 {
+            step_object(&mut orb, config, 1.0 / 120.0);
+        }
+
+        assert!(orb.position.y < 1.0 - radius - 0.01);
+        assert!(orb.velocity.y < 0.0);
+        assert!(orb.position.is_finite());
+        assert!(orb.velocity.is_finite());
+    }
+
+    #[test]
+    fn maximized_window_on_one_monitor_cannot_pin_an_embedded_orb_to_desktop_bottom() {
+        let den = DenState::for_seed(16);
+        let mut orb = WorldObject::canonical_orb(16, den.anchor);
+        let config = ObjectPhysicsConfig {
+            desktop_aspect: 3_440.0 / 1_440.0,
+            reference_height_px: 1_152.0,
+            pet_radius_px_at_reference: 58.0,
+        };
+        let radius = orb.radius_px_at_reference / config.reference_height_px;
+        orb.position = Vec2::new(0.52, 1.0);
+        orb.velocity = Vec2::ZERO;
+        let mut windows = WindowAffordanceFrame::default();
+        windows.push(WindowAffordance {
+            id: WindowId(78),
+            bounds: NormalizedRect {
+                minimum: Vec2::ZERO,
+                maximum: Vec2::new(0.88, 1.0),
+            },
+            is_visible: true,
+            ..WindowAffordance::default()
+        });
+        windows.finish();
+
+        let mut contact_count = 0_usize;
+        for _ in 0..30 {
+            let mut environment = EmbodiedEnvironmentFrame::default();
+            step_object_with_windows(&mut orb, config, &windows, 1.0 / 120.0, &mut environment);
+            contact_count += environment.contact_count;
+        }
+
+        assert_eq!(contact_count, 0);
+        assert!(orb.position.y < 1.0 - radius - 0.01);
+        assert!(orb.velocity.y < 0.0);
         assert!(orb.position.is_finite());
         assert!(orb.velocity.is_finite());
     }

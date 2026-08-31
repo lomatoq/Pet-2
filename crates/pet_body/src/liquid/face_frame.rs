@@ -171,7 +171,6 @@ impl FaceFrameRuntime {
             .map(|index| particles[index].component_id);
         let mut supported_weight = 0.0;
         let mut supported_count = 0_usize;
-        let mut render_center = Vec2::ZERO;
         let mut component_center = Vec2::ZERO;
         let mut component_count = 0_usize;
         if let Some(component) = carrier_component {
@@ -187,7 +186,6 @@ impl FaceFrameRuntime {
                 }
                 supported_count += 1;
                 supported_weight += weight;
-                render_center += (particle.render_position - body_origin) * weight;
             }
         }
 
@@ -197,18 +195,17 @@ impl FaceFrameRuntime {
             && supported_weight > 1.0e-5
             && raw_confidence >= 0.08;
         if enough_support {
-            render_center /= supported_weight;
             component_center /= component_count as f32;
 
-            // Horizontal neutral alignment follows the symmetry center of the
-            // whole permanent-carrier component, not the uneven face weights.
-            // Vertical placement remains attached to the visible face patch.
+            // The neutral semantic face follows the permanent carrier's center
+            // plus its authored upright offset. Face-weighted material is used
+            // only for carrier support/confidence: if it rigidly spins, the
+            // material may flow behind the face but cannot make the face orbit.
             // There is intentionally no largest-component, AABB, cursor, or
             // interaction fallback.
             let origin_bias = Vec2::from_array(self.tuning.origin) - DEFAULT_FACE_ORIGIN;
-            let candidate_origin = Vec2::new(component_center.x, render_center.y)
-                + origin_bias
-                + self.attention_offset;
+            let candidate_origin =
+                component_center + DEFAULT_FACE_ORIGIN + origin_bias + self.attention_offset;
             if candidate_origin.is_finite() {
                 self.target_origin = self.target_origin.lerp(candidate_origin, recovery_blend);
             }
@@ -452,6 +449,39 @@ mod tests {
         assert_eq!(runtime.target_roll, 0.0);
         assert!(angle.abs() < 1.0e-6, "neutral face roll {angle}");
         assert!(runtime.frame.axis_y.y > 0.999_999);
+    }
+
+    #[test]
+    fn rigid_material_spin_cannot_orbit_the_semantic_face() {
+        let (mut particles, count) = initialize_particles(10);
+        let mut runtime = FaceFrameRuntime::default();
+        for _ in 0..120 {
+            update(&mut runtime, &particles, count, 1.0 / 120.0);
+        }
+        let target_before = runtime.target_origin;
+        let component_center = particles[..count]
+            .iter()
+            .map(|particle| particle.render_position)
+            .sum::<Vec2>()
+            / count as f32;
+
+        for angle in [0.7_f32, 1.4, 2.1, 2.8] {
+            let rotation = Vec2::from_angle(angle);
+            for particle in &mut particles[..count] {
+                let arm = particle.render_position - component_center;
+                particle.render_position = component_center
+                    + Vec2::new(
+                        arm.x * rotation.x - arm.y * rotation.y,
+                        arm.x * rotation.y + arm.y * rotation.x,
+                    );
+            }
+            runtime.update(&particles, count, 0, Vec2::ZERO, Vec2::ZERO, 1.0 / 120.0);
+            assert!(
+                runtime.target_origin.distance(target_before) < 1.0e-5,
+                "semantic face orbited with material spin: before={target_before:?}, after={:?}",
+                runtime.target_origin
+            );
+        }
     }
 
     #[test]
