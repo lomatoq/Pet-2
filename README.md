@@ -79,9 +79,13 @@ bash ./scripts/build_macos.sh
 bash ./scripts/package_macos.sh
 ```
 
-The macOS archive contains `Pet2.app`, `Body Lab.app`, the deterministic
-`tools/HabitatLab` runner, and `Pet2-Dev.command`. Double-click the latter to
-start Pet 2 with live telemetry and open Body Lab on its Live Brain view.
+The macOS archive contains `Pet2.app`, `Body Lab.app`, `Habitat Lab.app`, the
+deterministic `tools/HabitatLab` runner, and `Pet2-Dev.command`. Double-click the
+latter to start Pet 2 with live telemetry and open Body Lab on its Live Brain
+view. The standalone Habitat Lab bundle keeps the same cross-platform scenario
+engine and has its own regular macOS application identity. Opening it runs the
+canonical habitat story and opens the latest visual report; JSON evidence is
+kept under `Application Support/Pet 2/Habitat Lab`.
 
 The checked-in ICO and ICNS packaging assets are reproducible with
 `scripts/generate_icons.ps1`; they are not loaded by the organism at runtime.

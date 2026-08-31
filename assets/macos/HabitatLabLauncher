@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+
+contents="$(cd "$(dirname "$0")/.." && pwd)"
+runner="$contents/Resources/HabitatLabRunner"
+reports="${HOME}/Library/Application Support/Pet 2/Habitat Lab"
+mkdir -p "$reports"
+
+report="$reports/latest-habitat.svg"
+summary="$reports/latest-summary.json"
+trace="$reports/latest-trace.json"
+state="$reports/latest-ecology.json"
+
+"$runner" \
+  --scenario habitat_story_v1 \
+  --screenshot "$report" \
+  --trace "$trace" \
+  --save "$state" > "$summary"
+
+open "$report"
