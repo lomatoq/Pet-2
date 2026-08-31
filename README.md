@@ -84,8 +84,9 @@ deterministic `tools/HabitatLab` runner, and `Pet2-Dev.command`. Double-click th
 latter to start Pet 2 with live telemetry and open Body Lab on its Live Brain
 view. The standalone Habitat Lab bundle keeps the same cross-platform scenario
 engine and has its own regular macOS application identity. Opening it runs the
-canonical habitat story and opens the latest visual report; JSON evidence is
-kept under `Application Support/Pet 2/Habitat Lab`.
+canonical habitat story in a persistent native window, with scenario, seed and
+duration controls plus an embedded visual report. JSON evidence is kept under
+`Application Support/Pet 2/Habitat Lab`.
 
 Packaging leaves only the ZIP archive in `dist`; the installed applications are
 therefore not duplicated in Spotlight or Launchpad by an unpacked build tree.

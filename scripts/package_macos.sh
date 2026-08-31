@@ -4,8 +4,14 @@ set -euo pipefail
 workspace="$(cd "$(dirname "$0")/.." && pwd)"
 target="${PET2_MACOS_TARGET:-aarch64-apple-darwin}"
 case "${target%%-*}" in
-  aarch64) package_name="Pet2-macos-arm64" ;;
-  x86_64) package_name="Pet2-macos-x64" ;;
+  aarch64)
+    package_name="Pet2-macos-arm64"
+    swift_target="arm64-apple-macosx13.0"
+    ;;
+  x86_64)
+    package_name="Pet2-macos-x64"
+    swift_target="x86_64-apple-macosx13.0"
+    ;;
   *) echo "unsupported macOS target: $target" >&2; exit 1 ;;
 esac
 package_root="$(mktemp -d "${TMPDIR:-/tmp}/pet2-package.XXXXXX")"
@@ -46,7 +52,13 @@ cp "$workspace/config/default.json" "$pet_app/Contents/Resources/default.json"
 cp "$workspace/target/$target/release/body_lab" "$lab_app/Contents/MacOS/BodyLab"
 cp "$workspace/assets/macos/BodyLab-Info.plist" "$lab_app/Contents/Info.plist"
 
-cp "$workspace/assets/macos/HabitatLabLauncher" "$habitat_app/Contents/MacOS/HabitatLab"
+xcrun --sdk macosx swiftc \
+  -target "$swift_target" \
+  -O \
+  -framework AppKit \
+  -framework WebKit \
+  "$workspace/assets/macos/HabitatLab.swift" \
+  -o "$habitat_app/Contents/MacOS/HabitatLab"
 cp "$workspace/target/$target/release/habitat_lab" "$habitat_app/Contents/Resources/HabitatLabRunner"
 cp "$workspace/assets/macos/HabitatLab-Info.plist" "$habitat_app/Contents/Info.plist"
 
