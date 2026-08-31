@@ -37,7 +37,8 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "std", "CFArray", "CFCGTypes", "CFDictionary", "CFNumber", "CFString"
 ] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
-    "std", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGWindow"
+    "std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGEvent",
+    "CGEventSource", "CGEventTypes", "CGGeometry", "CGImage", "CGWindow"
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
 

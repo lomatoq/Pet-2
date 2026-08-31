@@ -8,7 +8,7 @@ $expectedPrefix = $distRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Pat
 if (-not $dist.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "refusing to clean package path outside $distRoot"
 }
-cargo build --manifest-path (Join-Path $workspace 'Cargo.toml') --release --target $Target -p pet2 -p body_lab
+cargo build --manifest-path (Join-Path $workspace 'Cargo.toml') --release --target $Target -p pet2 -p body_lab -p habitat_lab
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
 if (Test-Path -LiteralPath $dist) {
     Remove-Item -LiteralPath $dist -Recurse -Force
@@ -16,8 +16,10 @@ if (Test-Path -LiteralPath $dist) {
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'config') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'licenses') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $dist 'tools') | Out-Null
 Copy-Item -Force (Join-Path $workspace "target/$Target/release/pet2.exe") (Join-Path $dist 'Pet2.exe')
 Copy-Item -Force (Join-Path $workspace "target/$Target/release/body_lab.exe") (Join-Path $dist 'BodyLab.exe')
+Copy-Item -Force (Join-Path $workspace "target/$Target/release/habitat_lab.exe") (Join-Path $dist 'tools/HabitatLab.exe')
 Copy-Item -Force (Join-Path $workspace 'README.md') (Join-Path $dist 'README.txt')
 Copy-Item -Force (Join-Path $workspace 'LICENSE') (Join-Path $dist 'licenses/LICENSE')
 Copy-Item -Force (Join-Path $workspace 'config/default.json') (Join-Path $dist 'config/default.json')

@@ -2,6 +2,8 @@
 mod macos;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod portable_fallback;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod visual_sampling;
 #[cfg(target_os = "windows")]
 mod windows;
 

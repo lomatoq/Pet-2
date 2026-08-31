@@ -45,6 +45,7 @@ jobs:
       - run: bash ./scripts/build_macos.sh
       - run: bash ./scripts/test_headless.sh
       - run: bash ./scripts/package_macos.sh
+      - run: test -x "dist/Pet2-macos-arm64/Pet2.app/Contents/MacOS/Pet2" -a -x "dist/Pet2-macos-arm64/Body Lab.app/Contents/MacOS/BodyLab" -a -x "dist/Pet2-macos-arm64/tools/HabitatLab"
       - uses: actions/upload-artifact@v4
         with:
           name: Pet2-macos-arm64

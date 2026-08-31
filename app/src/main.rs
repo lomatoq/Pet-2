@@ -176,10 +176,47 @@ impl Drop for SingleInstanceGuard {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+struct SingleInstanceGuard {
+    _lock_file: std::fs::File,
+}
+
+#[cfg(target_os = "macos")]
+impl SingleInstanceGuard {
+    fn acquire() -> Result<Option<Self>, std::io::Error> {
+        use std::{fs::OpenOptions, os::fd::AsRawFd};
+
+        let path = std::env::temp_dir().join("io.lomatoq.pet2.single-instance-v1.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        // SAFETY: `lock_file` owns a valid descriptor for the lifetime of the
+        // guard. `flock` is process-scoped and the kernel releases it on crash.
+        let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(Some(Self {
+                _lock_file: lock_file,
+            }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+        {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 struct SingleInstanceGuard;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl SingleInstanceGuard {
     fn acquire() -> Result<Option<Self>, std::io::Error> {
         Ok(Some(Self))
@@ -4658,7 +4695,7 @@ fn print_help() {
          \n  --debug-log              Write 1 Hz frame and embodiment diagnostics\n\
          \n  --dev-mode               Start bounded 5 Hz causal telemetry\n\
          \n  --no-audio               Disable the audio device\n\
-         \n\nHOTKEY: Win+Alt+D toggles bounded causal telemetry at runtime\n"
+         \n\nHOTKEY: Cmd/Win+Alt+D toggles bounded causal telemetry at runtime\n"
     );
 }
 

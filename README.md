@@ -8,8 +8,9 @@ are required.
 > Status: v0.1 living-desktop habitat slice. The repository implements the portable
 > LifeCore, procedural body and voice, a persistent object ecology, multi-step
 > behavior episodes, native overlay/sensor adapters, versioned persistence,
-> deterministic Habitat Lab, packaging, and Windows/macOS CI. Interactive macOS
-> behavior still needs hands-on validation on Apple Silicon hardware.
+> deterministic Habitat Lab, packaging, and Windows/macOS CI. Windows and macOS
+> share the same visual feature extraction, simulation, persistence, and tools;
+> only native capture, overlay, input, audio, and packaging remain platform-specific.
 
 ## Supported targets
 
@@ -22,7 +23,7 @@ are required.
 
 ## Quick start
 
-```powershell
+```bash
 cargo run -p pet2 -- --headless-smoke 60 --seed 42 --reset-pet --no-audio --data-dir target/smoke-state
 cargo test --workspace
 cargo run -p pet2
@@ -36,7 +37,7 @@ simulation and persistence continue to work.
 
 ## Portable state
 
-```powershell
+```bash
 cargo run -p pet2 -- --export-state pet2-state.json --seed 42 --reset-pet
 cargo run -p pet2 -- --import-state pet2-state.json
 ```
@@ -78,6 +79,10 @@ bash ./scripts/build_macos.sh
 bash ./scripts/package_macos.sh
 ```
 
+The macOS archive contains `Pet2.app`, `Body Lab.app`, the deterministic
+`tools/HabitatLab` runner, and `Pet2-Dev.command`. Double-click the latter to
+start Pet 2 with live telemetry and open Body Lab on its Live Brain view.
+
 The checked-in ICO and ICNS packaging assets are reproducible with
 `scripts/generate_icons.ps1`; they are not loaded by the organism at runtime.
 
@@ -113,8 +118,9 @@ the interaction hull is large enough to reach an orb resting on the screen floor
 Navigation targets are projected onto the actual union of monitor rectangles, so
 an L-shaped desktop cannot leave the pet pursuing an unreachable point in a gap.
 
-Windows visual sensing performs one reduced `64x36` desktop capture and derives a
-privacy-safe `16x9` grid with `4x4` color/edge samples per cell. The pet's own body
+Windows and macOS visual sensing perform one reduced `64x36` desktop capture and
+derive the same privacy-safe `16x9` grid with `4x4` color/edge samples per cell.
+The pet's own body
 footprint is masked before temporal saliency, preventing self-attention lock.
 Static saturated colors and structured monochrome shapes can claim attention on
 their own, causing gaze/travel plus bounded hue, glow, flow, and cohesion changes.
@@ -136,10 +142,11 @@ keyboard hooks:
 
 ## Body Lab and live brain monitor
 
-The Windows package keeps one companion tool, `BodyLab.exe`. Run
-`Pet2-Dev.cmd` to start Pet 2 with 5 Hz causal telemetry and open the existing
-Body Lab directly on its Live Brain view. If a normal Pet 2 instance is already
-running, close it first because the desktop organism is single-instance.
+Both packages keep the same companion tool: `BodyLab.exe` on Windows and
+`Body Lab.app` on macOS. Run `Pet2-Dev.cmd` or `Pet2-Dev.command` to start Pet 2
+with 5 Hz causal telemetry and open Body Lab directly on its Live Brain view.
+If a normal Pet 2 instance is already running, close it first because the
+desktop organism is single-instance on both platforms.
 
 Inside Body Lab, `F12` switches the same window between Liquid Body Lab and Live
 Brain. In Live Brain, `Space`, the arrow keys, the timeline slider, and the
@@ -164,9 +171,10 @@ portable import/export, reset, focus, audio, and isolated data-directory options
 - Windows uses Win32 cursor, idle, foreground process, visible-window geometry,
   tool-window/no-activate styles, and a Per-Monitor-V2 manifest.
 - macOS uses AppKit/Quartz cursor, idle and frontmost-application APIs, a floating
-  all-spaces `NSWindow`, and `LSUIElement=true`. It requests no Accessibility or
-  Screen Recording entitlement; window-geometry sensing is capability-disabled
-  when it cannot be obtained without permissions.
+  all-spaces `NSWindow`, and `LSUIElement=true`. It requests the standard Screen
+  Recording consent once for reduced visual sensing; denial keeps the organism
+  running with that capability disabled. No Accessibility permission is needed.
+  Retina and mixed-scale Quartz coordinates are converted at the platform edge.
 - Audio-device loss is non-fatal. LifeCore, body motion, persistence, and silent
   operation continue while the output stream is recreated.
 
