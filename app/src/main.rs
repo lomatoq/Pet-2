@@ -21,26 +21,29 @@ use std::{
 };
 
 use desktop_host::{
-    DesktopVisualFrame, DisplayTopology, EventLogEntry, MonitorId, MonitorInfo,
-    PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition, PhysicalDesktopPoint, PlatformBackend,
-    PointerState, PortablePetState, RectI, SensorNormalizer, StateStore, create_platform_backend,
-    prepare_overlay_window_attributes,
+    DesktopVisualFrame, DisplayTopology, EventLogEntry, LabControlCommand, LabControlEnvelope,
+    LabDrive, MonitorId, MonitorInfo, PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition,
+    PhysicalDesktopPoint, PlatformBackend, PointerState, PortablePetState, RectI, SensorNormalizer,
+    StateStore, create_platform_backend, prepare_overlay_window_attributes,
 };
-use ecology_runtime::EcologyRuntime;
+use ecology_runtime::{EcologyResolveFrame, EcologyRuntime, VisualAttentionSample};
 use glam::Vec2;
+#[cfg(test)]
+use lifecore::MAX_MUTATION_HISTORY;
 use lifecore::{
-    ActionId, BodyIntent, CollisionEvent, DebugState, ExpressionState, FeedbackEvent, Genome,
-    LIFECORE_HZ, LifeCore, LocomotionMode, PoseIntent, SensorFrame, VitaOutput, VocalTrigger,
-    stable_hash_bytes,
+    ActionId, BodyIntent, CollisionEvent, DebugState, Drives, ExpressionState, FeedbackEvent,
+    Genome, LIFECORE_HZ, LifeCore, LocomotionMode, PoseIntent, SensorFrame, VitaOutput,
+    VocalTrigger, stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
 use pet_audio::{AudioCallbackLevels, AudioEngine, AudioVisualFeedback, SelectedOutputConfig};
 use pet_body::{
-    EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile, ProceduralBody,
-    RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
+    BodyRenderMode, EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile,
+    MaterialVariant, ProceduralBody, RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
 use pet_ecology::{
-    ActionSignature, EcologyVocalTrigger, EpisodeGoal, EpisodePhase, MorselProfile, ObjectKind,
+    ActionSignature, EcologyOutcome, EcologyVocalTrigger, EpisodeGoal, EpisodePhase, MorselProfile,
+    ObjectKind,
 };
 use pet_perception::{SpatialVisualCell, SpatialVisualFrame, VisualFeatureFrame};
 use vita_runtime::{BrainMode, VitaRuntime};
@@ -83,6 +86,12 @@ const PRODUCTION_PRESENTATION_SCALE: f32 = 1.845;
 // attachments per frame even though drawing is scissored to the creature.
 // Keep Lab at authored 2x and use native resolution for production.
 const PRODUCTION_RENDER_SCALE: u32 = 1;
+const DEBUG_LOG_INTERVAL: f32 = 1.0;
+const DEV_MODE_LOG_INTERVAL: f32 = 0.20;
+const LAB_CONTROL_POLL_INTERVAL_SECONDS: f32 = 0.10;
+const CAUSAL_TELEMETRY_SCHEMA_VERSION: u32 = 2;
+const TELEMETRY_RECENT_MEMORY_LIMIT: usize = 16;
+const TELEMETRY_EPISODE_MEMORY_LIMIT: usize = 16;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let Some(_single_instance) = SingleInstanceGuard::acquire()? else {
@@ -90,6 +99,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
     let arguments = Arguments::parse(env::args().skip(1))?;
+    startup_probe(arguments.debug_log, "arguments parsed");
     if arguments.help {
         print_help();
         return Ok(());
@@ -99,6 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(StateStore::at)
         .map_or_else(StateStore::discover, Ok)?;
+    startup_probe(arguments.debug_log, "state store ready");
     if arguments.headless
         || arguments.headless_smoke_seconds.is_some()
         || arguments.simulate_hours.is_some()
@@ -106,11 +117,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_headless(arguments, store);
     }
     let prepared = prepare_state(&arguments, &store)?;
+    startup_probe(arguments.debug_log, "portable state prepared");
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut application = PetApplication::new(arguments, store, prepared)?;
+    startup_probe(application.arguments.debug_log, "application assembled");
     event_loop.run_app(&mut application)?;
     Ok(())
+}
+
+fn startup_probe(enabled: bool, stage: &str) {
+    if enabled {
+        eprintln!("Pet 2 startup: {stage}");
+    }
 }
 
 #[cfg(windows)]
@@ -183,6 +202,7 @@ struct Arguments {
     focus_mode: bool,
     brain_mode: BrainMode,
     debug_log: bool,
+    dev_mode: bool,
     help: bool,
 }
 
@@ -227,6 +247,10 @@ impl Arguments {
                     parsed.brain_mode = value("--brain-mode", &mut arguments)?.parse()?;
                 }
                 "--debug-log" => parsed.debug_log = true,
+                "--dev-mode" => {
+                    parsed.debug_log = true;
+                    parsed.dev_mode = true;
+                }
                 "--help" | "-h" => parsed.help = true,
                 other => return Err(format!("unknown argument: {other}").into()),
             }
@@ -830,11 +854,25 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     let mut feedback = body.simulation.feedback.clone();
     let mut action_counts = BTreeMap::<String, u64>::new();
     let mut morph_command_counts = BTreeMap::<String, u64>::new();
+    let mut morph_control_counts = BTreeMap::<String, u64>::new();
     let mut morph_switches = 0_u64;
     let mut previous_morph_command = MorphCommand::Idle;
     let mut morph_tick_microseconds = Vec::with_capacity(tick_count.min(20_000) as usize);
     let mut distance_traveled = 0.0_f32;
     let mut moving_ticks = 0_u64;
+    let mut goal_progress_ticks = 0_u64;
+    let mut zone_transitions = 0_u64;
+    let mut previous_zone = spatial_zone(feedback.world_position);
+    let mut episode_starts = BTreeMap::<String, u64>::new();
+    let mut episode_completions = BTreeMap::<String, u64>::new();
+    let mut orb_contact_count = 0_u64;
+    let mut orb_distance_traveled = 0.0_f32;
+    let mut previous_orb_position = ecology
+        .state()
+        .objects
+        .iter()
+        .find(|object| object.kind == ObjectKind::Orb)
+        .map(|object| object.position);
     let mut minimum_position = feedback.world_position;
     let mut maximum_position = feedback.world_position;
     let feedback_interval = (5.0 / dt).round().max(1.0) as u64;
@@ -862,11 +900,24 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         }
         vita.observe(&sensors, &feedback, dt);
         let morph_started = Instant::now();
-        let morph_output = morph.tick(&sensors, &feedback, &life.state, dt);
+        let morph_world = ecology.morph_world_input(feedback.world_position, life.state.drives);
+        let morph_output =
+            morph.tick_with_world(&sensors, &feedback, &life.state, &morph_world, dt);
         morph_tick_microseconds.push(morph_started.elapsed().as_secs_f64() * 1_000_000.0);
         *morph_command_counts
             .entry(morph_output.command.as_wire().to_owned())
             .or_default() += 1;
+        for (channel, control) in [
+            ("manipulation", morph_output.manipulation),
+            ("perception", morph_output.perception),
+            ("carry", morph_output.carry),
+        ] {
+            if control != MorphCommand::Idle {
+                *morph_control_counts
+                    .entry(format!("{channel}:{}", control.as_wire()))
+                    .or_default() += 1;
+            }
+        }
         if previous_morph_command != MorphCommand::Idle
             && morph_output.command != previous_morph_command
         {
@@ -887,16 +938,35 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             dt,
         );
         output.body_intent = resolved_intent;
-        output.body_intent = ecology
-            .resolve_intent(
-                output.body_intent,
-                output.selected_action,
-                &sensors,
-                &feedback,
-                life.state.focus_mode,
+        let ecology_output = ecology.resolve_intent(
+            output.body_intent,
+            EcologyResolveFrame {
+                selected_action: output.selected_action,
+                drives: life.state.drives,
+                sensors: &sensors,
+                body: &feedback,
+                focus_mode: life.state.focus_mode,
                 dt,
-            )
-            .body_intent;
+            },
+        );
+        for outcome in ecology_output.outcomes[..ecology_output.outcome_count]
+            .iter()
+            .copied()
+        {
+            match outcome {
+                EcologyOutcome::EpisodeStarted(goal) => {
+                    *episode_starts.entry(format!("{goal:?}")).or_default() += 1;
+                }
+                EcologyOutcome::EpisodeCompleted(goal) => {
+                    *episode_completions.entry(format!("{goal:?}")).or_default() += 1;
+                }
+                EcologyOutcome::ObjectContact(_) => {
+                    orb_contact_count = orb_contact_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        output.body_intent = ecology_output.body_intent;
         let visual_mind = visual_mind_input(
             &life,
             &sensors,
@@ -908,12 +978,16 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         *action_counts
             .entry(format!("{:?}", output.selected_action))
             .or_default() += 1;
+        let goal_distance_before = feedback
+            .world_position
+            .distance(output.body_intent.target_position);
         body.fixed_update(
             &life.state.genome,
             &output.body_intent,
             &sensors,
             dt.min(1.0 / 30.0),
         );
+        apply_headless_rect_domain(&mut body.simulation.feedback);
         ecology.fixed_update(
             16.0 / 9.0,
             &empty_window_affordances,
@@ -937,6 +1011,29 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         distance_traveled += step_distance;
         if step_distance > 0.000_1 {
             moving_ticks = moving_ticks.saturating_add(1);
+        }
+        let goal_distance_after = next_feedback
+            .world_position
+            .distance(output.body_intent.target_position);
+        if goal_distance_before - goal_distance_after > 0.000_05 {
+            goal_progress_ticks = goal_progress_ticks.saturating_add(1);
+        }
+        let zone = spatial_zone(next_feedback.world_position);
+        if zone != previous_zone {
+            zone_transitions = zone_transitions.saturating_add(1);
+            previous_zone = zone;
+        }
+        if let Some(orb_position) = ecology
+            .state()
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Orb)
+            .map(|object| object.position)
+        {
+            if let Some(previous) = previous_orb_position {
+                orb_distance_traveled += orb_position.distance(previous);
+            }
+            previous_orb_position = Some(orb_position);
         }
         minimum_position = minimum_position.min(next_feedback.world_position);
         maximum_position = maximum_position.max(next_feedback.world_position);
@@ -971,6 +1068,17 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     let morph_state = morph.snapshot();
     let ecology_state = ecology.snapshot();
     let ecology_bytes = serde_json::to_vec(&ecology_state)?;
+    let behavior_acceptance_required = arguments.headless_smoke_seconds.is_some()
+        && arguments.simulate_hours.is_none()
+        && !arguments.focus_mode
+        && duration_seconds >= 60.0;
+    let behavior_acceptance = HeadlessBehaviorAcceptance {
+        bounded: minimum_position.cmpge(Vec2::splat(0.099)).all()
+            && maximum_position.cmple(Vec2::splat(0.901)).all(),
+        travels: distance_traveled >= 0.50 && zone_transitions >= 2,
+        pursues_goals: goal_progress_ticks as f64 / tick_count.max(1) as f64 >= 0.08,
+        plays_with_orb: orb_contact_count >= 1 && orb_distance_traveled >= 0.25,
+    };
     let summary = serde_json::json!({
         "schema_version": portable.schema_version,
         "brain_mode": brain_mode.as_str(),
@@ -984,9 +1092,19 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         "action_counts": action_counts,
         "distance_traveled": distance_traveled,
         "moving_fraction": moving_ticks as f64 / tick_count.max(1) as f64,
+        "goal_progress_fraction": goal_progress_ticks as f64 / tick_count.max(1) as f64,
+        "zone_transitions": zone_transitions,
         "position_bounds": {
             "minimum": [minimum_position.x, minimum_position.y],
             "maximum": [maximum_position.x, maximum_position.y],
+        },
+        "behavior_acceptance": {
+            "required": behavior_acceptance_required,
+            "bounded": behavior_acceptance.bounded,
+            "travels": behavior_acceptance.travels,
+            "pursues_goals": behavior_acceptance.pursues_goals,
+            "plays_with_orb": behavior_acceptance.plays_with_orb,
+            "passed": behavior_acceptance.passed(),
         },
         "drives": life.state.drives,
         "affect": life.state.affect,
@@ -1007,6 +1125,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             "upstream_commit": morph_brain::UPSTREAM_COMMIT,
             "network": { "neurons": 526, "synapses": 17475, "populations": 57 },
             "command_counts": morph_command_counts,
+            "control_counts": morph_control_counts,
             "command_switches": morph_switches,
             "tick_p50_us": morph_p50_us,
             "tick_p95_us": morph_p95_us,
@@ -1018,9 +1137,23 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             "schema_version": ecology_state.schema_version,
             "object_count": ecology_state.objects.len(),
             "state_hash": stable_hash_bytes(&ecology_bytes),
+            "episode_starts": episode_starts,
+            "episode_completions": episode_completions,
+            "orb_contact_count": orb_contact_count,
+            "orb_distance_traveled": orb_distance_traveled,
         },
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    if behavior_acceptance_required && !behavior_acceptance.passed() {
+        return Err(format!(
+            "headless behavior acceptance failed: bounded={}, travels={}, pursues_goals={}, plays_with_orb={}",
+            behavior_acceptance.bounded,
+            behavior_acceptance.travels,
+            behavior_acceptance.pursues_goals,
+            behavior_acceptance.plays_with_orb,
+        )
+        .into());
+    }
     store.save_state(&portable)?;
     store.save_morph_brain(&morph_state)?;
     store.save_ecology_state(&ecology_state)?;
@@ -1028,6 +1161,43 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         store.export_state(&portable, path)?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeadlessBehaviorAcceptance {
+    bounded: bool,
+    travels: bool,
+    pursues_goals: bool,
+    plays_with_orb: bool,
+}
+
+impl HeadlessBehaviorAcceptance {
+    fn passed(self) -> bool {
+        self.bounded && self.travels && self.pursues_goals && self.plays_with_orb
+    }
+}
+
+fn apply_headless_rect_domain(feedback: &mut lifecore::BodyFeedback) {
+    const MARGIN: f32 = 0.10;
+    for axis in 0..2 {
+        if feedback.world_position[axis] < MARGIN {
+            feedback.world_position[axis] = MARGIN;
+            if feedback.velocity[axis] < 0.0 {
+                feedback.velocity[axis] *= -0.12;
+            }
+        } else if feedback.world_position[axis] > 1.0 - MARGIN {
+            feedback.world_position[axis] = 1.0 - MARGIN;
+            if feedback.velocity[axis] > 0.0 {
+                feedback.velocity[axis] *= -0.12;
+            }
+        }
+    }
+}
+
+fn spatial_zone(position: Vec2) -> u8 {
+    let column = (position.x.clamp(0.0, 0.999_999) * 4.0) as u8;
+    let row = (position.y.clamp(0.0, 0.999_999) * 3.0) as u8;
+    row * 4 + column
 }
 
 struct TeachRecorder {
@@ -1090,6 +1260,188 @@ impl TeachRecorder {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct GazeCausalTrace {
+    lifecore_target: Option<Vec2>,
+    vita_target: Option<Vec2>,
+    ecology_target: Option<Vec2>,
+    source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabCommandStatus {
+    AwaitingCommand,
+    Applied,
+    NoChange,
+    Expired,
+    PredatesProcess,
+    Invalid,
+    LoadError,
+}
+
+impl LabCommandStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingCommand => "awaiting_command",
+            Self::Applied => "applied",
+            Self::NoChange => "no_change",
+            Self::Expired => "expired",
+            Self::PredatesProcess => "predates_process",
+            Self::Invalid => "invalid",
+            Self::LoadError => "load_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabCommandAdmission {
+    Execute,
+    Stale,
+    Expired,
+    PredatesProcess,
+    Invalid,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDrivePulse {
+    command_id: u64,
+    drive: LabDrive,
+    delta: f32,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AppliedDriveOverlay {
+    natural: Drives,
+    effective: Drives,
+}
+
+impl AppliedDriveOverlay {
+    fn apply_to(self, drives: &mut Drives) {
+        *drives = self.effective;
+    }
+
+    fn restore_exact(self, drives: &mut Drives) {
+        *drives = self.natural;
+    }
+}
+
+#[derive(Debug)]
+struct LabInterventionState {
+    process_started_unix_ms: u64,
+    last_seen_command_id: Option<u64>,
+    last_command_kind: Option<&'static str>,
+    last_command_status: LabCommandStatus,
+    active_pulses: Vec<ActiveDrivePulse>,
+    last_natural_drives: Option<Drives>,
+    last_effective_drives: Option<Drives>,
+}
+
+impl Default for LabInterventionState {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl LabInterventionState {
+    fn new(process_started_unix_ms: u64) -> Self {
+        Self {
+            process_started_unix_ms,
+            last_seen_command_id: None,
+            last_command_kind: None,
+            last_command_status: LabCommandStatus::AwaitingCommand,
+            active_pulses: Vec::new(),
+            last_natural_drives: None,
+            last_effective_drives: None,
+        }
+    }
+
+    fn admit_command(
+        &mut self,
+        envelope: &LabControlEnvelope,
+        now_unix_ms: u64,
+    ) -> LabCommandAdmission {
+        if envelope.validate().is_err() {
+            self.last_command_status = LabCommandStatus::Invalid;
+            return LabCommandAdmission::Invalid;
+        }
+        if self
+            .last_seen_command_id
+            .is_some_and(|last_seen| envelope.command_id <= last_seen)
+        {
+            return LabCommandAdmission::Stale;
+        }
+
+        // Advancing the monotonic watermark before checking expiry prevents a
+        // newer-but-expired slot from being retried, or from allowing an older
+        // command to replay after it.
+        self.last_seen_command_id = Some(envelope.command_id);
+        self.last_command_kind = Some(lab_command_name(&envelope.command));
+        if envelope.issued_unix_ms < self.process_started_unix_ms {
+            self.last_command_status = LabCommandStatus::PredatesProcess;
+            return LabCommandAdmission::PredatesProcess;
+        }
+        if envelope.is_expired(now_unix_ms) {
+            self.last_command_status = LabCommandStatus::Expired;
+            LabCommandAdmission::Expired
+        } else {
+            LabCommandAdmission::Execute
+        }
+    }
+
+    fn note_applied(&mut self, changed: bool) {
+        self.last_command_status = if changed {
+            LabCommandStatus::Applied
+        } else {
+            LabCommandStatus::NoChange
+        };
+    }
+
+    fn note_load_error(&mut self) {
+        self.last_command_status = LabCommandStatus::LoadError;
+    }
+
+    fn replace_drive_pulse(
+        &mut self,
+        command_id: u64,
+        drive: LabDrive,
+        delta: f32,
+        duration_seconds: f32,
+        now: Instant,
+    ) {
+        self.expire_pulses(now);
+        self.active_pulses.retain(|pulse| pulse.drive != drive);
+        let safe_seconds = if duration_seconds.is_finite() {
+            duration_seconds.clamp(0.1, 30.0)
+        } else {
+            0.0
+        };
+        let duration = Duration::from_secs_f32(safe_seconds);
+        let expires_at = now.checked_add(duration).unwrap_or(now);
+        self.active_pulses.push(ActiveDrivePulse {
+            command_id,
+            drive,
+            delta: delta.clamp(-1.0, 1.0),
+            expires_at,
+        });
+    }
+
+    fn expire_pulses(&mut self, now: Instant) {
+        self.active_pulses.retain(|pulse| pulse.expires_at > now);
+    }
+
+    fn drive_overlay(&mut self, natural: Drives, now: Instant) -> AppliedDriveOverlay {
+        self.expire_pulses(now);
+        let mut effective = natural;
+        for pulse in &self.active_pulses {
+            add_drive_delta(&mut effective, pulse.drive, pulse.delta);
+        }
+        self.last_natural_drives = Some(natural);
+        self.last_effective_drives = Some(effective);
+        AppliedDriveOverlay { natural, effective }
+    }
+}
+
 struct PetRuntime {
     window: Arc<Window>,
     renderer: Renderer,
@@ -1132,12 +1484,16 @@ struct PetRuntime {
     last_visual_sample: Option<DesktopVisualFrame>,
     save_accumulator: f32,
     tuning_poll_accumulator: f32,
+    lab_control_poll_accumulator: f32,
+    lab_interventions: LabInterventionState,
     tuning_last_modified: Option<SystemTime>,
     was_sleeping: bool,
     visible_after_first_frame: bool,
     modifiers: ModifiersState,
     debug_logging: bool,
+    debug_interval: f32,
     debug_accumulator: f32,
+    telemetry_sequence: u64,
     fps_accumulator: f32,
     frames_since_fps: u32,
     fps: f32,
@@ -1154,6 +1510,7 @@ struct PetRuntime {
     brain_tick_microseconds: f64,
     last_debug: Option<DebugState>,
     last_vita: Option<VitaOutput>,
+    gaze_trace: GazeCausalTrace,
     last_morph: MorphOutput,
     teach: TeachRecorder,
     physics_timings: TimingWindow,
@@ -1207,10 +1564,17 @@ impl PetApplication {
         runtime.visual_poll_accumulator += elapsed;
         runtime.save_accumulator += elapsed;
         runtime.tuning_poll_accumulator += elapsed;
+        runtime.lab_control_poll_accumulator += elapsed;
         runtime.debug_accumulator += elapsed;
         runtime.fps_accumulator += elapsed;
         runtime.max_frame_gap_ms = runtime.max_frame_gap_ms.max(elapsed * 1_000.0);
         runtime.frame_gap_timings.observe(elapsed * 1_000.0);
+
+        if runtime.lab_control_poll_accumulator >= LAB_CONTROL_POLL_INTERVAL_SECONDS {
+            runtime.lab_control_poll_accumulator %= LAB_CONTROL_POLL_INTERVAL_SECONDS;
+            poll_lab_control(&self.store, runtime, SystemTime::now(), now);
+        }
+        runtime.lab_interventions.expire_pulses(now);
 
         if runtime.tuning_poll_accumulator >= 0.25 {
             runtime.tuning_poll_accumulator %= 0.25;
@@ -1384,19 +1748,21 @@ impl PetApplication {
                 click_rhythm.map_or([0.0; 8], |rhythm| rhythm.intervals);
             runtime.ecology.set_click_rhythm(click_rhythm);
             let visual_target = runtime.vita.visual_attention_target();
-            let visual_hue = visual_target
-                .and_then(|target| {
-                    runtime
-                        .last_visual_sample
-                        .map(|frame| frame.cell_at(target.position).hue)
-                })
-                .unwrap_or(0.0);
-            runtime.ecology.set_visual_attention(
-                visual_target.map(|target| target.position),
-                visual_hue,
-                visual_target.map_or(0.0, |target| target.score),
-                visual_target.is_some_and(|target| target.explicit),
-            );
+            let visual_cell = visual_target.and_then(|target| {
+                runtime
+                    .last_visual_sample
+                    .map(|frame| frame.cell_at(target.position))
+            });
+            let visual_hue = visual_cell.map_or(0.0, |cell| cell.hue);
+            runtime.ecology.set_visual_attention(VisualAttentionSample {
+                target: visual_target.map(|target| target.position),
+                hue: visual_hue,
+                strength: visual_target.map_or(0.0, |target| target.score),
+                explicit: visual_target.is_some_and(|target| target.explicit),
+                colorfulness: visual_cell.map_or(0.0, |cell| cell.colorfulness),
+                structure: visual_cell.map_or(0.0, |cell| cell.edge_density),
+                surprise: visual_cell.map_or(0.0, |cell| cell.sudden_change.max(cell.motion)),
+            });
             if let Some(signature) = runtime
                 .teach
                 .observe(runtime.sensors.cursor_position, runtime.sensors.timestamp)
@@ -1534,16 +1900,38 @@ impl PetApplication {
         synchronize_audio_learning(runtime);
         while runtime.life_accumulator >= LIFE_DT {
             let tick_started = Instant::now();
-            let morph_output = runtime.morph.tick(
+            // Lab drive pulses are an observational experiment layer, never a
+            // second homeostasis owner. Morph sees a reversible overlay on the
+            // pre-LifeCore state, then LifeCore advances from its exact natural
+            // drives as it always has.
+            let morph_overlay = runtime
+                .lab_interventions
+                .drive_overlay(runtime.life.state.drives, tick_started);
+            morph_overlay.apply_to(&mut runtime.life.state.drives);
+            let morph_world = runtime.ecology.morph_world_input(
+                runtime.body.simulation.feedback.world_position,
+                runtime.life.state.drives,
+            );
+            let morph_output = runtime.morph.tick_with_world(
                 &runtime.sensors,
                 &runtime.body.simulation.feedback,
                 &runtime.life.state,
+                &morph_world,
                 LIFE_DT,
             );
+            morph_overlay.restore_exact(&mut runtime.life.state.drives);
             let mut output =
                 runtime
                     .life
                     .tick(&runtime.sensors, &runtime.body.simulation.feedback, LIFE_DT);
+            let lifecore_gaze = output.body_intent.gaze_target;
+            // Resolution gets a second overlay based on the newly advanced
+            // natural drives. Restoring by assignment (rather than subtracting
+            // deltas) is exact even when an effective value was clamped.
+            let resolution_overlay = runtime
+                .lab_interventions
+                .drive_overlay(runtime.life.state.drives, tick_started);
+            resolution_overlay.apply_to(&mut runtime.life.state.drives);
             let (resolved_intent, vita_output) = runtime.vita.resolve_intent_with_morph(
                 runtime.brain_mode,
                 &runtime.life.state,
@@ -1553,15 +1941,44 @@ impl PetApplication {
                 Some(morph_output),
                 LIFE_DT,
             );
+            let vita_gaze = resolved_intent.gaze_target;
             output.body_intent = resolved_intent;
             let ecology_output = runtime.ecology.resolve_intent(
                 output.body_intent,
-                output.selected_action,
-                &runtime.sensors,
-                &runtime.body.simulation.feedback,
-                runtime.life.state.focus_mode,
-                LIFE_DT,
+                EcologyResolveFrame {
+                    selected_action: output.selected_action,
+                    drives: runtime.life.state.drives,
+                    sensors: &runtime.sensors,
+                    body: &runtime.body.simulation.feedback,
+                    focus_mode: runtime.life.state.focus_mode,
+                    dt: LIFE_DT,
+                },
             );
+            resolution_overlay.restore_exact(&mut runtime.life.state.drives);
+            let ecology_gaze = ecology_output.body_intent.gaze_target;
+            let gaze_source = if let Some(goal) = ecology_output.debug.active_goal {
+                format!("ecology:{goal:?}")
+            } else if vita_gaze != lifecore_gaze
+                || vita_output
+                    .as_ref()
+                    .is_some_and(|vita| vita.direct_viewer_gaze)
+            {
+                format!(
+                    "vita:{}",
+                    vita_output.as_ref().map_or_else(
+                        || "filtered".to_owned(),
+                        |vita| format!("{:?}", vita.attention.kind)
+                    )
+                )
+            } else {
+                format!("lifecore:{:?}", output.selected_action)
+            };
+            runtime.gaze_trace = GazeCausalTrace {
+                lifecore_target: lifecore_gaze,
+                vita_target: vita_gaze,
+                ecology_target: ecology_gaze,
+                source: gaze_source,
+            };
             output.body_intent = ecology_output.body_intent;
             let ecology_vocal_trigger = ecology_output.vocal_trigger;
             preserve_navigation_during_material_drag(
@@ -1569,6 +1986,7 @@ impl PetApplication {
                 &mut output.body_intent,
                 runtime.sensors.pet_dragged,
             );
+            project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
             runtime.brain_tick_microseconds = tick_started.elapsed().as_secs_f64() * 1_000_000.0;
             runtime.last_debug = Some(output.debug.clone());
             runtime.last_vita = vita_output;
@@ -1603,11 +2021,13 @@ impl PetApplication {
             }
             runtime.life_accumulator -= LIFE_DT;
         }
-        if runtime.debug_accumulator >= 1.0 {
-            runtime.debug_accumulator %= 1.0;
+        if runtime.debug_accumulator >= runtime.debug_interval {
+            runtime.debug_accumulator %= runtime.debug_interval;
             if runtime.debug_logging
                 && let Some(debug) = &runtime.last_debug
             {
+                runtime.telemetry_sequence = runtime.telemetry_sequence.saturating_add(1);
+                let telemetry_sequence = runtime.telemetry_sequence;
                 let liquid = runtime.body.embodiment.liquid.diagnostics();
                 let physics_timing = runtime.physics_timings.percentiles();
                 let render_timing = runtime.render_timings.percentiles();
@@ -1646,6 +2066,7 @@ impl PetApplication {
                         .find(|skill| skill.id == skill_id)
                 });
                 let ecology_visual = runtime.ecology.visual_context();
+                let ecology_visual_effect = runtime.ecology.visual_effect();
                 let saliency_target = runtime.vita.visual_attention_target();
                 let ecology_state = runtime.ecology.state();
                 let orb = ecology_state
@@ -1653,6 +2074,8 @@ impl PetApplication {
                     .iter()
                     .find(|object| object.kind == ObjectKind::Orb);
                 let ecology_environment = runtime.ecology.environment();
+                let (gaze_fixation_elapsed, gaze_fixation_duration) =
+                    runtime.body.embodiment.fixation_timing();
                 let ecology_contacts = ecology_environment.contacts[..ecology_environment
                     .contact_count
                     .min(ecology_environment.contacts.len())]
@@ -1681,9 +2104,82 @@ impl PetApplication {
                     "visual_deborah": liquid.visual_deborah,
                     "finite": liquid.finite,
                 });
+                let life_details = lifecore_telemetry_json(&runtime.life, debug);
+                let activity_details = activity_telemetry_json(
+                    &runtime.life,
+                    ecology_debug,
+                    active_ecology,
+                    &ecology_scores,
+                );
+                let vita_details = vita_telemetry_json(&runtime.vita, runtime.last_vita.as_ref());
+                let morph_diagnostics = runtime.morph.diagnostics();
+                let morph_details =
+                    morph_telemetry_json(runtime.last_morph, runtime.brain_mode, morph_diagnostics);
+                let lab_interventions =
+                    lab_interventions_telemetry_json(&runtime.lab_interventions, Instant::now());
+                let mutation_history_count = runtime.life.state.development.mutation_history.len();
+                let latest_mutation = runtime
+                    .life
+                    .state
+                    .development
+                    .mutation_history
+                    .last()
+                    .map(mutation_record_telemetry_json);
+                let audio_visual = runtime.audio.visual_feedback();
+                let audio_levels = runtime.audio.callback_levels();
+                let body_feedback = &runtime.body.simulation.feedback;
+                let action_definition = runtime.life.state.current_action.definition();
                 let mut debug_details = serde_json::json!({
+                    "telemetry_schema": "pet2.causal_telemetry",
+                    "telemetry_schema_version": CAUSAL_TELEMETRY_SCHEMA_VERSION,
+                    "schema_version": CAUSAL_TELEMETRY_SCHEMA_VERSION,
+                    "sequence": telemetry_sequence,
+                    "identity_seed": runtime.life.state.genome.identity_seed,
+                    "lineage_id": format!("{:032x}", runtime.life.state.genome.lineage_id),
+                    "generation": runtime.life.state.genome.generation,
+                    "genome_hash": runtime.life.state.genome.stable_hash(),
+                    "tick": runtime.life.state.tick_count,
+                    "elapsed_seconds": runtime.life.state.elapsed_seconds,
+                    "identity": {
+                        "identity_seed": runtime.life.state.genome.identity_seed,
+                        "identity_seed_hex": format!("{:016x}", runtime.life.state.genome.identity_seed),
+                        "lineage_id": format!("{:032x}", runtime.life.state.genome.lineage_id),
+                        "generation": runtime.life.state.genome.generation,
+                        "genome_hash": runtime.life.state.genome.stable_hash(),
+                        "genome": genome_telemetry_json(&runtime.life.state.genome),
+                    },
+                    "development": {
+                        "stage": runtime.life.state.development.stage,
+                        "metamorphosis_count": runtime.life.state.development.metamorphosis_count,
+                        "lifetime": &runtime.life.state.development.lifetime,
+                        // Full bounded lineage history already lives in the
+                        // validated atomic state.json that Body Lab reads for
+                        // evolution replay. Repeating ~266 KiB at 5 Hz would
+                        // collapse the bounded telemetry timeline to seconds.
+                        "mutation_history_count": mutation_history_count,
+                        "latest_mutation": latest_mutation,
+                    },
+                    "lifecore": life_details,
+                    "activity": activity_details,
                     "action": format!("{:?}", runtime.life.state.current_action),
+                    "action_elapsed_seconds": runtime.life.state.action_elapsed_seconds,
+                    "action_minimum_seconds": action_definition.minimum_duration,
+                    "action_maximum_seconds": action_definition.maximum_duration,
+                    "action_cooldowns": runtime.life.state.action_cooldowns,
+                    "recent_actions": runtime.life.state.recent_actions.iter().copied().map(action_wire_name).collect::<Vec<_>>(),
+                    "pending_attention": runtime.life.state.pending_attention.as_ref().map(|pending| serde_json::json!({
+                        "action": action_wire_name(pending.action),
+                        "elapsed_seconds": pending.elapsed_seconds,
+                        "response_window_seconds": pending.response_window_seconds,
+                    })),
+                    "successful_interactions": runtime.life.state.successful_interactions,
+                    "ignored_attempts": runtime.life.state.ignored_attempts,
+                    "focus_mode": runtime.life.state.focus_mode,
                     "locomotion": format!("{:?}", runtime.intent.locomotion),
+                    "body_render_mode": format!("{:?}", runtime.body.tuning_profile().render_mode),
+                    "material_variant": format!("{:?}", runtime.body.tuning_profile().material.variant),
+                    "liquid_profile_name": runtime.body.tuning_profile().name.as_str(),
+                    "liquid_profile_revision": runtime.body.tuning_profile().profile_revision,
                     "world_position": runtime.body.simulation.feedback.world_position.to_array(),
                     "target_position": runtime.intent.target_position.to_array(),
                     "velocity": runtime.body.simulation.feedback.velocity.to_array(),
@@ -1713,9 +2209,60 @@ impl PetApplication {
                     "liquid_com_follow_ratio": liquid.com_follow_ratio,
                     "liquid_orientation": liquid.orientation,
                     "liquid_lean_target": liquid.lean_target,
-                    "liquid": liquid_debug,
+                    "liquid": liquid_debug.clone(),
+                    "body": {
+                        "render_mode": format!("{:?}", runtime.body.tuning_profile().render_mode),
+                        "material_variant": format!("{:?}", runtime.body.tuning_profile().material.variant),
+                        "profile_revision": runtime.body.tuning_profile().profile_revision,
+                        "world_position": body_feedback.world_position.to_array(),
+                        "target_position": runtime.intent.target_position.to_array(),
+                        "velocity": body_feedback.velocity.to_array(),
+                        "acceleration": body_feedback.acceleration.to_array(),
+                        "grounded": body_feedback.grounded,
+                        "clinging": body_feedback.clinging,
+                        "cursor_contact": body_feedback.cursor_contact,
+                        "collision": body_feedback.collision.as_ref().map(|collision| serde_json::json!({
+                            "normal": collision.normal.to_array(),
+                            "intensity": collision.intensity,
+                        })),
+                        "pose_error": body_feedback.pose_error,
+                        "locomotion_completed": body_feedback.locomotion_completed,
+                        "locomotion": format!("{:?}", runtime.intent.locomotion),
+                        "desired_speed": runtime.intent.desired_speed,
+                        "pose": format!("{:?}", runtime.intent.pose),
+                        "expression": runtime.intent.expression,
+                        "liquid": liquid_debug,
+                    },
+                    "perception": {
+                        // Deliberately aggregate-only: no key text, window IDs,
+                        // surface IDs, absolute pixels, or captured screen data.
+                        "timestamp": runtime.sensors.timestamp,
+                        "day_phase": runtime.sensors.day_phase,
+                        "time_of_day_01": runtime.sensors.time_of_day_01,
+                        "cursor_distance_to_pet": runtime.sensors.cursor_distance_to_pet,
+                        "cursor_approach_speed": runtime.sensors.cursor_approach_speed,
+                        "cursor_speed": runtime.sensors.cursor_velocity.length(),
+                        "pointer": {
+                            "down": runtime.sensors.pointer_down,
+                            "pressed": runtime.sensors.pointer_pressed,
+                            "released": runtime.sensors.pointer_released,
+                            "pet_hovered": runtime.sensors.pet_hovered,
+                            "pet_touched": runtime.sensors.pet_touched,
+                            "pet_dragged": runtime.sensors.pet_dragged,
+                        },
+                        "user_idle_seconds": runtime.sensors.user_idle_seconds,
+                        "user_activity_rate": runtime.sensors.user_activity_rate,
+                        "user_presence": runtime.sensors.user_presence,
+                        "user_availability": runtime.sensors.user_availability,
+                        "active_app_category": runtime.sensors.active_app_category,
+                        "audio_rms": runtime.sensors.audio_rms,
+                        "voice_activity": runtime.sensors.voice_activity,
+                        "mean_luminance": runtime.sensors.mean_luminance,
+                        "local_luminance": runtime.sensors.local_luminance,
+                    },
                     "strongest_drive": format!("{:?}", debug.strongest_drive),
                     "strongest_drive_value": debug.strongest_drive_value,
+                    "drives": runtime.life.state.drives,
                     "affect": runtime.life.state.affect,
                     "attachment": runtime.life.state.affect.attachment,
                     "attention_budget": debug.attention_budget,
@@ -1736,9 +2283,30 @@ impl PetApplication {
                     "render_microseconds": runtime.render_microseconds,
                     "brain_tick_microseconds": runtime.brain_tick_microseconds,
                     "brain_mode": runtime.brain_mode.as_str(),
-                    "morph": morph_output_json(runtime.last_morph),
+                    "morph": morph_details,
+                    "morph_diagnostics": morph_diagnostics,
+                    "lab_interventions": lab_interventions,
+                    "fusion": serde_json::Value::Null,
                     "intent_pose": format!("{:?}", runtime.intent.pose),
                     "gaze_mode": format!("{:?}", runtime.body.embodiment.pose.gaze_mode),
+                    "gaze": {
+                        "source": runtime.gaze_trace.source.as_str(),
+                        "lifecore_target": runtime.gaze_trace.lifecore_target.map(|target| target.to_array()),
+                        "vita_resolved_target": runtime.gaze_trace.vita_target.map(|target| target.to_array()),
+                        "ecology_resolved_target": runtime.gaze_trace.ecology_target.map(|target| target.to_array()),
+                        "intent_world_target": runtime.intent.gaze_target.map(|target| target.to_array()),
+                        "interaction_target": runtime.intent.interaction_target.as_ref().map(|target| format!("{target:?}")),
+                        "cursor_world": runtime.sensors.cursor_position.to_array(),
+                        "semantic_local_target": runtime.body.embodiment.semantic_gaze_target().to_array(),
+                        "presented_local": runtime.body.embodiment.pose.gaze.to_array(),
+                        "fixation_locked": runtime.body.embodiment.fixation_locked(),
+                        "fixation_elapsed": gaze_fixation_elapsed,
+                        "fixation_duration": gaze_fixation_duration,
+                        "attention_kind": runtime.last_vita.as_ref().map(|output| format!("{:?}", output.attention.kind)),
+                        "attention_position": runtime.last_vita.as_ref().and_then(|output| output.attention.position).map(|target| target.to_array()),
+                        "attention_confidence": runtime.last_vita.as_ref().map(|output| output.attention.confidence),
+                        "attention_commitment_remaining": runtime.last_vita.as_ref().map(|output| output.attention.commitment_remaining),
+                    },
                     "blink_left": runtime.body.embodiment.pose.blink_left,
                     "blink_right": runtime.body.embodiment.pose.blink_right,
                     "pupil_size": runtime.body.embodiment.pose.pupil_size,
@@ -1754,6 +2322,16 @@ impl PetApplication {
                     },
                     "expression_blink_left": runtime.intent.expression.blink_left,
                     "expression_blink_right": runtime.intent.expression.blink_right,
+                    "expression": runtime.intent.expression,
+                    "ecology_visual_effect": {
+                        "hue": ecology_visual_effect.hue,
+                        "color_blend": ecology_visual_effect.color_blend,
+                        "flow_boost": ecology_visual_effect.flow_boost,
+                        "glow_boost": ecology_visual_effect.glow_boost,
+                        "cohesion_bias": ecology_visual_effect.cohesion_bias,
+                        "translucency_boost": ecology_visual_effect.translucency_boost,
+                        "contrast_reduction": ecology_visual_effect.contrast_reduction,
+                    },
                     "vita_attention": runtime.last_vita.as_ref().map(|output| format!("{:?}", output.attention.kind)),
                     "vita_emotion": runtime.last_vita.as_ref().and_then(|output| output.dominant_emotion).map(|emotion| format!("{:?}", emotion.kind)),
                     "vita_influence": runtime.last_vita.as_ref().and_then(|output| output.influence.as_ref()).map(|decision| format!("{:?}", decision.strategy)),
@@ -1764,6 +2342,7 @@ impl PetApplication {
                     "typing_rate_hz": runtime.vita.percept().typing_rate_hz,
                     "scroll_velocity": runtime.vita.percept().scroll_velocity,
                     "window_pressure": runtime.vita.percept().window_pressure,
+                    "vita": vita_details,
                     "ecology": {
                         "ecology_schema": ecology_state.schema_version,
                         "active_episode_id": active_ecology.map(|episode| episode.id),
@@ -1771,7 +2350,13 @@ impl PetApplication {
                         "phase": ecology_debug.active_phase.map(|phase| format!("{phase:?}")),
                         "reason": format!("{:?}", ecology_debug.selected_reason),
                         "phase_elapsed": active_ecology.map(|episode| episode.elapsed_seconds),
+                        "phase_elapsed_seconds": active_ecology.map(|episode| episode.phase_elapsed_seconds),
+                        "commitment_remaining_seconds": active_ecology.map(|episode| episode.commitment_remaining),
                         "attempts": active_ecology.map(|episode| episode.attempts),
+                        "prediction_confidence": active_ecology.map(|episode| episode.prediction_confidence),
+                        "expected_outcome": active_ecology.map(|episode| format!("{:?}", episode.expected_outcome)),
+                        "decision_tick": ecology_debug.tick,
+                        "focus_mode_filtered": ecology_debug.focus_mode_filtered,
                         "candidate_scores": ecology_scores,
                         "escape_confidence": active_ecology
                             .filter(|episode| episode.goal == EpisodeGoal::EscapePressure)
@@ -1783,6 +2368,8 @@ impl PetApplication {
                                     && episode.phase == EpisodePhase::AskForHelp
                             }),
                         "orb_state": orb.map(|object| format!("{:?}", object.lifecycle)),
+                        "orb_grounded": ecology_environment.orb_grounded,
+                        "orb_trapped": ecology_environment.orb_trapped,
                         "orb_position": orb.map(|object| object.position.to_array()),
                         "orb_velocity": orb.map(|object| object.velocity.to_array()),
                         "orb_familiarity": orb.map(|object| object.familiarity),
@@ -1795,8 +2382,13 @@ impl PetApplication {
                         "window_pressure": ecology_environment.pressure,
                         "external_contacts": ecology_contacts,
                         "saliency_target": saliency_target.map(|target| target.position.to_array()),
+                        "saliency_kind": saliency_target.map(|target| format!("{:?}", target.kind)),
+                        "saliency_score": saliency_target.map(|target| target.score),
                         "chromatic_blend": ecology_visual.chromatic_blend,
                         "camouflage_blend": ecology_visual.camouflage_blend,
+                        "visual_structure": ecology_visual.visual_structure,
+                        "visual_surprise": ecology_visual.visual_surprise,
+                        "ecology_vocal_trigger": runtime.ecology.last_vocal_trigger().map(|trigger| format!("{trigger:?}")),
                         "active_skill": active_skill_id,
                         "skill_competence": active_skill.map(|skill| skill.competence),
                         "skill_uncertainty": active_skill.map(|skill| skill.uncertainty),
@@ -1813,6 +2405,22 @@ impl PetApplication {
                         "camera": [camera_timing.p50, camera_timing.p95, camera_timing.p99],
                         "background_poll_upload": [background_timing.p50, background_timing.p95, background_timing.p99],
                     },
+                    "performance": {
+                        "fps": runtime.fps,
+                        "maximum_frame_gap_ms": runtime.max_frame_gap_ms,
+                        "brain_tick_microseconds": runtime.brain_tick_microseconds,
+                        "telemetry_interval_seconds": runtime.debug_interval,
+                        "timings_ms": {
+                            "physics": [physics_timing.p50, physics_timing.p95, physics_timing.p99],
+                            "render": [render_timing.p50, render_timing.p95, render_timing.p99],
+                            "frame_gap": [frame_gap_timing.p50, frame_gap_timing.p95, frame_gap_timing.p99],
+                            "desktop_poll": [desktop_timing.p50, desktop_timing.p95, desktop_timing.p99],
+                            "camera": [camera_timing.p50, camera_timing.p95, camera_timing.p99],
+                            "background_poll_upload": [background_timing.p50, background_timing.p95, background_timing.p99],
+                        },
+                        "skipped_render_frames": runtime.skipped_render_frames,
+                        "dropped_body_time_seconds": runtime.dropped_body_time_seconds,
+                    },
                     "audio_state": format!("{:?}", runtime.audio.state),
                     "audio_device": runtime.audio.device_name(),
                     "audio_config": runtime.audio.selected_config().map(|config| format!("{:?}", config)),
@@ -1824,6 +2432,29 @@ impl PetApplication {
                     "audio_recent_peak": runtime.audio.recent_peak,
                     "audio_accepted_requests": runtime.audio.accepted_requests,
                     "audio_rejected_requests": runtime.audio.rejected_requests,
+                    "audio": {
+                        "state": format!("{:?}", runtime.audio.state),
+                        "configured": runtime.audio.selected_config().is_some(),
+                        "active": audio_visual.active,
+                        "motif_id": audio_visual.motif_id,
+                        "syllable_index": audio_visual.syllable_index,
+                        "envelope": audio_visual.envelope,
+                        "mouth_open": audio_visual.mouth_open,
+                        "pitch_normalized": audio_visual.pitch_normalized,
+                        "noisiness": audio_visual.noisiness,
+                        "purr": audio_visual.purr,
+                        "callback_rms": audio_levels.rms,
+                        "callback_peak": audio_levels.peak,
+                        "recent_rms": runtime.audio.recent_rms,
+                        "recent_peak": runtime.audio.recent_peak,
+                        "accepted_requests": runtime.audio.accepted_requests,
+                        "rejected_requests": runtime.audio.rejected_requests,
+                    },
+                    "privacy": {
+                        "raw_key_text": false,
+                        "window_identifiers": false,
+                        "screen_capture_pixels": false,
+                    },
                 });
                 if let Some(fusion) = runtime.vita.fusion_diagnostics()
                     && let Some(details) = debug_details.as_object_mut()
@@ -1840,7 +2471,7 @@ impl PetApplication {
                         }),
                     );
                 }
-                let _ = self.store.append_event(&EventLogEntry {
+                let _ = self.store.append_telemetry(&EventLogEntry {
                     monotonic_seconds: runtime.normalizer.monotonic_seconds(),
                     kind: "debug_state".into(),
                     details: debug_details,
@@ -1865,6 +2496,7 @@ impl PetApplication {
 
 impl ApplicationHandler for PetApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        startup_probe(self.arguments.debug_log, "native resume entered");
         event_loop.listen_device_events(DeviceEvents::Always);
         if self.runtime.is_some() {
             if let Some(runtime) = self.runtime.as_mut() {
@@ -1910,6 +2542,7 @@ impl ApplicationHandler for PetApplication {
                 return;
             }
         };
+        startup_probe(self.arguments.debug_log, "overlay window created");
         let initial_size = window.outer_size();
         let mut platform = create_platform_backend();
         if let Err(error) = platform
@@ -1920,6 +2553,7 @@ impl ApplicationHandler for PetApplication {
             event_loop.exit();
             return;
         }
+        startup_probe(self.arguments.debug_log, "desktop integration initialized");
         let mut body = match ProceduralBody::generate(&prepared.life.state.genome) {
             Ok(body) => body,
             Err(error) => {
@@ -1928,8 +2562,11 @@ impl ApplicationHandler for PetApplication {
                 return;
             }
         };
+        startup_probe(self.arguments.debug_log, "procedural body generated");
         if let Err(error) = load_migrate_apply_liquid_tuning(&self.store, &mut body) {
-            eprintln!("could not load liquid tuning profile; using analytic jelly: {error}");
+            eprintln!(
+                "could not load production liquid tuning; using built-in Particle PBF / Cinematic Jelly: {error}"
+            );
         }
         body.set_presentation_scale(production_presentation_scale(initial_size.height));
         body.simulation.feedback.world_position =
@@ -1961,6 +2598,7 @@ impl ApplicationHandler for PetApplication {
                 return;
             }
         };
+        startup_probe(self.arguments.debug_log, "renderer initialized");
         // Use the same deterministic material-formation backdrop as Body Lab. It
         // remains transparent in the final compositor; only the refracted liquid
         // sees the screen-anchored checker.
@@ -1974,6 +2612,7 @@ impl ApplicationHandler for PetApplication {
         let audio = AudioManager::new(self.arguments.no_audio);
         let acknowledged_window_origin = window.outer_position().unwrap_or(host_origin);
         let runtime_started = Instant::now();
+        let runtime_started_unix_ms = unix_time_millis(SystemTime::now());
         let last_morph = prepared.morph.last_output();
         self.runtime = Some(PetRuntime {
             window,
@@ -2017,12 +2656,20 @@ impl ApplicationHandler for PetApplication {
             last_visual_sample: None,
             save_accumulator: 0.0,
             tuning_poll_accumulator: 0.0,
+            lab_control_poll_accumulator: LAB_CONTROL_POLL_INTERVAL_SECONDS,
+            lab_interventions: LabInterventionState::new(runtime_started_unix_ms),
             tuning_last_modified,
             was_sleeping: false,
             visible_after_first_frame: false,
             modifiers: ModifiersState::empty(),
             debug_logging: self.arguments.debug_log,
+            debug_interval: if self.arguments.dev_mode {
+                DEV_MODE_LOG_INTERVAL
+            } else {
+                DEBUG_LOG_INTERVAL
+            },
             debug_accumulator: 0.0,
+            telemetry_sequence: 0,
             fps_accumulator: 0.0,
             frames_since_fps: 0,
             fps: 0.0,
@@ -2039,6 +2686,7 @@ impl ApplicationHandler for PetApplication {
             brain_tick_microseconds: 0.0,
             last_debug: None,
             last_vita: None,
+            gaze_trace: GazeCausalTrace::default(),
             last_morph,
             teach: TeachRecorder::default(),
             physics_timings: TimingWindow::default(),
@@ -2048,6 +2696,7 @@ impl ApplicationHandler for PetApplication {
             camera_timings: TimingWindow::default(),
             background_timings: TimingWindow::default(),
         });
+        startup_probe(self.arguments.debug_log, "native runtime installed");
     }
 
     fn window_event(
@@ -2418,17 +3067,654 @@ fn apply_shared_feedback(runtime: &mut PetRuntime, event: FeedbackEvent) {
     runtime.life.apply_feedback(event);
 }
 
+fn poll_lab_control(
+    store: &StateStore,
+    runtime: &mut PetRuntime,
+    wall_now: SystemTime,
+    monotonic_now: Instant,
+) {
+    let envelope = match store.load_lab_control() {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => return,
+        Err(_) => {
+            // The external slot is untrusted. Storage already enforces its
+            // schema and byte cap; telemetry records only a categorical error
+            // so paths or payload fragments never leak into the monitor.
+            runtime.lab_interventions.note_load_error();
+            return;
+        }
+    };
+    let admission = runtime
+        .lab_interventions
+        .admit_command(&envelope, unix_time_millis(wall_now));
+    if admission != LabCommandAdmission::Execute {
+        return;
+    }
+
+    let command_id = envelope.command_id;
+    let changed = match envelope.command {
+        LabControlCommand::CueAttention {
+            position,
+            duration_seconds,
+        } => {
+            runtime
+                .vita
+                .cue_shared_attention(Vec2::from_array(position), duration_seconds);
+            true
+        }
+        LabControlCommand::DrivePulse {
+            drive,
+            delta,
+            duration_seconds,
+        } => {
+            runtime.lab_interventions.replace_drive_pulse(
+                command_id,
+                drive,
+                delta,
+                duration_seconds,
+                monotonic_now,
+            );
+            true
+        }
+        LabControlCommand::Reward { value } => {
+            apply_shared_feedback(runtime, FeedbackEvent::Reward(value));
+            runtime.save_accumulator = 30.0;
+            true
+        }
+        LabControlCommand::FocusMode { enabled } => {
+            if runtime.life.state.focus_mode == enabled {
+                false
+            } else {
+                apply_shared_feedback(
+                    runtime,
+                    if enabled {
+                        FeedbackEvent::FocusModeEnabled
+                    } else {
+                        FeedbackEvent::FocusModeDisabled
+                    },
+                );
+                runtime.save_accumulator = 30.0;
+                true
+            }
+        }
+        LabControlCommand::ClearDrivePulses => {
+            let changed = !runtime.lab_interventions.active_pulses.is_empty();
+            runtime.lab_interventions.active_pulses.clear();
+            changed
+        }
+    };
+    runtime.lab_interventions.note_applied(changed);
+}
+
+fn unix_time_millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |duration| {
+        duration.as_millis().min(u128::from(u64::MAX)) as u64
+    })
+}
+
+const fn lab_command_name(command: &LabControlCommand) -> &'static str {
+    match command {
+        LabControlCommand::CueAttention { .. } => "cue_attention",
+        LabControlCommand::DrivePulse { .. } => "drive_pulse",
+        LabControlCommand::Reward { .. } => "reward",
+        LabControlCommand::FocusMode { .. } => "focus_mode",
+        LabControlCommand::ClearDrivePulses => "clear_drive_pulses",
+    }
+}
+
+const fn lab_drive_name(drive: LabDrive) -> &'static str {
+    match drive {
+        LabDrive::Safety => "safety",
+        LabDrive::Play => "play",
+        LabDrive::Curiosity => "curiosity",
+        LabDrive::Autonomy => "autonomy",
+        LabDrive::Sleep => "sleep",
+        LabDrive::Social => "social",
+        LabDrive::Comfort => "comfort",
+        LabDrive::Novelty => "novelty",
+    }
+}
+
+fn add_drive_delta(drives: &mut Drives, drive: LabDrive, delta: f32) {
+    let value = match drive {
+        LabDrive::Safety => &mut drives.safety,
+        LabDrive::Play => &mut drives.play,
+        LabDrive::Curiosity => &mut drives.curiosity,
+        LabDrive::Autonomy => &mut drives.autonomy,
+        LabDrive::Sleep => &mut drives.sleep,
+        LabDrive::Social => &mut drives.social,
+        LabDrive::Comfort => &mut drives.comfort,
+        LabDrive::Novelty => &mut drives.novelty,
+    };
+    *value = (*value + delta).clamp(0.0, 1.0);
+}
+
 fn morph_output_json(output: MorphOutput) -> serde_json::Value {
     serde_json::json!({
         "command": output.command.as_wire(),
+        "manipulation": output.manipulation.as_wire(),
+        "perception": output.perception.as_wire(),
+        "carry": output.carry.as_wire(),
         "command_rates": output.command_rates,
         "winner_rate": output.winner_rate,
+        "manipulation_rate": output.manipulation_rate,
+        "perception_rate": output.perception_rate,
+        "carry_rate": output.carry_rate,
         "confidence": output.confidence,
         "attention": format!("{:?}", output.attention),
+        "attention_object_slot": output.attention_object_slot,
+        "object_target": output.object_target.map(|target| target.to_array()),
         "valence": output.valence,
         "arousal": output.arousal,
         "conflict": output.conflict,
         "turn": output.turn,
+    })
+}
+
+fn action_wire_name(action: ActionId) -> String {
+    serde_json::to_value(action)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{action:?}"))
+}
+
+/// Keep lineage checkpoints self-contained for an offline, read-only evolution
+/// scrubber. Restored legacy saves may temporarily contain a longer v1 vector,
+/// so the telemetry boundary applies the same newest-first bound as LifeCore.
+fn genome_telemetry_json(genome: &Genome) -> serde_json::Value {
+    // serde_json cannot represent an arbitrary u128 as a JSON number. Keep the
+    // full genome while encoding the lineage identifier losslessly as hex.
+    serde_json::json!({
+        "identity_seed": genome.identity_seed,
+        "lineage_id": format!("{:032x}", genome.lineage_id),
+        "generation": genome.generation,
+        "body": &genome.body,
+        "voice": &genome.voice,
+        "temperament": &genome.temperament,
+        "brain": &genome.brain,
+        "mutation_rate": genome.mutation_rate,
+        "developmental_plasticity": genome.developmental_plasticity,
+    })
+}
+
+fn mutation_record_telemetry_json(record: &lifecore::MutationRecord) -> serde_json::Value {
+    serde_json::json!({
+        "generation": record.generation,
+        "stage": record.stage,
+        "changed_traits": &record.changed_traits,
+        "before_genome": record.before_genome.as_ref().map(genome_telemetry_json),
+        "after_genome": record.after_genome.as_ref().map(genome_telemetry_json),
+        "parent_genome_hash": record.parent_genome_hash,
+        "child_genome_hash": record.child_genome_hash,
+        "lifetime_snapshot": &record.lifetime_snapshot,
+    })
+}
+
+#[cfg(test)]
+fn mutation_history_json(life: &LifeCore) -> serde_json::Value {
+    let history = &life.state.development.mutation_history;
+    let start = history.len().saturating_sub(MAX_MUTATION_HISTORY);
+    serde_json::Value::Array(
+        history[start..]
+            .iter()
+            .map(mutation_record_telemetry_json)
+            .collect(),
+    )
+}
+
+fn lifecore_telemetry_json(life: &LifeCore, debug: &DebugState) -> serde_json::Value {
+    let state = &life.state;
+    let definition = state.current_action.definition();
+    let cooldowns = ActionId::ALL
+        .iter()
+        .copied()
+        .zip(state.action_cooldowns)
+        .map(|(action, remaining_seconds)| {
+            serde_json::json!({
+                "action": action_wire_name(action),
+                "remaining_seconds": remaining_seconds,
+            })
+        })
+        .collect::<Vec<_>>();
+    let recent_actions = state
+        .recent_actions
+        .iter()
+        .copied()
+        .map(action_wire_name)
+        .collect::<Vec<_>>();
+    let pending_attention = state.pending_attention.as_ref().map(|pending| {
+        serde_json::json!({
+            "action": action_wire_name(pending.action),
+            "elapsed_seconds": pending.elapsed_seconds,
+            "response_window_seconds": pending.response_window_seconds,
+            "progress": (pending.elapsed_seconds / pending.response_window_seconds.max(f32::EPSILON))
+                .clamp(0.0, 1.0),
+        })
+    });
+
+    let memory = life.memory_system();
+    let recent_memory_start = memory
+        .short_term
+        .len()
+        .saturating_sub(TELEMETRY_RECENT_MEMORY_LIMIT);
+    let recent_memory = memory
+        .short_term
+        .iter()
+        .skip(recent_memory_start)
+        .map(|event| {
+            // Context vectors can encode user routines. The causal summary keeps
+            // only the organism-side choice and outcome, never the raw context.
+            serde_json::json!({
+                "timestamp": event.timestamp,
+                "action": action_wire_name(event.action),
+                "outcome": event.outcome,
+                "reward": event.reward,
+                "salience": event.salience,
+            })
+        })
+        .collect::<Vec<_>>();
+    let episodic = memory
+        .episodic
+        .iter()
+        .take(TELEMETRY_EPISODE_MEMORY_LIMIT)
+        .map(|episode| {
+            serde_json::json!({
+                "action": action_wire_name(episode.representative.action),
+                "outcome": episode.representative.outcome,
+                "occurrence_count": episode.occurrence_count,
+                "mean_reward": episode.mean_reward,
+                "salience": episode.representative.salience,
+            })
+        })
+        .collect::<Vec<_>>();
+    let habits = memory
+        .habits
+        .iter()
+        .map(|habit| {
+            serde_json::json!({
+                "actions": habit.actions.iter().copied().map(action_wire_name).collect::<Vec<_>>(),
+                "success_score": habit.success_score,
+                "use_count": habit.use_count,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let bandit = life.contextual_bandit();
+    let mut learned_min = f32::INFINITY;
+    let mut learned_max = f32::NEG_INFINITY;
+    for weight in bandit.weights.iter().flatten().copied() {
+        learned_min = learned_min.min(weight);
+        learned_max = learned_max.max(weight);
+    }
+    if !learned_min.is_finite() || !learned_max.is_finite() {
+        learned_min = 0.0;
+        learned_max = 0.0;
+    }
+    let vocal_motifs = state
+        .vocal_motifs
+        .iter()
+        .map(|motif| {
+            serde_json::json!({
+                "id": motif.id,
+                "expected_reward": motif.expected_reward,
+                "novelty": motif.novelty,
+                "use_count": motif.use_count,
+                "success_count": motif.success_count,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "tick": state.tick_count,
+        "elapsed_seconds": state.elapsed_seconds,
+        "action": {
+            "current": action_wire_name(state.current_action),
+            "elapsed_seconds": state.action_elapsed_seconds,
+            "minimum_seconds": definition.minimum_duration,
+            "maximum_seconds": definition.maximum_duration,
+            "minimum_satisfied": state.action_elapsed_seconds >= definition.minimum_duration,
+            "progress": (state.action_elapsed_seconds / definition.maximum_duration.max(f32::EPSILON))
+                .clamp(0.0, 1.0),
+            "cooldowns": cooldowns,
+            "recent": recent_actions,
+            "predicted_value": debug.predicted_action_value,
+        },
+        "attention": {
+            "budget": state.attention_budget,
+            "pending": pending_attention,
+            "ignored_attempts": state.ignored_attempts,
+            "successful_interactions": state.successful_interactions,
+            "focus_mode": state.focus_mode,
+        },
+        "drives": state.drives,
+        "affect": state.affect,
+        "recent_reward": state.recent_reward,
+        "learning": {
+            "plastic_weight_range": debug.plastic_weight_range,
+            "brain_divergence_count": debug.brain_divergence_count,
+            "contextual_bandit": {
+                "total_updates": bandit.total_updates,
+                "learning_rate": bandit.learning_rate,
+                "attempts": bandit.attempts,
+                "weight_range": [learned_min, learned_max],
+            },
+            "memory": {
+                "short_term_count": memory.short_term.len(),
+                "episodic_count": memory.episodic.len(),
+                "habit_count": memory.habits.len(),
+                "recent": recent_memory,
+                "episodic": episodic,
+                "habits": habits,
+                "user_model": {
+                    "average_response_delay": memory.user_model.average_response_delay,
+                    "preferred_sound_intensity": memory.user_model.preferred_sound_intensity,
+                    "typical_activity_rate": memory.user_model.typical_activity_rate,
+                    "attention_preference_count": memory.user_model.preferred_attention_strategies.len(),
+                    "app_category_count": memory.user_model.interaction_by_app.len(),
+                },
+            },
+            "vocal_repertoire": {
+                "motif_count": state.vocal_motifs.len(),
+                "selected_motif_id": state.selected_motif_id,
+                "motifs": vocal_motifs,
+                "pending_delivery": state.pending_vocal_delivery.as_ref().map(|pending| serde_json::json!({
+                    "request_id": pending.request_id,
+                    "motif_id": pending.motif_id,
+                    "response_window_seconds": pending.response_window_seconds,
+                    "penalize_if_ignored": pending.penalize_if_ignored,
+                })),
+                "pending_credit": state.pending_vocal_credit.as_ref().map(|pending| serde_json::json!({
+                    "motif_id": pending.motif_id,
+                    "elapsed_seconds": pending.elapsed_seconds,
+                    "response_window_seconds": pending.response_window_seconds,
+                    "penalize_if_ignored": pending.penalize_if_ignored,
+                })),
+            },
+        },
+        "development": {
+            "stage": state.development.stage,
+            "metamorphosis_count": state.development.metamorphosis_count,
+            "lifetime": state.development.lifetime,
+            // Exact before/after genomes live once at
+            // /details/development/mutation_history. Repeating the whole
+            // lineage here at 5 Hz would halve the bounded replay window.
+            "mutation_history_count": state.development.mutation_history.len(),
+        },
+    })
+}
+
+fn activity_telemetry_json(
+    life: &LifeCore,
+    trace: &pet_ecology::EcologyDecisionTrace,
+    episode: Option<&pet_ecology::ActivityEpisode>,
+    scores: &[serde_json::Value],
+) -> serde_json::Value {
+    let state = &life.state;
+    let definition = state.current_action.definition();
+    let opportunities = trace.scores[..trace.score_count.min(trace.scores.len())]
+        .iter()
+        .filter(|score| score.eligible)
+        .map(|score| {
+            serde_json::json!({
+                "goal": score.goal.map(|goal| format!("{goal:?}")),
+                "score": score.score,
+                "reason": format!("{:?}", score.reason),
+            })
+        })
+        .collect::<Vec<_>>();
+    let recent_outcome_start = life
+        .memory_system()
+        .short_term
+        .len()
+        .saturating_sub(TELEMETRY_RECENT_MEMORY_LIMIT);
+    let recent_outcomes = life
+        .memory_system()
+        .short_term
+        .iter()
+        .skip(recent_outcome_start)
+        .map(|event| {
+            serde_json::json!({
+                "action": action_wire_name(event.action),
+                "outcome": event.outcome,
+                "reward": event.reward,
+            })
+        })
+        .collect::<Vec<_>>();
+    let activity = activity_family(state.current_action, episode);
+
+    serde_json::json!({
+        // Mirrors the upstream ActivitySystem contract using Pet2's existing
+        // LifeCore action arbiter plus the EpisodeDirector, without creating a
+        // second behavior supervisor.
+        "activity": activity,
+        "concrete_action": action_wire_name(state.current_action),
+        "source": if episode.is_some() { "ecology_episode" } else { "lifecore_action" },
+        "phase": episode.map_or_else(
+            || "lifecore".to_owned(),
+            |active| format!("{:?}", active.phase),
+        ),
+        "reason": episode.map_or_else(
+            || "lifecore_arbitration".to_owned(),
+            |active| format!("{:?}", active.reason_code),
+        ),
+        "elapsed_ms": f64::from(state.action_elapsed_seconds) * 1_000.0,
+        "min_ms": f64::from(definition.minimum_duration) * 1_000.0,
+        "max_ms": f64::from(definition.maximum_duration) * 1_000.0,
+        "progress": (state.action_elapsed_seconds / definition.maximum_duration.max(f32::EPSILON))
+            .clamp(0.0, 1.0),
+        "scores": scores,
+        "opportunities": opportunities,
+        "bouts": state.recent_actions.iter().copied().map(action_wire_name).collect::<Vec<_>>(),
+        "recent_outcomes": recent_outcomes,
+        "episode": episode.map(|active| serde_json::json!({
+            "id": active.id,
+            "goal": format!("{:?}", active.goal),
+            "phase": format!("{:?}", active.phase),
+            "reason": format!("{:?}", active.reason_code),
+            "elapsed_ms": f64::from(active.elapsed_seconds) * 1_000.0,
+            "phase_elapsed_ms": f64::from(active.phase_elapsed_seconds) * 1_000.0,
+            "commitment_remaining_ms": f64::from(active.commitment_remaining) * 1_000.0,
+            "attempts": active.attempts,
+            "prediction_confidence": active.prediction_confidence,
+            "expected_outcome": format!("{:?}", active.expected_outcome),
+        })),
+    })
+}
+
+fn activity_family(
+    action: ActionId,
+    episode: Option<&pet_ecology::ActivityEpisode>,
+) -> &'static str {
+    if let Some(episode) = episode {
+        return match episode.goal {
+            EpisodeGoal::EscapePressure | EpisodeGoal::RecoverAfterPressure => "safety",
+            EpisodeGoal::InspectMorsel
+            | EpisodeGoal::EatMorsel
+            | EpisodeGoal::RefuseMorsel
+            | EpisodeGoal::StoreMorsel => "forage",
+            EpisodeGoal::SleepInDen => "sleep",
+            EpisodeGoal::OfferOrb
+            | EpisodeGoal::ChaseOrb
+            | EpisodeGoal::InterceptOrb
+            | EpisodeGoal::RetrieveOrb
+            | EpisodeGoal::ReturnOrb
+            | EpisodeGoal::CarryOrbHome
+            | EpisodeGoal::SoloOrbPlay
+            | EpisodeGoal::HideOrb
+            | EpisodeGoal::SeekOrb
+            | EpisodeGoal::PracticeSkill
+            | EpisodeGoal::PerformSkill
+            | EpisodeGoal::RhythmEcho => "play",
+            EpisodeGoal::SharedAttention | EpisodeGoal::ChromaticEcho => "socialize",
+            EpisodeGoal::ReturnHome
+            | EpisodeGoal::ExitDen
+            | EpisodeGoal::PeekFromDen
+            | EpisodeGoal::InspectWindow
+            | EpisodeGoal::RideWindow
+            | EpisodeGoal::Camouflage => "explore",
+        };
+    }
+
+    match action {
+        ActionId::RetreatFromCursor | ActionId::FrustratedRetreat => "safety",
+        ActionId::Sleep => "sleep",
+        ActionId::IdleHover | ActionId::LandOnWindow | ActionId::ClingToWindowSide => "rest",
+        ActionId::InviteCursorChase
+        | ActionId::PlayCursorChase
+        | ActionId::BringProceduralOrb
+        | ActionId::HideAndSeek
+        | ActionId::SelfPlay => "play",
+        ActionId::ObserveUserActivity
+        | ActionId::ApproachCursor
+        | ActionId::InvitePetting
+        | ActionId::MimicClickRhythm
+        | ActionId::SilentStare
+        | ActionId::HappyDisplay
+        | ActionId::Chirp
+        | ActionId::Purr => "socialize",
+        ActionId::ObserveCursor
+        | ActionId::WakeUp
+        | ActionId::ExploreScreen
+        | ActionId::PeekFromEdge
+        | ActionId::Metamorphosis => "explore",
+    }
+}
+
+fn morph_telemetry_json(
+    output: MorphOutput,
+    brain_mode: BrainMode,
+    diagnostics: morph_brain::MorphDiagnostics,
+) -> serde_json::Value {
+    let mut morph = morph_output_json(output);
+    if let Some(object) = morph.as_object_mut() {
+        object.insert(
+            "upstream_commit".into(),
+            serde_json::json!(morph_brain::UPSTREAM_COMMIT),
+        );
+        object.insert("brain_mode".into(), serde_json::json!(brain_mode.as_str()));
+        object.insert("diagnostics".into(), serde_json::json!(diagnostics));
+    }
+    morph
+}
+
+fn lab_interventions_telemetry_json(
+    state: &LabInterventionState,
+    now: Instant,
+) -> serde_json::Value {
+    let active_pulses = state
+        .active_pulses
+        .iter()
+        .filter_map(|pulse| {
+            pulse
+                .expires_at
+                .checked_duration_since(now)
+                .map(|remaining| {
+                    serde_json::json!({
+                        "command_id": pulse.command_id,
+                        "drive": lab_drive_name(pulse.drive),
+                        "delta": pulse.delta,
+                        "expires_in_ms": remaining.as_millis().min(u128::from(u64::MAX)) as u64,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    let active_pulse_count = active_pulses.len();
+
+    serde_json::json!({
+        "last_command_id": state.last_seen_command_id,
+        "last_command": state.last_command_kind,
+        "last_command_status": state.last_command_status.as_str(),
+        "active_pulse_count": active_pulse_count,
+        "active_pulses": active_pulses,
+        "natural_drives": state.last_natural_drives,
+        "effective_drives": state.last_effective_drives,
+        "overlay_active": active_pulse_count > 0,
+        "overlay_stages": ["pre_morph", "post_lifecore_resolution"],
+        "persistent_homeostasis_owner": "lifecore",
+    })
+}
+
+fn vita_telemetry_json(runtime: &VitaRuntime, output: Option<&VitaOutput>) -> serde_json::Value {
+    let state = runtime.state();
+    let percept = runtime.percept();
+    let influence = &state.influence;
+    let attempts = influence
+        .attempts
+        .iter()
+        .copied()
+        .fold(0_u32, u32::saturating_add);
+    let successes = influence
+        .successes
+        .iter()
+        .copied()
+        .fold(0_u32, u32::saturating_add);
+    let current_model = state.self_model.action_models[state.self_model.last_action.index()];
+
+    serde_json::json!({
+        "schema_version": state.schema_version,
+        "elapsed_seconds": state.elapsed_seconds,
+        "attention": state.attention,
+        "attention_switches": state.attention_switches,
+        "appraisal": state.appraisal,
+        "mood": state.mood,
+        "emotions": state.emotions,
+        "self_model": {
+            "last_action": action_wire_name(state.self_model.last_action),
+            "prediction_error": state.self_model.prediction_error,
+            "agency": state.self_model.agency,
+            "uncertainty": state.self_model.uncertainty,
+            "body_schema_confidence": state.self_model.body_schema_confidence,
+            "calibration_urge": state.self_model.calibration_urge,
+            "external_force_likelihood": state.self_model.external_force_likelihood,
+            "current_action_model": {
+                "mean_delta_position": current_model.mean_delta_position.to_array(),
+                "mean_delta_velocity": current_model.mean_delta_velocity.to_array(),
+                "contact_probability": current_model.contact_probability,
+                "confidence": current_model.confidence,
+                "samples": current_model.samples,
+            },
+        },
+        "influence": {
+            "mode": influence.mode,
+            "cooldown_seconds": influence.cooldown_seconds,
+            "consecutive_ignored": influence.consecutive_ignored,
+            "attempts": attempts,
+            "successes": successes,
+        },
+        "favorite_place_count": state.favorite_places.len(),
+        "percept": {
+            "pointer_gesture": percept.pointer,
+            "typing_rate_hz": percept.typing_rate_hz,
+            "typing_burstiness": percept.typing_burstiness,
+            "typing_pause_seconds": percept.typing_pause_seconds,
+            "click_rate_hz": percept.click_rate_hz,
+            "scroll_velocity": percept.scroll_velocity,
+            "scroll_burstiness": percept.scroll_burstiness,
+            "window_motion": percept.window_motion,
+            "window_pressure": percept.window_pressure,
+            "popup_salience": percept.popup_salience,
+            "mean_luminance": percept.mean_luminance,
+            "local_luminance": percept.local_luminance,
+            "colorfulness": percept.colorfulness,
+            "warmth": percept.warmth,
+            "dominant_hue": percept.dominant_hue,
+            "visual_motion": percept.visual_motion,
+            "visual_change": percept.visual_change,
+            "user_available": percept.user_available,
+            "event_count": percept.events.len(),
+        },
+        "output": output.map(|value| serde_json::json!({
+            "attention": value.attention,
+            "appraisal": value.appraisal,
+            "dominant_emotion": value.dominant_emotion,
+            "influence": value.influence,
+            "self_check": value.self_check,
+            "gaze_target": value.gaze_target.map(|target| target.to_array()),
+            "direct_viewer_gaze": value.direct_viewer_gaze,
+            "pose_override": value.pose_override.map(|pose| format!("{pose:?}")),
+            "locomotion_override": value.locomotion_override.map(|mode| format!("{mode:?}")),
+            "target_override": value.target_override.map(|target| target.to_array()),
+            "interaction_override": value.interaction_override.as_ref().map(|target| format!("{target:?}")),
+        })),
     })
 }
 
@@ -2510,6 +3796,7 @@ fn enqueue_ecology_voice(runtime: &mut PetRuntime, trigger: EcologyVocalTrigger)
         EcologyVocalTrigger::HomeReturn => VocalTrigger::HomeReturn,
         EcologyVocalTrigger::SkillMastered => VocalTrigger::SkillMastered,
         EcologyVocalTrigger::RhythmEcho => VocalTrigger::RhythmEcho,
+        EcologyVocalTrigger::VisualNotice => VocalTrigger::VisualNotice,
     };
     let Some(request) = runtime.life.request_vocalization(trigger, &runtime.sensors) else {
         return;
@@ -2646,19 +3933,20 @@ fn load_migrate_apply_liquid_tuning(
     store: &StateStore,
     body: &mut ProceduralBody,
 ) -> Result<Option<LiquidTuningProfile>, String> {
-    let Some(authored) = store
+    let stored = store
         .load_liquid_tuning::<LiquidTuningProfile>()
-        .map_err(|error| error.to_string())?
-    else {
-        return Ok(None);
-    };
-    let applied = authored
+        .map_err(|error| error.to_string())?;
+    let was_persisted = stored.is_some();
+    let authored =
+        stored.unwrap_or_else(|| approved_production_liquid_tuning(body.tuning_profile().seed));
+    let sanitized = authored
         .clone()
         .sanitized()
         .map_err(|error| error.to_string())?;
+    let applied = production_liquid_tuning(sanitized);
     body.apply_tuning_profile(applied.clone())
         .map_err(|error| error.to_string())?;
-    if authored != applied {
+    if !was_persisted || authored != applied {
         store
             .save_liquid_tuning(&applied)
             .map_err(|error| error.to_string())?;
@@ -2672,6 +3960,134 @@ fn load_migrate_apply_liquid_tuning(
         })
         .map_err(|error| error.to_string())?;
     Ok(Some(applied))
+}
+
+/// Production has one approved body/material pair. The analytic body and safe
+/// material remain available inside Body Lab for diagnostics, but a stale user
+/// profile must not silently switch the desktop organism back to either lane.
+fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningProfile {
+    let reference = approved_production_liquid_tuning(profile.seed);
+    let stale_body = profile.render_mode != BodyRenderMode::ParticlePbf;
+    let stale_material = profile.material.variant != MaterialVariant::CinematicJelly;
+    if stale_body {
+        profile.render_mode = BodyRenderMode::ParticlePbf;
+        profile.pbf = reference.pbf;
+        profile.material = reference.material;
+        profile.face = reference.face;
+        profile.compositor = reference.compositor;
+    }
+    if stale_material {
+        profile.material = reference.material;
+    }
+    profile
+}
+
+/// Reproduces the user-approved `Black copy` profile without relying on the
+/// profile being present in one particular Windows AppData directory.
+fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
+    let mut profile = LiquidTuningProfile::for_seed(seed);
+    profile.name = "PET-2 Production Black".to_owned();
+    profile.render_mode = BodyRenderMode::ParticlePbf;
+
+    profile.pbf.density_compliance = 1.2e-5;
+    profile.pbf.numerical_xsph = 0.014;
+    profile.pbf.viscosity = 0.015;
+    profile.pbf.surface_tension = 2.5;
+    profile.pbf.flight_stretch = 1.9;
+    profile.pbf.grab_stiffness = 390.0;
+    profile.pbf.pointer_support_scale = 2.4;
+    profile.pbf.pointer_response_hz = 35.0;
+    profile.pbf.anisotropy_max = 2.01;
+    profile.pbf.return_strength = 0.05;
+    profile.pbf.character_field_radius_scale = 1.17;
+
+    profile.material.variant = MaterialVariant::CinematicJelly;
+    profile.material.override_genome_colors = true;
+    profile.material.primary_hsv = [0.0, 0.0, 0.0];
+    profile.material.secondary_hsv = [0.0, 0.39, 0.0];
+    profile.material.glow_hsv = [0.0, 0.0, 0.06];
+    profile.material.absorption = 0.5;
+    profile.material.scattering = 2.8;
+    profile.material.thickness = 0.9;
+    profile.material.translucency = 0.84;
+    profile.material.refraction = 2.4;
+    profile.material.blur = 2.8;
+    profile.material.rim_strength = 4.0;
+    profile.material.rim_power = 5.5;
+    profile.material.broad_specular = 0.25;
+    profile.material.broad_specular_power = 11.0;
+    profile.material.tight_specular = 0.65;
+    profile.material.tight_specular_power = 64.0;
+    profile.material.emission = 0.3;
+    profile.material.fresnel_f0 = 0.035;
+    profile.material.core_level = 1.35;
+    profile.material.thickness_gamma = 0.25;
+    profile.material.pseudo_depth = 0.3;
+    profile.material.normal_scale = 1.3;
+    profile.material.light_wrap = 1.2;
+    profile.material.ambient_scatter = 0.9;
+    profile.material.direct_scatter = 0.55;
+    profile.material.transmission_hue_preservation = 0.25;
+    profile.material.internal_flow = 0.12;
+    profile.material.halo = 0.09;
+    profile.material.opacity = 0.6;
+    profile.material.cinematic_smoothing = 0.07;
+    profile.material.internal_orb_count = 6;
+    profile.material.internal_orb_intensity = 0.5;
+    profile.material.internal_orb_size = 0.033;
+    profile.material.internal_orb_halo = 2.05;
+    profile.material.internal_orb_speed = 0.4;
+    profile.material.internal_orb_depth = 0.4;
+    profile.material.internal_orb_spread = 0.72;
+    profile.material.studio_intensity = 1.5;
+    profile.material.studio_base_roughness = 0.62;
+    profile.material.studio_coat_roughness = 0.21;
+    profile.material.narrow_rim_strength = 3.0;
+    profile.material.broad_rim_strength = 0.62;
+    profile.material.rim_saturation = 1.15;
+    profile.material.edge_light_width = 23.0;
+    profile.material.caustic_strength = 0.55;
+    profile.material.caustic_scale = 2.0;
+    profile.material.caustic_speed = 0.55;
+    profile.material.caustic_dispersion = 0.65;
+    profile.material.rounded_highlight_strength = 0.15;
+    profile.material.highlight_tint = 0.18;
+    profile.material.soul_glow_count = 3;
+    profile.material.soul_glow_strength = 0.95;
+    profile.material.soul_glow_size = 0.195;
+    profile.material.soul_glow_speed = 0.28;
+    profile.material.soul_glow_pulse = 0.18;
+    profile.material.soul_glow_feather = 0.8;
+    profile.material.bloom_strength = 0.05;
+
+    profile.face.origin = [0.0, -0.03];
+    profile.face.scale = [0.96, 1.02];
+    profile.face.eye_size_scale = 0.55;
+    profile.face.eye_spacing_scale = 1.0;
+    profile.face.pupil_scale = 1.5;
+    profile.face.eye_highlight_scale = 2.15;
+    profile.face.eye_socket_strength = 0.34;
+    profile.face.relief_strength = 0.6;
+    profile.face.relief_darkness = 0.79;
+    profile.face.relief_coat_strength = 1.6;
+    profile.face.pupil_light_response = 1.65;
+    profile.face.pupil_emotion_response = 1.42;
+    profile.face.pupil_focus_response = 1.65;
+    profile.face.microsaccade_amount = 1.65;
+    profile.face.microsaccade_rate = 1.35;
+    profile.face.maximum_roll_radians = 0.13;
+    profile.face.translation_smoothing = 16.0;
+    profile.face.rotation_smoothing = 10.0;
+    profile.face.scale_smoothing = 13.0;
+
+    profile.compositor.render_scale = 2;
+    profile.compositor.shadow_horizontal_offset = 0.0;
+    profile.compositor.shadow_vertical_offset = 0.0;
+    profile.compositor.shadow_feather = 64.0;
+    profile.compositor.shadow_opacity = 0.31;
+    profile.compositor.shadow_color = [1.0, 1.0, 1.0];
+    profile.compositor.exposure = 1.0;
+    profile
 }
 
 fn normalized_scroll(delta: MouseScrollDelta) -> f32 {
@@ -2828,6 +4244,26 @@ fn safe_body_center(
     // hundreds of unnecessary pixels away from monitor edges.
     let margin = 176.0;
     nearest_covered_center(topology, desired, Vec2::splat(-margin), Vec2::splat(margin))
+}
+
+fn project_navigation_target_to_monitor_union(
+    intent: &mut lifecore::BodyIntent,
+    topology: &DisplayTopology,
+) {
+    if !matches!(
+        intent.locomotion,
+        LocomotionMode::Seek
+            | LocomotionMode::Arrive
+            | LocomotionMode::Orbit
+            | LocomotionMode::Wander
+    ) || !intent.target_position.is_finite()
+        || !topology.virtual_physical_bounds.is_valid()
+    {
+        return;
+    }
+    let desired = virtual_normalized_to_physical(topology, intent.target_position);
+    let projected = safe_body_center(topology, desired, PhysicalSize::new(1, 1));
+    intent.target_position = physical_to_virtual_normalized(topology, projected);
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3002,6 +4438,12 @@ fn apply_screen_domain(
             });
         } else {
             body.simulation.feedback.collision = None;
+        }
+        // Positive screen Y points downward. A rejected downward move is a
+        // real support contact, allowing the next motor tick to distinguish
+        // standing/resting weight from free flight.
+        if outward.y > 0.55 {
+            body.simulation.feedback.grounded = true;
         }
     }
     let acceleration_px = (physical_velocity - *previous_velocity_px) / dt;
@@ -3213,8 +4655,10 @@ fn print_help() {
          \n  --evolve                 Trigger one bounded metamorphosis\n\
          \n  --focus-mode             Suppress unsolicited attention\n\
          \n  --brain-mode MODE        classic, morphic, fusion, morph-shadow, or morph-fusion\n\
-         \n  --debug-log             Write live frame and embodiment diagnostics\n\
-         \n  --no-audio               Disable the audio device\n"
+         \n  --debug-log              Write 1 Hz frame and embodiment diagnostics\n\
+         \n  --dev-mode               Start bounded 5 Hz causal telemetry\n\
+         \n  --no-audio               Disable the audio device\n\
+         \n\nHOTKEY: Win+Alt+D toggles bounded causal telemetry at runtime\n"
     );
 }
 
@@ -3223,6 +4667,195 @@ mod tests {
     use pet_body::{BodyRenderMode, MaterialVariant};
 
     use super::*;
+
+    #[test]
+    fn causal_telemetry_keeps_one_exact_bounded_lineage_history() {
+        let mut life = LifeCore::new(Genome::from_seed(0x00CA_55A1), 0x0005_1A7E);
+        let _ = life.trigger_metamorphosis();
+        let output = life.tick(&SensorFrame::default(), &Default::default(), LIFE_DT);
+
+        let details = lifecore_telemetry_json(&life, &output.debug);
+        let mutation_history = mutation_history_json(&life);
+        let history = mutation_history
+            .as_array()
+            .expect("mutation history is a JSON array");
+
+        assert!(!history.is_empty());
+        assert!(history.len() <= MAX_MUTATION_HISTORY);
+        let latest = history.last().unwrap();
+        assert!(latest["before_genome"].is_object());
+        assert!(latest["after_genome"].is_object());
+        assert!(latest["parent_genome_hash"].is_u64());
+        assert!(latest["child_genome_hash"].is_u64());
+        assert!(latest["lifetime_snapshot"].is_object());
+        assert_eq!(
+            latest["child_genome_hash"].as_u64(),
+            Some(life.state.genome.stable_hash())
+        );
+        assert_eq!(details["tick"].as_u64(), Some(life.state.tick_count));
+        assert_eq!(details["attention"]["focus_mode"].as_bool(), Some(false));
+        assert_eq!(
+            details["development"]["mutation_history_count"].as_u64(),
+            Some(history.len() as u64)
+        );
+        assert!(details["development"].get("mutation_history").is_none());
+
+        // Behavioral outcomes are observable, but raw context vectors that can
+        // encode user routines never cross this telemetry boundary.
+        let encoded = serde_json::to_string(&details).unwrap();
+        assert!(!encoded.contains("\"context\":"));
+    }
+
+    #[test]
+    fn maximum_lineage_history_leaves_room_in_the_bounded_telemetry_record() {
+        let mut life = LifeCore::new(Genome::from_seed(0xE701_0710), 0x64);
+        for _ in 0..MAX_MUTATION_HISTORY {
+            let _ = life.trigger_metamorphosis();
+        }
+
+        let history = mutation_history_json(&life);
+        assert_eq!(history.as_array().map(Vec::len), Some(MAX_MUTATION_HISTORY));
+        let bytes = serde_json::to_vec(&history).unwrap().len() as u64;
+        assert!(
+            bytes < desktop_host::TELEMETRY_LOG_MAX_BYTES / 2,
+            "lineage payload ({bytes} bytes) leaves too little room for a causal frame"
+        );
+    }
+
+    #[test]
+    fn activity_telemetry_matches_the_upstream_activity_contract_without_a_second_supervisor() {
+        let mut life = LifeCore::new(Genome::from_seed(77), 91);
+        let _ = life.tick(&SensorFrame::default(), &Default::default(), LIFE_DT);
+        let trace = pet_ecology::EcologyDecisionTrace::default();
+        let activity = activity_telemetry_json(&life, &trace, None, &[]);
+
+        for key in [
+            "activity",
+            "phase",
+            "reason",
+            "elapsed_ms",
+            "min_ms",
+            "max_ms",
+            "progress",
+            "scores",
+            "opportunities",
+            "bouts",
+            "recent_outcomes",
+        ] {
+            assert!(activity.get(key).is_some(), "missing activity key {key}");
+        }
+        assert_eq!(activity["activity"], "rest");
+        assert_eq!(activity["concrete_action"], "idle_hover");
+        assert_eq!(activity["source"], "lifecore_action");
+        assert_eq!(activity["phase"], "lifecore");
+    }
+
+    #[test]
+    fn morph_telemetry_names_its_source_commit_and_contains_live_diagnostics() {
+        let brain = MorphBrain::new(0xD1A6_0057, None).unwrap();
+        let morph = morph_telemetry_json(
+            MorphOutput::default(),
+            BrainMode::MorphFusion,
+            brain.diagnostics(),
+        );
+        assert_eq!(morph["upstream_commit"], morph_brain::UPSTREAM_COMMIT);
+        assert_eq!(morph["brain_mode"], "morph-fusion");
+        assert!(morph["diagnostics"].is_object());
+        assert!(morph["diagnostics"]["population_rates"].is_object());
+        assert!(morph["diagnostics"]["classical_weights"].is_object());
+        assert!(morph.get("command").is_some());
+    }
+
+    #[test]
+    fn lab_control_is_strictly_monotonic_and_marks_newer_expired_commands_seen() {
+        let command = LabControlCommand::DrivePulse {
+            drive: LabDrive::Curiosity,
+            delta: 0.4,
+            duration_seconds: 2.0,
+        };
+        let envelope = |command_id, issued_unix_ms, expires_after_ms| LabControlEnvelope {
+            schema_version: desktop_host::LAB_CONTROL_SCHEMA_VERSION,
+            command_id,
+            issued_unix_ms,
+            expires_after_ms,
+            command: command.clone(),
+        };
+        let mut state = LabInterventionState::default();
+
+        assert_eq!(
+            state.admit_command(&envelope(7, 1_000, 2_000), 1_100),
+            LabCommandAdmission::Execute
+        );
+        state.note_applied(true);
+        assert_eq!(
+            state.admit_command(&envelope(7, 1_000, 2_000), 1_100),
+            LabCommandAdmission::Stale
+        );
+        assert_eq!(
+            state.admit_command(&envelope(6, 1_000, 2_000), 1_100),
+            LabCommandAdmission::Stale
+        );
+        assert_eq!(
+            state.admit_command(&envelope(8, 1_000, 100), 1_100),
+            LabCommandAdmission::Expired
+        );
+        assert_eq!(state.last_seen_command_id, Some(8));
+        assert_eq!(state.last_command_status, LabCommandStatus::Expired);
+        assert_eq!(
+            state.admit_command(&envelope(7, 1_000, 2_000), 1_100),
+            LabCommandAdmission::Stale
+        );
+    }
+
+    #[test]
+    fn lab_control_from_before_this_process_cannot_replay_after_restart() {
+        let envelope = |command_id, issued_unix_ms| LabControlEnvelope {
+            schema_version: desktop_host::LAB_CONTROL_SCHEMA_VERSION,
+            command_id,
+            issued_unix_ms,
+            expires_after_ms: 30_000,
+            command: LabControlCommand::Reward { value: 0.5 },
+        };
+        let mut state = LabInterventionState::new(2_000);
+
+        assert_eq!(
+            state.admit_command(&envelope(41, 1_999), 2_001),
+            LabCommandAdmission::PredatesProcess
+        );
+        assert_eq!(state.last_seen_command_id, Some(41));
+        assert_eq!(state.last_command_status, LabCommandStatus::PredatesProcess);
+        assert_eq!(
+            state.admit_command(&envelope(42, 2_000), 2_001),
+            LabCommandAdmission::Execute
+        );
+    }
+
+    #[test]
+    fn lab_drive_overlay_restores_post_lifecore_drives_exactly() {
+        let now = Instant::now();
+        let mut interventions = LabInterventionState::default();
+        interventions.replace_drive_pulse(11, LabDrive::Curiosity, 1.0, 5.0, now);
+        let natural = LifeCore::new(Genome::from_seed(33), 44).state.drives;
+        let overlay = interventions.drive_overlay(natural, now);
+        let mut runtime_drives = natural;
+
+        overlay.apply_to(&mut runtime_drives);
+        assert_eq!(runtime_drives.curiosity, 1.0);
+        assert_ne!(runtime_drives, natural);
+        overlay.restore_exact(&mut runtime_drives);
+
+        assert_eq!(runtime_drives, natural);
+        assert_eq!(interventions.last_natural_drives, Some(natural));
+        assert_eq!(interventions.last_effective_drives, Some(overlay.effective));
+    }
+
+    #[test]
+    fn lab_wall_clock_conversion_and_expiry_never_panic_before_unix_epoch() {
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond before the epoch is representable");
+        assert_eq!(unix_time_millis(before_epoch), 0);
+    }
 
     #[test]
     fn teach_recorder_is_explicit_bounded_and_stores_only_a_signature() {
@@ -3581,6 +5214,51 @@ mod tests {
     }
 
     #[test]
+    fn navigation_target_in_monitor_gap_is_projected_to_reachable_screen_space() {
+        let topology = DisplayTopology::new(
+            vec![
+                two_monitor_topology().monitors[0].clone(),
+                MonitorInfo {
+                    id: MonitorId("upper-right".into()),
+                    physical_bounds: RectI {
+                        minimum: PhysicalDesktopPoint { x: 1_920, y: -900 },
+                        maximum: PhysicalDesktopPoint { x: 3_200, y: 0 },
+                    },
+                    working_area: RectI {
+                        minimum: PhysicalDesktopPoint { x: 1_920, y: -900 },
+                        maximum: PhysicalDesktopPoint { x: 3_200, y: 0 },
+                    },
+                    scale_factor: 1.5,
+                    primary: false,
+                },
+            ],
+            3,
+        );
+        let unreachable = Vec2::new(2_300.0, 540.0);
+        let mut intent = BodyIntent {
+            locomotion: LocomotionMode::Wander,
+            target_position: physical_to_virtual_normalized(&topology, unreachable),
+            target_surface: None,
+            desired_speed: 0.1,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Curious,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+
+        project_navigation_target_to_monitor_union(&mut intent, &topology);
+
+        let projected = virtual_normalized_to_physical(&topology, intent.target_position);
+        assert!(aabb_covered(
+            &topology,
+            projected - Vec2::splat(176.0),
+            projected + Vec2::splat(176.0),
+        ));
+        assert!(projected.distance(unreachable) > 100.0);
+    }
+
+    #[test]
     fn global_button_capture_survives_leaving_the_overlay_until_release() {
         let mut pointer = PointerState::default();
         let mut tracker = DesktopPointerTracker::default();
@@ -3714,5 +5392,59 @@ mod tests {
         assert_eq!(restarted.material.variant, MaterialVariant::CinematicJelly);
         assert_eq!(restarted.pbf.viscosity, 0.041);
         assert_eq!(restarted_body.tuning_profile(), &restarted);
+    }
+
+    #[test]
+    fn fresh_store_persists_the_approved_second_body_and_material() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let genome = lifecore::Genome::from_seed(0xB0D1);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+
+        let applied = load_migrate_apply_liquid_tuning(&store, &mut body)
+            .unwrap()
+            .unwrap();
+        let persisted = store
+            .load_liquid_tuning::<LiquidTuningProfile>()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(applied.render_mode, BodyRenderMode::ParticlePbf);
+        assert_eq!(applied.material.variant, MaterialVariant::CinematicJelly);
+        assert_eq!(applied.material.primary_hsv, [0.0, 0.0, 0.0]);
+        assert_eq!(applied.material.opacity, 0.6);
+        assert_eq!(applied.pbf.flight_stretch, 1.9);
+        assert_eq!(persisted, applied);
+        assert_eq!(body.tuning_profile(), &applied);
+    }
+
+    #[test]
+    fn stale_analytic_safe_profile_cannot_replace_the_production_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let genome = lifecore::Genome::from_seed(0xB0D2);
+        let mut stale = LiquidTuningProfile::for_seed(genome.identity_seed);
+        stale.render_mode = BodyRenderMode::AnalyticJelly;
+        stale.material.variant = MaterialVariant::CurrentSafe;
+        stale.pbf.flight_stretch = 0.1;
+        stale.material.opacity = 1.0;
+        store.save_liquid_tuning(&stale).unwrap();
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+
+        let applied = load_migrate_apply_liquid_tuning(&store, &mut body)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(applied.render_mode, BodyRenderMode::ParticlePbf);
+        assert_eq!(applied.material.variant, MaterialVariant::CinematicJelly);
+        assert_eq!(applied.pbf.flight_stretch, 1.9);
+        assert_eq!(applied.material.opacity, 0.6);
+        assert_eq!(
+            store
+                .load_liquid_tuning::<LiquidTuningProfile>()
+                .unwrap()
+                .unwrap(),
+            applied
+        );
     }
 }

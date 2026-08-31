@@ -1,10 +1,38 @@
 # PET-2 Liquid Body Lab
 
-Run the development-only laboratory with:
+Run the liquid editor with:
 
 ```powershell
 cargo run -p body_lab
 ```
+
+Start on the live organism monitor with:
+
+```powershell
+cargo run -p pet2 -- --dev-mode
+cargo run -p body_lab -- --live-pet
+```
+
+`F12` switches the same window between Liquid Body Lab and Live Brain without
+discarding either view's state. In Live Brain, `Space` plays or pauses the
+captured timeline, the left/right arrows step frames, and the slider and speed
+buttons scrub the bounded history. Replay changes only what the monitor shows;
+it never rolls back the running organism.
+
+Live Brain reads `telemetry.jsonl` and its single rotated previous file, falling
+back to legacy `events.jsonl` when no bounded stream exists. Its typed Lab
+controls can issue expiring attention cues and drive pulses, clear pulses, set
+focus mode, or apply an explicit learning reward. Controls are enabled only
+while following a fresh incremental live frame.
+
+The separate Evolution rewind is also read-only. It exposes the exact bounded
+before/after genome checkpoints and their lifetime snapshots from validated
+`state.json` (at most 64 records), gated by lineage and truncated to the selected
+telemetry frame's mutation count/generation so replay never leaks a future
+mutation into the past.
+
+New telemetry groups contain normalized or
+aggregate state, not pixels, typed text, raw audio, or native window IDs.
 
 The single preview is the conserved soft-field particle liquid from the research
 specification. The analytic fallback is intentionally not shown: every visible

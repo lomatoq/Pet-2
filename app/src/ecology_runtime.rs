@@ -2,14 +2,18 @@ use std::time::Instant;
 
 use desktop_host::{StateStore, StorageError};
 use glam::Vec2;
-use lifecore::{ActionId, BodyFeedback, BodyIntent, SensorFrame};
+use lifecore::{ActionId, BodyFeedback, BodyIntent, Drives, SensorFrame};
+use morph_brain::{
+    MORPH_ACTION_CONTROL_COUNT, MORPH_OBJECT_SLOT_COUNT, MorphObjectInput, MorphWorldInput,
+};
 use pet_body::EcologyVisualEffect;
 use pet_ecology::{
     ActionSignature, ActivityEpisode, ContactSource, EcologyBehaviorFrame, EcologyDecisionTrace,
     EcologyOutcome, EcologyOutput, EcologyState, EcologyVisualContext, EcologyVocalTrigger,
-    EmbodiedEnvironmentFrame, EpisodeDirector, ExternalContact, MAX_OBJECT_SPEED, MorselProfile,
-    ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig, RhythmSignature,
-    WindowAffordanceFrame, resolve_object_body_contact, step_object_with_windows,
+    EmbodiedEnvironmentFrame, EpisodeDirector, EpisodeGoal, ExternalContact, MAX_OBJECT_SPEED,
+    MorselProfile, ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig,
+    RhythmSignature, WindowAffordanceFrame, WorldObject, resolve_object_body_contact,
+    step_object_with_windows,
 };
 
 /// Application integration boundary for the portable habitat. Native input,
@@ -30,6 +34,9 @@ pub struct EcologyRuntime {
     visual_target: Option<Vec2>,
     visual_hue: f32,
     visual_strength: f32,
+    visual_colorfulness: f32,
+    visual_structure: f32,
+    visual_surprise: f32,
     shared_attention: bool,
     click_rhythm: Option<RhythmSignature>,
     last_debug: EcologyDecisionTrace,
@@ -37,6 +44,136 @@ pub struct EcologyRuntime {
     last_motor_error: Option<f32>,
     episode_tick_microseconds: f64,
     object_physics_microseconds: f64,
+    desktop_aspect: f32,
+}
+
+fn morph_object_priority(
+    object: &WorldObject,
+    pet_position: Vec2,
+    desktop_aspect: f32,
+    active_object: Option<ObjectId>,
+    drives: Drives,
+) -> f32 {
+    let distance = desktop_distance(object.position, pet_position, desktop_aspect);
+    let goal = if Some(object.id) == active_object {
+        1.0
+    } else {
+        0.0
+    };
+    let kind_value = match object.kind {
+        ObjectKind::Orb => drives.play,
+        ObjectKind::Morsel => drives.curiosity,
+    };
+    goal * 4.0
+        + (-distance * 3.2).exp()
+        + object.novelty * 0.42
+        + object.preference.max(0.0) * 0.30
+        + kind_value * 0.36
+        + (object.velocity.length() / MAX_OBJECT_SPEED).clamp(0.0, 1.0) * 0.40
+}
+
+fn morph_action_biases(
+    goal: EpisodeGoal,
+    distance: f32,
+    drives: Drives,
+) -> [f32; MORPH_ACTION_CONTROL_COUNT] {
+    const SAMPLE: usize = 0;
+    const PUSH: usize = 1;
+    const TOUCH: usize = 2;
+    const PULL: usize = 3;
+    const LISTEN: usize = 4;
+    const SNIFF: usize = 5;
+    const GRASP: usize = 6;
+    const RELEASE: usize = 7;
+    let mut biases = [0.0; MORPH_ACTION_CONTROL_COUNT];
+    match goal {
+        EpisodeGoal::ChaseOrb | EpisodeGoal::InterceptOrb | EpisodeGoal::SoloOrbPlay => {
+            if distance <= 0.17 {
+                biases[PUSH] = 0.82 + drives.play * 0.72;
+                biases[TOUCH] = 0.22 + drives.curiosity * 0.24;
+            }
+        }
+        EpisodeGoal::RetrieveOrb
+        | EpisodeGoal::CarryOrbHome
+        | EpisodeGoal::ReturnOrb
+        | EpisodeGoal::HideOrb
+        | EpisodeGoal::StoreMorsel => {
+            if distance <= 0.14 {
+                biases[GRASP] = 0.86 + drives.autonomy * 0.54;
+                biases[PULL] = 0.32 + drives.play * 0.28;
+            }
+        }
+        EpisodeGoal::OfferOrb => {
+            biases[RELEASE] = 0.92 + drives.social * 0.46;
+        }
+        EpisodeGoal::InspectMorsel => {
+            if distance <= 0.25 {
+                biases[SNIFF] = 0.78 + drives.curiosity * 0.58;
+                biases[LISTEN] = 0.18 + drives.curiosity * 0.18;
+            }
+        }
+        EpisodeGoal::EatMorsel => {
+            if distance <= 0.12 {
+                biases[SAMPLE] = 0.92 + drives.curiosity * 0.42;
+            }
+        }
+        EpisodeGoal::RefuseMorsel => {
+            if distance <= 0.16 {
+                biases[PUSH] = 0.86;
+            }
+        }
+        EpisodeGoal::InspectWindow | EpisodeGoal::SharedAttention => {
+            biases[LISTEN] = 0.30 + drives.curiosity * 0.28;
+        }
+        _ => {}
+    }
+    biases
+}
+
+fn desktop_distance(left: Vec2, right: Vec2, desktop_aspect: f32) -> f32 {
+    Vec2::new(
+        (left.x - right.x) * desktop_aspect.clamp(0.25, 8.0),
+        left.y - right.y,
+    )
+    .length()
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
+    let hue = hue.rem_euclid(1.0) * 6.0;
+    let saturation = saturation.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    let chroma = value * saturation;
+    let x = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let (red, green, blue) = match hue.floor() as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let offset = value - chroma;
+    [red + offset, green + offset, blue + offset]
+}
+
+pub(crate) struct EcologyResolveFrame<'a> {
+    pub selected_action: ActionId,
+    pub drives: Drives,
+    pub sensors: &'a SensorFrame,
+    pub body: &'a BodyFeedback,
+    pub focus_mode: bool,
+    pub dt: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VisualAttentionSample {
+    pub target: Option<Vec2>,
+    pub hue: f32,
+    pub strength: f32,
+    pub explicit: bool,
+    pub colorfulness: f32,
+    pub structure: f32,
+    pub surprise: f32,
 }
 
 impl EcologyRuntime {
@@ -69,6 +206,9 @@ impl EcologyRuntime {
             visual_target: None,
             visual_hue: 0.0,
             visual_strength: 0.0,
+            visual_colorfulness: 0.0,
+            visual_structure: 0.0,
+            visual_surprise: 0.0,
             shared_attention: false,
             click_rhythm: None,
             last_debug: EcologyDecisionTrace::default(),
@@ -76,6 +216,7 @@ impl EcologyRuntime {
             last_motor_error: None,
             episode_tick_microseconds: 0.0,
             object_physics_microseconds: 0.0,
+            desktop_aspect: 1.0,
         })
     }
 
@@ -83,19 +224,34 @@ impl EcologyRuntime {
     pub fn resolve_intent(
         &mut self,
         brain_intent: BodyIntent,
-        selected_action: ActionId,
-        sensors: &SensorFrame,
-        body: &BodyFeedback,
-        focus_mode: bool,
-        dt: f32,
+        frame: EcologyResolveFrame<'_>,
     ) -> EcologyOutput {
+        let EcologyResolveFrame {
+            selected_action,
+            drives,
+            sensors,
+            body,
+            focus_mode,
+            dt,
+        } = frame;
         let frame = EcologyBehaviorFrame {
             selected_action,
             pet_position: body.world_position,
             pet_velocity: body.velocity,
+            desktop_aspect: self.desktop_aspect,
             cursor_position: sensors.cursor_position,
             pointer_down: sensors.pointer_down,
             user_activity: sensors.user_activity_rate,
+            user_available: sensors.user_availability.unwrap_or({
+                if sensors.user_idle_seconds < 120.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }),
+            play_drive: drives.play,
+            curiosity_drive: drives.curiosity,
+            autonomy_drive: drives.autonomy,
             focus_mode,
             sleeping: selected_action == ActionId::Sleep,
             window_pressure: self.environment.pressure,
@@ -119,7 +275,11 @@ impl EcologyRuntime {
             visual_target: self.visual_target,
             visual_hue: self.visual_hue,
             visual_strength: self.visual_strength,
+            visual_colorfulness: self.visual_colorfulness,
+            visual_structure: self.visual_structure,
+            visual_surprise: self.visual_surprise,
             shared_attention: self.shared_attention,
+            autonomous_play_ready: false,
             click_rhythm: self.click_rhythm,
             timestamp: sensors.timestamp,
         };
@@ -148,8 +308,9 @@ impl EcologyRuntime {
         dt: f32,
     ) {
         let started = Instant::now();
+        self.desktop_aspect = desktop_aspect.clamp(0.25, 8.0);
         let config = ObjectPhysicsConfig {
-            desktop_aspect,
+            desktop_aspect: self.desktop_aspect,
             ..ObjectPhysicsConfig::default()
         };
         self.environment = EmbodiedEnvironmentFrame {
@@ -189,8 +350,21 @@ impl EcologyRuntime {
                 .iter()
                 .filter(|contact| contact.source == ContactSource::Window)
                 .count();
+            let window_contacts = &self.environment.contacts[contacts_before
+                ..self
+                    .environment
+                    .contact_count
+                    .min(self.environment.contacts.len())];
+            let has_opposing_normals = window_contacts.iter().enumerate().any(|(index, left)| {
+                left.source == ContactSource::Window
+                    && window_contacts[index + 1..].iter().any(|right| {
+                        right.source == ContactSource::Window
+                            && left.normal_world.dot(right.normal_world) < -0.35
+                    })
+            });
             orb_has_opposing_contacts |= object.kind == ObjectKind::Orb
                 && window_contact_count >= 2
+                && has_opposing_normals
                 && object.velocity.length() < 0.15;
             resolve_object_body_contact(
                 object,
@@ -200,19 +374,11 @@ impl EcologyRuntime {
                 &mut self.environment,
             );
         }
-        let trapped_now = orb_has_opposing_contacts
-            || self.state.objects.iter().any(|object| {
-                object.kind == ObjectKind::Orb
-                    && matches!(
-                        object.lifecycle,
-                        ObjectLifecycle::Free | ObjectLifecycle::Sleeping
-                    )
-                    && object.velocity.length() < 0.08
-                    && windows.as_slice().iter().any(|window| {
-                        object.position.cmpge(window.bounds.minimum).all()
-                            && object.position.cmple(window.bounds.maximum).all()
-                    })
-            });
+        // Being inside a window bounding box is not a trap. Large/maximized
+        // windows routinely cover the orb, and lower z-order edges may be fully
+        // occluded. A trap requires sustained, physically resolved opposing
+        // contacts with low escape velocity.
+        let trapped_now = orb_has_opposing_contacts;
         self.orb_trapped_seconds = if trapped_now {
             (self.orb_trapped_seconds + dt.max(0.0)).min(8.0)
         } else {
@@ -237,13 +403,16 @@ impl EcologyRuntime {
         self.state.spawn_morsel(position, profile, timestamp)
     }
 
-    pub fn set_visual_attention(
-        &mut self,
-        target: Option<Vec2>,
-        hue: f32,
-        strength: f32,
-        explicit: bool,
-    ) {
+    pub fn set_visual_attention(&mut self, sample: VisualAttentionSample) {
+        let VisualAttentionSample {
+            target,
+            hue,
+            strength,
+            explicit,
+            colorfulness,
+            structure,
+            surprise,
+        } = sample;
         self.visual_target = target.filter(|position| position.is_finite());
         self.visual_hue = if hue.is_finite() {
             hue.rem_euclid(1.0)
@@ -252,6 +421,21 @@ impl EcologyRuntime {
         };
         self.visual_strength = if strength.is_finite() {
             strength.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.visual_colorfulness = if colorfulness.is_finite() {
+            colorfulness.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.visual_structure = if structure.is_finite() {
+            structure.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.visual_surprise = if surprise.is_finite() {
+            surprise.clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -330,6 +514,24 @@ impl EcologyRuntime {
         if context_blend > effect.color_blend {
             effect.hue = self.last_visual_context.chromatic_hue;
             effect.color_blend = context_blend;
+        }
+        let visual_energy = self
+            .last_visual_context
+            .visual_structure
+            .max(self.last_visual_context.visual_surprise)
+            .clamp(0.0, 1.0);
+        if visual_energy > 0.0 {
+            // Shape/change perception must alter the visible body, not only an
+            // internal target. Structure tightens the liquid silhouette while
+            // surprise produces a short flow/glow pulse.
+            effect.flow_boost = effect.flow_boost.max(0.24 + visual_energy * 0.62);
+            effect.glow_boost = effect.glow_boost.max(0.30 + visual_energy * 0.52);
+            effect.cohesion_bias = effect
+                .cohesion_bias
+                .max(0.42 + self.last_visual_context.visual_structure * 0.46);
+            effect.translucency_boost = effect
+                .translucency_boost
+                .max(self.last_visual_context.visual_surprise * 0.14);
         }
         effect.contrast_reduction = self.last_visual_context.camouflage_blend * 0.45;
         effect.bounded()
@@ -619,6 +821,104 @@ impl EcologyRuntime {
         &self.state
     }
 
+    /// Converts the portable habitat into the bounded, anonymous object slots
+    /// expected by Thandorcat/morph. Labels and hidden object kinds never cross
+    /// this boundary; the neural side receives appearance, motion, familiarity,
+    /// location and an affordance bias from the already-authoritative episode.
+    #[must_use]
+    pub fn morph_world_input(&self, pet_position: Vec2, drives: Drives) -> MorphWorldInput {
+        let active_object = self
+            .director
+            .active_episode()
+            .and_then(|episode| episode.object_id);
+        let mut visible = self
+            .state
+            .objects
+            .iter()
+            .filter(|object| {
+                !matches!(
+                    object.lifecycle,
+                    ObjectLifecycle::Consumed | ObjectLifecycle::StoredInDen
+                )
+            })
+            .collect::<Vec<_>>();
+        visible.sort_by(|left, right| {
+            morph_object_priority(
+                right,
+                pet_position,
+                self.desktop_aspect,
+                active_object,
+                drives,
+            )
+            .total_cmp(&morph_object_priority(
+                left,
+                pet_position,
+                self.desktop_aspect,
+                active_object,
+                drives,
+            ))
+        });
+
+        let mut input = MorphWorldInput::default();
+        for (slot, object) in visible
+            .into_iter()
+            .take(MORPH_OBJECT_SLOT_COUNT)
+            .enumerate()
+        {
+            let distance = desktop_distance(object.position, pet_position, self.desktop_aspect);
+            let motion = (object.velocity.length() / MAX_OBJECT_SPEED).clamp(0.0, 1.0);
+            let proximity = (-distance * 3.8).exp().clamp(0.0, 1.0);
+            let goal_salience = if Some(object.id) == active_object {
+                0.28
+            } else {
+                0.0
+            };
+            let salience = (0.10
+                + proximity * 0.28
+                + object.novelty * 0.24
+                + object.preference.max(0.0) * 0.18
+                + motion * 0.22
+                + goal_salience)
+                .clamp(0.0, 1.0);
+            let edge_distance = object
+                .position
+                .x
+                .min(1.0 - object.position.x)
+                .min(object.position.y.min(1.0 - object.position.y));
+            input.objects[slot] = Some(MorphObjectInput {
+                position: object.position,
+                salience,
+                motion,
+                size: (object.radius_px_at_reference / 64.0).clamp(0.0, 1.0),
+                roundness: 1.0,
+                color_rgb: hsv_to_rgb(object.hue, object.saturation, object.value),
+                state: if motion > 0.04 || object.lifecycle != ObjectLifecycle::Free {
+                    1.0
+                } else {
+                    0.0
+                },
+                familiarity: object.familiarity,
+                edge: (1.0 - edge_distance / 0.12).clamp(0.0, 1.0),
+                luminance: object.value,
+                texture: (object.glow * 0.55 + object.wear * 0.45).clamp(0.0, 1.0),
+            });
+            if input.selected_slot.is_none()
+                && (Some(object.id) == active_object || active_object.is_none())
+            {
+                input.selected_slot = Some(slot as u8);
+            }
+        }
+
+        if let Some(active) = self.director.active_episode()
+            && let Some(slot) = input.selected_slot
+            && let Some(object) = input.objects[usize::from(slot)]
+        {
+            let distance = desktop_distance(object.position, pet_position, self.desktop_aspect);
+            input.action_biases = morph_action_biases(active.goal, distance, drives);
+        }
+        input
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> EcologyState {
         self.state.snapshot()
@@ -767,11 +1067,14 @@ mod tests {
         };
         let _ = runtime.resolve_intent(
             intent,
-            ActionId::BringProceduralOrb,
-            &sensors,
-            &body,
-            false,
-            0.05,
+            EcologyResolveFrame {
+                selected_action: ActionId::BringProceduralOrb,
+                drives: Drives::initial(&lifecore::Genome::from_seed(78).temperament),
+                sensors: &sensors,
+                body: &body,
+                focus_mode: false,
+                dt: 0.05,
+            },
         );
         assert_eq!(runtime.state.den.slots, [None; 3]);
         assert_eq!(runtime.state.objects.len(), 1);
@@ -879,6 +1182,45 @@ mod tests {
         let radius = runtime.state.objects[0].radius_px_at_reference
             / ObjectPhysicsConfig::default().reference_height_px;
         assert!(runtime.state.objects[0].position.y > radius + 0.01);
+        runtime.state.validate().unwrap();
+    }
+
+    #[test]
+    fn resting_inside_a_window_bbox_is_not_misclassified_as_trapped() {
+        use pet_ecology::{NormalizedRect, WindowAffordance, WindowId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 79, true).unwrap();
+        runtime.state.objects[0].position = Vec2::new(0.5, 0.4);
+        runtime.state.objects[0].velocity = Vec2::ZERO;
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::Free;
+        let body = BodyFeedback {
+            world_position: Vec2::new(0.1, 0.1),
+            ..BodyFeedback::default()
+        };
+        let mut windows = WindowAffordanceFrame::default();
+        windows.push(WindowAffordance {
+            id: WindowId(1),
+            bounds: NormalizedRect {
+                minimum: Vec2::ZERO,
+                maximum: Vec2::ONE,
+            },
+            is_visible: true,
+            ..WindowAffordance::default()
+        });
+        windows.finish();
+
+        for _ in 0..2_400 {
+            runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+        }
+
+        assert!(!runtime.environment.orb_trapped);
+        assert!(runtime.environment.orb_grounded);
+        assert_eq!(
+            runtime.state.objects[0].lifecycle,
+            ObjectLifecycle::Sleeping
+        );
         runtime.state.validate().unwrap();
     }
 }

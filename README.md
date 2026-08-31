@@ -23,7 +23,7 @@ are required.
 ## Quick start
 
 ```powershell
-cargo run -p pet2 -- --headless-smoke 10 --seed 42 --reset-pet --no-audio --data-dir target/smoke-state
+cargo run -p pet2 -- --headless-smoke 60 --seed 42 --reset-pet --no-audio --data-dir target/smoke-state
 cargo test --workspace
 cargo run -p pet2
 cargo run -p habitat_lab -- --scenario habitat_story_v1 --ticks 1600 --trace target/habitat.json --screenshot target/habitat.svg
@@ -60,7 +60,8 @@ crates/pet_ecology   portable objects, den, metabolism, skills, physics, and epi
 crates/pet_perception reduced window, gesture, rhythm, and 16x9 visual affordances
 crates/desktop_host  platform contract, sensors, coordinates, overlay, storage
 app                  desktop runtime and state import/export CLI
-tools/habitat_lab    deterministic ecology scenario runner and SVG/JSON evidence
+tools/body_lab       liquid tuning plus the live brain, telemetry, and evolution monitor
+tools/habitat_lab    developer-only deterministic scenario runner and SVG/JSON evidence
 ```
 
 Build and package entry points live in `scripts/`. CI runs formatting, Clippy,
@@ -96,9 +97,28 @@ native handles, or OS object identifiers.
 
 The orb uses a `4 px` drag threshold: clicking does not snap or stop it, while
 dragging preserves the grab offset, follows with bounded spring response, and
-releases physical velocity. Stationary windows only collide on a fresh swept
-crossing, so a maximized window cannot expel an already embedded orb to a screen
-edge; moving windows still transfer bounded impulse.
+releases physical velocity. It falls under deterministic screen-height gravity,
+bounces with authored restitution, loses tangential energy on floor contact, and
+sleeps only after physically settling. Stationary windows only collide on a fresh
+swept crossing, so a maximized window cannot expel an already embedded orb to a
+screen edge; moving windows still transfer bounded impulse. Window stacking order
+is preserved through perception and physics, so a covered lower-window edge cannot
+become an invisible wall. Sustained opposing contacts—not mere inclusion in a
+window bounding box—are required before the brain treats the orb as trapped.
+
+The episode director can start solo play from endogenous play, curiosity, and
+autonomy instead of waiting for a coincidental high-level action. It seeks a
+distant orb, enters a contact-sized orbit, and authors alternating physical taps;
+the interaction hull is large enough to reach an orb resting on the screen floor.
+Navigation targets are projected onto the actual union of monitor rectangles, so
+an L-shaped desktop cannot leave the pet pursuing an unreachable point in a gap.
+
+Windows visual sensing performs one reduced `64x36` desktop capture and derives a
+privacy-safe `16x9` grid with `4x4` color/edge samples per cell. The pet's own body
+footprint is masked before temporal saliency, preventing self-attention lock.
+Static saturated colors and structured monochrome shapes can claim attention on
+their own, causing gaze/travel plus bounded hue, glow, flow, and cohesion changes.
+A smaller visual reflex remains visible while safety motion owns locomotion.
 
 The overlay is click-through outside the projected procedural silhouette and
 interactive habitat objects. These in-window controls never install global
@@ -112,7 +132,29 @@ keyboard hooks:
 - `Cmd/Win + Alt + B`: cycle Morphic, Fusion, Morph Shadow, Morph Fusion, and Classic brain modes.
 - `Cmd/Win + Alt + R`: apply positive debug reward.
 - `Cmd/Win + Alt + N`: apply negative debug reward.
-- `Cmd/Win + Alt + D`: append a debug snapshot to `events.jsonl`.
+- `Cmd/Win + Alt + D`: toggle bounded causal telemetry logging.
+
+## Body Lab and live brain monitor
+
+The Windows package keeps one companion tool, `BodyLab.exe`. Run
+`Pet2-Dev.cmd` to start Pet 2 with 5 Hz causal telemetry and open the existing
+Body Lab directly on its Live Brain view. If a normal Pet 2 instance is already
+running, close it first because the desktop organism is single-instance.
+
+Inside Body Lab, `F12` switches the same window between Liquid Body Lab and Live
+Brain. In Live Brain, `Space`, the arrow keys, the timeline slider, and the
+playback-rate buttons replay the captured state. This rewinds the observation,
+not the running organism. The live view follows attention, decisions, drives,
+affect, body and object motion, Morph/VITA/Fusion state, learning, identity, and
+exact bounded mutation checkpoints.
+
+Telemetry is written to an 8 MiB `telemetry.jsonl` plus one rotated previous
+file. The older semantic `events.jsonl` is not truncated or rotated and no
+longer receives high-rate debug frames; ordinary semantic events still append
+there. Lab interventions use a closed, expiring command set. Attention cues and drive pulses are
+temporary, while reward intentionally changes learned state. No screen captures
+or pixel buffers, typed text, raw audio, or native window identifiers are added
+to the new telemetry groups.
 
 Use `cargo run -p pet2 -- --help` for deterministic seed, accelerated simulation,
 portable import/export, reset, focus, audio, and isolated data-directory options.

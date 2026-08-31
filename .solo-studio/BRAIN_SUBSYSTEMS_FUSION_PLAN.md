@@ -1,6 +1,6 @@
 # Pet 2 — карта мозга, падсістэм і план fusion
 
-Updated: 2026-08-25
+Updated: 2026-08-31
 Status: Morph gates 1–4 implemented; bounded same-process fusion under live QA
 Scope: тое, што ўжо ёсць у рэпазіторыі, тое, што было запланавана, і бяспечная інтэграцыя з інфраструктурай калегі без страты нашага візуалу.
 
@@ -20,7 +20,7 @@ Morph — другая частка праекта ад калегі, а не з
 
 ## Рэалізаваны Morph slice (2026-08-25)
 
-- Падцягнуты рэальны [Thandorcat/morph](https://github.com/Thandorcat/morph), commit `3c6e27e3b55e4aff1d6c2c254713cdbd79099715`.
+- Падцягнуты рэальны [Thandorcat/morph](https://github.com/Thandorcat/morph), commit `6aa4e7c871c11ff2fa1619942611d4fb50457e49`.
 - Дакладная тапалогія (`526` нейронаў, `17,475` сінапсаў, `57` папуляцый), delay-каналы, Tsodyks–Markram depression, LIF dynamics, readout і plasticity-індэксы перанесены ў workspace crate `morph_brain`.
 - JS golden trace параўноўвае rates, voltage, adaptation і STD з Rust-портам; максімальны дапуск `8e-4`.
 - `Morph Shadow` дае нулявы ўплыў; `Morph Fusion` мае bounded authority `≤0.30` у тым самым `FusionArbiter`.

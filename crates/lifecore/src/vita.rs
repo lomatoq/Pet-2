@@ -1089,6 +1089,31 @@ impl VitaMind {
         } else {
             self.state.attention.confidence =
                 smooth(self.state.attention.confidence, best.confidence, 0.8, dt);
+            // Commitment owns the semantic subject, not a frozen screen
+            // coordinate. Cursor/gesture/window/visual subjects can move while
+            // they remain selected; leaving `position` untouched made the eyes
+            // stare at the point where the cursor used to be for up to 2.1 s.
+            let live_position = if self.state.attention.kind == AttentionKind::Cursor {
+                Some(sensors.cursor_position)
+            } else if best.kind == self.state.attention.kind {
+                best.position
+            } else {
+                self.state.attention.position
+            };
+            if live_position != self.state.attention.position {
+                self.state.attention.position = match (self.state.attention.position, live_position)
+                {
+                    (Some(current), Some(target)) if current.is_finite() && target.is_finite() => {
+                        let response_hz = match self.state.attention.kind {
+                            AttentionKind::Cursor | AttentionKind::Gesture => 18.0,
+                            AttentionKind::Window | AttentionKind::Visual => 9.0,
+                            _ => 6.0,
+                        };
+                        Some(current.lerp(target, 1.0 - (-response_hz * dt).exp()))
+                    }
+                    (_, position) => position,
+                };
+            }
         }
     }
 
@@ -1567,6 +1592,50 @@ mod tests {
             );
             assert!(output.influence.is_none());
         }
+    }
+
+    #[test]
+    fn committed_cursor_attention_follows_the_live_cursor_instead_of_freezing_coordinates() {
+        let core = LifeCore::new(Genome::from_seed(0x000C_0A5E), 7);
+        let mut life = core.state.clone();
+        life.drives.social = 1.0;
+        life.affect.attachment = 1.0;
+        let mut mind = VitaMind::new(core.state.genome.identity_seed);
+        mind.state.attention = AttentionState {
+            kind: AttentionKind::Cursor,
+            position: Some(Vec2::new(0.12, 0.18)),
+            confidence: 0.82,
+            commitment_remaining: 1.5,
+            habituation: 0.2,
+        };
+        let sensors = SensorFrame {
+            cursor_position: Vec2::new(0.84, 0.76),
+            cursor_distance_to_pet: 0.10,
+            ..SensorFrame::default()
+        };
+
+        mind.update_attention(
+            &VitaPerceptFrame {
+                // Viewer wins the candidate contest, while commitment keeps
+                // Cursor as the subject. Its live position must still move.
+                user_available: 1.0,
+                ..VitaPerceptFrame::default()
+            },
+            &sensors,
+            &life,
+            0.05,
+        );
+
+        let followed = mind.state.attention.position.unwrap();
+        assert!(
+            followed.x > 0.50,
+            "cursor target stayed stale: {followed:?}"
+        );
+        assert!(
+            followed.y > 0.45,
+            "cursor target stayed stale: {followed:?}"
+        );
+        assert!(mind.state.attention.commitment_remaining > 1.0);
     }
 
     #[test]

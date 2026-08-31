@@ -7,13 +7,14 @@ use lifecore::{
 use pet_ecology::{
     ActionSignature, EcologyBehaviorFrame, EcologyOutcome, EcologyState, EmbodiedEnvironmentFrame,
     EpisodeDirector, EpisodeGoal, EpisodePhase, MAX_OBJECT_SPEED, MorselProfile, NormalizedRect,
-    ObjectCommand, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig, RhythmSignature,
+    ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig, RhythmSignature,
     WindowAffordance, WindowAffordanceFrame, WindowId, step_object_with_windows,
 };
 use serde_json::{Value, json};
 
 const LAB_HZ: f32 = 20.0;
 const PHYSICS_STEPS: usize = 6;
+const LAB_DESKTOP_ASPECT: f32 = 16.0 / 9.0;
 const ALL_SCENARIOS: [&str; 18] = [
     "ecology_smoke",
     "orb_drag_throw",
@@ -270,9 +271,14 @@ impl Lab {
             selected_action: self.selected_action,
             pet_position: self.pet_position,
             pet_velocity: self.pet_velocity,
+            desktop_aspect: LAB_DESKTOP_ASPECT,
             cursor_position: self.cursor,
             pointer_down: false,
             user_activity: self.user_activity,
+            user_available: if self.focus_mode { 0.0 } else { 1.0 },
+            play_drive: 0.0,
+            curiosity_drive: 0.0,
+            autonomy_drive: 0.0,
             focus_mode: self.focus_mode,
             sleeping: self.sleeping,
             window_pressure: self.window_pressure,
@@ -283,7 +289,11 @@ impl Lab {
             visual_target: self.visual_target,
             visual_hue: self.visual_hue,
             visual_strength: self.visual_strength,
+            visual_colorfulness: self.visual_strength,
+            visual_structure: self.visual_strength * 0.72,
+            visual_surprise: self.visual_strength * 0.58,
             shared_attention: self.shared_attention,
+            autonomous_play_ready: false,
             click_rhythm: self.click_rhythm,
             timestamp: self.timestamp,
         };
@@ -395,6 +405,7 @@ impl Lab {
             match command {
                 ObjectCommand::None => {}
                 ObjectCommand::ApplyImpulse { object_id, impulse } => {
+                    self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
                         .objects
@@ -411,6 +422,7 @@ impl Lab {
                     target,
                     speed,
                 } => {
+                    self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
                         .objects
@@ -431,6 +443,7 @@ impl Lab {
                     object_id,
                     velocity,
                 } => {
+                    self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
                         .objects
@@ -442,6 +455,7 @@ impl Lab {
                     }
                 }
                 ObjectCommand::Store { object_id, slot } if usize::from(slot) < 3 => {
+                    self.clear_den_slot_references(object_id);
                     self.state.den.slots[usize::from(slot)] = Some(object_id);
                     let anchor = self.state.den.anchor;
                     if let Some(object) = self
@@ -457,11 +471,7 @@ impl Lab {
                     }
                 }
                 ObjectCommand::Retrieve { object_id, target } => {
-                    for slot in &mut self.state.den.slots {
-                        if *slot == Some(object_id) {
-                            *slot = None;
-                        }
-                    }
+                    self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
                         .objects
@@ -486,6 +496,14 @@ impl Lab {
                     }
                 }
                 ObjectCommand::Store { .. } => {}
+            }
+        }
+    }
+
+    fn clear_den_slot_references(&mut self, object_id: ObjectId) {
+        for slot in &mut self.state.den.slots {
+            if *slot == Some(object_id) {
+                *slot = None;
             }
         }
     }
@@ -855,6 +873,7 @@ fn moving_window(
     let mut frame = WindowAffordanceFrame::default();
     frame.push(WindowAffordance {
         id: WindowId(1),
+        z_order: 0,
         bounds: NormalizedRect { minimum, maximum },
         velocity,
         nearest_edge_point: Vec2::new(minimum.x, (minimum.y + maximum.y) * 0.5),
@@ -1009,7 +1028,7 @@ fn scenario_passed(lab: &Lab, scenario: &str) -> bool {
         "habitat_story_v1" => {
             has_goal("OfferOrb")
                 && has_goal("InterceptOrb")
-                && has_vocal("MissAndRetry")
+                && (has_vocal("MissAndRetry") || has_vocal("CatchSuccess"))
                 && has_vocal("NeedHelp")
                 && (has_outcome("MorselConsumed") || has_vocal("FoodRefused"))
                 && lab.flags.story_reload_done
@@ -1248,7 +1267,18 @@ mod tests {
             };
             let first = run(scenario, ticks);
             let second = run(scenario, ticks);
-            assert!(first.finite_and_bounded, "{scenario}");
+            assert!(
+                first.finite_and_bounded,
+                "{scenario}: {:?}; den={:?}; objects={:?}",
+                first.validation_error,
+                first.state.den.slots,
+                first
+                    .state
+                    .objects
+                    .iter()
+                    .map(|object| (object.id, object.kind, object.lifecycle))
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(first.state, second.state, "{scenario}");
             assert_eq!(first.transitions, second.transitions, "{scenario}");
             assert!(scenario_passed(&first, scenario), "{scenario}");

@@ -46,7 +46,7 @@ for (let frame = 0; frame < 40; frame++) {
 
 const fixture = {
   schema: 1,
-  upstream_commit: '3c6e27e3b55e4aff1d6c2c254713cdbd79099715',
+  upstream_commit: '6aa4e7c871c11ff2fa1619942611d4fb50457e49',
   seed: 1234,
   frames: 40,
   frame_ms: 50,

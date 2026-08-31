@@ -44,6 +44,22 @@ impl Genome {
         crate::stable_hash_bytes(&bytes)
     }
 
+    /// Validates the portable genotype without silently clamping imported data.
+    ///
+    /// Checkpoints are lineage evidence, so accepting a NaN or an out-of-domain
+    /// trait and repairing it in place would change the recorded organism. New
+    /// mutations are clamped before they are recorded; persisted data must
+    /// already satisfy the same bounds.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.body.is_valid()
+            && self.voice.is_valid()
+            && self.temperament.is_valid()
+            && self.brain.is_valid()
+            && unit_value(self.mutation_rate)
+            && unit_value(self.developmental_plasticity)
+    }
+
     pub(crate) fn clamp_all(&mut self) {
         self.body.clamp_all();
         self.voice.clamp_all();
@@ -106,6 +122,25 @@ impl TemperamentGenome {
             *value = unit(*value);
         }
     }
+
+    fn is_valid(&self) -> bool {
+        [
+            self.sociability,
+            self.curiosity,
+            self.boldness,
+            self.playfulness,
+            self.patience,
+            self.persistence,
+            self.autonomy,
+            self.vocality,
+            self.adaptability,
+            self.attachment_speed,
+            self.exploration_rate,
+            self.circadian_phase,
+        ]
+        .into_iter()
+        .all(unit_value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -142,6 +177,16 @@ impl BrainGenome {
         self.plastic_decay = self.plastic_decay.clamp(0.99, 1.0);
         self.maximum_plastic_delta = self.maximum_plastic_delta.clamp(0.05, 0.4);
         self.time_constant_scale = self.time_constant_scale.clamp(0.65, 1.5);
+    }
+
+    fn is_valid(&self) -> bool {
+        finite_in_range(self.recurrent_connectivity, 0.08, 0.12)
+            && finite_in_range(self.plastic_fraction, 0.08, 0.35)
+            && finite_in_range(self.learning_rate, 0.001, 0.03)
+            && finite_in_range(self.eligibility_tau, 0.2, 6.0)
+            && finite_in_range(self.plastic_decay, 0.99, 1.0)
+            && finite_in_range(self.maximum_plastic_delta, 0.05, 0.4)
+            && finite_in_range(self.time_constant_scale, 0.65, 1.5)
     }
 }
 
@@ -224,6 +269,33 @@ impl VoiceGenome {
         self.purr_rate = self.purr_rate.clamp(20.0, 38.0);
         self.phrase_speed = self.phrase_speed.clamp(0.5, 1.8);
         self.maximum_loudness = self.maximum_loudness.clamp(0.05, 0.5);
+    }
+
+    fn is_valid(&self) -> bool {
+        let harmonic_sum = self.harmonic_mix.iter().sum::<f32>();
+        finite_in_range(self.base_pitch_hz, 220.0, 800.0)
+            && finite_in_range(self.pitch_range_octaves, 0.3, 2.0)
+            && self
+                .harmonic_mix
+                .iter()
+                .all(|harmonic| harmonic.is_finite() && *harmonic >= 0.0)
+            && harmonic_sum.is_finite()
+            && (harmonic_sum - 1.0).abs() <= 0.002
+            && unit_value(self.breathiness)
+            && unit_value(self.roughness)
+            && unit_value(self.brightness)
+            && finite_in_range(self.formant_scale, 0.55, 1.6)
+            && finite_in_range(self.formant_spacing, 0.6, 1.5)
+            && unit_value(self.mouth_resonance)
+            && finite_in_range(self.vibrato_rate, 1.0, 14.0)
+            && finite_in_range(self.vibrato_depth, 0.0, 0.08)
+            && finite_in_range(self.trill_rate, 4.0, 30.0)
+            && finite_in_range(self.attack_ms, 2.0, 120.0)
+            && finite_in_range(self.release_ms, 15.0, 300.0)
+            && unit_value(self.click_amount)
+            && finite_in_range(self.purr_rate, 20.0, 38.0)
+            && finite_in_range(self.phrase_speed, 0.5, 1.8)
+            && finite_in_range(self.maximum_loudness, 0.05, 0.5)
     }
 }
 
@@ -331,6 +403,36 @@ impl BodyGenome {
         self.pattern_contrast = self.pattern_contrast.clamp(0.02, 0.72);
         self.bioluminescence = self.bioluminescence.clamp(0.04, 0.75);
     }
+
+    fn is_valid(&self) -> bool {
+        finite_in_range(self.body_length, 0.60, 1.35)
+            && finite_in_range(self.body_width, 0.40, 1.05)
+            && finite_in_range(self.body_roundness, 0.35, 1.0)
+            && finite_in_range(self.head_ratio, 0.30, 0.70)
+            && finite_in_range(self.eye_size, 0.07, 0.26)
+            && finite_in_range(self.eye_spacing, 0.16, 0.48)
+            && finite_in_range(self.pupil_ratio, 0.25, 0.82)
+            && finite_in_range(self.wing_span, 0.35, 1.5)
+            && finite_in_range(self.wing_aspect, 0.4, 1.8)
+            && unit_value(self.wing_roundness)
+            && finite_in_range(self.wing_translucency, 0.10, 0.78)
+            && finite_in_range(self.tail_length, 0.25, 1.6)
+            && finite_in_range(self.tail_thickness, 0.035, 0.20)
+            && (3..=10).contains(&self.tail_segments)
+            && finite_in_range(self.limb_length, 0.10, 0.46)
+            && finite_in_range(self.limb_thickness, 0.035, 0.18)
+            && finite_in_range(self.ear_fin_size, 0.03, 0.38)
+            && finite_in_range(self.crest_size, 0.0, 0.32)
+            && unit_value(self.softness)
+            && unit_value(self.visual_mass)
+            && unit_value(self.inertia)
+            && hsv_is_valid(self.primary_color_hsv)
+            && hsv_is_valid(self.secondary_color_hsv)
+            && hsv_is_valid(self.glow_color_hsv)
+            && finite_in_range(self.pattern_scale, 0.8, 6.0)
+            && finite_in_range(self.pattern_contrast, 0.02, 0.72)
+            && finite_in_range(self.bioluminescence, 0.04, 0.75)
+    }
 }
 
 pub(crate) fn unit_f32(rng: &mut impl RngCore) -> f32 {
@@ -366,4 +468,44 @@ fn clamp_hsv(value: Vec3) -> Vec3 {
         unit(value.y),
         unit(value.z).max(0.12),
     )
+}
+
+fn finite_in_range(value: f32, minimum: f32, maximum: f32) -> bool {
+    value.is_finite() && (minimum..=maximum).contains(&value)
+}
+
+fn unit_value(value: f32) -> bool {
+    finite_in_range(value, 0.0, 1.0)
+}
+
+fn hsv_is_valid(value: Vec3) -> bool {
+    value.is_finite()
+        && (0.0..1.0).contains(&value.x)
+        && unit_value(value.y)
+        && finite_in_range(value.z, 0.12, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_genome_is_valid() {
+        assert!(Genome::from_seed(42).is_valid());
+    }
+
+    #[test]
+    fn validation_rejects_non_finite_and_out_of_domain_traits() {
+        let mut genome = Genome::from_seed(42);
+        genome.body.tail_length = f32::NAN;
+        assert!(!genome.is_valid());
+
+        let mut genome = Genome::from_seed(42);
+        genome.voice.maximum_loudness = 0.75;
+        assert!(!genome.is_valid());
+
+        let mut genome = Genome::from_seed(42);
+        genome.temperament.autonomy = -0.01;
+        assert!(!genome.is_valid());
+    }
 }

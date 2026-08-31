@@ -5,6 +5,12 @@ use crate::{MAX_OBJECT_SPEED, ObjectKind, ObjectLifecycle, WindowAffordanceFrame
 pub const MAX_EXTERNAL_CONTACTS: usize = 8;
 const INVALID_BOUNDARY_RECOVERY_SPEED: f32 = 0.08;
 const EMBEDDED_WINDOW_MOTION_THRESHOLD_PX_PER_SECOND: f32 = 8.0;
+/// Downward acceleration in virtual-desktop-height units per second squared.
+/// It is intentionally authored in physical height space so ultrawide layouts
+/// do not change the fall or bounce.
+pub const ORB_SCREEN_GRAVITY: f32 = 0.72;
+const FLOOR_REST_SPEED: f32 = 0.055;
+const FLOOR_TANGENTIAL_FRICTION: f32 = 0.82;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ContactSource {
@@ -30,6 +36,7 @@ pub struct EmbodiedEnvironmentFrame {
     pub contacts: [ExternalContact; MAX_EXTERNAL_CONTACTS],
     pub contact_count: usize,
     pub orb_position: Option<Vec2>,
+    pub orb_grounded: bool,
     pub den_anchor: Option<Vec2>,
     pub pressure: f32,
     pub escape_direction: Vec2,
@@ -57,7 +64,11 @@ impl Default for ObjectPhysicsConfig {
         Self {
             desktop_aspect: 16.0 / 9.0,
             reference_height_px: 1_152.0,
-            pet_radius_px_at_reference: 58.0,
+            // The interaction hull must match the visible liquid body rather
+            // than its small face carrier. With the old 58 px proxy, a body
+            // kept safely inside the desktop could never reach a 31 px orb
+            // resting on the floor.
+            pet_radius_px_at_reference: 118.0,
         }
     }
 }
@@ -96,6 +107,16 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
     let mut position = Vec2::new(object.position.x * aspect, object.position.y);
     let minimum = Vec2::splat(radius);
     let maximum = Vec2::new(aspect - radius, 1.0 - radius);
+    let resting_on_floor = object.kind == ObjectKind::Orb
+        && position.y >= maximum.y - 1.0e-6
+        && object.velocity.length_squared() < 1.0e-8;
+    if object.lifecycle == ObjectLifecycle::Sleeping && resting_on_floor {
+        object.position = Vec2::new(position.clamp(minimum, maximum).x / aspect, maximum.y);
+        return;
+    }
+    if object.lifecycle == ObjectLifecycle::Sleeping {
+        object.lifecycle = ObjectLifecycle::Free;
+    }
 
     // Older builds could persist the object's center either directly on the
     // desktop edge or exactly on the radius-aware boundary with zero velocity.
@@ -104,17 +125,19 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
     // points inward, so it passes through untouched.
     let persisted_position = position;
     position = position.clamp(minimum, maximum);
-    for axis in 0..2 {
-        if persisted_position[axis] <= minimum[axis] + 1.0e-6 {
-            if object.velocity[axis] <= 0.0 {
-                object.velocity[axis] = (-object.velocity[axis] * object.restitution)
-                    .max(INVALID_BOUNDARY_RECOVERY_SPEED);
-            }
-        } else if persisted_position[axis] >= maximum[axis] - 1.0e-6 && object.velocity[axis] >= 0.0
-        {
-            object.velocity[axis] = -((object.velocity[axis] * object.restitution)
-                .max(INVALID_BOUNDARY_RECOVERY_SPEED));
-        }
+    if persisted_position.x <= minimum.x + 1.0e-6 && object.velocity.x <= 0.0 {
+        object.velocity.x =
+            (-object.velocity.x * object.restitution).max(INVALID_BOUNDARY_RECOVERY_SPEED);
+    } else if persisted_position.x >= maximum.x - 1.0e-6 && object.velocity.x >= 0.0 {
+        object.velocity.x =
+            -((object.velocity.x * object.restitution).max(INVALID_BOUNDARY_RECOVERY_SPEED));
+    }
+    if persisted_position.y <= minimum.y + 1.0e-6 && object.velocity.y <= 0.0 {
+        object.velocity.y =
+            (-object.velocity.y * object.restitution).max(INVALID_BOUNDARY_RECOVERY_SPEED);
+    }
+    if object.kind == ObjectKind::Orb {
+        object.velocity.y += ORB_SCREEN_GRAVITY * dt;
     }
     let damping = (-object.linear_drag.max(0.0) * dt).exp();
     object.velocity *= damping;
@@ -147,9 +170,18 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
             }
         }
         if let Some(axis) = hit_axis {
+            let incoming_speed = object.velocity[axis];
             position += object.velocity * hit_time;
             position = position.clamp(minimum, maximum);
-            object.velocity[axis] = -object.velocity[axis] * object.restitution;
+            let floor_contact = axis == 1 && incoming_speed > 0.0;
+            if floor_contact && incoming_speed <= FLOOR_REST_SPEED {
+                object.velocity.y = 0.0;
+            } else {
+                object.velocity[axis] = -incoming_speed * object.restitution;
+            }
+            if floor_contact {
+                object.velocity.x *= FLOOR_TANGENTIAL_FRICTION;
+            }
             remaining -= hit_time;
             if hit_time <= 1.0e-7 {
                 remaining = (remaining - 1.0e-5).max(0.0);
@@ -161,7 +193,15 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
     }
     position = position.clamp(minimum, maximum);
     object.position = Vec2::new(position.x / aspect, position.y);
-    if object.velocity.length_squared() < 1.0e-8 {
+    let floor_supported = object.kind == ObjectKind::Orb
+        && position.y >= maximum.y - 1.0e-6
+        && object.velocity.y.abs() <= FLOOR_REST_SPEED;
+    if floor_supported {
+        object.velocity.y = 0.0;
+    }
+    if (floor_supported && object.velocity.x.abs() < 0.004)
+        || object.velocity.length_squared() < 1.0e-8
+    {
         object.velocity = Vec2::ZERO;
         object.lifecycle = ObjectLifecycle::Sleeping;
     } else if object.lifecycle == ObjectLifecycle::Sleeping {
@@ -205,7 +245,7 @@ pub fn step_object_with_windows(
     let mut end = Vec2::new(object.position.x * aspect, object.position.y);
 
     let mut window_contacts = 0_usize;
-    for window in windows.as_slice() {
+    for (window_index, window) in windows.as_slice().iter().enumerate() {
         if !window.is_visible || !window.is_valid() {
             continue;
         }
@@ -240,28 +280,38 @@ pub fn step_object_with_windows(
         {
             continue;
         }
+        let mut resolved_end = end;
         let mut normal = Vec2::ZERO;
         let mut penetration = 0.0;
         if embedded_at_frame_start {
             let (resolved, overlap_normal, depth) =
                 resolve_inside_rect(relative_start, minimum, maximum);
-            end = resolved;
+            resolved_end = resolved;
             normal = overlap_normal;
             penetration = depth;
         } else if let Some((time, hit_normal)) =
             swept_point_aabb(relative_start, relative_delta, minimum, maximum)
         {
-            end = start.lerp(end, time) + hit_normal * 1.0e-5;
+            resolved_end = start.lerp(end, time) + hit_normal * 1.0e-5;
             normal = hit_normal;
         } else if point_in_rect(end, minimum, maximum) {
             let (resolved, overlap_normal, depth) = resolve_inside_rect(end, minimum, maximum);
-            end = resolved;
+            resolved_end = resolved;
             normal = overlap_normal;
             penetration = depth;
         }
         if normal == Vec2::ZERO {
             continue;
         }
+        let surface_point_height = resolved_end - normal * radius;
+        let surface_point_world = Vec2::new(
+            (surface_point_height.x / aspect).clamp(0.0, 1.0),
+            surface_point_height.y.clamp(0.0, 1.0),
+        );
+        if window_contact_is_occluded(windows, window_index, window.z_order, surface_point_world) {
+            continue;
+        }
+        end = resolved_end;
         let relative_velocity = object.velocity - window_velocity;
         let incoming = relative_velocity.dot(normal);
         if incoming < 0.0 {
@@ -274,10 +324,9 @@ pub fn step_object_with_windows(
             object.velocity = object.velocity.normalize_or_zero() * MAX_OBJECT_SPEED;
         }
         object.lifecycle = ObjectLifecycle::Free;
-        let point = Vec2::new((end.x / aspect).clamp(0.0, 1.0), end.y.clamp(0.0, 1.0));
         environment.push_contact(ExternalContact {
             source: ContactSource::Window,
-            point_world: point,
+            point_world: surface_point_world,
             normal_world: normal,
             penetration_px: penetration * reference_height,
             relative_velocity_px: relative_velocity * reference_height,
@@ -292,7 +341,23 @@ pub fn step_object_with_windows(
     object.position = Vec2::new(end.x / aspect, end.y);
     if object.kind == ObjectKind::Orb {
         environment.orb_position = Some(object.position);
+        environment.orb_grounded =
+            end.y >= desktop_maximum.y - 1.0e-6 && object.velocity.y.abs() <= FLOOR_REST_SPEED;
     }
+}
+
+fn window_contact_is_occluded(
+    windows: &WindowAffordanceFrame,
+    window_index: usize,
+    z_order: u16,
+    point: Vec2,
+) -> bool {
+    windows.as_slice()[..window_index].iter().any(|front| {
+        front.z_order < z_order
+            && front.is_visible
+            && front.is_valid()
+            && point_in_rect(point, front.bounds.minimum, front.bounds.maximum)
+    })
 }
 
 pub fn resolve_object_body_contact(
@@ -509,6 +574,10 @@ mod tests {
         let den = DenState::for_seed(8);
         let mut horizontal = WorldObject::canonical_orb(8, den.anchor);
         let mut vertical = horizontal.clone();
+        // This test isolates coordinate scaling from the orb's deliberate
+        // downward acceleration.
+        horizontal.kind = ObjectKind::Morsel;
+        vertical.kind = ObjectKind::Morsel;
         horizontal.position = Vec2::splat(0.5);
         vertical.position = Vec2::splat(0.5);
         horizontal.velocity = Vec2::new(0.1, 0.0);
@@ -558,6 +627,49 @@ mod tests {
         assert!(orb.velocity.x < 0.0);
         assert_eq!(environment.contact_count, 1);
         assert_eq!(environment.contacts[0].source, ContactSource::Window);
+    }
+
+    #[test]
+    fn covered_back_window_edge_cannot_create_a_phantom_collision() {
+        let den = DenState::for_seed(19);
+        let mut orb = WorldObject::canonical_orb(19, den.anchor);
+        orb.position = Vec2::new(0.60, 0.50);
+        orb.velocity = Vec2::new(0.50, 0.0);
+        orb.linear_drag = 0.0;
+        let mut windows = WindowAffordanceFrame::default();
+        windows.push(WindowAffordance {
+            id: WindowId(1),
+            z_order: 0,
+            bounds: NormalizedRect {
+                minimum: Vec2::new(0.55, 0.25),
+                maximum: Vec2::new(0.70, 0.75),
+            },
+            is_visible: true,
+            ..WindowAffordance::default()
+        });
+        windows.push(WindowAffordance {
+            id: WindowId(2),
+            z_order: 1,
+            bounds: NormalizedRect {
+                minimum: Vec2::new(0.62, 0.30),
+                maximum: Vec2::new(0.625, 0.70),
+            },
+            is_visible: true,
+            ..WindowAffordance::default()
+        });
+        windows.finish();
+        let mut environment = EmbodiedEnvironmentFrame::default();
+
+        step_object_with_windows(
+            &mut orb,
+            ObjectPhysicsConfig::default(),
+            &windows,
+            1.0 / 30.0,
+            &mut environment,
+        );
+
+        assert_eq!(environment.contact_count, 0);
+        assert!(orb.velocity.x > 0.0);
     }
 
     #[test]
@@ -697,20 +809,27 @@ mod tests {
     }
 
     #[test]
-    fn invalid_saved_edge_position_recovers_with_inward_motion() {
+    fn orb_has_gravity_bounces_and_eventually_sleeps_on_the_floor() {
         let den = DenState::for_seed(15);
         let mut orb = WorldObject::canonical_orb(15, den.anchor);
         let config = ObjectPhysicsConfig::default();
         let radius = orb.radius_px_at_reference / config.reference_height_px;
-        orb.position = Vec2::new(0.37, 1.0 - radius);
+        orb.position = Vec2::new(0.37, 0.24);
         orb.velocity = Vec2::ZERO;
+        let mut maximum_downward_speed = 0.0_f32;
+        let mut bounced = false;
 
-        for _ in 0..30 {
+        for _ in 0..2_400 {
             step_object(&mut orb, config, 1.0 / 120.0);
+            maximum_downward_speed = maximum_downward_speed.max(orb.velocity.y);
+            bounced |= orb.velocity.y < -0.05;
         }
 
-        assert!(orb.position.y < 1.0 - radius - 0.01);
-        assert!(orb.velocity.y < 0.0);
+        assert!(maximum_downward_speed > 0.35);
+        assert!(bounced);
+        assert!((orb.position.y - (1.0 - radius)).abs() < 1.0e-5);
+        assert_eq!(orb.velocity, Vec2::ZERO);
+        assert_eq!(orb.lifecycle, ObjectLifecycle::Sleeping);
         assert!(orb.position.is_finite());
         assert!(orb.velocity.is_finite());
     }
@@ -747,8 +866,9 @@ mod tests {
         }
 
         assert_eq!(contact_count, 0);
-        assert!(orb.position.y < 1.0 - radius - 0.01);
-        assert!(orb.velocity.y < 0.0);
+        assert!((orb.position.y - (1.0 - radius)).abs() < 1.0e-5);
+        assert_eq!(orb.velocity, Vec2::ZERO);
+        assert_eq!(orb.lifecycle, ObjectLifecycle::Sleeping);
         assert!(orb.position.is_finite());
         assert!(orb.velocity.is_finite());
     }

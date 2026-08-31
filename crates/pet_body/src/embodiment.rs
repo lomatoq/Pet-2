@@ -11,6 +11,7 @@ use crate::{
 
 const LUMINANCE_HISTORY: usize = 32;
 const MAX_GAZE_STEP: f32 = 0.08;
+const LOCKED_MICROSACCADE_LIMIT: f32 = 0.018;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct LuminanceSample {
@@ -156,7 +157,7 @@ impl EmbodiedRuntime {
             seed,
             elapsed: 0.0,
             fixation_elapsed: 0.0,
-            fixation_duration: 0.7 + seed_phase.sin().abs() * 0.8,
+            fixation_duration: 0.35 + seed_phase.sin().abs() * 0.45,
             gaze_target: Vec2::ZERO,
             base_gaze: Vec2::ZERO,
             gaze_velocity: Vec2::ZERO,
@@ -166,7 +167,7 @@ impl EmbodiedRuntime {
             microsaccade_target: Vec2::ZERO,
             microsaccade_elapsed: 0.0,
             microsaccade_duration: 0.05,
-            next_microsaccade: 0.55 + deterministic_unit(seed, 0, 0x51) * 0.65,
+            next_microsaccade: 0.32 + deterministic_unit(seed, 0, 0x51) * 0.42,
             microsaccade_sequence: 0,
             fixation_locked: false,
             face_attention_fixation: Vec2::ZERO,
@@ -242,6 +243,19 @@ impl EmbodiedRuntime {
     #[must_use]
     pub fn fixation_locked(&self) -> bool {
         self.fixation_locked
+    }
+
+    /// Eye-local semantic target selected before presentation smoothing and
+    /// microsaccades. Exposed for causal dev telemetry only.
+    #[must_use]
+    pub fn semantic_gaze_target(&self) -> Vec2 {
+        self.gaze_target
+    }
+
+    /// Elapsed and scheduled duration of the current semantic fixation.
+    #[must_use]
+    pub fn fixation_timing(&self) -> (f32, f32) {
+        (self.fixation_elapsed, self.fixation_duration)
     }
 
     /// Advances presentation-only trackers once per redraw. Simulation updates
@@ -421,27 +435,29 @@ impl EmbodiedRuntime {
     ) {
         self.fixation_elapsed += dt;
         let target_distance = desired.distance(self.gaze_target);
-        let should_saccade = target_distance > 0.12
+        let should_saccade = target_distance > 0.065
             || self.fixation_elapsed >= self.fixation_duration
-            || matches!(mode, GazeMode::DirectViewer | GazeMode::Sleep)
-                && self.pose.gaze_mode != mode;
+            || self.pose.gaze_mode != mode;
         if should_saccade && desired.is_finite() {
             self.gaze_target = desired.clamp(Vec2::splat(-0.92), Vec2::splat(0.92));
             self.fixation_elapsed = 0.0;
-            self.fixation_duration = (0.45
-                + 1.35 * (0.5 + 0.5 * (self.elapsed * 0.71 + self.seed_phase).sin())
-                + affect.stress * 0.28)
-                .clamp(0.28, 2.2);
+            let attention_hold = mind.attention_commitment * 0.20;
+            self.fixation_duration = (0.22
+                + 0.58 * (0.5 + 0.5 * (self.elapsed * 0.89 + self.seed_phase).sin())
+                + attention_hold
+                + affect.stress * 0.14)
+                .clamp(0.18, 1.15);
             self.saccade_strength = target_distance.clamp(0.0, 1.0);
         }
-        self.saccade_strength = (self.saccade_strength - dt * 5.5).max(0.0);
+        self.saccade_strength = (self.saccade_strength - dt * 7.5).max(0.0);
         let stable_target = desired.distance(self.gaze_target) < 0.035;
-        let fixation_lock = mode == GazeMode::Sleep
-            || stable_target
-                && ((mind.attention_confidence >= 0.72 && mind.attention_commitment >= 0.35)
-                    || expression.pupil_focus >= 0.82);
-        self.fixation_locked = fixation_lock;
-        if fixation_lock {
+        let sleep_lock = mode == GazeMode::Sleep;
+        let strong_fixation = !sleep_lock
+            && stable_target
+            && ((mind.attention_confidence >= 0.72 && mind.attention_commitment >= 0.35)
+                || expression.pupil_focus >= 0.82);
+        self.fixation_locked = sleep_lock || strong_fixation;
+        if sleep_lock {
             let decay = 1.0 - (-18.0 * dt).exp();
             self.microsaccade_offset = self.microsaccade_offset.lerp(Vec2::ZERO, decay);
             if self.microsaccade_offset.length_squared() < 1.0e-8 {
@@ -451,6 +467,15 @@ impl EmbodiedRuntime {
             self.microsaccade_target = Vec2::ZERO;
             self.microsaccade_elapsed = self.microsaccade_duration;
         } else {
+            if strong_fixation {
+                // A fixation is a semantic lock, not a frozen eyeball. Keep
+                // its deterministic micro-motion below a much tighter cap.
+                let limit =
+                    LOCKED_MICROSACCADE_LIMIT * face_tuning.microsaccade_amount.clamp(0.0, 1.0);
+                self.microsaccade_offset = self.microsaccade_offset.clamp_length_max(limit);
+                self.microsaccade_from = self.microsaccade_from.clamp_length_max(limit);
+                self.microsaccade_target = self.microsaccade_target.clamp_length_max(limit);
+            }
             self.next_microsaccade -= dt;
             if self.next_microsaccade <= 0.0 {
                 let sequence = self.microsaccade_sequence;
@@ -464,15 +489,20 @@ impl EmbodiedRuntime {
                 // maps it by 0.32 eye radii. Convert the authored 0.006..0.018
                 // eye-local microsaccade into that normalized space so it remains
                 // subtle but actually visible at desktop scale.
-                let amplitude = (0.020 + deterministic_unit(self.seed, sequence, 0xA7) * 0.036)
-                    * face_tuning.microsaccade_amount;
+                let fixation_scale = if strong_fixation { 0.32 } else { 1.0 };
+                let amplitude = (0.018 + deterministic_unit(self.seed, sequence, 0xA7) * 0.038)
+                    * face_tuning.microsaccade_amount
+                    * fixation_scale;
                 self.microsaccade_from = self.microsaccade_offset;
                 self.microsaccade_target = direction * amplitude;
                 self.microsaccade_elapsed = 0.0;
                 self.microsaccade_duration =
-                    0.035 + deterministic_unit(self.seed, sequence, 0xC1) * 0.035;
-                let rate = (0.60 + affect.arousal * 1.20) * face_tuning.microsaccade_rate.max(0.01);
-                let interval_jitter = 0.78 + deterministic_unit(self.seed, sequence, 0xD3) * 0.54;
+                    0.028 + deterministic_unit(self.seed, sequence, 0xC1) * 0.030;
+                let fixation_rate = if strong_fixation { 0.82 } else { 1.0 };
+                let rate = (0.85 + affect.arousal * 1.65)
+                    * face_tuning.microsaccade_rate.max(0.01)
+                    * fixation_rate;
+                let interval_jitter = 0.62 + deterministic_unit(self.seed, sequence, 0xD3) * 0.44;
                 self.next_microsaccade = interval_jitter / rate.max(0.05);
                 self.microsaccade_sequence = self.microsaccade_sequence.wrapping_add(1);
             }
@@ -598,7 +628,7 @@ impl EmbodiedRuntime {
         } else {
             self.gaze_target
         };
-        let frequency = 28.0 + self.saccade_strength * 38.0;
+        let frequency = 36.0 + self.saccade_strength * 48.0;
         // The explicit spring used by the soft-body presentation can overshoot
         // or become unstable during a frame hitch. Gaze uses the closed-form
         // critically damped solution and recovers to the last presented value,
@@ -1191,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_lock_suppresses_events_and_damps_existing_microsaccade() {
+    fn strong_fixation_keeps_small_deterministic_microsaccades_but_sleep_is_still() {
         let genome = Genome::from_seed(0xF0C05);
         let traits = DerivedVisualTraits::from_genome(&genome);
         let mut runtime = EmbodiedRuntime::new(genome.identity_seed, &traits);
@@ -1202,7 +1232,7 @@ mod tests {
             pupil_focus: 1.0,
             ..lifecore::ExpressionState::default()
         };
-        for _ in 0..30 {
+        for _ in 0..12 {
             runtime.update_gaze(
                 GazeMode::TrackWorldTarget,
                 Vec2::ZERO,
@@ -1217,8 +1247,38 @@ mod tests {
                 1.0 / 120.0,
             );
         }
-        assert_eq!(runtime.microsaccade_sequence, sequence);
-        assert!(runtime.microsaccade_offset.length() < 0.001);
+        assert!(runtime.fixation_locked);
+        assert_eq!(runtime.microsaccade_sequence, sequence + 1);
+        assert!(runtime.microsaccade_target.length() > 0.0);
+        assert!(
+            runtime.microsaccade_target.length() <= LOCKED_MICROSACCADE_LIMIT + 1.0e-6,
+            "target={:?}",
+            runtime.microsaccade_target
+        );
+        assert!(runtime.microsaccade_offset.length() > 0.0);
+        assert!(runtime.microsaccade_offset.length() <= LOCKED_MICROSACCADE_LIMIT + 1.0e-6);
+
+        let sleeping_sequence = runtime.microsaccade_sequence;
+        runtime.next_microsaccade = 0.0;
+        runtime.microsaccade_offset = Vec2::new(0.012, -0.006);
+        for _ in 0..120 {
+            runtime.update_gaze(
+                GazeMode::Sleep,
+                Vec2::ZERO,
+                AffectState::default(),
+                VisualMindInput {
+                    attention_confidence: 1.0,
+                    attention_commitment: 1.0,
+                    ..VisualMindInput::default()
+                },
+                expression,
+                FaceTuning::default(),
+                1.0 / 120.0,
+            );
+        }
+        assert!(runtime.fixation_locked);
+        assert_eq!(runtime.microsaccade_sequence, sleeping_sequence);
+        assert_eq!(runtime.microsaccade_offset, Vec2::ZERO);
 
         expression.pupil_focus = 0.5;
         runtime.next_microsaccade = 0.0;
@@ -1231,12 +1291,59 @@ mod tests {
             FaceTuning::default(),
             1.0 / 120.0,
         );
-        assert_eq!(runtime.microsaccade_sequence, sequence + 1);
+        assert_eq!(runtime.microsaccade_sequence, sleeping_sequence + 1);
         assert!(
-            (0.020..=0.056_1).contains(&runtime.microsaccade_target.length()),
+            (0.018..=0.056_1).contains(&runtime.microsaccade_target.length()),
             "target={:?}",
             runtime.microsaccade_target
         );
+    }
+
+    #[test]
+    fn gaze_acquires_subtle_target_changes_quickly_with_short_bounded_fixations() {
+        let genome = Genome::from_seed(0xFA57_E1E5);
+        let traits = DerivedVisualTraits::from_genome(&genome);
+        let mut runtime = EmbodiedRuntime::new(genome.identity_seed, &traits);
+        runtime.fixation_duration = 10.0;
+        let subtle_target = Vec2::new(0.075, 0.0);
+
+        runtime.update_gaze(
+            GazeMode::TrackWorldTarget,
+            subtle_target,
+            AffectState::default(),
+            VisualMindInput::default(),
+            lifecore::ExpressionState::default(),
+            FaceTuning::default(),
+            1.0 / 120.0,
+        );
+        assert_eq!(runtime.semantic_gaze_target(), subtle_target);
+        assert!((0.18..=1.15).contains(&runtime.fixation_duration));
+
+        let far_target = Vec2::new(0.80, -0.42);
+        runtime.update_gaze(
+            GazeMode::TrackWorldTarget,
+            far_target,
+            AffectState::default(),
+            VisualMindInput::default(),
+            lifecore::ExpressionState::default(),
+            FaceTuning::default(),
+            1.0 / 60.0,
+        );
+        let mut acquired_frame = None;
+        for frame in 1..=15 {
+            runtime.present_gaze(1.0 / 60.0);
+            if runtime.pose.gaze.distance(far_target) <= 0.04 {
+                acquired_frame = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            acquired_frame.is_some_and(|frame| frame <= 13),
+            "presented gaze did not acquire target quickly: frame={acquired_frame:?} gaze={:?}",
+            runtime.pose.gaze
+        );
+        assert!(runtime.pose.gaze.max_element() <= 0.95);
+        assert!(runtime.pose.gaze.min_element() >= -0.95);
     }
 
     #[test]

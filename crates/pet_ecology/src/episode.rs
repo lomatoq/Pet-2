@@ -1,5 +1,5 @@
 use glam::Vec2;
-use lifecore::{ActionId, BodyIntent, LocomotionMode, PoseIntent};
+use lifecore::{ActionId, BodyIntent, InteractionTarget, LocomotionMode, PoseIntent};
 
 use crate::{
     EcologyDecisionTrace, EcologyState, GoalScore, ObjectId, ObjectKind, ObjectLifecycle,
@@ -111,6 +111,8 @@ pub enum EpisodeReason {
     TrappedObject,
     FoodOpportunity,
     SharedAttentionCue,
+    VisualNovelty,
+    AutonomousPlay,
     PracticeDue,
     ExplicitTeachMode,
     SafetyAbort,
@@ -187,6 +189,8 @@ pub struct EcologyVisualContext {
     pub chromatic_hue: f32,
     pub chromatic_blend: f32,
     pub camouflage_blend: f32,
+    pub visual_structure: f32,
+    pub visual_surprise: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +205,7 @@ pub enum EcologyVocalTrigger {
     HomeReturn,
     SkillMastered,
     RhythmEcho,
+    VisualNotice,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -236,9 +241,16 @@ pub struct EcologyBehaviorFrame {
     pub selected_action: ActionId,
     pub pet_position: Vec2,
     pub pet_velocity: Vec2,
+    /// Desktop width / height. All proximity decisions use height-space so a
+    /// threshold means the same physical distance on 16:9 and ultrawide hosts.
+    pub desktop_aspect: f32,
     pub cursor_position: Vec2,
     pub pointer_down: bool,
     pub user_activity: f32,
+    pub user_available: f32,
+    pub play_drive: f32,
+    pub curiosity_drive: f32,
+    pub autonomy_drive: f32,
     pub focus_mode: bool,
     pub sleeping: bool,
     pub window_pressure: f32,
@@ -249,7 +261,11 @@ pub struct EcologyBehaviorFrame {
     pub visual_target: Option<Vec2>,
     pub visual_hue: f32,
     pub visual_strength: f32,
+    pub visual_colorfulness: f32,
+    pub visual_structure: f32,
+    pub visual_surprise: f32,
     pub shared_attention: bool,
+    pub autonomous_play_ready: bool,
     pub click_rhythm: Option<crate::RhythmSignature>,
     pub timestamp: f64,
 }
@@ -263,12 +279,27 @@ enum EpisodeStep {
 
 /// The sole ecology behavior writer. With no active episode this boundary is a
 /// strict pass-through and therefore preserves every existing brain mode.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct EpisodeDirector {
     active: Option<ActivityEpisode>,
     tick: u64,
     visual_episode_cooldown: f32,
     orb_bid_cooldown: f32,
+    endogenous_idle_seconds: f32,
+    endogenous_play_cooldown: f32,
+}
+
+impl Default for EpisodeDirector {
+    fn default() -> Self {
+        Self {
+            active: None,
+            tick: 0,
+            visual_episode_cooldown: 0.0,
+            orb_bid_cooldown: 0.0,
+            endogenous_idle_seconds: 0.0,
+            endogenous_play_cooldown: 0.0,
+        }
+    }
 }
 
 impl EpisodeDirector {
@@ -296,6 +327,8 @@ impl EpisodeDirector {
         };
         self.active = None;
         self.orb_bid_cooldown = 45.0;
+        self.endogenous_play_cooldown = self.endogenous_play_cooldown.max(45.0);
+        self.endogenous_idle_seconds = 0.0;
         state.episode_stats.aborted[EpisodeGoal::OfferOrb.index()] =
             state.episode_stats.aborted[EpisodeGoal::OfferOrb.index()].saturating_add(1);
         if let Some(orb) = state
@@ -358,6 +391,7 @@ impl EpisodeDirector {
         };
         self.visual_episode_cooldown = (self.visual_episode_cooldown - dt).max(0.0);
         self.orb_bid_cooldown = (self.orb_bid_cooldown - dt).max(0.0);
+        self.endogenous_play_cooldown = (self.endogenous_play_cooldown - dt).max(0.0);
         let mut frame = frame;
         if self.visual_episode_cooldown > 0.0 {
             frame.visual_strength = 0.0;
@@ -366,6 +400,32 @@ impl EpisodeDirector {
         if self.orb_bid_cooldown > 0.0 && frame.selected_action == ActionId::BringProceduralOrb {
             frame.selected_action = ActionId::IdleHover;
         }
+        let brain_is_traversing = matches!(
+            frame.selected_action,
+            ActionId::ExploreScreen
+                | ActionId::HideAndSeek
+                | ActionId::SelfPlay
+                | ActionId::ApproachCursor
+                | ActionId::RetreatFromCursor
+                | ActionId::FrustratedRetreat
+                | ActionId::LandOnWindow
+                | ActionId::ClingToWindowSide
+                | ActionId::PeekFromEdge
+        );
+        if self.active.is_none() && !brain_is_traversing && !frame.sleeping && !frame.focus_mode {
+            self.endogenous_idle_seconds = (self.endogenous_idle_seconds + dt).min(30.0);
+        } else if self.active.is_none() {
+            self.endogenous_idle_seconds = (self.endogenous_idle_seconds - dt * 1.5).max(0.0);
+        }
+        let endogenous_need = frame
+            .play_drive
+            .max(frame.curiosity_drive * 0.82)
+            .max(frame.autonomy_drive * 0.72);
+        frame.autonomous_play_ready = !frame.focus_mode
+            && !frame.sleeping
+            && self.endogenous_play_cooldown <= 0.0
+            && ((self.endogenous_idle_seconds >= 3.5 && endogenous_need >= 0.14)
+                || self.endogenous_idle_seconds >= 8.0);
         let mut output = empty_output(brain_intent);
         output.debug.tick = self.tick;
         output.debug.focus_mode_filtered = frame.focus_mode;
@@ -426,6 +486,10 @@ impl EpisodeDirector {
                 prediction_confidence: 0.52,
                 expected_outcome: expected_outcome_for(goal),
             });
+            if goal == EpisodeGoal::SoloOrbPlay && reason == EpisodeReason::AutonomousPlay {
+                self.endogenous_idle_seconds = 0.0;
+                self.endogenous_play_cooldown = 10.0;
+            }
             push_outcome(&mut output, EcologyOutcome::EpisodeStarted(goal));
             output.debug.selected_reason = reason;
         }
@@ -462,7 +526,15 @@ impl EpisodeDirector {
                         | EpisodeGoal::ChromaticEcho
                         | EpisodeGoal::Camouflage
                 ) {
-                    self.visual_episode_cooldown = 1.5;
+                    self.visual_episode_cooldown =
+                        if active.reason_code == EpisodeReason::SharedAttentionCue {
+                            1.5
+                        } else {
+                            4.5
+                        };
+                }
+                if active.goal == EpisodeGoal::SoloOrbPlay {
+                    self.endogenous_play_cooldown = self.endogenous_play_cooldown.max(8.0);
                 }
             }
             EpisodeStep::Abort(reason) => {
@@ -534,6 +606,24 @@ fn select_episode(
             None,
         ));
     }
+    if frame.visual_target.is_some()
+        && frame.visual_strength >= 0.12
+        && (frame.visual_colorfulness >= 0.42
+            || frame.visual_structure >= 0.24
+            || frame.visual_surprise >= 0.18)
+    {
+        let color_dominates =
+            frame.visual_colorfulness >= frame.visual_structure.max(frame.visual_surprise);
+        return Some((
+            if color_dominates {
+                EpisodeGoal::ChromaticEcho
+            } else {
+                EpisodeGoal::SharedAttention
+            },
+            EpisodeReason::VisualNovelty,
+            None,
+        ));
+    }
     if let Some(morsel) = state.objects.iter().find(|object| {
         object.kind == ObjectKind::Morsel
             && matches!(
@@ -554,6 +644,16 @@ fn select_episode(
         return Some((
             EpisodeGoal::ChaseOrb,
             EpisodeReason::UserEngaged,
+            Some(orb.id),
+        ));
+    }
+    if frame.autonomous_play_ready
+        && frame.selected_action != ActionId::BringProceduralOrb
+        && orb.novelty > 0.04
+    {
+        return Some((
+            EpisodeGoal::SoloOrbPlay,
+            EpisodeReason::AutonomousPlay,
             Some(orb.id),
         ));
     }
@@ -692,13 +792,19 @@ fn fill_candidate_trace(
         ),
         (
             EpisodeGoal::SoloOrbPlay,
-            if frame.selected_action == ActionId::SelfPlay {
+            if frame.autonomous_play_ready {
+                0.76
+            } else if frame.selected_action == ActionId::SelfPlay {
                 0.70
             } else {
                 0.0
             },
             orb.is_some() && !frame.focus_mode,
-            EpisodeReason::ObjectNovelty,
+            if frame.autonomous_play_ready {
+                EpisodeReason::AutonomousPlay
+            } else {
+                EpisodeReason::ObjectNovelty
+            },
         ),
         (
             EpisodeGoal::RideWindow,
@@ -728,17 +834,34 @@ fn fill_candidate_trace(
         ),
         (
             EpisodeGoal::SharedAttention,
-            if frame.shared_attention { 0.98 } else { 0.0 },
-            frame.shared_attention && frame.visual_target.is_some() && !frame.focus_mode,
-            EpisodeReason::SharedAttentionCue,
+            if frame.shared_attention {
+                0.98
+            } else {
+                frame.visual_strength * frame.visual_structure.max(frame.visual_surprise) * 0.92
+            },
+            frame.visual_target.is_some()
+                && (frame.shared_attention
+                    || frame.visual_structure >= 0.24
+                    || frame.visual_surprise >= 0.18)
+                && !frame.focus_mode,
+            if frame.shared_attention {
+                EpisodeReason::SharedAttentionCue
+            } else {
+                EpisodeReason::VisualNovelty
+            },
         ),
         (
             EpisodeGoal::ChromaticEcho,
-            frame.visual_strength * 0.66,
+            frame.visual_strength * frame.visual_colorfulness.max(0.35) * 0.90,
             frame.visual_target.is_some()
-                && frame.selected_action == ActionId::ExploreScreen
+                && (frame.selected_action == ActionId::ExploreScreen
+                    || frame.visual_colorfulness >= 0.42)
                 && !frame.focus_mode,
-            EpisodeReason::SharedAttentionCue,
+            if frame.visual_colorfulness >= 0.42 {
+                EpisodeReason::VisualNovelty
+            } else {
+                EpisodeReason::SharedAttentionCue
+            },
         ),
         (
             EpisodeGoal::Camouflage,
@@ -841,7 +964,7 @@ fn drive_episode(
                 EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.28 => {
                     set_phase(active, EpisodePhase::Approach);
                 }
-                EpisodePhase::Approach if frame.pet_position.distance(orb.position) <= 0.055 => {
+                EpisodePhase::Approach if frame.pet_position.distance(orb.position) <= 0.15 => {
                     set_phase(active, EpisodePhase::Manipulate);
                 }
                 EpisodePhase::Manipulate if active.phase_elapsed_seconds >= 0.35 => {
@@ -893,15 +1016,31 @@ fn drive_episode(
             else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
+            let orb_distance =
+                desktop_distance(frame.pet_position, orb.position, frame.desktop_aspect);
             output.body_intent.target_position = orb.position;
             output.body_intent.gaze_target = Some(orb.position);
+            // An earlier VITA stage may have selected direct viewer contact.
+            // Name the orb as the interaction subject so gaze_mode cannot throw
+            // away this explicit orb target and stare straight ahead instead.
+            output.body_intent.interaction_target = Some(InteractionTarget::ProceduralOrb);
             output.body_intent.locomotion = if active.goal == EpisodeGoal::ChaseOrb {
                 LocomotionMode::Seek
+            } else if orb_distance > 0.15 {
+                active.phase = EpisodePhase::Approach;
+                LocomotionMode::Seek
             } else {
+                active.phase = EpisodePhase::Execute;
                 LocomotionMode::Orbit
             };
             output.body_intent.pose = PoseIntent::Playful;
-            output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.48);
+            output.body_intent.desired_speed = output.body_intent.desired_speed.max(
+                if active.goal == EpisodeGoal::SoloOrbPlay && orb_distance > 0.15 {
+                    0.64
+                } else {
+                    0.48
+                },
+            );
             if active.goal == EpisodeGoal::ChaseOrb
                 && orb.lifecycle == ObjectLifecycle::Free
                 && orb.velocity.length() >= 0.18
@@ -917,24 +1056,41 @@ fn drive_episode(
                 active.expected_outcome = ExpectedOutcome::ObjectMoves;
                 return EpisodeStep::Continue;
             }
-            if frame.pet_position.distance(orb.position) <= 0.048
-                && orb.lifecycle != ObjectLifecycle::GrabbedByUser
-            {
-                let direction = (orb.position - frame.pet_position)
-                    .normalize_or_zero()
-                    .lerp(Vec2::new(0.22, -0.16), 0.24)
-                    .normalize_or_zero();
+            if orb_distance <= 0.15 && orb.lifecycle != ObjectLifecycle::GrabbedByUser {
+                let contact_axis = (orb.position - frame.pet_position).normalize_or_zero();
+                let authored_tap = Vec2::new(
+                    if active.attempts.is_multiple_of(2) {
+                        0.72
+                    } else {
+                        -0.72
+                    },
+                    -0.50,
+                )
+                .normalize();
+                let direction = if contact_axis.length_squared() > 1.0e-6 {
+                    contact_axis.lerp(authored_tap, 0.76).normalize_or_zero()
+                } else {
+                    authored_tap
+                };
                 push_command(
                     output,
                     ObjectCommand::ApplyImpulse {
                         object_id: orb.id,
-                        impulse: direction * (0.15 + frame.user_activity * 0.08),
+                        impulse: direction
+                            * (0.18 + frame.user_activity * 0.06 + frame.play_drive * 0.05),
                     },
                 );
+                push_outcome(output, EcologyOutcome::ObjectContact(orb.id));
                 active.attempts = active.attempts.saturating_add(1);
                 active.phase = EpisodePhase::Execute;
             }
-            if active.elapsed_seconds >= 4.5 || active.attempts >= 3 {
+            let complete = if active.goal == EpisodeGoal::SoloOrbPlay {
+                (active.attempts >= 3 && active.elapsed_seconds >= 2.2)
+                    || active.elapsed_seconds >= 9.0
+            } else {
+                active.elapsed_seconds >= 4.5 || active.attempts >= 3
+            };
+            if complete {
                 return EpisodeStep::Complete;
             }
         }
@@ -969,7 +1125,7 @@ fn drive_episode(
                 EpisodePhase::Execute => {
                     let target = active.target_position.unwrap_or(orb_position);
                     output.body_intent.target_position = target;
-                    if catch_distance <= 0.060 {
+                    if catch_distance <= 0.12 {
                         push_command(
                             output,
                             ObjectCommand::ApplyImpulse {
@@ -1076,7 +1232,7 @@ fn drive_episode(
                 EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.20 => {
                     set_phase(active, EpisodePhase::Approach);
                 }
-                EpisodePhase::Approach if frame.pet_position.distance(orb.position) <= 0.07 => {
+                EpisodePhase::Approach if frame.pet_position.distance(orb.position) <= 0.15 => {
                     set_phase(active, EpisodePhase::Manipulate);
                 }
                 EpisodePhase::Manipulate => {
@@ -1405,14 +1561,38 @@ fn drive_episode(
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
             active.target_position = Some(target);
-            output.body_intent.gaze_target = if active.elapsed_seconds < 1.8 {
+            if active.elapsed_seconds <= dt * 1.5 {
+                output.vocal_trigger = Some(EcologyVocalTrigger::VisualNotice);
+            }
+            output.body_intent.gaze_target = if active.elapsed_seconds < 2.2 {
                 Some(target)
             } else {
                 Some(frame.cursor_position)
             };
-            output.body_intent.locomotion = LocomotionMode::Hover;
             output.body_intent.pose = PoseIntent::Curious;
-            if active.elapsed_seconds >= 2.35 || !frame.shared_attention {
+            let away = (frame.pet_position - target).normalize_or(Vec2::new(-1.0, 0.0));
+            let standoff = (target + away * 0.11).clamp(Vec2::splat(0.03), Vec2::splat(0.97));
+            if active.phase == EpisodePhase::Orient && active.phase_elapsed_seconds >= 0.24 {
+                set_phase(active, EpisodePhase::Approach);
+            }
+            if active.phase == EpisodePhase::Approach {
+                output.body_intent.target_position = standoff;
+                output.body_intent.locomotion = LocomotionMode::Arrive;
+                output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.42);
+                if frame.pet_position.distance(standoff) <= 0.055
+                    || active.phase_elapsed_seconds >= 1.35
+                {
+                    set_phase(active, EpisodePhase::Inspect);
+                }
+            } else {
+                output.body_intent.target_position = frame.pet_position;
+                output.body_intent.locomotion = LocomotionMode::Hover;
+            }
+            if active.elapsed_seconds >= 3.1
+                || (active.reason_code == EpisodeReason::SharedAttentionCue
+                    && !frame.shared_attention
+                    && active.elapsed_seconds >= 1.0)
+            {
                 return EpisodeStep::Complete;
             }
         }
@@ -1491,9 +1671,22 @@ fn drive_episode(
             };
             active.target_position = Some(target);
             output.body_intent.gaze_target = Some(target);
-            output.body_intent.locomotion = LocomotionMode::Hover;
             output.body_intent.pose = PoseIntent::Curious;
-            if active.elapsed_seconds >= 1.8 {
+            if active.elapsed_seconds <= dt * 1.5 {
+                output.vocal_trigger = Some(EcologyVocalTrigger::VisualNotice);
+            }
+            let away = (frame.pet_position - target).normalize_or(Vec2::new(-1.0, 0.0));
+            let standoff = (target + away * 0.12).clamp(Vec2::splat(0.03), Vec2::splat(0.97));
+            if frame.pet_position.distance(standoff) > 0.055 && active.elapsed_seconds < 1.65 {
+                output.body_intent.target_position = standoff;
+                output.body_intent.locomotion = LocomotionMode::Arrive;
+                output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.40);
+            } else {
+                output.body_intent.target_position = frame.pet_position;
+                output.body_intent.locomotion = LocomotionMode::Orbit;
+                output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.24);
+            }
+            if active.elapsed_seconds >= 2.6 {
                 return EpisodeStep::Complete;
             }
         }
@@ -1542,6 +1735,11 @@ fn commitment_for(goal: EpisodeGoal) -> f32 {
     }
 }
 
+fn desktop_distance(left: Vec2, right: Vec2, aspect: f32) -> f32 {
+    let delta = left - right;
+    Vec2::new(delta.x * aspect.clamp(0.25, 8.0), delta.y).length()
+}
+
 fn expected_outcome_for(goal: EpisodeGoal) -> ExpectedOutcome {
     match goal {
         EpisodeGoal::OfferOrb => ExpectedOutcome::UserTouchesObject,
@@ -1557,6 +1755,9 @@ fn expected_outcome_for(goal: EpisodeGoal) -> ExpectedOutcome {
         EpisodeGoal::RefuseMorsel => ExpectedOutcome::MorselRefused,
         EpisodeGoal::StoreMorsel => ExpectedOutcome::ObjectReturnsHome,
         EpisodeGoal::PracticeSkill | EpisodeGoal::PerformSkill => ExpectedOutcome::SkillReproduced,
+        EpisodeGoal::SharedAttention | EpisodeGoal::ChromaticEcho | EpisodeGoal::Camouflage => {
+            ExpectedOutcome::AttentionShared
+        }
         _ => ExpectedOutcome::None,
     }
 }
@@ -1566,11 +1767,30 @@ fn visual_context(
     active: Option<&ActivityEpisode>,
     frame: EcologyBehaviorFrame,
 ) -> EcologyVisualContext {
-    let chromatic_blend = active.map_or(0.0, |episode| match episode.goal {
-        EpisodeGoal::ChromaticEcho => frame.visual_strength.min(0.35),
-        EpisodeGoal::SharedAttention => (frame.visual_strength * 0.55).min(0.24),
-        _ => 0.0,
-    });
+    let visual_reflex = frame.visual_target.is_some()
+        && frame.visual_strength >= 0.12
+        && (frame.visual_colorfulness >= 0.42
+            || frame.visual_structure >= 0.24
+            || frame.visual_surprise >= 0.18);
+    let chromatic_blend = active.map_or_else(
+        || {
+            if visual_reflex && frame.visual_colorfulness >= 0.42 {
+                (0.10 + frame.visual_strength * 0.22 + frame.visual_colorfulness * 0.12).min(0.34)
+            } else {
+                0.0
+            }
+        },
+        |episode| match episode.goal {
+            EpisodeGoal::ChromaticEcho => {
+                (0.28 + frame.visual_strength * 0.52 + frame.visual_colorfulness * 0.18).min(0.78)
+            }
+            EpisodeGoal::SharedAttention => (frame.visual_strength * 0.38).min(0.24),
+            _ if visual_reflex && frame.visual_colorfulness >= 0.42 => {
+                (0.10 + frame.visual_strength * 0.22 + frame.visual_colorfulness * 0.12).min(0.34)
+            }
+            _ => 0.0,
+        },
+    );
     let camouflage_blend = active.map_or(0.0, |episode| {
         if episode.goal == EpisodeGoal::Camouflage {
             (0.30 + frame.visual_strength * 0.25).min(0.55)
@@ -1578,6 +1798,23 @@ fn visual_context(
             0.0
         }
     });
+    let visual_response = visual_reflex
+        || active.is_some_and(|episode| {
+            matches!(
+                episode.goal,
+                EpisodeGoal::SharedAttention | EpisodeGoal::ChromaticEcho
+            )
+        });
+    let visual_structure = if visual_response {
+        frame.visual_structure.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let visual_surprise = if visual_response {
+        frame.visual_surprise.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     EcologyVisualContext {
         orb_position: state
             .objects
@@ -1592,6 +1829,12 @@ fn visual_context(
         chromatic_hue: frame.visual_hue.rem_euclid(1.0),
         chromatic_blend,
         camouflage_blend,
+        // Fast visual reflexes remain visible even while a higher-priority
+        // safety episode owns locomotion. The full response still belongs to
+        // SharedAttention/ChromaticEcho; this small flow/glow/color pulse keeps
+        // window escape from making the organism look blind.
+        visual_structure,
+        visual_surprise,
     }
 }
 
@@ -1649,9 +1892,14 @@ mod tests {
             selected_action: action,
             pet_position: Vec2::splat(0.5),
             pet_velocity: Vec2::ZERO,
+            desktop_aspect: 16.0 / 9.0,
             cursor_position: Vec2::new(0.72, 0.44),
             pointer_down: false,
             user_activity: 0.5,
+            user_available: 1.0,
+            play_drive: 0.0,
+            curiosity_drive: 0.0,
+            autonomy_drive: 0.0,
             focus_mode: false,
             sleeping: false,
             window_pressure: 0.0,
@@ -1662,7 +1910,11 @@ mod tests {
             visual_target: None,
             visual_hue: 0.0,
             visual_strength: 0.0,
+            visual_colorfulness: 0.0,
+            visual_structure: 0.0,
+            visual_surprise: 0.0,
             shared_attention: false,
+            autonomous_play_ready: false,
             click_rhythm: None,
             timestamp: 1.0,
         }
@@ -1687,6 +1939,103 @@ mod tests {
             state.episode_stats.started[EpisodeGoal::OfferOrb.index()],
             1
         );
+    }
+
+    #[test]
+    fn endogenous_play_reaches_and_taps_the_orb_without_a_random_self_play_action() {
+        let mut state = EcologyState::new(9_101);
+        let orb_position = state.objects[0].position;
+        let mut director = EpisodeDirector::default();
+        let mut saw_contact_command = false;
+        let mut saw_orb_attention_owner = false;
+        for tick in 0..100 {
+            let mut frame = behavior_frame(ActionId::IdleHover);
+            frame.timestamp = tick as f64 * 0.05;
+            frame.play_drive = 0.78;
+            frame.curiosity_drive = 0.52;
+            frame.pet_position = orb_position;
+            let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+            if output.debug.active_goal == Some(EpisodeGoal::SoloOrbPlay) {
+                saw_orb_attention_owner |=
+                    output.body_intent.interaction_target == Some(InteractionTarget::ProceduralOrb);
+            }
+            saw_contact_command |= output.object_commands[..output.object_command_count]
+                .iter()
+                .any(|command| matches!(command, ObjectCommand::ApplyImpulse { .. }));
+        }
+
+        assert!(saw_contact_command);
+        assert!(saw_orb_attention_owner);
+        assert!(state.episode_stats.started[EpisodeGoal::SoloOrbPlay.index()] > 0);
+    }
+
+    #[test]
+    fn saturated_color_starts_visible_chromatic_reaction_without_action_coincidence() {
+        let mut state = EcologyState::new(9_102);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.visual_target = Some(Vec2::new(0.82, 0.24));
+        frame.visual_hue = 0.61;
+        frame.visual_strength = 0.74;
+        frame.visual_colorfulness = 0.92;
+
+        let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+
+        assert_eq!(output.debug.active_goal, Some(EpisodeGoal::ChromaticEcho));
+        assert_eq!(output.debug.selected_reason, EpisodeReason::VisualNovelty);
+        assert_eq!(output.body_intent.locomotion, LocomotionMode::Arrive);
+        assert_eq!(
+            output.vocal_trigger,
+            Some(EcologyVocalTrigger::VisualNotice)
+        );
+        assert!(output.visual_context.chromatic_blend > 0.55);
+    }
+
+    #[test]
+    fn structured_shape_causes_orient_then_approach() {
+        let mut state = EcologyState::new(9_103);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.visual_target = Some(Vec2::new(0.18, 0.78));
+        frame.visual_strength = 0.68;
+        frame.visual_structure = 0.90;
+        let mut approached = false;
+
+        for tick in 0..10 {
+            frame.timestamp = tick as f64 * 0.05;
+            let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+            approached |= output.body_intent.locomotion == LocomotionMode::Arrive
+                && output.body_intent.target_position != frame.pet_position;
+        }
+
+        assert!(approached);
+        assert_eq!(
+            director.active_episode().map(|episode| episode.goal),
+            Some(EpisodeGoal::SharedAttention)
+        );
+    }
+
+    #[test]
+    fn urgent_escape_keeps_visual_reflex_visible_without_surrendering_safety_motion() {
+        let mut state = EcologyState::new(9_104);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.window_pressure = 1.0;
+        frame.window_escape_direction = Vec2::X;
+        frame.visual_target = Some(Vec2::new(0.20, 0.22));
+        frame.visual_hue = 0.82;
+        frame.visual_strength = 0.72;
+        frame.visual_colorfulness = 0.88;
+        frame.visual_structure = 0.76;
+        frame.visual_surprise = 0.64;
+
+        let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+
+        assert_eq!(output.debug.active_goal, Some(EpisodeGoal::EscapePressure));
+        assert_eq!(output.body_intent.locomotion, LocomotionMode::Seek);
+        assert!(output.visual_context.chromatic_blend >= 0.25);
+        assert_eq!(output.visual_context.visual_structure, 0.76);
+        assert_eq!(output.visual_context.visual_surprise, 0.64);
     }
 
     #[test]
@@ -1736,6 +2085,8 @@ mod tests {
             tick: 0,
             visual_episode_cooldown: 0.0,
             orb_bid_cooldown: 0.0,
+            endogenous_idle_seconds: 0.0,
+            endogenous_play_cooldown: 0.0,
         };
         let mut frame = behavior_frame(ActionId::BringProceduralOrb);
         frame.pet_position = state.den.anchor;

@@ -5,6 +5,8 @@ use lifecore::{
     ActionId, BodyFeedback, BodyIntent, FeedbackEvent, LifeState, LocomotionMode, PoseIntent,
     SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame, VitaState, apply_emotion_to_expression,
 };
+#[cfg(test)]
+use morph_brain::MORPH_COMMAND_COUNT;
 use morph_brain::{MorphAttention, MorphCommand, MorphOutput};
 use pet_ecology::{RhythmSignature, WindowAffordanceFrame};
 use pet_perception::{
@@ -17,10 +19,10 @@ use pet_perception::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BrainMode {
     Classic,
-    #[default]
     Morphic,
     Fusion,
     MorphShadow,
+    #[default]
     MorphFusion,
 }
 
@@ -305,7 +307,9 @@ impl VitaRuntime {
             ),
             perception: PerceptionRuntime::default(),
             percept: VitaPerceptFrame::default(),
-            active_mode: BrainMode::default(),
+            // Force the first non-classic resolve through its entry path so
+            // the arbiter starts from the actual current body target.
+            active_mode: BrainMode::Classic,
             fusion: FusionArbiter::default(),
             last_fusion: None,
         }
@@ -461,9 +465,16 @@ fn enrich_with_morph(
     if !morph.confidence.is_finite() || !morph.conflict.is_finite() || !morph.arousal.is_finite() {
         return 0.0;
     }
+    let object_control_confidence = (morph
+        .manipulation_rate
+        .max(morph.perception_rate)
+        .max(morph.carry_rate)
+        / 45.0)
+        .clamp(0.0, 1.0)
+        * (1.0 - morph.conflict.clamp(0.0, 1.0));
+    let neural_confidence = morph.confidence.max(object_control_confidence);
     let authority =
-        (morph.confidence.clamp(0.0, 1.0) * (1.0 - morph.conflict.clamp(0.0, 1.0) * 0.55) * 0.30)
-            .clamp(0.0, 0.30);
+        (neural_confidence * (1.0 - morph.conflict.clamp(0.0, 1.0) * 0.55) * 0.30).clamp(0.0, 0.30);
     if authority < 0.025 {
         return 0.0;
     }
@@ -484,6 +495,10 @@ fn enrich_with_morph(
 
     if morph.attention == MorphAttention::Cursor {
         vita.gaze_target = Some(sensors.cursor_position.clamp(Vec2::ZERO, Vec2::ONE));
+    } else if morph.attention == MorphAttention::Object {
+        vita.gaze_target = morph
+            .object_target
+            .map(|target| target.clamp(Vec2::ZERO, Vec2::ONE));
     }
     match morph.command {
         MorphCommand::Approach if morph.attention == MorphAttention::Cursor => {
@@ -499,6 +514,43 @@ fn enrich_with_morph(
             vita.appraisal.threat = vita.appraisal.threat.max(morph.confidence * 0.75);
         }
         _ => {}
+    }
+    if let Some(target) = morph
+        .object_target
+        .map(|target| target.clamp(Vec2::ZERO, Vec2::ONE))
+    {
+        match morph.manipulation {
+            MorphCommand::Push | MorphCommand::Touch => {
+                vita.gaze_target = Some(target);
+                vita.target_override = Some(target);
+                vita.pose_override = Some(PoseIntent::Playful);
+            }
+            MorphCommand::Pull | MorphCommand::Sample => {
+                vita.gaze_target = Some(target);
+                vita.target_override = Some(target);
+                vita.pose_override = Some(PoseIntent::Curious);
+            }
+            _ => {}
+        }
+        match morph.perception {
+            MorphCommand::Listen | MorphCommand::Sniff => {
+                vita.gaze_target = Some(target);
+                vita.pose_override = Some(PoseIntent::Curious);
+            }
+            _ => {}
+        }
+        match morph.carry {
+            MorphCommand::Grasp => {
+                vita.gaze_target = Some(target);
+                vita.target_override = Some(target);
+                vita.pose_override = Some(PoseIntent::Compact);
+            }
+            MorphCommand::Release => {
+                vita.gaze_target = Some(target);
+                vita.pose_override = Some(PoseIntent::Display);
+            }
+            _ => {}
+        }
     }
     vita.appraisal.threat = blend_scalar(local_threat, vita.appraisal.threat, authority);
     vita.gaze_target =
@@ -579,8 +631,8 @@ mod tests {
     }
 
     #[test]
-    fn brain_mode_parser_has_a_reversible_morphic_default() {
-        assert_eq!(BrainMode::default(), BrainMode::Morphic);
+    fn brain_mode_parser_has_a_reversible_morph_fusion_default() {
+        assert_eq!(BrainMode::default(), BrainMode::MorphFusion);
         assert_eq!("classic".parse::<BrainMode>(), Ok(BrainMode::Classic));
         assert_eq!("smart".parse::<BrainMode>(), Ok(BrainMode::Morphic));
         assert_eq!("hybrid".parse::<BrainMode>(), Ok(BrainMode::Fusion));
@@ -737,7 +789,11 @@ mod tests {
         };
         let morph = MorphOutput {
             command: MorphCommand::Perk,
-            command_rates: [0.0, 0.0, 40.0, 0.0, 0.0, 0.0],
+            command_rates: {
+                let mut rates = [0.0; MORPH_COMMAND_COUNT];
+                rates[4] = 40.0;
+                rates
+            },
             winner_rate: 40.0,
             confidence: 0.90,
             attention: MorphAttention::Cursor,
@@ -745,6 +801,7 @@ mod tests {
             arousal: 0.8,
             conflict: 0.05,
             turn: 0.4,
+            ..MorphOutput::default()
         };
         let _ = runtime.resolve_intent_with_morph(
             BrainMode::MorphShadow,
@@ -797,7 +854,7 @@ mod tests {
         };
         let morph = MorphOutput {
             command: MorphCommand::Approach,
-            command_rates: [0.0; 6],
+            command_rates: [0.0; MORPH_COMMAND_COUNT],
             winner_rate: 80.0,
             confidence: 1.0,
             attention: MorphAttention::Cursor,
@@ -805,6 +862,7 @@ mod tests {
             arousal: 1.0,
             conflict: 0.0,
             turn: 0.0,
+            ..MorphOutput::default()
         };
 
         let local_confidence = vita.attention.confidence;
@@ -850,7 +908,7 @@ mod tests {
         };
         let morph = MorphOutput {
             command: MorphCommand::Play,
-            command_rates: [0.0; 6],
+            command_rates: [0.0; MORPH_COMMAND_COUNT],
             winner_rate: 90.0,
             confidence: 1.0,
             attention: MorphAttention::Cursor,
@@ -858,6 +916,7 @@ mod tests {
             arousal: 1.0,
             conflict: 0.0,
             turn: 1.0,
+            ..MorphOutput::default()
         };
 
         let (resolved, _) = runtime.resolve_intent_with_morph(

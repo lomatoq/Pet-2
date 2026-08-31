@@ -466,7 +466,7 @@ impl PerceptionRuntime {
     ) -> WindowEcology {
         let mut ecology = WindowEcology::default();
         let mut affordances = WindowAffordanceFrame::default();
-        for surface in &sensors.visible_surfaces {
+        for (z_order, surface) in sensors.visible_surfaces.iter().enumerate() {
             let id = surface.id.0.clone();
             let previous = self.surfaces.get(&id).cloned();
             let center = rect_center(surface.rect);
@@ -486,13 +486,26 @@ impl PerceptionRuntime {
                 .map_or(0.0, |history| history.age_seconds + dt);
             let (nearest, nearest_normal, inside_depth) =
                 closest_point_and_normal(pet_position, surface.rect);
+            let edge_occluded = sensors.visible_surfaces[..z_order]
+                .iter()
+                .any(|front| rect_contains_point(front.rect, nearest));
             let distance = nearest.distance(pet_position);
             let direction_to_pet = (pet_position - center).normalize_or_zero();
             let approach_speed = velocity.dot(direction_to_pet).max(0.0);
             let motion = (velocity.length() * 0.30).clamp(0.0, 1.0);
-            let overlap_pressure = (inside_depth * 18.0).clamp(0.0, 1.0);
-            let pressure =
-                (overlap_pressure + approach_speed * 0.42 * (1.0 - distance * 4.0)).clamp(0.0, 1.0);
+            // Desktop windows are visual surfaces underneath the transparent pet,
+            // not solid filled boxes around it. Merely being inside a static
+            // window's bounding rectangle is therefore not pressure. Pressure is
+            // reserved for an edge that is both close enough to touch the body and
+            // moving toward it; otherwise a normal maximized or right-aligned app
+            // can own the safety arbiter forever.
+            let edge_proximity = (1.0 - inside_depth * 12.5).clamp(0.0, 1.0);
+            let contact_pressure = approach_speed * 0.42 * edge_proximity;
+            let pressure = if edge_occluded {
+                0.0
+            } else {
+                contact_pressure.clamp(0.0, 1.0)
+            };
             ecology.motion = ecology.motion.max(motion);
             ecology.pressure = ecology.pressure.max(pressure);
             if ecology.nearest_edge.is_none_or(|current| {
@@ -523,6 +536,7 @@ impl PerceptionRuntime {
             }
             affordances.push(WindowAffordance {
                 id: WindowId(stable_hash_bytes(surface.id.0.as_bytes()).max(1)),
+                z_order: z_order.min(u16::MAX as usize) as u16,
                 bounds: NormalizedRect {
                     minimum: surface.rect.minimum,
                     maximum: surface.rect.maximum,
@@ -736,6 +750,14 @@ fn rect_area(rect: Rect) -> f32 {
     extent.x * extent.y
 }
 
+fn rect_contains_point(rect: Rect, point: Vec2) -> bool {
+    const EDGE_EPSILON: f32 = 1.0e-5;
+    point.x > rect.minimum.x + EDGE_EPSILON
+        && point.x < rect.maximum.x - EDGE_EPSILON
+        && point.y > rect.minimum.y + EDGE_EPSILON
+        && point.y < rect.maximum.y - EDGE_EPSILON
+}
+
 fn event_priority(event: &StimulusEvent) -> f32 {
     event.intensity * 0.38
         + event.novelty * 0.25
@@ -841,6 +863,76 @@ mod tests {
         let affordance = runtime.window_affordances().windows[0];
         assert!(affordance.bounds.is_valid());
         assert_ne!(affordance.id.0, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn window_affordances_preserve_front_order_and_hide_covered_pressure() {
+        let mut runtime = PerceptionRuntime::default();
+        let sensors = SensorFrame {
+            timestamp: 1.0,
+            visible_surfaces: vec![
+                SurfaceRect {
+                    id: SurfaceId("front".into()),
+                    rect: Rect {
+                        minimum: Vec2::new(0.30, 0.30),
+                        maximum: Vec2::new(0.70, 0.70),
+                    },
+                },
+                SurfaceRect {
+                    id: SurfaceId("behind".into()),
+                    rect: Rect {
+                        minimum: Vec2::new(0.35, 0.35),
+                        maximum: Vec2::new(0.65, 0.65),
+                    },
+                },
+            ],
+            ..SensorFrame::default()
+        };
+        let body = BodyFeedback {
+            world_position: Vec2::splat(0.50),
+            ..BodyFeedback::default()
+        };
+
+        let _ = runtime.update(&sensors, &body, 1.0 / 60.0);
+        let affordances = runtime.window_affordances();
+
+        assert_eq!(affordances.count, 2);
+        assert_eq!(affordances.windows[0].z_order, 0);
+        assert_eq!(affordances.windows[1].z_order, 1);
+        assert_eq!(affordances.windows[1].overlap_pressure, 0.0);
+    }
+
+    #[test]
+    fn static_window_bbox_containing_pet_is_not_physical_pressure() {
+        let mut runtime = PerceptionRuntime::default();
+        let sensors = SensorFrame {
+            timestamp: 1.0,
+            visible_surfaces: vec![SurfaceRect {
+                id: SurfaceId("ordinary-static-window".into()),
+                rect: Rect {
+                    minimum: Vec2::new(0.62, 0.08),
+                    maximum: Vec2::ONE,
+                },
+            }],
+            ..SensorFrame::default()
+        };
+        let body = BodyFeedback {
+            world_position: Vec2::new(0.95, 0.66),
+            ..BodyFeedback::default()
+        };
+
+        let percept = runtime.update(&sensors, &body, 1.0 / 60.0);
+        let affordances = runtime.window_affordances();
+
+        assert_eq!(percept.window_pressure, 0.0);
+        assert_eq!(affordances.pressure, 0.0);
+        assert_eq!(affordances.windows[0].overlap_pressure, 0.0);
+        assert!(
+            !percept
+                .events
+                .iter()
+                .any(|event| { event.kind == StimulusKind::MovingWindow && event.threat > 0.0 })
+        );
     }
 
     #[test]

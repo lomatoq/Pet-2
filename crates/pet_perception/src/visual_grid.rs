@@ -85,6 +85,7 @@ pub enum VisualRegionKind {
     Bright,
     Dark,
     UnusualColor,
+    StructuredShape,
     SharedCue,
 }
 
@@ -166,24 +167,43 @@ impl SpatialAttentionRuntime {
         };
         let mut best = None;
         for (index, cell) in frame.cells.iter().copied().enumerate() {
-            let active_motion = cell.motion.max(cell.sudden_change);
-            self.habituation[index] = if active_motion > 0.12 {
-                (self.habituation[index] + dt * active_motion * 0.32).clamp(0.0, 0.92)
+            let raw_salience = cell
+                .motion
+                .max(cell.sudden_change)
+                .max(cell.colorfulness)
+                .max(cell.edge_density);
+            self.habituation[index] = if raw_salience > 0.12 {
+                (self.habituation[index] + dt * raw_salience * 0.24).clamp(0.0, 0.88)
             } else {
-                (self.habituation[index] - dt * 0.08).max(0.0)
+                (self.habituation[index] - dt * 0.10).max(0.0)
             };
-            let motion_score = cell.motion * (1.0 - self.habituation[index]);
+            let novelty_gain = 1.0 - self.habituation[index];
+            let motion_score = cell.motion * novelty_gain;
             let luminance_score = ((cell.luminance - 0.5).abs() * 2.0 - 0.35).max(0.0);
-            let color_score = (cell.colorfulness - 0.42).max(0.0);
-            let score = (cell.sudden_change * 0.46
-                + motion_score * 0.28
-                + luminance_score * 0.14
-                + color_score * 0.12)
+            // A saturated or structured static region must be able to cross the
+            // attention threshold on its own. The previous weights made the
+            // mathematical maximum for color alone lower than that threshold,
+            // while edge density was sampled but never used at all.
+            let color_score = ((cell.colorfulness - 0.30) / 0.70).clamp(0.0, 1.0) * novelty_gain;
+            let shape_score = ((cell.edge_density - 0.16) / 0.64).clamp(0.0, 1.0) * novelty_gain;
+            let sudden_score = cell.sudden_change * novelty_gain;
+            let score = (sudden_score * 0.40
+                + motion_score * 0.22
+                + luminance_score * 0.08
+                + color_score * 0.24
+                + shape_score * 0.22)
                 .clamp(0.0, 1.0);
-            let kind = if cell.sudden_change >= motion_score.max(luminance_score) {
+            let kind = if sudden_score
+                >= motion_score
+                    .max(luminance_score)
+                    .max(color_score)
+                    .max(shape_score)
+            {
                 VisualRegionKind::SuddenChange
-            } else if motion_score >= luminance_score.max(color_score) {
+            } else if motion_score >= luminance_score.max(color_score).max(shape_score) {
                 VisualRegionKind::Motion
+            } else if shape_score >= luminance_score.max(color_score) {
+                VisualRegionKind::StructuredShape
             } else if luminance_score >= color_score {
                 if cell.luminance >= 0.5 {
                     VisualRegionKind::Bright
@@ -261,5 +281,37 @@ mod tests {
         }
         assert!(runtime.habituation[17] > 0.7);
         assert!(runtime.target().is_none_or(|target| target.score < 0.3));
+    }
+
+    #[test]
+    fn saturated_static_color_can_claim_attention_without_motion() {
+        let mut runtime = SpatialAttentionRuntime::default();
+        let mut frame = SpatialVisualFrame::default();
+        frame.cells[23].colorfulness = 1.0;
+
+        runtime.update(Some(&frame), 0.05);
+
+        let target = runtime
+            .target()
+            .expect("color should be behaviorally visible");
+        assert_eq!(target.kind, VisualRegionKind::UnusualColor);
+        assert_eq!(cell_index(target.position), 23);
+        assert!(target.score >= 0.12);
+    }
+
+    #[test]
+    fn structured_monochrome_region_can_claim_attention() {
+        let mut runtime = SpatialAttentionRuntime::default();
+        let mut frame = SpatialVisualFrame::default();
+        frame.cells[71].edge_density = 1.0;
+
+        runtime.update(Some(&frame), 0.05);
+
+        let target = runtime
+            .target()
+            .expect("shape should be behaviorally visible");
+        assert_eq!(target.kind, VisualRegionKind::StructuredShape);
+        assert_eq!(cell_index(target.position), 71);
+        assert!(target.score >= 0.12);
     }
 }

@@ -762,6 +762,7 @@ pub enum VocalTrigger {
     HomeReturn,
     SkillMastered,
     RhythmEcho,
+    VisualNotice,
 }
 
 impl VocalTrigger {
@@ -779,7 +780,8 @@ impl VocalTrigger {
             | Self::FoodRefused
             | Self::HomeReturn
             | Self::SkillMastered
-            | Self::RhythmEcho => true,
+            | Self::RhythmEcho
+            | Self::VisualNotice => true,
         }
     }
 

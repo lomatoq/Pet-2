@@ -324,7 +324,14 @@ impl LifeCore {
         }
     }
 
-    pub fn restore(snapshot: LifeSnapshot) -> Result<Self, LifeError> {
+    pub fn restore(mut snapshot: LifeSnapshot) -> Result<Self, LifeError> {
+        // Validate the on-disk shape before applying the narrow v1 lineage
+        // migration, then validate the normalized state again.
+        snapshot.validate()?;
+        snapshot
+            .state
+            .development
+            .repair_legacy_current_generation(&snapshot.state.genome);
         snapshot.validate()?;
         let mut rng = ChaCha8Rng::from_seed(snapshot.rng.seed);
         rng.set_stream(snapshot.rng.stream);
@@ -718,6 +725,7 @@ impl LifeCore {
             VocalTrigger::HomeReturn => (0.88, 0.78, 0.65, true),
             VocalTrigger::SkillMastered => (1.15, 1.14, 0.92, false),
             VocalTrigger::RhythmEcho => (1.02, 1.0, 0.90, false),
+            VocalTrigger::VisualNotice => (1.10, 0.84, 0.80, false),
         };
         Some(VocalRequest {
             motif_id,
@@ -1154,16 +1162,13 @@ fn body_intent_for(
             Some(InteractionTarget::User),
             0.06,
         ),
-        ActionId::RetreatFromCursor | ActionId::FrustratedRetreat => {
-            let away = (body.world_position - sensors.cursor_position).normalize_or_zero();
-            (
-                LocomotionMode::Flee,
-                (body.world_position + away * 0.35).clamp(Vec2::splat(0.05), Vec2::splat(0.95)),
-                PoseIntent::Compact,
-                None,
-                0.58,
-            )
-        }
+        ActionId::RetreatFromCursor | ActionId::FrustratedRetreat => (
+            LocomotionMode::Flee,
+            sensors.cursor_position,
+            PoseIntent::Compact,
+            None,
+            0.58,
+        ),
         ActionId::InviteCursorChase => (
             LocomotionMode::Hover,
             body.world_position,
@@ -1366,6 +1371,7 @@ fn motif_style_score(motif: &VocalMotif, trigger: VocalTrigger, affect: AffectSt
         VocalTrigger::HomeReturn => [0.24, 0.62, 0.22, 0.05, 0.12, 0.70, 0.40],
         VocalTrigger::SkillMastered => [0.82, 0.26, 0.20, 0.24, 0.18, 0.56, 0.82],
         VocalTrigger::RhythmEcho => [0.55, 0.30, 0.56, 0.82, 0.30, 0.68, 0.50],
+        VocalTrigger::VisualNotice => [0.74, 0.22, 0.16, 0.32, 0.20, 0.42, 0.76],
     };
     target[0] = (target[0] + affect.arousal * 0.10).clamp(0.0, 1.0);
     target[4] = (target[4] + affect.stress * 0.28).clamp(0.0, 1.0);
@@ -2057,6 +2063,94 @@ mod tests {
             run_ticks(&mut restored, 500, &sensors)
         );
         assert_eq!(original.snapshot(), restored.snapshot());
+    }
+
+    #[test]
+    fn restore_enriches_only_the_legacy_record_for_the_current_generation() {
+        let mut core = LifeCore::new(Genome::from_seed(70), 110);
+        core.trigger_metamorphosis();
+        let mut legacy = core.snapshot();
+        let expected = legacy.state.genome.clone();
+        let record = legacy
+            .state
+            .development
+            .mutation_history
+            .last_mut()
+            .unwrap();
+        record.before_genome = None;
+        record.after_genome = None;
+        record.parent_genome_hash = None;
+        record.child_genome_hash = None;
+        record.lifetime_snapshot = None;
+
+        let restored = LifeCore::restore(legacy).unwrap();
+        let repaired = restored.state.development.mutation_history.last().unwrap();
+        assert!(repaired.before_genome.is_none());
+        assert!(repaired.parent_genome_hash.is_none());
+        assert!(repaired.lifetime_snapshot.is_none());
+        assert_eq!(repaired.after_genome.as_ref(), Some(&expected));
+        assert_eq!(repaired.child_genome_hash, Some(expected.stable_hash()));
+    }
+
+    #[test]
+    fn restore_does_not_fabricate_missing_legacy_generations() {
+        let mut core = LifeCore::new(Genome::from_seed(71), 111);
+        core.trigger_metamorphosis();
+        core.trigger_metamorphosis();
+        let mut legacy = core.snapshot();
+        legacy.state.development.mutation_history.clear();
+
+        let restored = LifeCore::restore(legacy).unwrap();
+        assert_eq!(restored.state.genome.generation, 2);
+        assert!(restored.state.development.mutation_history.is_empty());
+    }
+
+    #[test]
+    fn repaired_legacy_anchor_remains_valid_after_a_new_generation() {
+        let mut core = LifeCore::new(Genome::from_seed(73), 113);
+        core.trigger_metamorphosis();
+        let mut legacy = core.snapshot();
+        let record = legacy
+            .state
+            .development
+            .mutation_history
+            .last_mut()
+            .unwrap();
+        record.before_genome = None;
+        record.after_genome = None;
+        record.parent_genome_hash = None;
+        record.child_genome_hash = None;
+        record.lifetime_snapshot = None;
+
+        let mut restored = LifeCore::restore(legacy).unwrap();
+        restored.trigger_metamorphosis();
+        let replay = LifeCore::restore(restored.snapshot()).unwrap();
+
+        assert_eq!(replay.state.genome.generation, 2);
+        assert_eq!(replay.state.development.mutation_history.len(), 2);
+        assert!(
+            replay.state.development.mutation_history[0]
+                .before_genome
+                .is_none()
+        );
+        assert_eq!(
+            replay.state.development.mutation_history[0]
+                .after_genome
+                .as_ref(),
+            replay.state.development.mutation_history[1]
+                .before_genome
+                .as_ref()
+        );
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_evolution_checkpoint_hash() {
+        let mut core = LifeCore::new(Genome::from_seed(72), 112);
+        core.trigger_metamorphosis();
+        let mut snapshot = core.snapshot();
+        snapshot.state.development.mutation_history[0].child_genome_hash = Some(0);
+
+        assert!(LifeCore::restore(snapshot).is_err());
     }
 
     #[test]

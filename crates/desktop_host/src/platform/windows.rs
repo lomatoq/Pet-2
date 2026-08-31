@@ -17,9 +17,8 @@ use windows_sys::Win32::{
         Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
-            DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetPixel, HALFTONE, HBITMAP, HDC,
-            HGDIOBJ, NOMIRRORBITMAP, ReleaseDC, SRCCOPY, SelectObject, SetStretchBltMode,
-            StretchBlt,
+            DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HALFTONE, HBITMAP, HDC, HGDIOBJ,
+            NOMIRRORBITMAP, ReleaseDC, SRCCOPY, SelectObject, SetStretchBltMode, StretchBlt,
         },
     },
     System::{
@@ -45,6 +44,10 @@ use crate::{
     PlatformCapabilities, PlatformKind, RectI, VISUAL_GRID_CELLS, VISUAL_GRID_HEIGHT,
     VISUAL_GRID_WIDTH, VisualCell,
 };
+
+const VISUAL_CAPTURE_SAMPLES_PER_AXIS: usize = 4;
+const VISUAL_CAPTURE_WIDTH: usize = VISUAL_GRID_WIDTH * VISUAL_CAPTURE_SAMPLES_PER_AXIS;
+const VISUAL_CAPTURE_HEIGHT: usize = VISUAL_GRID_HEIGHT * VISUAL_CAPTURE_SAMPLES_PER_AXIS;
 
 pub struct WindowsBackend {
     started: Instant,
@@ -297,6 +300,8 @@ fn visual_sample_loop(
     samples: &Sender<DesktopVisualFrame>,
 ) {
     let mut previous = Vec::with_capacity(64);
+    let mut capture =
+        GdiBackgroundCapture::new(VISUAL_CAPTURE_WIDTH as u32, VISUAL_CAPTURE_HEIGHT as u32);
     let started = Instant::now();
     let mut sequence = 0_u64;
     while let Ok(mut request) = requests.recv() {
@@ -304,10 +309,14 @@ fn visual_sample_loop(
             request = newer;
         }
         sequence = sequence.saturating_add(1);
+        let Some(capture) = capture.as_mut() else {
+            continue;
+        };
         let Some(sample) = sample_desktop_visual(
             &request.topology,
             request.pet_position,
             &mut previous,
+            capture,
             sequence,
             started.elapsed().as_secs_f64(),
         ) else {
@@ -598,6 +607,7 @@ fn sample_desktop_visual(
     topology: &DisplayTopology,
     pet_position: Vec2,
     previous: &mut Vec<[f32; 3]>,
+    capture: &mut GdiBackgroundCapture,
     sequence: u64,
     timestamp: f64,
 ) -> Option<DesktopVisualFrame> {
@@ -605,17 +615,42 @@ fn sample_desktop_visual(
     if !virtual_bounds.is_valid() {
         return None;
     }
-    let device_context = unsafe { GetDC(std::ptr::null_mut()) };
-    if device_context.is_null() {
-        return None;
+    let pixels = capture.capture(
+        virtual_bounds.minimum.x,
+        virtual_bounds.minimum.y,
+        virtual_bounds.width().max(1) as u32,
+        virtual_bounds.height().max(1) as u32,
+    )?;
+    let sampled = sample_visual_cells(pixels, previous);
+    let (mut cells, mut means) = sampled?;
+    // GetDC(NULL) observes the composed desktop, including our own topmost
+    // organism. Without a self-mask the bright liquid body becomes the most
+    // salient "external" color/shape, so attention locks to its own position
+    // and locomotion appears dead. Replace the 3x3 footprint around the body
+    // with a neutral estimate before perception or temporal differencing sees
+    // it. The worker stores these scrubbed means for the next frame as well.
+    let self_mask = visual_self_mask(pet_position);
+    let neutral_rgb = mean_unmasked_rgb(&means, &self_mask);
+    for (index, masked) in self_mask.iter().copied().enumerate() {
+        if !masked {
+            continue;
+        }
+        means[index] = neutral_rgb;
+        cells[index].luminance = luminance(neutral_rgb);
+        cells[index].contrast = 0.0;
+        cells[index].colorfulness = 0.0;
+        cells[index].motion = 0.0;
+        cells[index].edge_density = 0.0;
+        cells[index].sudden_change = 0.0;
     }
-    let sampled = sample_visual_cells(device_context, virtual_bounds, previous);
-    unsafe {
-        ReleaseDC(std::ptr::null_mut(), device_context);
-    }
-    let (cells, means) = sampled?;
+    let unmasked_means = means
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, sample)| (!self_mask[index]).then_some(sample))
+        .collect::<Vec<_>>();
     let (mean_luminance, contrast, colorfulness, warmth, dominant_hue, edge_density) =
-        summarize_samples(&means);
+        summarize_samples(&unmasked_means);
     let motion_energy = cells.iter().map(|cell| cell.motion).sum::<f32>() / cells.len() as f32;
     let sudden_change = cells
         .iter()
@@ -645,41 +680,30 @@ fn sample_desktop_visual(
 }
 
 fn sample_visual_cells(
-    device_context: HDC,
-    bounds: RectI,
+    pixels: &[u8],
     previous: &[[f32; 3]],
 ) -> Option<([VisualCell; VISUAL_GRID_CELLS], Vec<[f32; 3]>)> {
-    if !bounds.is_valid() {
+    if pixels.len() < VISUAL_CAPTURE_WIDTH * VISUAL_CAPTURE_HEIGHT * 4 {
         return None;
     }
     let mut cells = [VisualCell::default(); VISUAL_GRID_CELLS];
     let mut means = Vec::with_capacity(VISUAL_GRID_CELLS);
     for row in 0..VISUAL_GRID_HEIGHT {
         for column in 0..VISUAL_GRID_WIDTH {
-            let mut samples = [[0.0_f32; 3]; 4];
+            let mut samples = [[0.0_f32; 3]; 16];
             let mut count = 0_usize;
-            for (offset_x, offset_y) in [
-                (0.25_f32, 0.25_f32),
-                (0.75, 0.25),
-                (0.25, 0.75),
-                (0.75, 0.75),
-            ] {
-                let normalized_x = (column as f32 + offset_x) / VISUAL_GRID_WIDTH as f32;
-                let normalized_y = (row as f32 + offset_y) / VISUAL_GRID_HEIGHT as f32;
-                let x = bounds.minimum.x + (normalized_x * bounds.width() as f32).round() as i32;
-                let y = bounds.minimum.y + (normalized_y * bounds.height() as f32).round() as i32;
-                let color = unsafe { GetPixel(device_context, x, y) };
-                if color != u32::MAX {
+            for sample_row in 0..VISUAL_CAPTURE_SAMPLES_PER_AXIS {
+                for sample_column in 0..VISUAL_CAPTURE_SAMPLES_PER_AXIS {
+                    let pixel_x = column * VISUAL_CAPTURE_SAMPLES_PER_AXIS + sample_column;
+                    let pixel_y = row * VISUAL_CAPTURE_SAMPLES_PER_AXIS + sample_row;
+                    let pixel = (pixel_y * VISUAL_CAPTURE_WIDTH + pixel_x) * 4;
                     samples[count] = [
-                        (color & 0xff) as f32 / 255.0,
-                        ((color >> 8) & 0xff) as f32 / 255.0,
-                        ((color >> 16) & 0xff) as f32 / 255.0,
+                        pixels[pixel + 2] as f32 / 255.0,
+                        pixels[pixel + 1] as f32 / 255.0,
+                        pixels[pixel] as f32 / 255.0,
                     ];
                     count += 1;
                 }
-            }
-            if count == 0 {
-                return None;
             }
             let valid_samples = &samples[..count];
             let mut mean_rgb = [0.0_f32; 3];
@@ -688,8 +712,13 @@ fn sample_visual_cells(
                     mean_rgb[channel] += sample[channel] / count as f32;
                 }
             }
-            let (luma, contrast, colorfulness, warmth, hue, edge_density) =
+            let (luma, contrast, colorfulness, warmth, hue, fallback_edge_density) =
                 summarize_samples(valid_samples);
+            let edge_density = if count == 16 {
+                grid_edge_density_4x4(valid_samples)
+            } else {
+                fallback_edge_density
+            };
             let index = row * VISUAL_GRID_WIDTH + column;
             let motion = previous.get(index).map_or(0.0, |old| {
                 (((mean_rgb[0] - old[0]).abs()
@@ -714,6 +743,60 @@ fn sample_visual_cells(
         }
     }
     Some((cells, means))
+}
+
+fn visual_self_mask(pet_position: Vec2) -> [bool; VISUAL_GRID_CELLS] {
+    let column = (pet_position.x.clamp(0.0, 0.999_999) * VISUAL_GRID_WIDTH as f32) as isize;
+    let row = (pet_position.y.clamp(0.0, 0.999_999) * VISUAL_GRID_HEIGHT as f32) as isize;
+    std::array::from_fn(|index| {
+        let candidate_row = (index / VISUAL_GRID_WIDTH) as isize;
+        let candidate_column = (index % VISUAL_GRID_WIDTH) as isize;
+        (candidate_row - row).abs() <= 1 && (candidate_column - column).abs() <= 1
+    })
+}
+
+fn mean_unmasked_rgb(means: &[[f32; 3]], mask: &[bool; VISUAL_GRID_CELLS]) -> [f32; 3] {
+    let mut sum = [0.0_f32; 3];
+    let mut count = 0_u32;
+    for (index, sample) in means.iter().copied().enumerate() {
+        if mask.get(index).copied().unwrap_or(true) {
+            continue;
+        }
+        for channel in 0..3 {
+            sum[channel] += sample[channel];
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return [0.5; 3];
+    }
+    for channel in &mut sum {
+        *channel /= count as f32;
+    }
+    sum
+}
+
+fn grid_edge_density_4x4(samples: &[[f32; 3]]) -> f32 {
+    if samples.len() != 16 {
+        return 0.0;
+    }
+    let luminances = samples.iter().copied().map(luminance).collect::<Vec<_>>();
+    let mut gradient = 0.0_f32;
+    let mut pairs = 0_u32;
+    for row in 0..4 {
+        for column in 0..4 {
+            let index = row * 4 + column;
+            if column + 1 < 4 {
+                gradient += (luminances[index + 1] - luminances[index]).abs();
+                pairs += 1;
+            }
+            if row + 1 < 4 {
+                gradient += (luminances[index + 4] - luminances[index]).abs();
+                pairs += 1;
+            }
+        }
+    }
+    (gradient / pairs.max(1) as f32 * 3.2).clamp(0.0, 1.0)
 }
 
 fn summarize_samples(samples: &[[f32; 3]]) -> (f32, f32, f32, f32, f32, f32) {
@@ -936,5 +1019,34 @@ fn classify_application(name: &str) -> AppCategory {
         AppCategory::System
     } else {
         AppCategory::Unknown
+    }
+}
+
+#[cfg(test)]
+mod visual_sampling_tests {
+    use super::*;
+
+    #[test]
+    fn self_mask_covers_the_body_cell_and_its_immediate_neighbors() {
+        let centered = visual_self_mask(Vec2::splat(0.5));
+        assert_eq!(centered.into_iter().filter(|masked| *masked).count(), 9);
+        let corner = visual_self_mask(Vec2::ZERO);
+        assert_eq!(corner.into_iter().filter(|masked| *masked).count(), 4);
+    }
+
+    #[test]
+    fn four_by_four_sampling_distinguishes_structure_from_flat_color() {
+        let flat = [[0.5_f32; 3]; 16];
+        assert_eq!(grid_edge_density_4x4(&flat), 0.0);
+        let checker: [[f32; 3]; 16] = std::array::from_fn(|index| {
+            let row = index / 4;
+            let column = index % 4;
+            if (row + column) % 2 == 0 {
+                [0.0; 3]
+            } else {
+                [1.0; 3]
+            }
+        });
+        assert!(grid_edge_density_4x4(&checker) > 0.95);
     }
 }

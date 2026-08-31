@@ -1,6 +1,8 @@
 use glam::Vec2;
 use lifecore::{BodyFeedback, BodyGenome, BodyIntent, LocomotionMode, SensorFrame, SurfaceRect};
 
+const BODY_SCREEN_GRAVITY: f32 = 0.16;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodySimulation {
     pub feedback: BodyFeedback,
@@ -40,6 +42,7 @@ impl BodySimulation {
         dt: f32,
     ) -> &BodyFeedback {
         let dt = dt.clamp(0.0, 1.0 / 30.0);
+        let was_grounded = self.feedback.grounded;
         self.wander_phase += dt * 0.73;
         self.feedback.collision = None;
         self.feedback.grounded = false;
@@ -67,12 +70,13 @@ impl BodySimulation {
             requested_target = surface_target(surface, intent.locomotion);
         }
         let target_response = match intent.locomotion {
-            LocomotionMode::Flee => 4.8,
+            LocomotionMode::Flee => 8.0,
             LocomotionMode::Seek
             | LocomotionMode::SurfaceApproach
             | LocomotionMode::Landing
-            | LocomotionMode::EdgeCling => 3.4,
-            LocomotionMode::Hover | LocomotionMode::Arrive | LocomotionMode::Orbit => 2.4,
+            | LocomotionMode::EdgeCling => 6.2,
+            LocomotionMode::Orbit => 4.4,
+            LocomotionMode::Hover | LocomotionMode::Arrive => 2.8,
             LocomotionMode::Wander => 1.65,
             LocomotionMode::Sleep | LocomotionMode::Cocoon => 6.0,
         };
@@ -81,14 +85,29 @@ impl BodySimulation {
         *embodied_target = embodied_target.lerp(requested_target, target_alpha);
         let mut target = *embodied_target * scale;
         let mut desired_velocity;
-        let speed_cap = match intent.locomotion {
-            LocomotionMode::Flee => 0.10,
-            LocomotionMode::Seek => 0.09,
+        let expression_energy = if intent.expression.body_glow.is_finite()
+            && intent.expression.pupil_size.is_finite()
+        {
+            (intent.expression.body_glow * 0.60 + intent.expression.pupil_size * 0.40)
+                .clamp(0.0, 1.0)
+        } else {
+            0.32
+        };
+        let purposeful_effort = ((intent.desired_speed - 0.12) / 0.40).clamp(0.0, 1.0);
+        let base_speed_cap = match intent.locomotion {
+            LocomotionMode::Flee => 0.11 + purposeful_effort * 0.21,
+            LocomotionMode::Seek => 0.09 + purposeful_effort * 0.21,
             LocomotionMode::SurfaceApproach
             | LocomotionMode::Landing
-            | LocomotionMode::EdgeCling => 0.075,
+            | LocomotionMode::EdgeCling => 0.080 + purposeful_effort * 0.070,
+            LocomotionMode::Orbit => 0.095 + purposeful_effort * 0.165,
+            LocomotionMode::Arrive => 0.090 + purposeful_effort * 0.100,
             _ => 0.085,
         };
+        // The expression comes from the authoritative affect/brain pipeline.
+        // Let it modulate actuator effort as well as the face so high arousal is
+        // physically quicker while low energy remains visibly heavier.
+        let speed_cap = base_speed_cap * (0.82 + expression_energy * 0.28);
         let desired_speed = intent.desired_speed.clamp(0.0, speed_cap) * reference_span;
         match intent.locomotion {
             LocomotionMode::Hover => {
@@ -162,10 +181,52 @@ impl BodySimulation {
             intent,
         );
         let velocity = self.feedback.velocity * scale;
-        let maximum_acceleration =
-            (0.42 / genome.inertia.max(0.2)).clamp(0.16, 1.45) * reference_span;
+        let purposeful_mode = matches!(
+            intent.locomotion,
+            LocomotionMode::Seek | LocomotionMode::Flee | LocomotionMode::Orbit
+        );
+        let requested_response = if purposeful_mode {
+            purposeful_effort
+        } else {
+            0.0
+        };
+        let braking_response = if purposeful_mode
+            && velocity.length_squared() > 1.0
+            && desired_velocity.dot(velocity) < velocity.length_squared() * 0.70
+        {
+            (velocity.length() / (0.24 * reference_span)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let purposeful_response = requested_response.max(braking_response);
+        let maximum_acceleration = ((0.48 / genome.inertia.max(0.2)).clamp(0.18, 1.30)
+            * reference_span
+            * (0.84 + expression_energy * 0.32)
+            * (1.0 + purposeful_response * 0.58))
+            .min(1.85 * reference_span);
+        let velocity_response = 5.8 + purposeful_response * 3.2;
+        let motor_acceleration = ((desired_velocity - velocity) * velocity_response)
+            .clamp_length_max(maximum_acceleration);
+        let supported = self.feedback.grounded
+            || self.feedback.clinging
+            || (was_grounded
+                && matches!(
+                    intent.locomotion,
+                    LocomotionMode::Sleep | LocomotionMode::Cocoon
+                ));
+        let lift_fraction = match intent.locomotion {
+            LocomotionMode::Sleep | LocomotionMode::Cocoon => 0.0,
+            LocomotionMode::EdgeCling => 1.0,
+            LocomotionMode::Landing if self.feedback.grounded => 1.0,
+            _ => (0.74 + expression_energy * 0.18).clamp(0.0, 0.94),
+        };
+        let gravity = if supported {
+            0.0
+        } else {
+            BODY_SCREEN_GRAVITY * reference_span * (1.0 - lift_fraction)
+        };
         let acceleration =
-            ((desired_velocity - velocity) * 5.2).clamp_length_max(maximum_acceleration);
+            (motor_acceleration + Vec2::Y * gravity).clamp_length_max(maximum_acceleration * 1.10);
         let velocity = (velocity + acceleration * dt).clamp_length_max(1.2 * reference_span);
         let position = position + velocity * dt;
         self.feedback.acceleration = acceleration / scale;
@@ -233,17 +294,31 @@ fn avoid_surfaces(
     ) {
         return Vec2::ZERO;
     }
-    surfaces.iter().fold(Vec2::ZERO, |avoidance, surface| {
-        let closest = position.clamp(surface.rect.minimum * scale, surface.rect.maximum * scale);
-        let delta = position - closest;
-        let distance = delta.length();
-        let clearance = 0.035 * reference_span;
-        if distance < clearance {
-            avoidance + delta.normalize_or_zero() * (clearance - distance) * 8.0
-        } else {
-            avoidance
-        }
-    })
+    surfaces
+        .iter()
+        .enumerate()
+        .fold(Vec2::ZERO, |avoidance, (index, surface)| {
+            let closest =
+                position.clamp(surface.rect.minimum * scale, surface.rect.maximum * scale);
+            let closest_world = closest / scale;
+            let occluded = surfaces[..index].iter().any(|front| {
+                closest_world.x > front.rect.minimum.x + 1.0e-5
+                    && closest_world.x < front.rect.maximum.x - 1.0e-5
+                    && closest_world.y > front.rect.minimum.y + 1.0e-5
+                    && closest_world.y < front.rect.maximum.y - 1.0e-5
+            });
+            if occluded {
+                return avoidance;
+            }
+            let delta = position - closest;
+            let distance = delta.length();
+            let clearance = 0.035 * reference_span;
+            if distance < clearance {
+                avoidance + delta.normalize_or_zero() * (clearance - distance) * 8.0
+            } else {
+                avoidance
+            }
+        })
 }
 
 #[cfg(test)]
@@ -345,5 +420,304 @@ mod tests {
             "waypoint switch reversed {before} px/s to {after} px/s"
         );
         assert!((after - before).abs() < 8.0);
+    }
+
+    #[test]
+    fn sleep_releases_active_lift_and_falls_under_screen_gravity() {
+        let genome = Genome::from_seed(93);
+        let mut simulation = BodySimulation::new(93);
+        simulation.feedback.world_position = Vec2::new(0.5, 0.30);
+        simulation.set_motion_space_pixels(Vec2::new(1_920.0, 1_080.0));
+        let intent = BodyIntent {
+            locomotion: LocomotionMode::Sleep,
+            target_position: simulation.feedback.world_position,
+            target_surface: None,
+            desired_speed: 0.0,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Sleeping,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+
+        for _ in 0..120 {
+            simulation.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+
+        assert!(simulation.feedback.world_position.y > 0.31);
+        assert!(simulation.feedback.velocity.y > 0.0);
+    }
+
+    #[test]
+    fn affective_expression_changes_motor_effort_without_breaking_speed_cap() {
+        let genome = Genome::from_seed(94);
+        let mut low = BodySimulation::new(94);
+        let mut high = BodySimulation::new(94);
+        low.feedback.world_position = Vec2::new(0.20, 0.50);
+        high.feedback.world_position = low.feedback.world_position;
+        low.set_motion_space_pixels(Vec2::new(1_920.0, 1_080.0));
+        high.set_motion_space_pixels(Vec2::new(1_920.0, 1_080.0));
+        let base = BodyIntent {
+            locomotion: LocomotionMode::Seek,
+            target_position: Vec2::new(0.80, 0.50),
+            target_surface: None,
+            desired_speed: 0.09,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Curious,
+            expression: ExpressionState {
+                body_glow: 0.05,
+                pupil_size: 0.20,
+                ..ExpressionState::default()
+            },
+            interaction_target: None,
+        };
+        let mut energized = base.clone();
+        energized.expression.body_glow = 1.0;
+        energized.expression.pupil_size = 1.0;
+
+        for _ in 0..120 {
+            low.fixed_update(&genome.body, &base, &SensorFrame::default(), 1.0 / 120.0);
+            high.fixed_update(
+                &genome.body,
+                &energized,
+                &SensorFrame::default(),
+                1.0 / 120.0,
+            );
+        }
+
+        let physical_scale = Vec2::new(1_920.0, 1_080.0);
+        let low_speed = (low.feedback.velocity * physical_scale).length();
+        let high_speed = (high.feedback.velocity * physical_scale).length();
+        assert!(high_speed > low_speed + 8.0);
+        assert!(high_speed < 120.0);
+    }
+
+    #[test]
+    fn explicit_high_effort_seek_is_visibly_faster_than_ambient_seek() {
+        let genome = Genome::from_seed(95);
+        let mut ambient = BodySimulation::new(95);
+        let mut purposeful = BodySimulation::new(95);
+        ambient.feedback.world_position = Vec2::new(0.20, 0.50);
+        purposeful.feedback.world_position = ambient.feedback.world_position;
+        let physical_scale = Vec2::new(1_920.0, 1_080.0);
+        ambient.set_motion_space_pixels(physical_scale);
+        purposeful.set_motion_space_pixels(physical_scale);
+        let ambient_intent = BodyIntent {
+            locomotion: LocomotionMode::Seek,
+            target_position: Vec2::new(0.80, 0.50),
+            target_surface: None,
+            desired_speed: 0.09,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Curious,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+        let mut purposeful_intent = ambient_intent.clone();
+        purposeful_intent.desired_speed = 0.64;
+
+        for _ in 0..120 {
+            ambient.fixed_update(
+                &genome.body,
+                &ambient_intent,
+                &SensorFrame::default(),
+                1.0 / 120.0,
+            );
+            purposeful.fixed_update(
+                &genome.body,
+                &purposeful_intent,
+                &SensorFrame::default(),
+                1.0 / 120.0,
+            );
+        }
+
+        let ambient_speed = (ambient.feedback.velocity * physical_scale).length();
+        let purposeful_speed = (purposeful.feedback.velocity * physical_scale).length();
+        assert!(purposeful_speed > ambient_speed * 2.5);
+        assert!(
+            (270.0..=310.0).contains(&purposeful_speed),
+            "purposeful seek speed={purposeful_speed} px/s"
+        );
+    }
+
+    #[test]
+    fn purposeful_seek_flee_and_orbit_have_fast_physical_pixel_speed_bands() {
+        let genome = Genome::from_seed(0xFA57);
+        let regular_scale = Vec2::new(1_920.0, 1_080.0);
+        let ultrawide_scale = Vec2::new(3_440.0, 1_080.0);
+        let base_intent = BodyIntent {
+            locomotion: LocomotionMode::Seek,
+            target_position: Vec2::new(0.92, 0.50),
+            target_surface: None,
+            desired_speed: 0.72,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Curious,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+        let mut regular_seek = BodySimulation::new(0xFA57);
+        let mut ultrawide_seek = BodySimulation::new(0xFA57);
+        regular_seek.feedback.world_position = Vec2::new(0.08, 0.50);
+        ultrawide_seek.feedback.world_position = Vec2::new(0.08, 0.50);
+        regular_seek.set_motion_space_pixels(regular_scale);
+        ultrawide_seek.set_motion_space_pixels(ultrawide_scale);
+        for _ in 0..150 {
+            regular_seek.fixed_update(
+                &genome.body,
+                &base_intent,
+                &SensorFrame::default(),
+                1.0 / 120.0,
+            );
+            ultrawide_seek.fixed_update(
+                &genome.body,
+                &base_intent,
+                &SensorFrame::default(),
+                1.0 / 120.0,
+            );
+        }
+        let seek_speed = (regular_seek.feedback.velocity * regular_scale).length();
+        let ultrawide_seek_speed = (ultrawide_seek.feedback.velocity * ultrawide_scale).length();
+        assert!(
+            (270.0..=310.0).contains(&seek_speed),
+            "seek={seek_speed} px/s"
+        );
+        assert!((seek_speed - ultrawide_seek_speed).abs() < 0.75);
+
+        let mut flee = BodySimulation::new(0xFA57);
+        flee.feedback.world_position = Vec2::new(0.62, 0.50);
+        flee.set_motion_space_pixels(regular_scale);
+        let mut flee_intent = base_intent.clone();
+        flee_intent.locomotion = LocomotionMode::Flee;
+        flee_intent.target_position = Vec2::new(0.18, 0.50);
+        for _ in 0..150 {
+            flee.fixed_update(
+                &genome.body,
+                &flee_intent,
+                &SensorFrame::default(),
+                1.0 / 120.0,
+            );
+        }
+        let flee_speed = (flee.feedback.velocity * regular_scale).length();
+        assert!(
+            (290.0..=335.0).contains(&flee_speed),
+            "flee={flee_speed} px/s"
+        );
+
+        let mut orbit = BodySimulation::new(0xFA57);
+        orbit.feedback.world_position = Vec2::new(0.59, 0.50);
+        orbit.set_motion_space_pixels(regular_scale);
+        let mut orbit_intent = base_intent;
+        orbit_intent.locomotion = LocomotionMode::Orbit;
+        orbit_intent.target_position = Vec2::new(0.50, 0.50);
+        for _ in 0..150 {
+            orbit.fixed_update(
+                &genome.body,
+                &orbit_intent,
+                &SensorFrame::default(),
+                1.0 / 120.0,
+            );
+        }
+        let orbit_speed = (orbit.feedback.velocity * regular_scale).length();
+        assert!(
+            (235.0..=285.0).contains(&orbit_speed),
+            "orbit={orbit_speed} px/s"
+        );
+    }
+
+    #[test]
+    fn purposeful_launch_and_brake_are_quick_but_never_reverse_or_teleport_in_one_step() {
+        let genome = Genome::from_seed(0x000B_2A4E);
+        let scale = Vec2::new(1_920.0, 1_080.0);
+        let mut simulation = BodySimulation::new(0x000B_2A4E);
+        simulation.feedback.world_position = Vec2::new(0.12, 0.50);
+        simulation.set_motion_space_pixels(scale);
+        let mut intent = BodyIntent {
+            locomotion: LocomotionMode::Seek,
+            target_position: Vec2::new(4.0, 0.50),
+            target_surface: None,
+            desired_speed: 0.72,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Curious,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+
+        for _ in 0..30 {
+            simulation.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        let launch_speed = (simulation.feedback.velocity * scale).length();
+        assert!(launch_speed > 175.0, "launch={launch_speed} px/s");
+        assert!(
+            simulation
+                .embodied_target
+                .is_some_and(|target| target.is_finite() && target.max_element() <= 0.98)
+        );
+
+        intent.desired_speed = 0.0;
+        let before_position = simulation.feedback.world_position;
+        let before_velocity = simulation.feedback.velocity.x * scale.x;
+        simulation.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 30.0);
+        let one_step_velocity = simulation.feedback.velocity.x * scale.x;
+        assert!(before_velocity > 0.0 && one_step_velocity > 0.0);
+        assert!(one_step_velocity < before_velocity);
+        assert!(simulation.feedback.world_position.distance(before_position) < 0.01);
+
+        for _ in 0..30 {
+            simulation.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        let braked_speed = (simulation.feedback.velocity * scale).length();
+        assert!(
+            braked_speed < launch_speed * 0.45,
+            "launch={launch_speed} brake={braked_speed} px/s"
+        );
+        assert!(simulation.feedback.world_position.is_finite());
+        assert!(simulation.feedback.velocity.is_finite());
+        assert!(simulation.feedback.acceleration.is_finite());
+    }
+
+    #[test]
+    fn covered_back_window_edge_does_not_double_motor_avoidance() {
+        let scale = Vec2::new(1_920.0, 1_080.0);
+        let position = Vec2::new(0.58, 0.50) * scale;
+        let front = SurfaceRect {
+            id: lifecore::SurfaceId("front".into()),
+            rect: lifecore::Rect {
+                minimum: Vec2::new(0.59, 0.30),
+                maximum: Vec2::new(0.72, 0.70),
+            },
+        };
+        let behind = SurfaceRect {
+            id: lifecore::SurfaceId("behind".into()),
+            rect: lifecore::Rect {
+                minimum: Vec2::new(0.60, 0.35),
+                maximum: Vec2::new(0.68, 0.65),
+            },
+        };
+        let intent = BodyIntent {
+            locomotion: LocomotionMode::Hover,
+            target_position: position / scale,
+            target_surface: None,
+            desired_speed: 0.0,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Neutral,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+
+        let front_only = avoid_surfaces(
+            position,
+            scale,
+            1_080.0,
+            std::slice::from_ref(&front),
+            &intent,
+        );
+        let stacked = avoid_surfaces(position, scale, 1_080.0, &[front, behind], &intent);
+
+        assert_eq!(front_only, stacked);
+        assert!(stacked.x < 0.0);
     }
 }

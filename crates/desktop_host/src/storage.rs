@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::PersistedPetPosition;
+use crate::{LabControlEnvelope, LabControlValidationError, PersistedPetPosition};
 
 pub const PORTABLE_STATE_SCHEMA_VERSION: u32 = 1;
+pub const TELEMETRY_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub const LAB_CONTROL_MAX_FILE_BYTES: u64 = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PortablePetState {
@@ -88,6 +90,10 @@ pub struct StoragePaths {
     pub morph_brain: PathBuf,
     pub ecology_state: PathBuf,
     pub events: PathBuf,
+    pub telemetry: PathBuf,
+    pub telemetry_previous: PathBuf,
+    pub lab_control: PathBuf,
+    pub lab_control_backup: PathBuf,
     pub backup: PathBuf,
     pub ecology_backup: PathBuf,
 }
@@ -108,6 +114,12 @@ pub enum StorageError {
     InvalidPosition,
     #[error("portable state contains an invalid VITA mind")]
     InvalidVitaState,
+    #[error("telemetry record is {record_bytes} bytes, exceeding the {max_bytes}-byte log cap")]
+    TelemetryRecordTooLarge { record_bytes: u64, max_bytes: u64 },
+    #[error(transparent)]
+    InvalidLabControl(#[from] LabControlValidationError),
+    #[error("Lab control file is {file_bytes} bytes, exceeding the {max_bytes}-byte cap")]
+    LabControlFileTooLarge { file_bytes: u64, max_bytes: u64 },
     #[error(transparent)]
     Ecology(#[from] EcologyError),
 }
@@ -136,6 +148,10 @@ impl StateStore {
                 morph_brain: root.join("morph-brain.json"),
                 ecology_state: root.join("ecology-state.json"),
                 events: root.join("events.jsonl"),
+                telemetry: root.join("telemetry.jsonl"),
+                telemetry_previous: root.join("telemetry.previous.jsonl"),
+                lab_control: root.join("lab-control.json"),
+                lab_control_backup: root.join("backups").join("lab-control.previous.json"),
                 backup: root.join("backups").join("state.previous.json"),
                 ecology_backup: root.join("backups").join("ecology-state.previous.json"),
                 root,
@@ -304,6 +320,35 @@ impl StateStore {
         atomic_json(&self.paths.ecology_state, &self.paths.ecology_backup, state)
     }
 
+    /// Loads only the primary command slot. A stale backup must never be
+    /// replayed after a partially written or externally corrupted command.
+    pub fn load_lab_control(&self) -> Result<Option<LabControlEnvelope>, StorageError> {
+        if !self.paths.lab_control.exists() {
+            return Ok(None);
+        }
+        let file_bytes = fs::metadata(&self.paths.lab_control)?.len();
+        if file_bytes > LAB_CONTROL_MAX_FILE_BYTES {
+            return Err(StorageError::LabControlFileTooLarge {
+                file_bytes,
+                max_bytes: LAB_CONTROL_MAX_FILE_BYTES,
+            });
+        }
+        let control: LabControlEnvelope = read_json(&self.paths.lab_control)?;
+        control.validate()?;
+        Ok(Some(control))
+    }
+
+    /// Replaces the one-command slot; this intentionally does not append a
+    /// queue that could grow without a bound or replay old interventions.
+    pub fn save_lab_control(&self, control: &LabControlEnvelope) -> Result<(), StorageError> {
+        control.validate()?;
+        atomic_json(
+            &self.paths.lab_control,
+            &self.paths.lab_control_backup,
+            control,
+        )
+    }
+
     pub fn append_event(&self, event: &EventLogEntry) -> Result<(), StorageError> {
         fs::create_dir_all(&self.paths.root)?;
         let mut file = OpenOptions::new()
@@ -315,6 +360,52 @@ impl StateStore {
         file.flush()?;
         Ok(())
     }
+
+    pub fn append_telemetry(&self, event: &EventLogEntry) -> Result<(), StorageError> {
+        self.append_telemetry_with_cap(event, TELEMETRY_LOG_MAX_BYTES)
+    }
+
+    fn append_telemetry_with_cap(
+        &self,
+        event: &EventLogEntry,
+        max_bytes: u64,
+    ) -> Result<(), StorageError> {
+        let line = encode_json_line(event)?;
+        let record_bytes = line.len() as u64;
+        if record_bytes > max_bytes {
+            return Err(StorageError::TelemetryRecordTooLarge {
+                record_bytes,
+                max_bytes,
+            });
+        }
+
+        fs::create_dir_all(&self.paths.root)?;
+        let current_bytes = match fs::metadata(&self.paths.telemetry) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        if current_bytes > 0 && current_bytes.saturating_add(record_bytes) > max_bytes {
+            if self.paths.telemetry_previous.exists() {
+                fs::remove_file(&self.paths.telemetry_previous)?;
+            }
+            fs::rename(&self.paths.telemetry, &self.paths.telemetry_previous)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.paths.telemetry)?;
+        file.write_all(&line)?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
+fn encode_json_line<T: Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 fn read_state(path: &Path) -> Result<PortablePetState, StorageError> {
@@ -372,6 +463,54 @@ mod tests {
     use lifecore::{Genome, LifeCore};
 
     use super::*;
+
+    fn telemetry_event(sequence: u64, payload_bytes: usize) -> EventLogEntry {
+        EventLogEntry {
+            monotonic_seconds: sequence as f64,
+            kind: "debug_state".into(),
+            details: serde_json::json!({
+                "sequence": sequence,
+                "payload": "x".repeat(payload_bytes),
+            }),
+        }
+    }
+
+    fn lab_control(command_id: u64, command: crate::LabControlCommand) -> LabControlEnvelope {
+        LabControlEnvelope {
+            schema_version: crate::LAB_CONTROL_SCHEMA_VERSION,
+            command_id,
+            issued_unix_ms: 1_728_000_000_000,
+            expires_after_ms: 5_000,
+            command,
+        }
+    }
+
+    fn read_json_lines(path: &Path) -> Vec<EventLogEntry> {
+        let bytes = fs::read(path).unwrap();
+        assert!(
+            !bytes.is_empty(),
+            "{} is unexpectedly empty",
+            path.display()
+        );
+        assert_eq!(
+            bytes.last(),
+            Some(&b'\n'),
+            "{} ends with a partial JSONL record",
+            path.display()
+        );
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
+    fn telemetry_sequences(path: &Path) -> Vec<u64> {
+        read_json_lines(path)
+            .into_iter()
+            .map(|event| event.details["sequence"].as_u64().unwrap())
+            .collect()
+    }
 
     #[test]
     fn state_roundtrip_is_valid_and_creates_backup() {
@@ -502,6 +641,208 @@ mod tests {
                 .unwrap(),
             first
         );
+    }
+
+    #[test]
+    fn lab_control_round_trip_atomically_replaces_the_single_command_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        assert_eq!(
+            store.paths.lab_control,
+            directory.path().join("lab-control.json")
+        );
+        assert_eq!(store.load_lab_control().unwrap(), None);
+
+        let first = lab_control(
+            101,
+            crate::LabControlCommand::CueAttention {
+                position: [0.25, 0.75],
+                duration_seconds: 2.0,
+            },
+        );
+        let latest = lab_control(
+            102,
+            crate::LabControlCommand::DrivePulse {
+                drive: crate::LabDrive::Curiosity,
+                delta: 0.6,
+                duration_seconds: 4.0,
+            },
+        );
+
+        store.save_lab_control(&first).unwrap();
+        assert_eq!(store.load_lab_control().unwrap(), Some(first.clone()));
+        store.save_lab_control(&latest).unwrap();
+
+        assert_eq!(store.load_lab_control().unwrap(), Some(latest));
+        assert_eq!(
+            read_json::<LabControlEnvelope>(&store.paths.lab_control_backup).unwrap(),
+            first
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("lab-control"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_lab_control_is_rejected_without_replacing_the_current_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let valid = lab_control(7, crate::LabControlCommand::FocusMode { enabled: true });
+        store.save_lab_control(&valid).unwrap();
+        let original = fs::read(&store.paths.lab_control).unwrap();
+
+        let mut invalid = valid;
+        invalid.expires_after_ms = crate::LAB_CONTROL_MAX_EXPIRY_MS + 1;
+        assert!(matches!(
+            store.save_lab_control(&invalid),
+            Err(StorageError::InvalidLabControl(
+                LabControlValidationError::InvalidExpiry
+            ))
+        ));
+        assert_eq!(fs::read(&store.paths.lab_control).unwrap(), original);
+        assert!(!store.paths.lab_control_backup.exists());
+    }
+
+    #[test]
+    fn lab_control_load_never_falls_back_to_a_stale_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let first = lab_control(1, crate::LabControlCommand::ClearDrivePulses);
+        let second = lab_control(2, crate::LabControlCommand::Reward { value: 0.5 });
+        store.save_lab_control(&first).unwrap();
+        store.save_lab_control(&second).unwrap();
+        assert!(store.paths.lab_control_backup.exists());
+
+        fs::write(&store.paths.lab_control, b"{broken").unwrap();
+        assert!(matches!(
+            store.load_lab_control(),
+            Err(StorageError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn lab_control_load_validates_schema_and_caps_external_file_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        fs::create_dir_all(&store.paths.root).unwrap();
+
+        let mut invalid_schema =
+            lab_control(1, crate::LabControlCommand::FocusMode { enabled: false });
+        invalid_schema.schema_version = crate::LAB_CONTROL_SCHEMA_VERSION + 1;
+        fs::write(
+            &store.paths.lab_control,
+            serde_json::to_vec(&invalid_schema).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_lab_control(),
+            Err(StorageError::InvalidLabControl(
+                LabControlValidationError::UnsupportedSchema
+            ))
+        ));
+
+        fs::write(
+            &store.paths.lab_control,
+            vec![b' '; LAB_CONTROL_MAX_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load_lab_control(),
+            Err(StorageError::LabControlFileTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn telemetry_rotation_is_bounded_parseable_and_keeps_only_one_previous_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        assert_eq!(
+            store.paths.telemetry,
+            directory.path().join("telemetry.jsonl")
+        );
+        assert_eq!(
+            store.paths.telemetry_previous,
+            directory.path().join("telemetry.previous.jsonl")
+        );
+
+        let semantic = EventLogEntry {
+            monotonic_seconds: 1.0,
+            kind: "user_feedback".into(),
+            details: serde_json::json!({"reward": 1.0}),
+        };
+        store.append_event(&semantic).unwrap();
+        let semantic_bytes = fs::read(&store.paths.events).unwrap();
+
+        let record_bytes = encode_json_line(&telemetry_event(0, 32)).unwrap().len() as u64;
+        let max_bytes = record_bytes * 2;
+        for sequence in 0..7 {
+            store
+                .append_telemetry_with_cap(&telemetry_event(sequence, 32), max_bytes)
+                .unwrap();
+        }
+
+        assert!(fs::metadata(&store.paths.telemetry).unwrap().len() <= max_bytes);
+        assert!(fs::metadata(&store.paths.telemetry_previous).unwrap().len() <= max_bytes);
+        assert_eq!(telemetry_sequences(&store.paths.telemetry_previous), [4, 5]);
+        assert_eq!(telemetry_sequences(&store.paths.telemetry), [6]);
+        assert_eq!(fs::read(&store.paths.events).unwrap(), semantic_bytes);
+
+        let mut telemetry_files = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("telemetry"))
+            .collect::<Vec<_>>();
+        telemetry_files.sort();
+        assert_eq!(
+            telemetry_files,
+            ["telemetry.jsonl", "telemetry.previous.jsonl"]
+        );
+    }
+
+    #[test]
+    fn telemetry_rotates_before_append_without_splitting_the_tail_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let first = telemetry_event(1, 48);
+        let second = telemetry_event(2, 48);
+        let first_bytes = encode_json_line(&first).unwrap().len() as u64;
+        let second_bytes = encode_json_line(&second).unwrap().len() as u64;
+        let max_bytes = first_bytes + second_bytes - 1;
+
+        store.append_telemetry_with_cap(&first, max_bytes).unwrap();
+        store.append_telemetry_with_cap(&second, max_bytes).unwrap();
+
+        assert_eq!(telemetry_sequences(&store.paths.telemetry_previous), [1]);
+        assert_eq!(telemetry_sequences(&store.paths.telemetry), [2]);
+        assert!(fs::metadata(&store.paths.telemetry).unwrap().len() <= max_bytes);
+        assert!(fs::metadata(&store.paths.telemetry_previous).unwrap().len() <= max_bytes);
+    }
+
+    #[test]
+    fn oversized_telemetry_record_is_rejected_without_rotation_or_partial_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let first = telemetry_event(1, 8);
+        let max_bytes = encode_json_line(&first).unwrap().len() as u64;
+        store.append_telemetry_with_cap(&first, max_bytes).unwrap();
+        let original = fs::read(&store.paths.telemetry).unwrap();
+
+        let oversized = telemetry_event(2, 512);
+        assert!(matches!(
+            store.append_telemetry_with_cap(&oversized, max_bytes),
+            Err(StorageError::TelemetryRecordTooLarge { .. })
+        ));
+        assert_eq!(fs::read(&store.paths.telemetry).unwrap(), original);
+        assert!(!store.paths.telemetry_previous.exists());
+        assert_eq!(telemetry_sequences(&store.paths.telemetry), [1]);
     }
 
     #[test]

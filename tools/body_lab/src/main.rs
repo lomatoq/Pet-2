@@ -1,13 +1,17 @@
 use std::{
+    collections::{BTreeSet, VecDeque},
+    env,
     fs::{self, File},
-    io::{BufReader, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use desktop_host::StateStore;
+use desktop_host::{
+    LAB_CONTROL_SCHEMA_VERSION, LabControlCommand, LabControlEnvelope, LabDrive, StateStore,
+};
 use egui::{CollapsingHeader, Context, DragValue, Sense, Slider};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor, wgpu};
 use egui_winit::State as EguiWinitState;
@@ -23,13 +27,14 @@ use pet_body::{
     MaterialVariant, ProceduralBody, RenderOutcome, Renderer, ReviewBackground, VisualMindInput,
     VoiceVisualState,
 };
+use serde_json::Value;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalPosition, LogicalSize, PhysicalSize},
     event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowId},
+    window::{Window, WindowId, WindowLevel},
 };
 
 const FRAME: Duration = Duration::from_micros(16_667);
@@ -38,6 +43,11 @@ const DEFAULT_BACKGROUND: usize = 3;
 const DEFAULT_PREVIEW_BOUNDS_MIN: Vec2 = Vec2::new(0.0, 0.035);
 const DEFAULT_PREVIEW_BOUNDS_MAX: Vec2 = Vec2::new(0.67, 0.965);
 const USER_PRESET_DIRECTORY: &str = "liquid-presets";
+const LIVE_FRAME_HISTORY_CAP: usize = 3_600;
+const LIVE_FRAME_HISTORY_BYTES: usize = 48 * 1_024 * 1_024;
+const LIVE_BOOTSTRAP_BYTES: u64 = 24 * 1_024 * 1_024;
+const EXPECTED_TELEMETRY_HZ: f32 = 5.0;
+const LAB_CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const BACKGROUNDS: [ReviewBackground; 6] = [
     ReviewBackground::Black,
     ReviewBackground::White,
@@ -48,14 +58,57 @@ const BACKGROUNDS: [ReviewBackground; 6] = [
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut live_pet = false;
+    let mut data_dir = None;
+    let mut arguments = env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--live-pet" => live_pet = true,
+            "--data-dir" => {
+                data_dir = Some(PathBuf::from(
+                    arguments.next().ok_or("--data-dir requires a path")?,
+                ));
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Body Lab\n\n  --live-pet       Start in Live Brain (telemetry.jsonl, rotated history, legacy events.jsonl fallback)\n  --data-dir PATH  Use the same overridden Pet 2 data directory\n\n  F12 switches Liquid Body Lab ↔ Live Brain"
+                );
+                return Ok(());
+            }
+            _ => return Err(format!("unknown Body Lab option: {argument}").into()),
+        }
+    }
+    // Discover the Pet store even when Body Lab is the initial view. F12 can
+    // then switch to the live monitor without restarting either surface.
+    let store = data_dir
+        .as_deref()
+        .map(StateStore::at)
+        .or_else(|| StateStore::discover().ok());
     let event_loop = EventLoop::new()?;
-    event_loop.run_app(&mut BodyLab::new(SEED))?;
+    event_loop.run_app(&mut BodyLab::new(SEED, store, live_pet))?;
     Ok(())
 }
 
 struct BodyLab {
     genome: Genome,
+    store: Option<StateStore>,
+    start_live: bool,
     runtime: Option<LabRuntime>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LabView {
+    Body,
+    Live,
+}
+
+impl LabView {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Body => Self::Live,
+            Self::Live => Self::Body,
+        }
+    }
 }
 
 struct LabRuntime {
@@ -81,6 +134,86 @@ struct LabRuntime {
     audio: Option<AudioEngine>,
     audio_error: Option<String>,
     voice_preview_counter: u64,
+    view: LabView,
+    body_window_size: LogicalSize<f64>,
+    live_window_size: LogicalSize<f64>,
+    live_monitor: Option<LivePetMonitor>,
+}
+
+struct LivePetMonitor {
+    control_store: StateStore,
+    telemetry_path: PathBuf,
+    telemetry_previous_path: PathBuf,
+    legacy_path: PathBuf,
+    using_legacy: bool,
+    previous_loaded: bool,
+    current_bootstrapped: bool,
+    offset: u64,
+    frames: VecDeque<Value>,
+    frame_sizes: VecDeque<usize>,
+    frame_history_bytes: usize,
+    history: VecDeque<LiveGraphSample>,
+    selected: usize,
+    follow_live: bool,
+    playing: bool,
+    playback_rate: f32,
+    playback_accumulator: f32,
+    last_playback_tick: Instant,
+    control_drive: LabDrive,
+    control_drive_delta: f32,
+    control_drive_duration: f32,
+    control_attention_duration: f32,
+    control_reward: f32,
+    control_counter: u64,
+    last_sent_command_id: u64,
+    pending_command_id: Option<u64>,
+    pending_command_sent_at: Option<Instant>,
+    control_status: String,
+    evolution_scrub: EvolutionScrubState,
+    canonical_evolution: CanonicalEvolutionCache,
+    last_state_poll: Instant,
+    state_file_signature: Option<(SystemTime, u64)>,
+    status: String,
+    last_poll: Instant,
+    last_received: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LiveGraphSample {
+    speed_px: f32,
+    pressure: f32,
+    deformation: f32,
+    visual_blend: f32,
+    orb_speed: f32,
+}
+
+#[derive(Debug, Default)]
+struct EvolutionScrubState {
+    history_key: String,
+    selected: usize,
+}
+
+#[derive(Clone, Copy)]
+enum EvolutionCheckpoint<'a> {
+    Before {
+        record_index: usize,
+        record: &'a Value,
+        genome: &'a Value,
+    },
+    After {
+        record_index: usize,
+        record: &'a Value,
+        genome: Option<&'a Value>,
+    },
+}
+
+#[derive(Debug, Default)]
+struct CanonicalEvolutionCache {
+    available: bool,
+    lineage_id: String,
+    generation: u32,
+    history: Vec<Value>,
+    status: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -172,9 +305,11 @@ impl Default for PreviewDrag {
 }
 
 impl BodyLab {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, store: Option<StateStore>, start_live: bool) -> Self {
         Self {
             genome: Genome::from_seed(seed),
+            store,
+            start_live,
             runtime: None,
         }
     }
@@ -185,12 +320,26 @@ impl ApplicationHandler for BodyLab {
         if self.runtime.is_some() {
             return;
         }
+        let live_pet = self.start_live;
         let window = match event_loop.create_window(
             Window::default_attributes()
-                .with_title("PET-2 Liquid Body Lab — zero-G soft fields")
-                .with_inner_size(LogicalSize::new(1_180.0, 820.0))
+                .with_title(if live_pet {
+                    "PET-2 Live Brain — causal dev panel"
+                } else {
+                    "PET-2 Liquid Body Lab — zero-G soft fields"
+                })
+                .with_inner_size(if live_pet {
+                    LogicalSize::new(1_040.0, 900.0)
+                } else {
+                    LogicalSize::new(1_180.0, 820.0)
+                })
                 .with_position(LogicalPosition::new(32.0, 48.0))
-                .with_resizable(true),
+                .with_resizable(true)
+                .with_window_level(if live_pet {
+                    WindowLevel::AlwaysOnTop
+                } else {
+                    WindowLevel::Normal
+                }),
         ) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -207,7 +356,7 @@ impl ApplicationHandler for BodyLab {
                 return;
             }
         };
-        let store = StateStore::discover().ok();
+        let store = self.store.clone().or_else(|| StateStore::discover().ok());
         let mut profile = LiquidTuningProfile::for_seed(self.genome.identity_seed);
         let mut migrated_material_preview = false;
         if let Some(saved) = store
@@ -303,6 +452,7 @@ impl ApplicationHandler for BodyLab {
             Ok(engine) => (Some(engine), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let live_monitor = store.as_ref().map(LivePetMonitor::new);
         let ui = LabUi {
             json_buffer: serde_json::to_string_pretty(&profile).unwrap_or_default(),
             preset_name_buffer: format!("{} copy", profile.name),
@@ -374,6 +524,14 @@ impl ApplicationHandler for BodyLab {
             audio,
             audio_error,
             voice_preview_counter: 0,
+            view: if live_pet {
+                LabView::Live
+            } else {
+                LabView::Body
+            },
+            body_window_size: LogicalSize::new(1_180.0, 820.0),
+            live_window_size: LogicalSize::new(1_040.0, 900.0),
+            live_monitor,
         });
     }
 
@@ -388,7 +546,20 @@ impl ApplicationHandler for BodyLab {
         }
         let wall_dt = (now - runtime.last_update).as_secs_f32().clamp(0.0, 0.05);
         runtime.last_update = now;
-        runtime.next_frame = now + FRAME;
+        runtime.next_frame = now
+            + if runtime.view == LabView::Live {
+                Duration::from_micros(33_333)
+            } else {
+                FRAME
+            };
+        if let Some(monitor) = runtime.live_monitor.as_mut() {
+            monitor.poll();
+        }
+        if runtime.view == LabView::Live {
+            runtime.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
+            return;
+        }
         let fixed_dt = 1.0 / runtime.ui.profile.pbf.fixed_hz.clamp(30.0, 120.0);
         if runtime.ui.playing || runtime.ui.drag.active {
             runtime.simulation_accumulator = (runtime.simulation_accumulator
@@ -510,6 +681,13 @@ impl ApplicationHandler for BodyLab {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
                 WindowEvent::Resized(size) => {
+                    if size.width > 0 && size.height > 0 {
+                        let logical = size.to_logical(runtime.window.scale_factor());
+                        match runtime.view {
+                            LabView::Body => runtime.body_window_size = logical,
+                            LabView::Live => runtime.live_window_size = logical,
+                        }
+                    }
                     runtime.renderer.resize(size);
                     sync_preview_viewport(
                         &mut runtime.body,
@@ -524,10 +702,33 @@ impl ApplicationHandler for BodyLab {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         match code {
                             KeyCode::Escape => event_loop.exit(),
-                            KeyCode::Space if !response.consumed => {
+                            KeyCode::F12 => {
+                                runtime.view = runtime.view.toggled();
+                                update_window_for_view(runtime);
+                            }
+                            KeyCode::Space if runtime.view == LabView::Live => {
+                                if let Some(monitor) = runtime.live_monitor.as_mut() {
+                                    monitor.toggle_playback();
+                                }
+                            }
+                            KeyCode::ArrowLeft if runtime.view == LabView::Live => {
+                                if let Some(monitor) = runtime.live_monitor.as_mut() {
+                                    monitor.select_previous();
+                                }
+                            }
+                            KeyCode::ArrowRight if runtime.view == LabView::Live => {
+                                if let Some(monitor) = runtime.live_monitor.as_mut() {
+                                    monitor.select_next();
+                                }
+                            }
+                            KeyCode::Space
+                                if runtime.view == LabView::Body && !response.consumed =>
+                            {
                                 runtime.ui.playing = !runtime.ui.playing;
                             }
-                            KeyCode::KeyR if !response.consumed => {
+                            KeyCode::KeyR
+                                if runtime.view == LabView::Body && !response.consumed =>
+                            {
                                 runtime.ui.reset_requested = true;
                             }
                             _ => {}
@@ -539,6 +740,26 @@ impl ApplicationHandler for BodyLab {
             }
         }
     }
+}
+
+fn update_window_for_view(runtime: &mut LabRuntime) {
+    match runtime.view {
+        LabView::Body => {
+            runtime
+                .window
+                .set_title("PET-2 Liquid Body Lab — zero-G soft fields");
+            runtime.window.set_window_level(WindowLevel::Normal);
+            let _ = runtime.window.request_inner_size(runtime.body_window_size);
+        }
+        LabView::Live => {
+            runtime
+                .window
+                .set_title("PET-2 Live Brain — causal dev panel");
+            runtime.window.set_window_level(WindowLevel::AlwaysOnTop);
+            let _ = runtime.window.request_inner_size(runtime.live_window_size);
+        }
+    }
+    runtime.window.request_redraw();
 }
 
 fn sync_preview_space(body: &mut ProceduralBody, size: PhysicalSize<u32>) {
@@ -860,20 +1081,32 @@ fn preview_navigation_anchor(scenario: PreviewScenario, drag: PreviewDrag) -> f3
 fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEventLoop) {
     let diagnostics = runtime.body.embodiment.liquid.diagnostics();
     let raw_input = runtime.egui_state.take_egui_input(runtime.window.as_ref());
-    let output = runtime.egui_context.run(raw_input, |context| {
-        runtime.ui.show(
-            context,
-            diagnostics,
-            runtime.body.embodiment.pose.pupil_size,
-            runtime.body.embodiment.pose.pupil_asymmetry,
-            runtime.fps,
-            runtime.p95_frame_ms,
-        );
+    let egui_context = runtime.egui_context.clone();
+    let output = egui_context.run(raw_input, |context| match runtime.view {
+        LabView::Live => {
+            if let Some(monitor) = runtime.live_monitor.as_mut() {
+                show_live_pet(context, monitor);
+            } else {
+                show_live_pet_unavailable(context);
+            }
+        }
+        LabView::Body => {
+            runtime.ui.show(
+                context,
+                diagnostics,
+                runtime.body.embodiment.pose.pupil_size,
+                runtime.body.embodiment.pose.pupil_asymmetry,
+                runtime.fps,
+                runtime.p95_frame_ms,
+            );
+        }
     });
     runtime
         .egui_state
         .handle_platform_output(runtime.window.as_ref(), output.platform_output);
-    if let Err(error) = apply_preview_profile(runtime) {
+    if runtime.view == LabView::Body
+        && let Err(error) = apply_preview_profile(runtime)
+    {
         runtime.ui.status = format!("Liquid profile rejected: {error}");
     }
     let paint_jobs = runtime
@@ -946,6 +1179,2499 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     if outcome == RenderOutcome::OutOfMemory {
         event_loop.exit();
     }
+}
+
+impl LivePetMonitor {
+    fn new(store: &StateStore) -> Self {
+        Self {
+            control_store: store.clone(),
+            telemetry_path: store.paths.telemetry.clone(),
+            telemetry_previous_path: store.paths.telemetry_previous.clone(),
+            legacy_path: store.paths.events.clone(),
+            using_legacy: false,
+            previous_loaded: false,
+            current_bootstrapped: false,
+            offset: 0,
+            frames: VecDeque::with_capacity(LIVE_FRAME_HISTORY_CAP),
+            frame_sizes: VecDeque::with_capacity(LIVE_FRAME_HISTORY_CAP),
+            frame_history_bytes: 0,
+            history: VecDeque::with_capacity(LIVE_FRAME_HISTORY_CAP),
+            selected: 0,
+            follow_live: true,
+            playing: false,
+            playback_rate: 1.0,
+            playback_accumulator: 0.0,
+            last_playback_tick: Instant::now(),
+            control_drive: LabDrive::Curiosity,
+            control_drive_delta: 0.25,
+            control_drive_duration: 4.0,
+            control_attention_duration: 2.0,
+            control_reward: 0.25,
+            control_counter: 0,
+            last_sent_command_id: store
+                .load_lab_control()
+                .ok()
+                .flatten()
+                .map_or(0, |control| control.command_id),
+            pending_command_id: None,
+            pending_command_sent_at: None,
+            control_status: "No intervention sent from this Body Lab session.".into(),
+            evolution_scrub: EvolutionScrubState::default(),
+            canonical_evolution: CanonicalEvolutionCache::default(),
+            last_state_poll: Instant::now() - Duration::from_secs(2),
+            state_file_signature: None,
+            status: format!("Waiting for {}", store.paths.telemetry.display()),
+            last_poll: Instant::now() - Duration::from_secs(1),
+            last_received: None,
+        }
+    }
+
+    fn poll(&mut self) {
+        self.advance_playback();
+        self.expire_pending_control();
+        self.poll_canonical_evolution();
+        if self.last_poll.elapsed() < Duration::from_millis(80) {
+            return;
+        }
+        self.last_poll = Instant::now();
+
+        let telemetry_available =
+            self.telemetry_path.exists() || self.telemetry_previous_path.exists();
+        if telemetry_available && self.using_legacy {
+            // The canonical bounded stream may appear after Body Lab starts.
+            // Prefer it immediately and drop only the in-memory legacy copy;
+            // no log on disk is ever changed here.
+            self.using_legacy = false;
+            self.previous_loaded = false;
+            self.current_bootstrapped = false;
+            self.offset = 0;
+            self.frames.clear();
+            self.frame_sizes.clear();
+            self.frame_history_bytes = 0;
+            self.history.clear();
+            self.selected = 0;
+            self.follow_live = true;
+        } else if !telemetry_available && !self.using_legacy {
+            self.using_legacy = true;
+            self.current_bootstrapped = false;
+            self.offset = 0;
+        }
+
+        if self.using_legacy && !self.legacy_path.exists() {
+            self.status = "No telemetry yet. Start Pet2.exe with --dev-mode.".into();
+            return;
+        }
+
+        let mut historical = 0_usize;
+        if !self.using_legacy && !self.previous_loaded {
+            self.previous_loaded = true;
+            let mut previous_offset = 0;
+            match read_telemetry_file(&self.telemetry_previous_path, &mut previous_offset, true) {
+                Ok(events) => {
+                    for event in events.into_iter().filter(is_telemetry_frame) {
+                        self.ingest(event);
+                        historical += 1;
+                    }
+                }
+                Err(error) => self.status = error,
+            }
+        }
+
+        let active_path = self.active_path().to_path_buf();
+        let incremental_read = self.current_bootstrapped;
+        let events = match read_telemetry_file(&active_path, &mut self.offset, true) {
+            Ok(events) => events,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.current_bootstrapped = true;
+        let mut received = 0_usize;
+        for event in events {
+            let accepted = if self.using_legacy {
+                event.get("kind").and_then(Value::as_str) == Some("debug_state")
+            } else {
+                is_telemetry_frame(&event)
+            };
+            if accepted {
+                self.ingest(event);
+                received += 1;
+            }
+        }
+        if telemetry_read_is_live(incremental_read, received) {
+            self.last_received = Some(Instant::now());
+            self.status = format!(
+                "LIVE · {received} new frame(s) · {}",
+                if self.using_legacy {
+                    "legacy events.jsonl fallback"
+                } else {
+                    "bounded telemetry.jsonl"
+                }
+            );
+        } else if received > 0 || historical > 0 {
+            self.status = format!(
+                "Loaded {} historical frame(s); waiting for an incremental telemetry append",
+                received.saturating_add(historical)
+            );
+        }
+    }
+
+    fn ingest(&mut self, event: Value) {
+        self.observe_control_acknowledgement(&event);
+        let frame_bytes = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len());
+        let velocity = vector2(&event, "/details/screen_velocity_px");
+        let orb_velocity = vector2(&event, "/details/ecology/orb_velocity");
+        let stretch = number(&event, "/details/liquid_stretch_ratio").unwrap_or(1.0) as f32;
+        let sample = LiveGraphSample {
+            speed_px: velocity.length(),
+            pressure: number(&event, "/details/ecology/window_pressure").unwrap_or(0.0) as f32,
+            deformation: (stretch - 1.0).abs(),
+            visual_blend: number(&event, "/details/ecology_visual_effect/color_blend")
+                .unwrap_or(0.0) as f32,
+            orb_speed: orb_velocity.length(),
+        };
+        self.frames.push_back(event);
+        self.frame_sizes.push_back(frame_bytes);
+        self.frame_history_bytes = self.frame_history_bytes.saturating_add(frame_bytes);
+        self.history.push_back(sample);
+        while self.frames.len() > LIVE_FRAME_HISTORY_CAP
+            || self.frame_history_bytes > LIVE_FRAME_HISTORY_BYTES
+        {
+            self.frames.pop_front();
+            self.history.pop_front();
+            if let Some(frame_bytes) = self.frame_sizes.pop_front() {
+                self.frame_history_bytes = self.frame_history_bytes.saturating_sub(frame_bytes);
+            }
+            if !self.follow_live {
+                self.selected = self.selected.saturating_sub(1);
+            }
+        }
+        if self.follow_live {
+            self.selected = self.frames.len().saturating_sub(1);
+        } else {
+            self.selected = self.selected.min(self.frames.len().saturating_sub(1));
+        }
+    }
+
+    fn poll_canonical_evolution(&mut self) {
+        if self.last_state_poll.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_state_poll = Instant::now();
+        let signature = fs::metadata(&self.control_store.paths.state)
+            .ok()
+            .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+        if signature.is_some() && signature == self.state_file_signature {
+            return;
+        }
+        match self.control_store.load_state() {
+            Ok(Some(state)) => {
+                let history =
+                    match serde_json::to_value(&state.life.state.development.mutation_history) {
+                        Ok(Value::Array(history)) => history,
+                        Ok(_) => Vec::new(),
+                        Err(error) => {
+                            self.canonical_evolution.available = false;
+                            self.canonical_evolution.status =
+                                format!("Canonical evolution serialization failed: {error}");
+                            return;
+                        }
+                    };
+                self.canonical_evolution = CanonicalEvolutionCache {
+                    available: true,
+                    lineage_id: format!("{:032x}", state.life.state.genome.lineage_id),
+                    generation: state.life.state.genome.generation,
+                    status: format!(
+                        "Canonical validated state.json · {} bounded mutation record(s) · generation {}",
+                        history.len(),
+                        state.life.state.genome.generation
+                    ),
+                    history,
+                };
+                self.state_file_signature = signature;
+            }
+            Ok(None) => {
+                self.canonical_evolution = CanonicalEvolutionCache {
+                    status:
+                        "Canonical state.json is not available; using telemetry evolution fallback."
+                            .into(),
+                    ..CanonicalEvolutionCache::default()
+                };
+                self.state_file_signature = None;
+            }
+            Err(error) => {
+                self.canonical_evolution.available = false;
+                self.canonical_evolution.status = format!(
+                    "Canonical state.json failed validation ({error}); using telemetry evolution fallback."
+                );
+            }
+        }
+    }
+
+    fn stale_seconds(&self) -> Option<f32> {
+        self.last_received
+            .map(|instant| instant.elapsed().as_secs_f32())
+    }
+
+    fn active_path(&self) -> &Path {
+        if self.using_legacy {
+            &self.legacy_path
+        } else {
+            &self.telemetry_path
+        }
+    }
+
+    fn selected_frame(&self) -> Option<&Value> {
+        self.frames.get(self.selected)
+    }
+
+    fn select_index(&mut self, index: usize) {
+        if self.frames.is_empty() {
+            return;
+        }
+        self.follow_live = false;
+        self.playing = false;
+        self.playback_accumulator = 0.0;
+        self.selected = index.min(self.frames.len() - 1);
+    }
+
+    fn select_previous(&mut self) {
+        self.select_index(self.selected.saturating_sub(1));
+    }
+
+    fn select_next(&mut self) {
+        self.select_index(
+            self.selected
+                .saturating_add(1)
+                .min(self.frames.len().saturating_sub(1)),
+        );
+    }
+
+    fn jump_live(&mut self) {
+        self.follow_live = true;
+        self.playing = false;
+        self.playback_accumulator = 0.0;
+        self.selected = self.frames.len().saturating_sub(1);
+    }
+
+    fn toggle_playback(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        if self.follow_live {
+            self.follow_live = false;
+            self.playing = false;
+        } else {
+            if self.selected >= self.frames.len().saturating_sub(1) {
+                self.selected = 0;
+            }
+            self.playing = !self.playing;
+        }
+        self.last_playback_tick = Instant::now();
+        self.playback_accumulator = 0.0;
+    }
+
+    fn advance_playback(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_playback_tick).as_secs_f32();
+        self.last_playback_tick = now;
+        if !self.playing || self.follow_live || self.frames.is_empty() {
+            return;
+        }
+        self.playback_accumulator += elapsed * EXPECTED_TELEMETRY_HZ * self.playback_rate;
+        let advance = self.playback_accumulator.floor() as usize;
+        if advance == 0 {
+            return;
+        }
+        self.playback_accumulator -= advance as f32;
+        self.selected = self.selected.saturating_add(advance);
+        if self.selected >= self.frames.len().saturating_sub(1) {
+            self.selected = self.frames.len().saturating_sub(1);
+            self.playing = false;
+        }
+    }
+
+    fn can_send_control(&self) -> bool {
+        self.pending_command_id.is_none()
+            && self.follow_live
+            && !self.frames.is_empty()
+            && self.selected == self.frames.len().saturating_sub(1)
+            && self.stale_seconds().is_some_and(|seconds| seconds <= 1.2)
+    }
+
+    fn send_control(&mut self, command: LabControlCommand) {
+        if !self.can_send_control() {
+            self.control_status =
+                "Control blocked: jump to a fresh Live frame before sending a command.".into();
+            return;
+        }
+        let issued_unix_ms = unix_time_ms();
+        self.control_counter = self.control_counter.wrapping_add(1).max(1);
+        let command_id = next_lab_command_id(
+            issued_unix_ms,
+            self.control_counter,
+            self.last_sent_command_id,
+        );
+        let envelope = build_lab_control_envelope(command_id, issued_unix_ms, command);
+        let description = lab_control_description(&envelope.command);
+        match self.control_store.save_lab_control(&envelope) {
+            Ok(()) => {
+                self.last_sent_command_id = envelope.command_id;
+                self.pending_command_id = Some(envelope.command_id);
+                self.pending_command_sent_at = Some(Instant::now());
+                self.control_status = format!(
+                    "Sent {description} · command {} · waiting for runtime acknowledgement · expires in {} ms",
+                    envelope.command_id, envelope.expires_after_ms
+                );
+            }
+            Err(error) => self.control_status = format!("Control write failed: {error}"),
+        }
+    }
+
+    fn observe_control_acknowledgement(&mut self, event: &Value) {
+        let Some(pending) = self.pending_command_id else {
+            return;
+        };
+        let Some(observed) = event
+            .pointer("/details/lab_interventions/last_command_id")
+            .and_then(Value::as_u64)
+        else {
+            return;
+        };
+        if observed < pending {
+            return;
+        }
+        let status = event
+            .pointer("/details/lab_interventions/last_command_status")
+            .and_then(Value::as_str)
+            .unwrap_or("status_unavailable");
+        self.control_status = if observed == pending {
+            format!("Runtime acknowledged command {pending}: {status}")
+        } else {
+            format!("Command {pending} was superseded; runtime watermark is {observed}: {status}")
+        };
+        self.pending_command_id = None;
+        self.pending_command_sent_at = None;
+    }
+
+    fn expire_pending_control(&mut self) {
+        if self.pending_command_id.is_some()
+            && self
+                .pending_command_sent_at
+                .is_some_and(|sent| sent.elapsed() >= LAB_CONTROL_ACK_TIMEOUT)
+        {
+            let pending = self.pending_command_id.take().unwrap_or_default();
+            self.pending_command_sent_at = None;
+            self.control_status = format!(
+                "No telemetry acknowledgement for command {pending} within {} s; slot unlocked without assuming it applied.",
+                LAB_CONTROL_ACK_TIMEOUT.as_secs()
+            );
+        }
+    }
+}
+
+fn telemetry_read_is_live(stream_was_bootstrapped: bool, received: usize) -> bool {
+    stream_was_bootstrapped && received > 0
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn next_lab_command_id(issued_unix_ms: u64, counter: u64, last_sent_id: u64) -> u64 {
+    issued_unix_ms
+        .saturating_mul(1_024)
+        .saturating_add(counter & 1_023)
+        .max(last_sent_id.saturating_add(1))
+        .max(1)
+}
+
+fn build_lab_control_envelope(
+    command_id: u64,
+    issued_unix_ms: u64,
+    command: LabControlCommand,
+) -> LabControlEnvelope {
+    let expires_after_ms = match &command {
+        LabControlCommand::CueAttention {
+            duration_seconds, ..
+        }
+        | LabControlCommand::DrivePulse {
+            duration_seconds, ..
+        } => ((*duration_seconds * 1_000.0).ceil() as u32).saturating_add(2_000),
+        LabControlCommand::Reward { .. }
+        | LabControlCommand::FocusMode { .. }
+        | LabControlCommand::ClearDrivePulses => 5_000,
+    }
+    .clamp(1_000, 30_000);
+    LabControlEnvelope {
+        schema_version: LAB_CONTROL_SCHEMA_VERSION,
+        command_id: command_id.max(1),
+        issued_unix_ms,
+        expires_after_ms,
+        command,
+    }
+}
+
+fn lab_control_description(command: &LabControlCommand) -> String {
+    match command {
+        LabControlCommand::CueAttention { position, .. } => {
+            format!("attention cue @ {:.2}, {:.2}", position[0], position[1])
+        }
+        LabControlCommand::DrivePulse { drive, delta, .. } => {
+            format!("{} drive {delta:+.2}", lab_drive_label(*drive))
+        }
+        LabControlCommand::Reward { value } => format!("learning reward {value:+.2}"),
+        LabControlCommand::FocusMode { enabled } => {
+            format!("focus mode {}", if *enabled { "on" } else { "off" })
+        }
+        LabControlCommand::ClearDrivePulses => "clear temporary drive pulses".into(),
+    }
+}
+
+fn lab_drive_label(drive: LabDrive) -> &'static str {
+    match drive {
+        LabDrive::Safety => "safety",
+        LabDrive::Play => "play",
+        LabDrive::Curiosity => "curiosity",
+        LabDrive::Autonomy => "autonomy",
+        LabDrive::Sleep => "sleep",
+        LabDrive::Social => "social",
+        LabDrive::Comfort => "comfort",
+        LabDrive::Novelty => "novelty",
+    }
+}
+
+fn read_telemetry_file(
+    path: &Path,
+    offset: &mut u64,
+    tail_on_first_read: bool,
+) -> Result<Vec<Value>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("Cannot inspect {}: {error}", path.display())),
+    };
+    if metadata.len() < *offset {
+        *offset = 0;
+    }
+    let mut truncated_start = false;
+    if tail_on_first_read && *offset == 0 && metadata.len() > LIVE_BOOTSTRAP_BYTES {
+        *offset = metadata.len() - LIVE_BOOTSTRAP_BYTES;
+        truncated_start = true;
+    }
+    let mut file =
+        File::open(path).map_err(|error| format!("Cannot open {}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(*offset))
+        .map_err(|error| format!("Cannot seek {}: {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    if truncated_start {
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+        *offset = offset.saturating_add(bytes as u64);
+    }
+    let mut events = Vec::new();
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
+        if bytes == 0 {
+            break;
+        }
+        // A writer can be between bytes of the final JSON line. Leave the
+        // cursor at its beginning so the completed record is read next poll.
+        if !line.ends_with('\n') {
+            break;
+        }
+        *offset = offset.saturating_add(bytes as u64);
+        if let Ok(event) = serde_json::from_str::<Value>(&line) {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
+fn is_telemetry_frame(event: &Value) -> bool {
+    event.get("kind").and_then(Value::as_str) == Some("debug_state")
+        || event.get("kind").is_none() && event.get("details").is_some_and(Value::is_object)
+}
+
+fn show_live_pet_unavailable(context: &Context) {
+    egui::CentralPanel::default().show(context, |ui| {
+        ui.heading("PET-2 Live Brain");
+        ui.label("Pet data directory is unavailable; telemetry cannot be discovered.");
+        ui.label("Press F12 to return to Liquid Body Lab.");
+    });
+}
+
+fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
+    egui::CentralPanel::default()
+        .frame(egui::Frame::default().fill(egui::Color32::from_rgb(12, 15, 22)))
+        .show(context, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("PET-2 Live Brain");
+                let stale = monitor.stale_seconds().is_none_or(|seconds| seconds > 1.2);
+                ui.colored_label(
+                    if stale {
+                        egui::Color32::from_rgb(255, 118, 105)
+                    } else {
+                        egui::Color32::from_rgb(105, 232, 172)
+                    },
+                    if stale { "OFFLINE / STALE" } else { "LIVE" },
+                );
+            });
+            ui.label("perception → arbitration → intent → motor → body / object");
+            ui.small(format!(
+                "{} · F12: Liquid Body Lab ↔ Live Brain",
+                monitor.active_path().display()
+            ));
+            ui.small(&monitor.status);
+            live_timeline(ui, monitor);
+            ui.separator();
+            live_controlled_intervention(ui, monitor);
+            ui.separator();
+
+            let stale_seconds = monitor.stale_seconds();
+            let selected_frame = monitor.selected;
+            let Some(latest) = monitor.frames.get(selected_frame) else {
+                ui.add_space(20.0);
+                ui.heading("Waiting for the organism");
+                ui.label("Close the normal Pet 2 instance, then run Pet2-Dev.cmd.");
+                ui.label(
+                    "No screen captures/pixel buffers, typed text, raw audio, or native window IDs are stored; legacy numeric desktop coordinates remain.",
+                );
+                return;
+            };
+
+            for (severity, message) in live_blockers(latest, stale_seconds) {
+                let color = match severity {
+                    2 => egui::Color32::from_rgb(255, 105, 96),
+                    1 => egui::Color32::from_rgb(255, 190, 92),
+                    _ => egui::Color32::from_rgb(108, 224, 166),
+                };
+                egui::Frame::default()
+                    .fill(color.gamma_multiply(0.13))
+                    .corner_radius(5.0)
+                    .inner_margin(egui::Margin::same(7))
+                    .show(ui, |ui| {
+                        ui.colored_label(color, message);
+                    });
+                ui.add_space(3.0);
+            }
+
+            live_attention_map(ui, latest);
+            live_chart(ui, &monitor.history, Some(monitor.selected));
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.columns(2, |columns| {
+                        live_perception_and_decision(&mut columns[0], latest);
+                        live_motor_and_body(&mut columns[1], latest);
+                    });
+                    ui.separator();
+                    ui.columns(2, |columns| {
+                        live_drives(&mut columns[0], latest);
+                        live_orb_and_performance(&mut columns[1], latest);
+                    });
+                    ui.separator();
+                    live_candidates(ui, latest);
+                    ui.separator();
+                    live_identity_and_evolution(
+                        ui,
+                        latest,
+                        &monitor.canonical_evolution,
+                        &mut monitor.evolution_scrub,
+                    );
+                    ui.separator();
+                    ui.columns(2, |columns| {
+                        live_morph_and_activity(&mut columns[0], latest);
+                        live_vita_and_fusion(&mut columns[1], latest);
+                    });
+                    ui.separator();
+                    live_learning_memory_social(ui, latest);
+                    live_raw_json(ui, latest);
+                });
+        });
+}
+
+fn live_timeline(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
+    let count = monitor.frames.len();
+    ui.horizontal_wrapped(|ui| {
+        let live_label = if monitor.follow_live {
+            "● Following live"
+        } else {
+            "Jump to live"
+        };
+        if ui
+            .add_enabled(count > 0, egui::Button::new(live_label))
+            .clicked()
+        {
+            monitor.jump_live();
+        }
+        if ui
+            .add_enabled(count > 0, egui::Button::new("⏮"))
+            .on_hover_text("Previous telemetry frame (Left arrow)")
+            .clicked()
+        {
+            monitor.select_previous();
+        }
+        let play_label = if monitor.follow_live || !monitor.playing {
+            "▶"
+        } else {
+            "⏸"
+        };
+        if ui
+            .add_enabled(count > 0, egui::Button::new(play_label))
+            .on_hover_text("Play/pause replay (Space)")
+            .clicked()
+        {
+            monitor.toggle_playback();
+        }
+        if ui
+            .add_enabled(count > 0, egui::Button::new("⏭"))
+            .on_hover_text("Next telemetry frame (Right arrow)")
+            .clicked()
+        {
+            monitor.select_next();
+        }
+        ui.label("Replay:");
+        for rate in [0.25_f32, 0.5, 1.0, 2.0, 4.0] {
+            ui.selectable_value(&mut monitor.playback_rate, rate, format!("{rate}×"));
+        }
+    });
+    if count > 0 {
+        let last = count - 1;
+        let mut selected = monitor.selected.min(last);
+        let response = ui.add(
+            Slider::new(&mut selected, 0..=last)
+                .show_value(false)
+                .text("telemetry history"),
+        );
+        if response.changed() {
+            monitor.select_index(selected);
+        }
+        let frame = monitor.selected_frame();
+        let timestamp = frame
+            .and_then(|value| number(value, "/monotonic_seconds"))
+            .map_or_else(|| "t= —".to_owned(), |time| format!("t={time:.3} s"));
+        let sequence = frame
+            .and_then(|value| first_scalar(value, &["/sequence", "/details/sequence"]))
+            .map_or_else(String::new, |value| format!(" · sequence {value}"));
+        ui.small(format!(
+            "Frame {} / {} · {timestamp}{sequence} · bounded in-memory history ({LIVE_FRAME_HISTORY_CAP} max) · read-only",
+            monitor.selected + 1,
+            count
+        ));
+    } else {
+        ui.small("No replay frames loaded yet · monitor is read-only");
+    }
+}
+
+fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
+    CollapsingHeader::new("Controlled intervention")
+        .default_open(false)
+        .show(ui, |ui| {
+            let enabled = monitor.can_send_control();
+            ui.label(
+                "Drive and attention changes are temporary and auto-expire. Reward changes learning; focus mode remains explicit. Timeline replay itself is always read-only.",
+            );
+            if !enabled {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 190, 92),
+                    monitor.pending_command_id.map_or(
+                        "Controls disabled: select ● Following live on a fresh frame.".into(),
+                        |command_id| {
+                            format!(
+                                "Controls locked until fresh telemetry acknowledges command {command_id}."
+                            )
+                        },
+                    ),
+                );
+            }
+
+            let mut pending_command = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Drive pulse");
+                egui::ComboBox::from_id_salt("lab_control_drive")
+                    .selected_text(lab_drive_label(monitor.control_drive))
+                    .show_ui(ui, |ui| {
+                        for drive in [
+                            LabDrive::Safety,
+                            LabDrive::Play,
+                            LabDrive::Curiosity,
+                            LabDrive::Autonomy,
+                            LabDrive::Sleep,
+                            LabDrive::Social,
+                            LabDrive::Comfort,
+                            LabDrive::Novelty,
+                        ] {
+                            ui.selectable_value(
+                                &mut monitor.control_drive,
+                                drive,
+                                lab_drive_label(drive),
+                            );
+                        }
+                    });
+                ui.label("Δ");
+                ui.add(
+                    DragValue::new(&mut monitor.control_drive_delta)
+                        .range(-1.0..=1.0)
+                        .speed(0.05),
+                );
+                ui.add(
+                    Slider::new(&mut monitor.control_drive_duration, 0.1..=30.0)
+                        .suffix(" s"),
+                );
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Apply temporary pulse"))
+                    .clicked()
+                {
+                    pending_command = Some(LabControlCommand::DrivePulse {
+                        drive: monitor.control_drive,
+                        delta: monitor.control_drive_delta,
+                        duration_seconds: monitor.control_drive_duration,
+                    });
+                }
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Clear drive pulses"))
+                    .clicked()
+                {
+                    pending_command = Some(LabControlCommand::ClearDrivePulses);
+                }
+            });
+
+            let attention_position = monitor
+                .selected_frame()
+                .and_then(|frame| optional_vector2(frame, "/details/gaze/cursor_world"))
+                .unwrap_or(Vec2::splat(0.5))
+                .clamp(Vec2::ZERO, Vec2::ONE);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Attention cue");
+                ui.monospace(format!(
+                    "cursor {:.3}, {:.3}",
+                    attention_position.x, attention_position.y
+                ));
+                ui.add(
+                    Slider::new(&mut monitor.control_attention_duration, 0.1..=10.0)
+                        .suffix(" s"),
+                );
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Cue attention"))
+                    .clicked()
+                {
+                    pending_command = Some(LabControlCommand::CueAttention {
+                        position: attention_position.to_array(),
+                        duration_seconds: monitor.control_attention_duration,
+                    });
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Learning reward");
+                ui.add(
+                    DragValue::new(&mut monitor.control_reward)
+                        .range(-1.0..=1.0)
+                        .speed(0.05),
+                );
+                if ui
+                    .add_enabled(
+                        enabled && monitor.control_reward.abs() >= 0.001,
+                        egui::Button::new("Apply reward"),
+                    )
+                    .clicked()
+                {
+                    pending_command = Some(LabControlCommand::Reward {
+                        value: monitor.control_reward,
+                    });
+                }
+                ui.strong("Focus");
+                if ui
+                    .add_enabled(enabled, egui::Button::new("On"))
+                    .clicked()
+                {
+                    pending_command = Some(LabControlCommand::FocusMode { enabled: true });
+                }
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Off"))
+                    .clicked()
+                {
+                    pending_command = Some(LabControlCommand::FocusMode { enabled: false });
+                }
+            });
+
+            if let Some(command) = pending_command {
+                monitor.send_control(command);
+            }
+            ui.small(&monitor.control_status);
+            if let Some(status) = monitor
+                .selected_frame()
+                .and_then(|frame| frame.pointer("/details/lab_interventions"))
+            {
+                ui.strong("Runtime acknowledgement / active interventions");
+                scalar_table(ui, "live_lab_intervention_status", status, 32);
+            }
+        });
+}
+
+fn live_blockers(latest: &Value, stale_seconds: Option<f32>) -> Vec<(u8, String)> {
+    let mut blockers = Vec::new();
+    if stale_seconds.is_none_or(|seconds| seconds > 1.2) {
+        blockers.push((2, "TELEMETRY STALE — the pet is not in --dev-mode".into()));
+    }
+    let body_mode = text(latest, "/details/body_render_mode");
+    let material = text(latest, "/details/material_variant");
+    if body_mode != "ParticlePbf" || material != "CinematicJelly" {
+        blockers.push((
+            2,
+            format!(
+                "WRONG BODY — runtime is {body_mode} / {material}; expected ParticlePbf / CinematicJelly"
+            ),
+        ));
+    }
+    let pressure = number(latest, "/details/ecology/window_pressure").unwrap_or(0.0);
+    let goal = text(latest, "/details/ecology/active_goal");
+    if pressure >= 0.22 {
+        blockers.push((
+            2,
+            format!("SAFETY OVERRIDE — window pressure {pressure:.2}; {goal} owns locomotion"),
+        ));
+    }
+    let visual_age = number(latest, "/details/ecology/visual_grid_age_ms");
+    if visual_age.is_none_or(|age| age > 250.0) {
+        blockers.push((2, "VISUAL OFFLINE — reduced desktop grid is stale".into()));
+    }
+    let saliency = text(latest, "/details/ecology/saliency_kind");
+    let saliency_score = number(latest, "/details/ecology/saliency_score").unwrap_or(0.0);
+    let color_blend = number(latest, "/details/ecology_visual_effect/color_blend").unwrap_or(0.0);
+    let structure = number(latest, "/details/ecology/visual_structure").unwrap_or(0.0);
+    let surprise = number(latest, "/details/ecology/visual_surprise").unwrap_or(0.0);
+    if !saliency.is_empty()
+        && saliency_score >= 0.12
+        && color_blend < 0.03
+        && structure < 0.05
+        && surprise < 0.05
+    {
+        blockers.push((
+            1,
+            format!("VISUAL NOT EXPRESSED — {saliency} {saliency_score:.2} reached attention only"),
+        ));
+    }
+    let speed = vector2(latest, "/details/screen_velocity_px").length();
+    let position = vector2(latest, "/details/world_position");
+    let target = vector2(latest, "/details/target_position");
+    if position.distance(target) > 0.08 && speed < 24.0 {
+        blockers.push((
+            1,
+            format!("MOTOR UNDERDRIVE — target is far but speed is only {speed:.1} px/s"),
+        ));
+    }
+    let stretch = number(latest, "/details/liquid_stretch_ratio").unwrap_or(1.0);
+    let liquid_speed = number(latest, "/details/liquid/maximum_speed").unwrap_or(0.0);
+    if (stretch - 1.0).abs() < 0.035 && liquid_speed < 0.09 {
+        blockers.push((
+            1,
+            format!("LOW DEFORMATION — stretch {stretch:.3}, internal speed {liquid_speed:.3}"),
+        ));
+    }
+    if blockers.is_empty() {
+        blockers.push((0, "No hard blocker in the current causal chain".into()));
+    }
+    blockers
+}
+
+fn live_attention_map(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("Attention map (normalized desktop)");
+    let width = ui.available_width().max(320.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 205.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 5.0, egui::Color32::from_rgb(20, 26, 37));
+
+    let to_screen = |point: Vec2| {
+        egui::pos2(
+            rect.left() + point.x.clamp(0.0, 1.0) * rect.width(),
+            rect.top() + point.y.clamp(0.0, 1.0) * rect.height(),
+        )
+    };
+    let body = optional_vector2(latest, "/details/world_position").unwrap_or(Vec2::splat(0.5));
+    let body_screen = to_screen(body);
+    painter.circle_filled(body_screen, 6.0, egui::Color32::WHITE);
+    painter.text(
+        body_screen + egui::vec2(8.0, -7.0),
+        egui::Align2::LEFT_CENTER,
+        "BODY",
+        egui::FontId::monospace(11.0),
+        egui::Color32::WHITE,
+    );
+
+    let points = [
+        (
+            "/details/gaze/intent_world_target",
+            "GAZE",
+            egui::Color32::from_rgb(89, 220, 255),
+            true,
+        ),
+        (
+            "/details/gaze/attention_position",
+            "VITA",
+            egui::Color32::from_rgb(203, 126, 255),
+            true,
+        ),
+        (
+            "/details/ecology/saliency_target",
+            "VISUAL",
+            egui::Color32::from_rgb(255, 203, 80),
+            true,
+        ),
+        (
+            "/details/ecology/orb_position",
+            "ORB",
+            egui::Color32::from_rgb(94, 235, 151),
+            false,
+        ),
+        (
+            "/details/gaze/cursor_world",
+            "CURSOR",
+            egui::Color32::from_rgb(255, 126, 126),
+            false,
+        ),
+    ];
+    for (path, label, color, attention_line) in points {
+        let Some(point) = optional_vector2(latest, path) else {
+            continue;
+        };
+        let screen = to_screen(point);
+        if attention_line {
+            painter.line_segment([body_screen, screen], egui::Stroke::new(1.2, color));
+        }
+        painter.circle_filled(screen, 4.5, color);
+        painter.text(
+            screen + egui::vec2(7.0, 7.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::monospace(10.0),
+            color,
+        );
+    }
+    ui.small(format!(
+        "owner: {} · cyan=final gaze · purple=VITA · yellow=visual · green=orb · red=cursor",
+        text(latest, "/details/gaze/source")
+    ));
+}
+
+fn live_perception_and_decision(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("Perception → decision");
+    egui::Grid::new("live_perception_grid")
+        .num_columns(2)
+        .show(ui, |ui| {
+            live_metric(ui, "Visual", text(latest, "/details/ecology/saliency_kind"));
+            live_metric(
+                ui,
+                "Visual score",
+                format_number(latest, "/details/ecology/saliency_score", 3),
+            );
+            live_metric(
+                ui,
+                "Visual age",
+                format!(
+                    "{} ms",
+                    format_number(latest, "/details/ecology/visual_grid_age_ms", 1)
+                ),
+            );
+            live_metric(ui, "Brain action", text(latest, "/details/action"));
+            live_metric(
+                ui,
+                "Ecology goal",
+                text(latest, "/details/ecology/active_goal"),
+            );
+            live_metric(ui, "Phase", text(latest, "/details/ecology/phase"));
+            live_metric(ui, "Reason", text(latest, "/details/ecology/reason"));
+            live_metric(ui, "Pose", text(latest, "/details/intent_pose"));
+            live_metric(ui, "Gaze", text(latest, "/details/gaze_mode"));
+            live_metric(ui, "Gaze owner", text(latest, "/details/gaze/source"));
+            live_metric(
+                ui,
+                "World target",
+                format_vector(latest, "/details/gaze/intent_world_target"),
+            );
+            live_metric(
+                ui,
+                "VITA attention",
+                format!(
+                    "{} @ {}",
+                    text(latest, "/details/gaze/attention_kind"),
+                    format_vector(latest, "/details/gaze/attention_position")
+                ),
+            );
+            live_metric(
+                ui,
+                "Attention conf/hold",
+                format!(
+                    "{} / {} s",
+                    format_number(latest, "/details/gaze/attention_confidence", 2),
+                    format_number(latest, "/details/gaze/attention_commitment_remaining", 2)
+                ),
+            );
+            live_metric(
+                ui,
+                "Eye target / shown",
+                format!(
+                    "{} / {}",
+                    format_vector(latest, "/details/gaze/semantic_local_target"),
+                    format_vector(latest, "/details/gaze/presented_local")
+                ),
+            );
+            live_metric(
+                ui,
+                "Fixation lock",
+                format!(
+                    "{} · {} / {} s",
+                    boolean(latest, "/details/gaze/fixation_locked"),
+                    format_number(latest, "/details/gaze/fixation_elapsed", 2),
+                    format_number(latest, "/details/gaze/fixation_duration", 2)
+                ),
+            );
+        });
+}
+
+fn live_motor_and_body(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("Motor → visible body");
+    let speed = vector2(latest, "/details/screen_velocity_px").length();
+    egui::Grid::new("live_motor_grid")
+        .num_columns(2)
+        .show(ui, |ui| {
+            live_metric(ui, "Body", text(latest, "/details/body_render_mode"));
+            live_metric(ui, "Material", text(latest, "/details/material_variant"));
+            live_metric(ui, "Profile", text(latest, "/details/liquid_profile_name"));
+            live_metric(ui, "Locomotion", text(latest, "/details/locomotion"));
+            live_metric(ui, "Speed", format!("{speed:.1} px/s"));
+            live_metric(
+                ui,
+                "Pressure",
+                format_number(latest, "/details/ecology/window_pressure", 3),
+            );
+            live_metric(
+                ui,
+                "Stretch",
+                format_number(latest, "/details/liquid_stretch_ratio", 3),
+            );
+            live_metric(
+                ui,
+                "Internal speed",
+                format_number(latest, "/details/liquid/maximum_speed", 3),
+            );
+            live_metric(
+                ui,
+                "Color blend",
+                format_number(latest, "/details/ecology_visual_effect/color_blend", 3),
+            );
+            live_metric(
+                ui,
+                "Flow / glow",
+                format!(
+                    "{} / {}",
+                    format_number(latest, "/details/ecology_visual_effect/flow_boost", 2),
+                    format_number(latest, "/details/ecology_visual_effect/glow_boost", 2)
+                ),
+            );
+            live_metric(
+                ui,
+                "Mouth / body glow",
+                format!(
+                    "{} / {}",
+                    format_number(latest, "/details/expression/mouth_curve", 2),
+                    format_number(latest, "/details/expression/body_glow", 2)
+                ),
+            );
+        });
+}
+
+fn live_drives(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("Internal drives");
+    let overlay_active = boolean(latest, "/details/lab_interventions/overlay_active");
+    if overlay_active {
+        ui.colored_label(
+            egui::Color32::from_rgb(255, 205, 92),
+            "Temporary overlay: natural → effective reaches Morph and VITA/Ecology; LifeCore homeostasis and resolved action remain natural.",
+        );
+    }
+    for drive in [
+        "safety",
+        "play",
+        "curiosity",
+        "autonomy",
+        "sleep",
+        "social",
+        "comfort",
+        "novelty",
+    ] {
+        let natural_path = if overlay_active {
+            format!("/details/lab_interventions/natural_drives/{drive}")
+        } else {
+            format!("/details/drives/{drive}")
+        };
+        let effective_path = format!("/details/lab_interventions/effective_drives/{drive}");
+        let natural = number(latest, &natural_path)
+            .or_else(|| number(latest, &format!("/details/drives/{drive}")))
+            .unwrap_or(0.0) as f32;
+        let effective = if overlay_active {
+            number(latest, &effective_path).unwrap_or(f64::from(natural)) as f32
+        } else {
+            natural
+        };
+        ui.horizontal(|ui| {
+            ui.label(format!("{drive:>9}"));
+            ui.add(
+                egui::ProgressBar::new(effective.clamp(0.0, 1.0))
+                    .desired_width(145.0)
+                    .show_percentage(),
+            );
+            if overlay_active {
+                ui.monospace(format!(
+                    "{natural:.2} → {effective:.2}  Δ{:+.2}",
+                    effective - natural
+                ));
+            }
+        });
+    }
+}
+
+fn live_orb_and_performance(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("Orb / runtime");
+    egui::Grid::new("live_orb_grid")
+        .num_columns(2)
+        .show(ui, |ui| {
+            live_metric(ui, "Orb", text(latest, "/details/ecology/orb_state"));
+            live_metric(
+                ui,
+                "Grounded / trapped",
+                format!(
+                    "{} / {}",
+                    boolean(latest, "/details/ecology/orb_grounded"),
+                    boolean(latest, "/details/ecology/orb_trapped")
+                ),
+            );
+            live_metric(
+                ui,
+                "Orb speed",
+                format!(
+                    "{:.3}",
+                    vector2(latest, "/details/ecology/orb_velocity").length()
+                ),
+            );
+            live_metric(ui, "FPS", format_number(latest, "/details/fps", 1));
+            live_metric(
+                ui,
+                "Physics p95",
+                format!(
+                    "{} ms",
+                    array_number(latest, "/details/timings_ms/physics", 1, 2)
+                ),
+            );
+            live_metric(
+                ui,
+                "Render p95",
+                format!(
+                    "{} ms",
+                    array_number(latest, "/details/timings_ms/render", 1, 2)
+                ),
+            );
+            live_metric(
+                ui,
+                "Brain tick",
+                format!(
+                    "{} µs",
+                    format_number(latest, "/details/brain_tick_microseconds", 1)
+                ),
+            );
+        });
+}
+
+fn live_candidates(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("Eligible behavior candidates");
+    let mut candidates = latest
+        .pointer("/details/ecology/candidate_scores")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|candidate| candidate.get("eligible").and_then(Value::as_bool) == Some(true))
+        .map(|candidate| {
+            (
+                candidate.get("goal").and_then(Value::as_str).unwrap_or("—"),
+                candidate
+                    .get("score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                candidate
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("—"),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
+    egui::Grid::new("live_candidates_grid")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Goal");
+            ui.strong("Score");
+            ui.strong("Reason");
+            ui.end_row();
+            for (goal, score, reason) in candidates.into_iter().take(8) {
+                ui.label(goal);
+                ui.label(format!("{score:.3}"));
+                ui.label(reason);
+                ui.end_row();
+            }
+        });
+}
+
+fn live_identity_and_evolution(
+    ui: &mut egui::Ui,
+    latest: &Value,
+    canonical: &CanonicalEvolutionCache,
+    scrub: &mut EvolutionScrubState,
+) {
+    CollapsingHeader::new("Identity / development / evolution")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 205, 92),
+                "READ-ONLY HISTORY — scrubbing inspects recorded frames; it never rewrites the live organism.",
+            );
+            egui::Grid::new("live_identity_grid")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    live_metric(
+                        ui,
+                        "Identity seed",
+                        first_scalar(
+                            latest,
+                            &[
+                                "/details/identity/seed",
+                                "/details/identity/identity_seed",
+                                "/details/identity_seed",
+                                "/details/genome/identity_seed",
+                            ],
+                        )
+                        .unwrap_or_else(|| "—".into()),
+                    );
+                    live_metric(
+                        ui,
+                        "Lineage",
+                        first_scalar(
+                            latest,
+                            &[
+                                "/details/identity/lineage_id",
+                                "/details/lineage_id",
+                                "/details/genome/lineage_id",
+                            ],
+                        )
+                        .unwrap_or_else(|| "—".into()),
+                    );
+                    live_metric(
+                        ui,
+                        "Generation",
+                        first_scalar(
+                            latest,
+                            &[
+                                "/details/identity/generation",
+                                "/details/development/generation",
+                                "/details/evolution/generation",
+                                "/details/genome/generation",
+                                "/details/generation",
+                            ],
+                        )
+                        .unwrap_or_else(|| "—".into()),
+                    );
+                    live_metric(
+                        ui,
+                        "Stage",
+                        first_scalar(
+                            latest,
+                            &[
+                                "/details/development/stage",
+                                "/details/evolution/stage",
+                                "/details/identity/stage",
+                            ],
+                        )
+                        .unwrap_or_else(|| "—".into()),
+                    );
+                    live_metric(
+                        ui,
+                        "Metamorphoses",
+                        first_scalar(
+                            latest,
+                            &[
+                                "/details/development/metamorphosis_count",
+                                "/details/evolution/metamorphosis_count",
+                            ],
+                        )
+                        .unwrap_or_else(|| "—".into()),
+                    );
+                    live_metric(
+                        ui,
+                        "Genome hash",
+                        first_scalar(
+                            latest,
+                            &[
+                                "/details/identity/genome_hash",
+                                "/details/evolution/genome_hash",
+                                "/details/genome_hash",
+                            ],
+                        )
+                        .unwrap_or_else(|| "—".into()),
+                    );
+                });
+
+            if let Some(lifetime) = pointer_any(
+                latest,
+                &[
+                    "/details/development/lifetime",
+                    "/details/evolution/lifetime",
+                    "/details/lifetime_statistics",
+                ],
+            ) {
+                ui.add_space(4.0);
+                ui.strong("Lifetime statistics at this frame");
+                scalar_table(ui, "live_lifetime_grid", lifetime, 24);
+            }
+
+            let (history, history_source) = evolution_history_for_frame(latest, canonical);
+            ui.add_space(5.0);
+            ui.strong(format!(
+                "Evolution rewind · read-only checkpoints ({})",
+                history.len()
+            ));
+            ui.small(history_source);
+            if history.is_empty() {
+                ui.small("No mutation checkpoint data is present in this telemetry schema.");
+                return;
+            }
+
+            let checkpoints = evolution_checkpoints(&history);
+            let history_key = mutation_history_key(&history);
+            scrub.synchronize(history_key, checkpoints.len());
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(scrub.selected > 0, egui::Button::new("⏮ Previous"))
+                    .clicked()
+                {
+                    scrub.selected = scrub.selected.saturating_sub(1);
+                }
+                if ui
+                    .add_enabled(
+                        scrub.selected + 1 < checkpoints.len(),
+                        egui::Button::new("Next ⏭"),
+                    )
+                    .clicked()
+                {
+                    scrub.selected = (scrub.selected + 1).min(checkpoints.len() - 1);
+                }
+                if ui.button("Newest").clicked() {
+                    scrub.selected = checkpoints.len() - 1;
+                }
+            });
+            ui.add(
+                Slider::new(&mut scrub.selected, 0..=checkpoints.len() - 1)
+                    .show_value(false)
+                    .text("evolution checkpoint"),
+            );
+            ui.small(format!(
+                "Checkpoint {} / {} · spans all {} bounded mutation record(s) · no reconstruction or live mutation",
+                scrub.selected + 1,
+                checkpoints.len(),
+                history.len()
+            ));
+
+            let legacy_count = history
+                .iter()
+                .filter(|record| {
+                    record
+                        .get("before_genome")
+                        .is_none_or(Value::is_null)
+                        || record.get("after_genome").is_none_or(Value::is_null)
+                })
+                .count();
+            if legacy_count > 0 {
+                ui.small(format!(
+                    "{legacy_count} legacy mutation record(s) lack an exact before/after pair; their metadata remains scrub-able, but their genome transition cannot be reconstructed."
+                ));
+            }
+
+            show_evolution_checkpoint(ui, checkpoints[scrub.selected], history.len());
+        });
+}
+
+impl EvolutionScrubState {
+    fn synchronize(&mut self, history_key: String, checkpoint_count: usize) {
+        if self.history_key != history_key {
+            self.history_key = history_key;
+            self.selected = checkpoint_count.saturating_sub(1);
+        } else {
+            self.selected = self.selected.min(checkpoint_count.saturating_sub(1));
+        }
+    }
+}
+
+fn evolution_history_for_frame<'a>(
+    latest: &'a Value,
+    canonical: &'a CanonicalEvolutionCache,
+) -> (Vec<&'a Value>, String) {
+    let selected_lineage = pointer_any(
+        latest,
+        &["/details/identity/lineage_id", "/details/lineage_id"],
+    )
+    .and_then(Value::as_str);
+    let selected_generation = pointer_any(
+        latest,
+        &[
+            "/details/identity/generation",
+            "/details/generation",
+            "/details/development/generation",
+        ],
+    )
+    .and_then(Value::as_u64);
+    let selected_count = pointer_any(
+        latest,
+        &[
+            "/details/development/mutation_history_count",
+            "/details/evolution/mutation_history_count",
+        ],
+    )
+    .and_then(Value::as_u64)
+    .map(|count| count as usize);
+    let latest_mutation = pointer_any(
+        latest,
+        &[
+            "/details/development/latest_mutation",
+            "/details/evolution/latest_mutation",
+        ],
+    )
+    .filter(|value| !value.is_null());
+    let lineage_matches = canonical.available
+        && selected_lineage
+            .is_some_and(|lineage| lineage.eq_ignore_ascii_case(&canonical.lineage_id));
+
+    if lineage_matches {
+        let mut history = canonical
+            .history
+            .iter()
+            .filter(|record| {
+                selected_generation.is_none_or(|generation| {
+                    record
+                        .get("generation")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|record_generation| record_generation <= generation)
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Some(count) = selected_count
+            && history.len() > count
+        {
+            history.truncate(count);
+        }
+        if let Some(latest_mutation) = latest_mutation {
+            let mutation_generation = latest_mutation.get("generation").and_then(Value::as_u64);
+            let belongs_to_frame = selected_generation
+                .zip(mutation_generation)
+                .is_none_or(|(selected, mutation)| mutation <= selected);
+            if belongs_to_frame {
+                if let Some(index) = history.iter().position(|record| {
+                    record.get("generation").and_then(Value::as_u64) == mutation_generation
+                }) {
+                    history[index] = latest_mutation;
+                } else {
+                    history.push(latest_mutation);
+                }
+                history.sort_by_key(|record| record.get("generation").and_then(Value::as_u64));
+            }
+        }
+        return (
+            history,
+            format!(
+                "{} · lineage matched · state generation {} · view truncated to generation {}{}",
+                canonical.status,
+                canonical.generation,
+                selected_generation.map_or_else(|| "—".into(), |value| value.to_string()),
+                selected_count.map_or_else(String::new, |count| {
+                    format!(" / {count} mutation record(s)")
+                })
+            ),
+        );
+    }
+
+    if let Some(history) = pointer_any(
+        latest,
+        &[
+            "/details/development/mutation_history",
+            "/details/evolution/mutation_history",
+            "/details/evolution/mutations",
+            "/details/mutation_history",
+        ],
+    )
+    .and_then(Value::as_array)
+    {
+        return (
+            history.iter().collect(),
+            format!(
+                "Legacy telemetry full-history fallback · {}{}",
+                if canonical.available {
+                    "canonical lineage mismatch · "
+                } else {
+                    ""
+                },
+                canonical.status
+            ),
+        );
+    }
+
+    if let Some(latest_mutation) = latest_mutation {
+        return (
+            vec![latest_mutation],
+            format!(
+                "Telemetry latest_mutation only · canonical history unavailable for selected lineage · {}",
+                canonical.status
+            ),
+        );
+    }
+    (
+        Vec::new(),
+        if canonical.available {
+            format!(
+                "Evolution unavailable: selected lineage {} does not match canonical lineage {}.",
+                selected_lineage.unwrap_or("—"),
+                canonical.lineage_id
+            )
+        } else {
+            canonical.status.clone()
+        },
+    )
+}
+
+fn mutation_history_key(history: &[&Value]) -> String {
+    let first = history.first();
+    let last = history.last();
+    let exact_pairs = history
+        .iter()
+        .filter(|record| {
+            record
+                .get("before_genome")
+                .is_some_and(|value| !value.is_null())
+                && record
+                    .get("after_genome")
+                    .is_some_and(|value| !value.is_null())
+        })
+        .count();
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        history.len(),
+        first
+            .and_then(|record| record.get("generation"))
+            .map_or_else(|| "—".into(), compact_json),
+        first
+            .and_then(|record| record.get("parent_genome_hash"))
+            .map_or_else(|| "—".into(), compact_json),
+        last.and_then(|record| record.get("generation"))
+            .map_or_else(|| "—".into(), compact_json),
+        last.and_then(|record| record.get("child_genome_hash"))
+            .map_or_else(|| "—".into(), compact_json),
+        exact_pairs,
+    )
+}
+
+fn evolution_checkpoints<'a>(history: &[&'a Value]) -> Vec<EvolutionCheckpoint<'a>> {
+    let earliest_before = history.iter().position(|record| {
+        record
+            .get("before_genome")
+            .is_some_and(|value| !value.is_null())
+    });
+    let mut checkpoints =
+        Vec::with_capacity(history.len() + usize::from(earliest_before.is_some()));
+    for (record_index, &record) in history.iter().enumerate() {
+        if earliest_before == Some(record_index)
+            && let Some(genome) = record.get("before_genome").filter(|value| !value.is_null())
+        {
+            checkpoints.push(EvolutionCheckpoint::Before {
+                record_index,
+                record,
+                genome,
+            });
+        }
+        checkpoints.push(EvolutionCheckpoint::After {
+            record_index,
+            record,
+            genome: record.get("after_genome").filter(|value| !value.is_null()),
+        });
+    }
+    checkpoints
+}
+
+fn show_evolution_checkpoint(
+    ui: &mut egui::Ui,
+    checkpoint: EvolutionCheckpoint<'_>,
+    history_len: usize,
+) {
+    let (record_index, record, genome, is_baseline) = match checkpoint {
+        EvolutionCheckpoint::Before {
+            record_index,
+            record,
+            genome,
+        } => (record_index, record, Some(genome), true),
+        EvolutionCheckpoint::After {
+            record_index,
+            record,
+            genome,
+        } => (record_index, record, genome, false),
+    };
+    let generation = if is_baseline {
+        genome
+            .and_then(|genome| genome.get("generation"))
+            .map_or_else(|| "—".into(), compact_json)
+    } else {
+        record
+            .get("generation")
+            .map_or_else(|| "—".into(), compact_json)
+    };
+    let stage = if is_baseline {
+        genome
+            .and_then(|genome| genome.get("generation"))
+            .and_then(Value::as_u64)
+            .map_or("pre-mutation", development_stage_for_generation)
+            .to_owned()
+    } else {
+        record.get("stage").map_or_else(|| "—".into(), compact_json)
+    };
+    let hash = record
+        .get(if is_baseline {
+            "parent_genome_hash"
+        } else {
+            "child_genome_hash"
+        })
+        .map_or_else(|| "—".into(), compact_json);
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(20, 26, 37))
+        .corner_radius(5.0)
+        .inner_margin(egui::Margin::same(7))
+        .show(ui, |ui| {
+            egui::Grid::new("selected_evolution_checkpoint")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    live_metric(
+                        ui,
+                        "Checkpoint kind",
+                        if is_baseline {
+                            "earliest exact before_genome".into()
+                        } else if genome.is_some() {
+                            "recorded after_genome".into()
+                        } else {
+                            "legacy metadata only".into()
+                        },
+                    );
+                    live_metric(ui, "Generation", generation);
+                    live_metric(ui, "Stage", stage);
+                    live_metric(ui, "Genome hash", hash);
+                    live_metric(
+                        ui,
+                        "Mutation record",
+                        format!("{} / {history_len}", record_index + 1),
+                    );
+                });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Changed traits:");
+                if is_baseline {
+                    ui.monospace("baseline before the selected mutation");
+                } else if let Some(traits) =
+                    record.get("changed_traits").and_then(Value::as_array)
+                {
+                    for trait_name in traits.iter().filter_map(Value::as_str) {
+                        ui.monospace(trait_name);
+                    }
+                } else {
+                    ui.monospace("—");
+                }
+            });
+
+            if let Some(lifetime) = record
+                .get("lifetime_snapshot")
+                .filter(|value| !value.is_null())
+            {
+                ui.strong("Lifetime snapshot that produced this mutation");
+                scalar_table(ui, "selected_evolution_lifetime", lifetime, 24);
+            } else {
+                ui.small("Lifetime snapshot unavailable for this legacy record.");
+            }
+
+            if is_baseline {
+                ui.small(
+                    "This is the earliest exact parent genome in the bounded history; no preceding transition is reconstructed.",
+                );
+                return;
+            }
+            match (
+                record.get("before_genome").filter(|value| !value.is_null()),
+                record.get("after_genome").filter(|value| !value.is_null()),
+            ) {
+                (Some(before), Some(after)) => {
+                    let mut differences = Vec::new();
+                    collect_json_differences("genome", before, after, &mut differences, 64);
+                    ui.strong("Exact trait transition · before → after");
+                    if differences.is_empty() {
+                        ui.small("Exact before/after genomes are equal.");
+                    } else {
+                        egui::Grid::new("selected_evolution_diffs")
+                            .num_columns(3)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.strong("Trait path");
+                                ui.strong("Before");
+                                ui.strong("After");
+                                ui.end_row();
+                                for (path, before, after) in differences {
+                                    ui.monospace(path);
+                                    ui.monospace(before);
+                                    ui.monospace(after);
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                }
+                _ => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 190, 92),
+                        "Legacy checkpoint: exact before→after trait diff is unavailable; nothing is inferred.",
+                    );
+                }
+            };
+        });
+}
+
+fn development_stage_for_generation(generation: u64) -> &'static str {
+    match generation {
+        0 => "juvenile",
+        1 => "young",
+        2 => "mature",
+        _ => "evolved",
+    }
+}
+
+fn live_morph_and_activity(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("Thandorcat Morph");
+    egui::Grid::new("live_morph_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            for (label, paths) in [
+                (
+                    "Command",
+                    &[
+                        "/details/morph/command",
+                        "/details/morph_diagnostics/command",
+                    ][..],
+                ),
+                (
+                    "Attention",
+                    &[
+                        "/details/morph/attention",
+                        "/details/morph_diagnostics/attention",
+                    ][..],
+                ),
+                (
+                    "Object slot",
+                    &[
+                        "/details/morph/attention_object_slot",
+                        "/details/morph_diagnostics/attention_object_slot",
+                    ][..],
+                ),
+                (
+                    "Object target",
+                    &[
+                        "/details/morph/object_target",
+                        "/details/morph_diagnostics/object_target",
+                    ][..],
+                ),
+                (
+                    "Reward trace",
+                    &[
+                        "/details/morph_diagnostics/reward_trace",
+                        "/details/morph/diagnostics/reward_trace",
+                        "/details/morph/reward_trace",
+                    ][..],
+                ),
+                (
+                    "Network age",
+                    &[
+                        "/details/morph_diagnostics/upstream_age_ms",
+                        "/details/morph/diagnostics/upstream_age_ms",
+                        "/details/morph_diagnostics/age",
+                        "/details/morph/diagnostics/age",
+                        "/details/morph/age",
+                    ][..],
+                ),
+                (
+                    "Spike count",
+                    &[
+                        "/details/morph_diagnostics/current_spike_count",
+                        "/details/morph/diagnostics/current_spike_count",
+                        "/details/morph_diagnostics/spike_count",
+                        "/details/morph/diagnostics/spike_count",
+                        "/details/morph/spike_count",
+                    ][..],
+                ),
+            ] {
+                live_metric(
+                    ui,
+                    label,
+                    first_scalar(latest, paths).unwrap_or_else(|| "—".into()),
+                );
+            }
+            let mean = first_scalar(
+                latest,
+                &[
+                    "/details/morph_diagnostics/mean_population_rate",
+                    "/details/morph/diagnostics/mean_population_rate",
+                    "/details/morph_diagnostics/mean_rate",
+                    "/details/morph/diagnostics/mean_rate",
+                    "/details/morph/mean_rate",
+                ],
+            );
+            let maximum = first_scalar(
+                latest,
+                &[
+                    "/details/morph_diagnostics/max_population_rate",
+                    "/details/morph/diagnostics/max_population_rate",
+                    "/details/morph_diagnostics/max_rate",
+                    "/details/morph/diagnostics/max_rate",
+                    "/details/morph/max_rate",
+                ],
+            );
+            live_metric(
+                ui,
+                "Mean / max (split)",
+                format!(
+                    "{} / {}",
+                    mean.unwrap_or_else(|| "—".into()),
+                    maximum.unwrap_or_else(|| "—".into())
+                ),
+            );
+        });
+
+    let population_rates = pointer_any(
+        latest,
+        &[
+            "/details/morph_diagnostics/population_rates",
+            "/details/morph/diagnostics/population_rates",
+            "/details/morph/population_rates",
+            "/details/morph_diagnostics/populations",
+        ],
+    );
+    ui.strong("Named population rates");
+    if let Some(rates) = population_rates {
+        egui::Grid::new("live_morph_populations")
+            .num_columns(4)
+            .striped(true)
+            .show(ui, |ui| {
+                let mut shown = 0;
+                for name in [
+                    "EXP", "PROX", "MOT", "TCH", "VIB", "LOOM", "HAB", "NOV", "KC", "VALP", "VALN",
+                    "MBON_A", "MBON_V", "ATT", "REST",
+                ] {
+                    if let Some(rate) = named_population_rate(rates, name) {
+                        ui.monospace(name);
+                        ui.monospace(format!("{rate:.3}"));
+                        shown += 1;
+                        if shown % 2 == 0 {
+                            ui.end_row();
+                        }
+                    }
+                }
+                if shown % 2 != 0 {
+                    ui.end_row();
+                }
+                if shown == 0 {
+                    ui.label("Population diagnostics are present but use an unknown schema.");
+                    ui.end_row();
+                }
+            });
+    } else {
+        ui.small("— not emitted by this runtime build");
+    }
+
+    if let Some(weights) = pointer_any(
+        latest,
+        &[
+            "/details/morph_diagnostics/weight_ranges",
+            "/details/morph/diagnostics/weight_ranges",
+            "/details/morph/weight_ranges",
+            "/details/morph_diagnostics/weights",
+        ],
+    ) {
+        ui.strong("Weight ranges");
+        scalar_table(ui, "live_morph_weights", weights, 18);
+    }
+    for (label, pointers, grid_id) in [
+        (
+            "Classical weights",
+            &[
+                "/details/morph_diagnostics/classical_weights",
+                "/details/morph/diagnostics/classical_weights",
+            ][..],
+            "live_morph_classical_weights",
+        ),
+        (
+            "Operant weights",
+            &[
+                "/details/morph_diagnostics/operant_weights",
+                "/details/morph/diagnostics/operant_weights",
+            ][..],
+            "live_morph_operant_weights",
+        ),
+    ] {
+        if let Some(weights) = pointer_any(latest, pointers) {
+            ui.strong(label);
+            scalar_table(ui, grid_id, weights, 12);
+        }
+    }
+
+    ui.add_space(6.0);
+    ui.strong("Thandorcat ActivitySystem mapping");
+    if let Some(activity) = latest.pointer("/details/activity") {
+        scalar_table(ui, "live_activity_grid", activity, 96);
+    } else {
+        egui::Grid::new("live_activity_fallback")
+            .num_columns(2)
+            .show(ui, |ui| {
+                live_metric(ui, "Activity", text(latest, "/details/action"));
+                live_metric(ui, "Phase", text(latest, "/details/ecology/phase"));
+                live_metric(ui, "Reason", text(latest, "/details/ecology/reason"));
+            });
+        ui.small("Mapped ActivitySystem payload is absent; showing runtime fallbacks.");
+    }
+}
+
+fn live_vita_and_fusion(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("VITA / Fusion");
+    egui::Grid::new("live_vita_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            for (label, paths) in [
+                (
+                    "Attention",
+                    &[
+                        "/details/vita/attention/kind",
+                        "/details/vita/output/attention/kind",
+                        "/details/vita_attention",
+                    ][..],
+                ),
+                (
+                    "Emotion",
+                    &["/details/vita/emotion", "/details/vita_emotion"][..],
+                ),
+                (
+                    "Influence",
+                    &[
+                        "/details/vita/influence/mode",
+                        "/details/vita/output/influence/strategy",
+                        "/details/vita_influence",
+                    ][..],
+                ),
+                (
+                    "Agency",
+                    &[
+                        "/details/vita/self_model/agency",
+                        "/details/vita/agency",
+                        "/details/vita_agency",
+                    ][..],
+                ),
+                (
+                    "Prediction error",
+                    &[
+                        "/details/vita/self_model/prediction_error",
+                        "/details/vita/prediction_error",
+                        "/details/vita_prediction_error",
+                    ][..],
+                ),
+                (
+                    "Uncertainty",
+                    &[
+                        "/details/vita/self_model/uncertainty",
+                        "/details/vita/uncertainty",
+                        "/details/vita_uncertainty",
+                    ][..],
+                ),
+                (
+                    "Calibration urge",
+                    &[
+                        "/details/vita/self_model/calibration_urge",
+                        "/details/vita/calibration_urge",
+                        "/details/vita_calibration_urge",
+                    ][..],
+                ),
+            ] {
+                live_metric(
+                    ui,
+                    label,
+                    first_scalar(latest, paths).unwrap_or_else(|| "—".into()),
+                );
+            }
+        });
+    if let Some(vita) = latest.pointer("/details/vita") {
+        CollapsingHeader::new("VITA state detail").show(ui, |ui| {
+            scalar_table(ui, "live_vita_detail_grid", vita, 72);
+        });
+    }
+    if let Some(fusion) = latest
+        .pointer("/details/fusion")
+        .filter(|value| !value.is_null())
+    {
+        ui.strong("Fusion authority");
+        scalar_table(ui, "live_fusion_grid", fusion, 24);
+    } else {
+        ui.small("Fusion diagnostics unavailable in this frame.");
+    }
+}
+
+fn live_learning_memory_social(ui: &mut egui::Ui, latest: &Value) {
+    CollapsingHeader::new("Learning / memory / social")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("live_learning_core")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    for (label, paths) in [
+                        (
+                            "Attention budget",
+                            &[
+                                "/details/lifecore/attention/budget",
+                                "/details/learning/attention_budget",
+                                "/details/attention_budget",
+                            ][..],
+                        ),
+                        (
+                            "Predicted action value",
+                            &[
+                                "/details/lifecore/action/predicted_value",
+                                "/details/learning/predicted_action_value",
+                                "/details/predicted_action_value",
+                            ][..],
+                        ),
+                        (
+                            "Recent reward",
+                            &[
+                                "/details/lifecore/recent_reward",
+                                "/details/learning/recent_reward",
+                                "/details/recent_reward",
+                            ][..],
+                        ),
+                        (
+                            "Plastic weight range",
+                            &[
+                                "/details/lifecore/learning/plastic_weight_range",
+                                "/details/learning/plastic_weight_range",
+                                "/details/plastic_weight_range",
+                            ][..],
+                        ),
+                        (
+                            "Attachment",
+                            &[
+                                "/details/lifecore/affect/attachment",
+                                "/details/social/attachment",
+                                "/details/attachment",
+                            ][..],
+                        ),
+                        (
+                            "Selected motif",
+                            &[
+                                "/details/lifecore/learning/vocal_repertoire/selected_motif_id",
+                                "/details/learning/selected_motif",
+                                "/details/selected_motif",
+                            ][..],
+                        ),
+                    ] {
+                        live_metric(
+                            ui,
+                            label,
+                            first_scalar(latest, paths).unwrap_or_else(|| "—".into()),
+                        );
+                    }
+                });
+            for (label, pointers, grid_id) in [
+                (
+                    "Learning detail",
+                    &[
+                        "/details/lifecore/learning",
+                        "/details/learning",
+                        "/details/learning_state",
+                    ][..],
+                    "live_learning_detail",
+                ),
+                (
+                    "Memory",
+                    &[
+                        "/details/lifecore/learning/memory",
+                        "/details/memory",
+                        "/details/memory_state",
+                    ][..],
+                    "live_memory_detail",
+                ),
+                (
+                    "Social",
+                    &["/details/social", "/details/social_state"][..],
+                    "live_social_detail",
+                ),
+            ] {
+                if let Some(group) = pointer_any(latest, pointers) {
+                    CollapsingHeader::new(label).show(ui, |ui| {
+                        scalar_table(ui, grid_id, group, 36);
+                    });
+                }
+            }
+        });
+}
+
+fn live_raw_json(ui: &mut egui::Ui, latest: &Value) {
+    CollapsingHeader::new("Raw telemetry JSON")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.small("Recorded frame exactly as received; read-only.");
+            let pretty = serde_json::to_string_pretty(latest)
+                .unwrap_or_else(|error| format!("<cannot format JSON: {error}>"));
+            egui::ScrollArea::vertical()
+                .id_salt("raw_telemetry_scroll")
+                .max_height(520.0)
+                .show(ui, |ui| {
+                    ui.monospace(pretty);
+                });
+        });
+}
+
+fn live_chart(ui: &mut egui::Ui, history: &VecDeque<LiveGraphSample>, selected: Option<usize>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(egui::Color32::from_rgb(93, 210, 255), "speed");
+        ui.colored_label(egui::Color32::from_rgb(255, 105, 96), "pressure");
+        ui.colored_label(egui::Color32::from_rgb(105, 232, 172), "deformation");
+        ui.colored_label(egui::Color32::from_rgb(198, 130, 255), "visual blend");
+        ui.colored_label(egui::Color32::from_rgb(255, 205, 92), "orb speed");
+    });
+    let width = ui.available_width().max(100.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 125.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(7, 9, 14));
+    if history.len() < 2 {
+        return;
+    }
+    // Frame order is a stable x-axis even across Pet restarts, where the
+    // monotonic timestamp can reset inside the same rotated log.
+    let x_denominator = history.len().saturating_sub(1).max(1) as f32;
+    let speed_scale = history
+        .iter()
+        .map(|sample| sample.speed_px)
+        .fold(0.0_f32, f32::max)
+        .mul_add(1.10, 0.0)
+        .max(360.0);
+    let draw = |values: Vec<f32>, maximum: f32, color: egui::Color32| {
+        let points = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                egui::pos2(
+                    rect.left() + index as f32 / x_denominator * rect.width(),
+                    rect.bottom() - (value / maximum).clamp(0.0, 1.0) * rect.height(),
+                )
+            })
+            .collect::<Vec<_>>();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
+    };
+    draw(
+        history.iter().map(|sample| sample.speed_px).collect(),
+        speed_scale,
+        egui::Color32::from_rgb(93, 210, 255),
+    );
+    draw(
+        history.iter().map(|sample| sample.pressure).collect(),
+        1.0,
+        egui::Color32::from_rgb(255, 105, 96),
+    );
+    draw(
+        history.iter().map(|sample| sample.deformation).collect(),
+        0.35,
+        egui::Color32::from_rgb(105, 232, 172),
+    );
+    draw(
+        history.iter().map(|sample| sample.visual_blend).collect(),
+        0.65,
+        egui::Color32::from_rgb(198, 130, 255),
+    );
+    draw(
+        history.iter().map(|sample| sample.orb_speed).collect(),
+        1.5,
+        egui::Color32::from_rgb(255, 205, 92),
+    );
+    if let Some(selected) = selected {
+        let x = rect.left()
+            + selected.min(history.len().saturating_sub(1)) as f32 / x_denominator * rect.width();
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0, egui::Color32::WHITE.gamma_multiply(0.7)),
+        );
+    }
+}
+
+fn live_metric(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(label);
+    ui.monospace(if value.is_empty() { "—" } else { &value });
+    ui.end_row();
+}
+
+fn text(value: &Value, pointer: &str) -> String {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn pointer_any<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a Value> {
+    pointers.iter().find_map(|pointer| value.pointer(pointer))
+}
+
+fn first_scalar(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointer_any(value, pointers).map(compact_json)
+}
+
+fn compact_json(value: &Value) -> String {
+    match value {
+        Value::Null => "—".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(values) if values.len() <= 8 => values
+            .iter()
+            .map(compact_json)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Array(values) => format!("[{} values]", values.len()),
+        Value::Object(values) => format!("{{{} fields}}", values.len()),
+    }
+}
+
+fn scalar_table(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &Value, limit: usize) {
+    let mut rows = Vec::new();
+    collect_scalar_rows(value, "", &mut rows, limit, 0);
+    egui::Grid::new(id)
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            if rows.is_empty() {
+                ui.label("—");
+                ui.label("No scalar fields");
+                ui.end_row();
+            } else {
+                for (label, value) in rows {
+                    ui.label(label);
+                    ui.monospace(value);
+                    ui.end_row();
+                }
+            }
+        });
+}
+
+fn collect_scalar_rows(
+    value: &Value,
+    prefix: &str,
+    rows: &mut Vec<(String, String)>,
+    limit: usize,
+    depth: usize,
+) {
+    if rows.len() >= limit || depth > 4 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                if rows.len() >= limit {
+                    break;
+                }
+                let label = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_scalar_rows(&object[key], &label, rows, limit, depth + 1);
+            }
+        }
+        Value::Array(values)
+            if values.len() <= 12
+                && values
+                    .iter()
+                    .all(|value| !value.is_array() && !value.is_object()) =>
+        {
+            rows.push((prefix.to_owned(), compact_json(value)));
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().take(8).enumerate() {
+                if rows.len() >= limit {
+                    break;
+                }
+                collect_scalar_rows(value, &format!("{prefix}[{index}]"), rows, limit, depth + 1);
+            }
+            if values.len() > 8 && rows.len() < limit {
+                rows.push((prefix.to_owned(), format!("{} entries", values.len())));
+            }
+        }
+        _ => rows.push((
+            if prefix.is_empty() {
+                "value".into()
+            } else {
+                prefix.to_owned()
+            },
+            compact_json(value),
+        )),
+    }
+}
+
+fn named_population_rate(value: &Value, name: &str) -> Option<f64> {
+    if let Some(object) = value.as_object() {
+        return object
+            .get(name)
+            .or_else(|| object.get(&name.to_ascii_lowercase()))
+            .and_then(|value| {
+                value
+                    .as_f64()
+                    .or_else(|| value.get("rate").and_then(Value::as_f64))
+            });
+    }
+    value.as_array()?.iter().find_map(|population| {
+        let population_name = population
+            .get("name")
+            .or_else(|| population.get("population"))
+            .and_then(Value::as_str)?;
+        population_name.eq_ignore_ascii_case(name).then(|| {
+            population
+                .get("rate")
+                .or_else(|| population.get("mean_rate"))
+                .and_then(Value::as_f64)
+        })?
+    })
+}
+
+fn collect_json_differences(
+    path: &str,
+    before: &Value,
+    after: &Value,
+    differences: &mut Vec<(String, String, String)>,
+    limit: usize,
+) {
+    if before == after || differences.len() >= limit {
+        return;
+    }
+    match (before, after) {
+        (Value::Object(before), Value::Object(after)) => {
+            let keys = before
+                .keys()
+                .chain(after.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for key in keys {
+                if differences.len() >= limit {
+                    break;
+                }
+                let child_path = format!("{path}.{key}");
+                match (before.get(&key), after.get(&key)) {
+                    (Some(before), Some(after)) => {
+                        collect_json_differences(&child_path, before, after, differences, limit)
+                    }
+                    (before, after) => differences.push((
+                        child_path,
+                        before.map_or_else(|| "<missing>".into(), compact_json),
+                        after.map_or_else(|| "<missing>".into(), compact_json),
+                    )),
+                }
+            }
+        }
+        (Value::Array(before), Value::Array(after)) if before.len().max(after.len()) <= 32 => {
+            for index in 0..before.len().max(after.len()) {
+                if differences.len() >= limit {
+                    break;
+                }
+                let child_path = format!("{path}[{index}]");
+                match (before.get(index), after.get(index)) {
+                    (Some(before), Some(after)) => {
+                        collect_json_differences(&child_path, before, after, differences, limit)
+                    }
+                    (before, after) => differences.push((
+                        child_path,
+                        before.map_or_else(|| "<missing>".into(), compact_json),
+                        after.map_or_else(|| "<missing>".into(), compact_json),
+                    )),
+                }
+            }
+        }
+        _ => differences.push((path.to_owned(), compact_json(before), compact_json(after))),
+    }
+}
+
+fn number(value: &Value, pointer: &str) -> Option<f64> {
+    value.pointer(pointer).and_then(Value::as_f64)
+}
+
+fn format_number(value: &Value, pointer: &str, decimals: usize) -> String {
+    number(value, pointer).map_or_else(|| "—".into(), |value| format!("{value:.decimals$}"))
+}
+
+fn array_number(value: &Value, pointer: &str, index: usize, decimals: usize) -> String {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .and_then(|values| values.get(index))
+        .and_then(Value::as_f64)
+        .map_or_else(|| "—".into(), |value| format!("{value:.decimals$}"))
+}
+
+fn boolean(value: &Value, pointer: &str) -> bool {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn vector2(value: &Value, pointer: &str) -> Vec2 {
+    let Some(values) = value.pointer(pointer).and_then(Value::as_array) else {
+        return Vec2::ZERO;
+    };
+    Vec2::new(
+        values.first().and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        values.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32,
+    )
+}
+
+fn optional_vector2(value: &Value, pointer: &str) -> Option<Vec2> {
+    let values = value.pointer(pointer)?.as_array()?;
+    Some(Vec2::new(
+        values.first()?.as_f64()? as f32,
+        values.get(1)?.as_f64()? as f32,
+    ))
+    .filter(|point| point.is_finite())
+}
+
+fn format_vector(value: &Value, pointer: &str) -> String {
+    optional_vector2(value, pointer).map_or_else(
+        || "—".into(),
+        |point| format!("{:.3}, {:.3}", point.x, point.y),
+    )
 }
 
 impl LabUi {
@@ -2806,5 +5532,84 @@ mod tests {
             preview_navigation_anchor(PreviewScenario::Calm, PreviewDrag::default()),
             0.0
         );
+    }
+
+    #[test]
+    fn controlled_intervention_builds_a_bounded_valid_drive_command() {
+        let envelope = build_lab_control_envelope(
+            0,
+            42_000,
+            LabControlCommand::DrivePulse {
+                drive: LabDrive::Curiosity,
+                delta: 0.35,
+                duration_seconds: 2.25,
+            },
+        );
+        assert_eq!(envelope.schema_version, LAB_CONTROL_SCHEMA_VERSION);
+        assert_eq!(envelope.command_id, 1);
+        assert_eq!(envelope.issued_unix_ms, 42_000);
+        assert_eq!(envelope.expires_after_ms, 4_250);
+        assert_eq!(
+            envelope.command,
+            LabControlCommand::DrivePulse {
+                drive: LabDrive::Curiosity,
+                delta: 0.35,
+                duration_seconds: 2.25,
+            }
+        );
+        envelope.validate().unwrap();
+    }
+
+    #[test]
+    fn evolution_rewind_matches_lineage_truncates_future_and_merges_latest() {
+        let canonical = CanonicalEvolutionCache {
+            available: true,
+            lineage_id: "0000000000000000000000000000002a".into(),
+            generation: 3,
+            history: vec![
+                serde_json::json!({"generation": 1, "marker": "state-1"}),
+                serde_json::json!({"generation": 2, "marker": "state-2"}),
+                serde_json::json!({"generation": 3, "marker": "future-3"}),
+            ],
+            status: "canonical".into(),
+        };
+        let frame = serde_json::json!({
+            "details": {
+                "identity": {
+                    "lineage_id": "0000000000000000000000000000002a",
+                    "generation": 2
+                },
+                "development": {
+                    "mutation_history_count": 2,
+                    "latest_mutation": {"generation": 2, "marker": "telemetry-2"}
+                }
+            }
+        });
+
+        let (history, source) = evolution_history_for_frame(&frame, &canonical);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["generation"], 1);
+        assert_eq!(history[1]["marker"], "telemetry-2");
+        assert!(source.contains("lineage matched"));
+
+        let checkpoints = evolution_checkpoints(&history);
+        let mut scrub = EvolutionScrubState::default();
+        scrub.synchronize(mutation_history_key(&history), checkpoints.len());
+        assert_eq!(scrub.selected, checkpoints.len() - 1);
+        scrub.selected = 0;
+        scrub.synchronize(mutation_history_key(&history), checkpoints.len());
+        assert_eq!(scrub.selected, 0, "same history preserves scrub position");
+    }
+
+    #[test]
+    fn bootstrap_frames_stay_stale_and_command_ids_survive_clock_rollback() {
+        assert!(!telemetry_read_is_live(false, 20));
+        assert!(telemetry_read_is_live(true, 1));
+        assert!(!telemetry_read_is_live(true, 0));
+
+        let prior = 9_000_000;
+        let after_clock_rollback = next_lab_command_id(1, 1, prior);
+        assert_eq!(after_clock_rollback, prior + 1);
+        assert_ne!(after_clock_rollback, 0);
     }
 }

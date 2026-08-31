@@ -32,6 +32,10 @@ impl NormalizedRect {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WindowAffordance {
     pub id: WindowId,
+    /// Front-to-back desktop stacking order. Zero is the frontmost window.
+    /// Preserving the host enumeration order prevents covered edges from
+    /// becoming invisible physics walls.
+    pub z_order: u16,
     pub bounds: NormalizedRect,
     pub velocity: Vec2,
     pub nearest_edge_point: Vec2,
@@ -92,7 +96,7 @@ impl WindowAffordanceFrame {
     }
 
     pub fn finish(&mut self) {
-        self.windows[..self.count].sort_by_key(|window| window.id.0);
+        self.windows[..self.count].sort_by_key(|window| (window.z_order, window.id.0));
         self.pressure = self.pressure.clamp(0.0, 1.0);
         self.motion_energy = self.motion_energy.clamp(0.0, 1.0);
         self.escape_direction = self.escape_direction.normalize_or_zero();

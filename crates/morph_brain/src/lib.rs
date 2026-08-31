@@ -8,17 +8,53 @@
 
 use std::{collections::HashMap, sync::OnceLock};
 
+use glam::Vec2;
 use lifecore::{BodyFeedback, FeedbackEvent, LifeState, SensorFrame};
 use serde::{Deserialize, Serialize};
 
-pub const UPSTREAM_COMMIT: &str = "3c6e27e3b55e4aff1d6c2c254713cdbd79099715";
+pub const UPSTREAM_COMMIT: &str = "6aa4e7c871c11ff2fa1619942611d4fb50457e49";
 pub const STATE_SCHEMA: u32 = 1;
 
 const ASSET_JSON: &str = include_str!("../assets/network-seed-1234.json");
 const SYN_TAU: [f32; 5] = [5.0, 8.0, 15.0, 50.0, 300.0];
 const DELAY_SLOTS: usize = 16;
 const V_RESET: f32 = -0.2;
-const COMMAND_NAMES: [&str; 6] = ["C_FLEE", "C_APPR", "C_PERK", "C_MELT", "C_GROOM", "C_PLAY"];
+pub const MORPH_COMMAND_COUNT: usize = 16;
+pub const MORPH_OBJECT_SLOT_COUNT: usize = 6;
+pub const MORPH_ACTION_CONTROL_COUNT: usize = 8;
+const COMMAND_NAMES: [&str; MORPH_COMMAND_COUNT] = [
+    "C_FLEE",
+    "C_APPR",
+    "C_TURN_L",
+    "C_TURN_R",
+    "C_PERK",
+    "C_MELT",
+    "C_GROOM",
+    "C_PLAY",
+    "C_SAMPLE",
+    "C_PUSH",
+    "C_TOUCH",
+    "C_PULL",
+    "C_LISTEN",
+    "C_SNIFF",
+    "C_GRASP",
+    "C_RELEASE",
+];
+const PRIMARY_COMMAND_NAMES: [&str; 6] =
+    ["C_FLEE", "C_APPR", "C_PERK", "C_MELT", "C_GROOM", "C_PLAY"];
+const MANIPULATION_COMMAND_NAMES: [&str; 4] = ["C_SAMPLE", "C_PUSH", "C_TOUCH", "C_PULL"];
+const PERCEPTION_COMMAND_NAMES: [&str; 2] = ["C_LISTEN", "C_SNIFF"];
+const CARRY_COMMAND_NAMES: [&str; 2] = ["C_GRASP", "C_RELEASE"];
+const ACTION_CONTROL_NAMES: [&str; MORPH_ACTION_CONTROL_COUNT] = [
+    "C_SAMPLE",
+    "C_PUSH",
+    "C_TOUCH",
+    "C_PULL",
+    "C_LISTEN",
+    "C_SNIFF",
+    "C_GRASP",
+    "C_RELEASE",
+];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +65,14 @@ pub enum MorphCommand {
     Melt,
     Groom,
     Play,
+    Sample,
+    Push,
+    Touch,
+    Pull,
+    Listen,
+    Sniff,
+    Grasp,
+    Release,
     #[default]
     Idle,
 }
@@ -43,6 +87,14 @@ impl MorphCommand {
             Self::Melt => "C_MELT",
             Self::Groom => "C_GROOM",
             Self::Play => "C_PLAY",
+            Self::Sample => "C_SAMPLE",
+            Self::Push => "C_PUSH",
+            Self::Touch => "C_TOUCH",
+            Self::Pull => "C_PULL",
+            Self::Listen => "C_LISTEN",
+            Self::Sniff => "C_SNIFF",
+            Self::Grasp => "C_GRASP",
+            Self::Release => "C_RELEASE",
             Self::Idle => "idle",
         }
     }
@@ -56,18 +108,59 @@ impl MorphCommand {
             "C_MELT" => Self::Melt,
             "C_GROOM" => Self::Groom,
             "C_PLAY" => Self::Play,
+            "C_SAMPLE" => Self::Sample,
+            "C_PUSH" => Self::Push,
+            "C_TOUCH" => Self::Touch,
+            "C_PULL" => Self::Pull,
+            "C_LISTEN" => Self::Listen,
+            "C_SNIFF" => Self::Sniff,
+            "C_GRASP" => Self::Grasp,
+            "C_RELEASE" => Self::Release,
             _ => Self::Idle,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MorphObjectInput {
+    pub position: Vec2,
+    pub salience: f32,
+    pub motion: f32,
+    pub size: f32,
+    pub roundness: f32,
+    pub color_rgb: [f32; 3],
+    pub state: f32,
+    pub familiarity: f32,
+    pub edge: f32,
+    pub luminance: f32,
+    pub texture: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MorphWorldInput {
+    pub objects: [Option<MorphObjectInput>; MORPH_OBJECT_SLOT_COUNT],
+    pub selected_slot: Option<u8>,
+    /// Biases for SAMPLE, PUSH, TOUCH, PULL, LISTEN, SNIFF, GRASP, RELEASE.
+    /// These are affordance suggestions; the corresponding neural WTA remains
+    /// authoritative over which mutually-exclusive control actually fires.
+    pub action_biases: [f32; MORPH_ACTION_CONTROL_COUNT],
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MorphOutput {
     pub command: MorphCommand,
-    pub command_rates: [f32; 6],
+    pub manipulation: MorphCommand,
+    pub perception: MorphCommand,
+    pub carry: MorphCommand,
+    pub command_rates: [f32; MORPH_COMMAND_COUNT],
     pub winner_rate: f32,
+    pub manipulation_rate: f32,
+    pub perception_rate: f32,
+    pub carry_rate: f32,
     pub confidence: f32,
     pub attention: MorphAttention,
+    pub attention_object_slot: Option<u8>,
+    pub object_target: Option<Vec2>,
     pub valence: f32,
     pub arousal: f32,
     pub conflict: f32,
@@ -83,6 +176,57 @@ pub enum MorphAttention {
     #[default]
     Wander,
     Object,
+}
+
+/// Compact, stable telemetry view of the named Morph populations that are
+/// meaningful at the organism boundary. Rates are exponentially-smoothed Hz.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct MorphPopulationRates {
+    pub exp: f32,
+    pub prox: f32,
+    pub mot: f32,
+    pub tch: f32,
+    pub vib: f32,
+    pub loom: f32,
+    pub hab: f32,
+    pub nov: f32,
+    pub kc: f32,
+    pub valp: f32,
+    pub valn: f32,
+    pub mbon_a: f32,
+    pub mbon_v: f32,
+    pub att: f32,
+    pub rest: f32,
+}
+
+/// Current learned-weight envelope plus its safe range relative to the pinned
+/// upstream weights. The relative values make differently-scaled pathways
+/// directly comparable in the developer monitor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct MorphWeightRange {
+    pub count: usize,
+    pub minimum: f32,
+    pub maximum: f32,
+    pub relative_minimum: f32,
+    pub relative_maximum: f32,
+    pub relative_lower_bound: f32,
+    pub relative_upper_bound: f32,
+}
+
+/// Read-only neural state intended for live telemetry. Calling
+/// [`MorphBrain::diagnostics`] never advances the network or consumes random
+/// numbers, so deterministic replay and the pinned golden trace are unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct MorphDiagnostics {
+    pub upstream_age_ms: f64,
+    pub reward_trace: f32,
+    pub current_spike_count: usize,
+    pub mean_population_rate: f32,
+    pub max_population_rate: f32,
+    pub population_rates: MorphPopulationRates,
+    pub classical_weights: MorphWeightRange,
+    pub operant_weights: MorphWeightRange,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -173,13 +317,25 @@ impl MorphBrain {
         life: &LifeState,
         dt: f32,
     ) -> MorphOutput {
+        self.tick_with_world(sensors, body, life, &MorphWorldInput::default(), dt)
+    }
+
+    #[must_use]
+    pub fn tick_with_world(
+        &mut self,
+        sensors: &SensorFrame,
+        body: &BodyFeedback,
+        life: &LifeState,
+        world: &MorphWorldInput,
+        dt: f32,
+    ) -> MorphOutput {
         let dt_ms = if dt.is_finite() {
             (dt.clamp(0.001, 0.1) * 1_000.0).round().max(1.0) as usize
         } else {
             1
         };
         self.age_ms += dt_ms as f64;
-        self.transduce(sensors, body, life, dt_ms as f32);
+        self.transduce(sensors, body, life, world, dt_ms as f32);
         self.apply_modulators(life);
 
         let mut completed = 0;
@@ -201,10 +357,9 @@ impl MorphBrain {
             self.reward_trace *= (-0.1_f32 / 1.8).exp();
         }
         self.readout.update(&self.net, dt_ms as f32);
-        self.last_output = self.readout.output(&self.net);
+        self.last_output = self.readout.output(&self.net, world);
         self.update_command_habituation(self.last_output.command, dt_ms as f32);
-        self.plasticity
-            .note_command(self.last_output.command, &self.net);
+        self.plasticity.note_controls(&self.last_output, &self.net);
         self.last_output
     }
 
@@ -237,6 +392,65 @@ impl MorphBrain {
         (self.net.n, self.net.edge_post.len(), self.net.pops.len())
     }
 
+    /// Returns the live state required by the developer telemetry panel without
+    /// exposing mutable network internals.
+    #[must_use]
+    pub fn diagnostics(&self) -> MorphDiagnostics {
+        let population_count = self.net.rates.len();
+        let (population_sum, max_population_rate) = self
+            .net
+            .rates
+            .iter()
+            .copied()
+            .map(sanitize_rate)
+            .fold((0.0_f32, 0.0_f32), |(sum, maximum), rate| {
+                (sum + rate, maximum.max(rate))
+            });
+        let mean_population_rate = if population_count == 0 {
+            0.0
+        } else {
+            population_sum / population_count as f32
+        };
+        let rate = |name| sanitize_rate(self.net.rate(name));
+
+        MorphDiagnostics {
+            upstream_age_ms: self.age_ms,
+            reward_trace: sanitize_signed(self.reward_trace),
+            current_spike_count: self.net.spike_count.min(self.net.n),
+            mean_population_rate,
+            max_population_rate,
+            population_rates: MorphPopulationRates {
+                exp: rate("EXP"),
+                prox: rate("PROX"),
+                mot: rate("MOT"),
+                tch: rate("TCH"),
+                vib: rate("VIB"),
+                loom: rate("LOOM"),
+                hab: rate("HAB"),
+                nov: rate("NOV"),
+                kc: rate("KC"),
+                valp: rate("VALP"),
+                valn: rate("VALN"),
+                mbon_a: rate("MBON_A"),
+                mbon_v: rate("MBON_V"),
+                att: rate("ATT"),
+                rest: rate("REST"),
+            },
+            classical_weights: weight_range(
+                &self.plasticity.classical_weights,
+                &self.plasticity.classical_initial,
+                0.20,
+                1.0,
+            ),
+            operant_weights: weight_range(
+                &self.plasticity.operant_weights,
+                &self.plasticity.operant_initial,
+                0.25,
+                2.6,
+            ),
+        }
+    }
+
     fn restore_weights(&mut self, state: &MorphBrainState) {
         self.plasticity.restore(&mut self.net, state);
     }
@@ -246,6 +460,7 @@ impl MorphBrain {
         sensors: &SensorFrame,
         body: &BodyFeedback,
         life: &LifeState,
+        world: &MorphWorldInput,
         dt_ms: f32,
     ) {
         self.net.external.fill(0.0);
@@ -306,10 +521,37 @@ impl MorphBrain {
             "SND",
             sensors.audio_rms.unwrap_or(0.0).clamp(0.0, 1.0),
         );
-        for name in [
-            "ODR", "TMP_HOT", "TMP_COLD", "GLR", "SURF", "OBJ", "OBJM", "REW",
-        ] {
+        for name in ["ODR", "TMP_HOT", "TMP_COLD", "GLR", "SURF", "REW"] {
             drive_feature(&mut self.net, name, 0.0);
+        }
+        let object_salience = world
+            .objects
+            .iter()
+            .flatten()
+            .map(|object| object.salience)
+            .fold(0.0_f32, f32::max);
+        let object_motion = world
+            .objects
+            .iter()
+            .flatten()
+            .map(|object| object.motion)
+            .fold(0.0_f32, f32::max);
+        drive_feature(&mut self.net, "OBJ", object_salience);
+        drive_feature(&mut self.net, "OBJM", object_motion);
+        for (name, feature) in [
+            ("OBJ_SIZE", MorphObjectFeature::Size),
+            ("OBJ_ROUND", MorphObjectFeature::Roundness),
+            ("OBJ_R", MorphObjectFeature::Red),
+            ("OBJ_G", MorphObjectFeature::Green),
+            ("OBJ_B", MorphObjectFeature::Blue),
+            ("OBJ_STATE", MorphObjectFeature::State),
+            ("OBJ_FAM", MorphObjectFeature::Familiarity),
+            ("OBJ_EDGE", MorphObjectFeature::Edge),
+            ("OBJ_MOTION", MorphObjectFeature::Motion),
+            ("OBJ_LIGHT", MorphObjectFeature::Luminance),
+            ("OBJ_TEXTURE", MorphObjectFeature::Texture),
+        ] {
+            drive_object_slots(&mut self.net, name, world, feature);
         }
         if let Some(signature) = self.net.pop("SIG") {
             for index in 0..signature.size {
@@ -361,6 +603,8 @@ impl MorphBrain {
             for target in 0..target_count {
                 let salience = if target == 0 {
                     cursor_salience
+                } else if (1..=MORPH_OBJECT_SLOT_COUNT).contains(&target) {
+                    world.objects[target - 1].map_or(0.0, |object| object.salience)
                 } else if target + 3 == target_count {
                     (0.18 + life.drives.curiosity * 0.46).clamp(0.0, 1.0)
                 } else if target + 2 == target_count {
@@ -443,6 +687,26 @@ impl MorphBrain {
                 - calm_veto
                 - self.command_habituation[0] * 0.55,
         );
+        let action_sleep_veto = [1.00, 1.05, 0.85, 1.05, 0.70, 0.75, 1.00, 0.80];
+        for index in 0..MORPH_ACTION_CONTROL_COUNT {
+            self.net.drive(
+                ACTION_CONTROL_NAMES[index],
+                command_bias - life.drives.sleep * action_sleep_veto[index]
+                    + world.action_biases[index].clamp(0.0, 2.4),
+            );
+        }
+        if let Some(object) = world
+            .selected_slot
+            .and_then(|slot| world.objects.get(usize::from(slot)))
+            .copied()
+            .flatten()
+        {
+            let distance = object.position.distance(body.world_position);
+            let approach = ((distance - 0.055) / 0.30).clamp(0.0, 1.0) * object.salience;
+            self.net.drive("C_APPR", approach * 0.42);
+            self.net
+                .drive("C_PERK", object.salience * 0.22 + object.motion * 0.18);
+        }
     }
 
     fn apply_modulators(&mut self, life: &LifeState) {
@@ -530,7 +794,16 @@ impl MorphBrain {
             MorphCommand::Play => Some(2),
             MorphCommand::Groom => Some(3),
             MorphCommand::Melt => Some(4),
-            MorphCommand::Flee | MorphCommand::Idle => None,
+            MorphCommand::Flee
+            | MorphCommand::Sample
+            | MorphCommand::Push
+            | MorphCommand::Touch
+            | MorphCommand::Pull
+            | MorphCommand::Listen
+            | MorphCommand::Sniff
+            | MorphCommand::Grasp
+            | MorphCommand::Release
+            | MorphCommand::Idle => None,
         };
         if let Some(index) = index {
             let calibration = [1.00, 1.08, 0.90, 0.65, 1.05];
@@ -547,7 +820,15 @@ impl MorphBrain {
             MorphCommand::Melt => Some(3),
             MorphCommand::Groom => Some(4),
             MorphCommand::Play => Some(5),
-            MorphCommand::Idle => None,
+            MorphCommand::Sample
+            | MorphCommand::Push
+            | MorphCommand::Touch
+            | MorphCommand::Pull
+            | MorphCommand::Listen
+            | MorphCommand::Sniff
+            | MorphCommand::Grasp
+            | MorphCommand::Release
+            | MorphCommand::Idle => None,
         };
         for index in 0..self.command_habituation.len() {
             let target = if active == Some(index) { 1.0 } else { 0.0 };
@@ -925,7 +1206,13 @@ struct Readout {
     attention_spikes: Vec<f32>,
     attention_winner: usize,
     winner: MorphCommand,
+    manipulation: MorphCommand,
+    perception: MorphCommand,
+    carry: MorphCommand,
     winner_rate: f32,
+    manipulation_rate: f32,
+    perception_rate: f32,
+    carry_rate: f32,
     valence: f32,
     arousal: f32,
     conflict: f32,
@@ -946,7 +1233,13 @@ impl Readout {
             attention_spikes: vec![0.0; attention_pop.size / 2],
             attention_winner: (attention_pop.size / 2).saturating_sub(3),
             winner: MorphCommand::Idle,
+            manipulation: MorphCommand::Idle,
+            perception: MorphCommand::Idle,
+            carry: MorphCommand::Idle,
             winner_rate: 0.0,
+            manipulation_rate: 0.0,
+            perception_rate: 0.0,
+            carry_rate: 0.0,
             valence: 0.0,
             arousal: 0.0,
             conflict: 0.0,
@@ -965,10 +1258,10 @@ impl Readout {
         let positive = net.rate("VALP");
         let negative = net.rate("VALN");
         let valence_raw = (positive - negative) / (positive + negative + 2.0);
-        let rates = COMMAND_NAMES.map(|name| net.rate(name).max(0.0));
+        let rates = PRIMARY_COMMAND_NAMES.map(|name| net.rate(name).max(0.0));
         let sum = rates.iter().sum::<f32>();
         let arousal_raw = (0.60 * ((net.weight_gain - 1.0) / 1.2).clamp(0.0, 1.0)
-            + 0.40 * (sum / COMMAND_NAMES.len() as f32 / 45.0).clamp(0.0, 1.0))
+            + 0.40 * (sum / PRIMARY_COMMAND_NAMES.len() as f32 / 45.0).clamp(0.0, 1.0))
         .clamp(0.0, 1.0);
         let conflict_raw = if sum > 0.001 {
             let entropy = rates.iter().fold(0.0, |entropy, rate| {
@@ -979,7 +1272,7 @@ impl Readout {
                     entropy
                 }
             });
-            (entropy / (COMMAND_NAMES.len() as f32).ln()).clamp(0.0, 1.0)
+            (entropy / (PRIMARY_COMMAND_NAMES.len() as f32).ln()).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -993,7 +1286,7 @@ impl Readout {
             .enumerate()
             .max_by(|(_, left), (_, right)| left.total_cmp(right))
             .unwrap_or((0, 0.0));
-        let candidate = MorphCommand::from_wire(COMMAND_NAMES[best_index]);
+        let candidate = MorphCommand::from_wire(PRIMARY_COMMAND_NAMES[best_index]);
         let threshold = if candidate == self.winner { 2.5 } else { 7.0 };
         self.winner = if best_rate > threshold {
             candidate
@@ -1001,6 +1294,11 @@ impl Readout {
             MorphCommand::Idle
         };
         self.winner_rate = best_rate;
+        (self.manipulation, self.manipulation_rate) =
+            group_winner(net, &MANIPULATION_COMMAND_NAMES, self.manipulation);
+        (self.perception, self.perception_rate) =
+            group_winner(net, &PERCEPTION_COMMAND_NAMES, self.perception);
+        (self.carry, self.carry_rate) = group_winner(net, &CARRY_COMMAND_NAMES, self.carry);
 
         if let Some((index, score)) = self
             .attention_spikes
@@ -1017,9 +1315,15 @@ impl Readout {
         }
     }
 
-    fn output(&self, net: &Network) -> MorphOutput {
+    fn output(&self, net: &Network, world: &MorphWorldInput) -> MorphOutput {
         let command_rates = COMMAND_NAMES.map(|name| net.rate(name));
         let attention_count = self.attention_spikes.len();
+        let attention_object_slot =
+            if (1..=MORPH_OBJECT_SLOT_COUNT).contains(&self.attention_winner) {
+                Some((self.attention_winner - 1) as u8)
+            } else {
+                None
+            };
         let attention = if self.attention_winner == 0 {
             MorphAttention::Cursor
         } else if self.attention_winner + 3 == attention_count {
@@ -1031,17 +1335,71 @@ impl Readout {
         } else {
             MorphAttention::Object
         };
+        let (manipulation, manipulation_rate) =
+            gated_object_control(self.manipulation, self.manipulation_rate, world);
+        let (perception, perception_rate) =
+            gated_object_control(self.perception, self.perception_rate, world);
+        let (carry, carry_rate) = gated_object_control(self.carry, self.carry_rate, world);
         MorphOutput {
             command: self.winner,
+            manipulation,
+            perception,
+            carry,
             command_rates,
             winner_rate: self.winner_rate,
+            manipulation_rate,
+            perception_rate,
+            carry_rate,
             confidence: (self.winner_rate / 45.0).clamp(0.0, 1.0) * (1.0 - self.conflict),
             attention,
+            attention_object_slot,
+            object_target: attention_object_slot
+                .or(world.selected_slot)
+                .and_then(|slot| world.objects.get(usize::from(slot)))
+                .copied()
+                .flatten()
+                .map(|object| object.position),
             valence: self.valence.clamp(-1.0, 1.0),
             arousal: self.arousal.clamp(0.0, 1.0),
             conflict: self.conflict.clamp(0.0, 1.0),
             turn: ((net.rate("C_TURN_R") - net.rate("C_TURN_L")) / 45.0).clamp(-1.0, 1.0),
         }
+    }
+}
+
+fn gated_object_control(
+    command: MorphCommand,
+    rate: f32,
+    world: &MorphWorldInput,
+) -> (MorphCommand, f32) {
+    let enabled = ACTION_CONTROL_NAMES
+        .iter()
+        .position(|name| *name == command.as_wire())
+        .is_some_and(|index| world.action_biases[index] > 0.05);
+    if enabled {
+        (command, rate)
+    } else {
+        (MorphCommand::Idle, 0.0)
+    }
+}
+
+fn group_winner<const N: usize>(
+    net: &Network,
+    names: &[&str; N],
+    previous: MorphCommand,
+) -> (MorphCommand, f32) {
+    let (index, rate) = names
+        .iter()
+        .map(|name| net.rate(name).max(0.0))
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .unwrap_or((0, 0.0));
+    let candidate = MorphCommand::from_wire(names[index]);
+    let threshold = if candidate == previous { 2.5 } else { 7.0 };
+    if rate > threshold {
+        (candidate, rate)
+    } else {
+        (MorphCommand::Idle, rate)
     }
 }
 
@@ -1110,9 +1468,27 @@ impl Plasticity {
         }
     }
 
-    fn note_command(&mut self, command: MorphCommand, _net: &Network) {
-        if command != MorphCommand::Idle {
+    fn note_controls(&mut self, output: &MorphOutput, _net: &Network) {
+        let strongest = [
+            (output.command, output.winner_rate),
+            (output.manipulation, output.manipulation_rate),
+            (output.perception, output.perception_rate),
+            (output.carry, output.carry_rate),
+        ]
+        .into_iter()
+        .filter(|(command, _)| {
+            self.operant_names
+                .iter()
+                .any(|name| name == command.as_wire())
+        })
+        .max_by(|(_, left), (_, right)| left.total_cmp(right));
+        if let Some((command, rate)) = strongest
+            && command != MorphCommand::Idle
+            && rate > 7.0
+        {
             self.last_command = command;
+        } else if output.command != MorphCommand::Idle {
+            self.last_command = output.command;
         }
     }
 
@@ -1200,6 +1576,109 @@ impl Plasticity {
 
 fn drive_feature(net: &mut Network, name: &str, value: f32) {
     net.drive(name, 0.85 + 1.05 * value.clamp(0.0, 1.0));
+}
+
+fn sanitize_rate(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn sanitize_signed(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn weight_range(
+    weights: &[f32],
+    initial: &[f32],
+    relative_lower_bound: f32,
+    relative_upper_bound: f32,
+) -> MorphWeightRange {
+    let count = weights.len().min(initial.len());
+    if count == 0 {
+        return MorphWeightRange {
+            relative_lower_bound,
+            relative_upper_bound,
+            ..MorphWeightRange::default()
+        };
+    }
+
+    let mut minimum = f32::INFINITY;
+    let mut maximum = f32::NEG_INFINITY;
+    let mut relative_minimum = f32::INFINITY;
+    let mut relative_maximum = f32::NEG_INFINITY;
+    for (&weight, &baseline) in weights.iter().zip(initial).take(count) {
+        let weight = sanitize_signed(weight);
+        let relative = if baseline.is_finite() && baseline.abs() > f32::EPSILON {
+            weight / baseline
+        } else {
+            1.0
+        };
+        minimum = minimum.min(weight);
+        maximum = maximum.max(weight);
+        relative_minimum = relative_minimum.min(relative);
+        relative_maximum = relative_maximum.max(relative);
+    }
+
+    MorphWeightRange {
+        count,
+        minimum,
+        maximum,
+        relative_minimum,
+        relative_maximum,
+        relative_lower_bound,
+        relative_upper_bound,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MorphObjectFeature {
+    Size,
+    Roundness,
+    Red,
+    Green,
+    Blue,
+    State,
+    Familiarity,
+    Edge,
+    Motion,
+    Luminance,
+    Texture,
+}
+
+fn drive_object_slots(
+    net: &mut Network,
+    name: &str,
+    world: &MorphWorldInput,
+    feature: MorphObjectFeature,
+) {
+    let Some(population) = net.pop(name) else {
+        return;
+    };
+    for index in 0..population.size {
+        let value = world
+            .objects
+            .get(index)
+            .copied()
+            .flatten()
+            .map(|object| match feature {
+                MorphObjectFeature::Size => object.size,
+                MorphObjectFeature::Roundness => object.roundness,
+                MorphObjectFeature::Red => object.color_rgb[0],
+                MorphObjectFeature::Green => object.color_rgb[1],
+                MorphObjectFeature::Blue => object.color_rgb[2],
+                MorphObjectFeature::State => object.state,
+                MorphObjectFeature::Familiarity => object.familiarity,
+                MorphObjectFeature::Edge => object.edge,
+                MorphObjectFeature::Motion => object.motion,
+                MorphObjectFeature::Luminance => object.luminance,
+                MorphObjectFeature::Texture => object.texture,
+            });
+        net.external[population.start + index] =
+            value.map_or(0.0, |value| 0.85 + 1.05 * value.clamp(0.0, 1.0));
+    }
 }
 
 fn normalize_signature(signature: &mut [f32]) {
@@ -1344,6 +1823,144 @@ mod tests {
         assert_eq!(
             restored.snapshot().operant_weights,
             snapshot.operant_weights
+        );
+    }
+
+    #[test]
+    fn object_slots_drive_the_parallel_manipulation_control_without_stealing_locomotion() {
+        let life = LifeCore::new(Genome::from_seed(31), 37);
+        let mut brain = MorphBrain::new(41, None).unwrap();
+        let sensors = SensorFrame::default();
+        let body = BodyFeedback {
+            world_position: Vec2::splat(0.5),
+            ..BodyFeedback::default()
+        };
+        let mut world = MorphWorldInput {
+            selected_slot: Some(0),
+            ..MorphWorldInput::default()
+        };
+        world.objects[0] = Some(MorphObjectInput {
+            position: Vec2::new(0.56, 0.5),
+            salience: 1.0,
+            motion: 0.6,
+            size: 0.5,
+            roundness: 1.0,
+            color_rgb: [0.9, 0.3, 0.1],
+            state: 1.0,
+            familiarity: 0.4,
+            edge: 0.0,
+            luminance: 0.8,
+            texture: 0.5,
+        });
+        world.action_biases[1] = 2.4;
+
+        let mut saw_push = false;
+        let mut saw_primary = false;
+        for _ in 0..120 {
+            let output = brain.tick_with_world(&sensors, &body, &life.state, &world, 0.05);
+            saw_push |= output.manipulation == MorphCommand::Push;
+            saw_primary |= output.command != MorphCommand::Idle;
+            assert_eq!(output.command_rates.len(), MORPH_COMMAND_COUNT);
+            assert_eq!(output.object_target, Some(Vec2::new(0.56, 0.5)));
+        }
+        assert!(
+            saw_push,
+            "the dedicated manipulation WTA never emitted PUSH"
+        );
+        assert!(
+            saw_primary,
+            "parallel object control incorrectly silenced the locomotor WTA"
+        );
+    }
+
+    #[test]
+    fn diagnostics_are_typed_finite_and_observational_only() {
+        let life = LifeCore::new(Genome::from_seed(0xD1A6), 0x1057);
+        let mut observed = MorphBrain::new(0xA11D, None).unwrap();
+        let mut control = MorphBrain::new(0xA11D, None).unwrap();
+        let mut sensors = SensorFrame::default();
+        let body = BodyFeedback::default();
+
+        for tick in 0..48 {
+            sensors.cursor_position = Vec2::new(0.18 + tick as f32 * 0.009, 0.62);
+            sensors.cursor_distance_to_pet = (0.42 - tick as f32 * 0.006).max(0.04);
+            sensors.cursor_approach_speed = 0.11;
+            let observed_output = observed.tick(&sensors, &body, &life.state, 0.025);
+            let diagnostics = observed.diagnostics();
+            let control_output = control.tick(&sensors, &body, &life.state, 0.025);
+
+            assert_eq!(observed_output, control_output);
+            assert_eq!(diagnostics.upstream_age_ms, (tick + 1) as f64 * 25.0);
+            assert!(diagnostics.reward_trace.is_finite());
+            assert!(diagnostics.current_spike_count <= observed.network_shape().0);
+            assert!(diagnostics.mean_population_rate.is_finite());
+            assert!(diagnostics.max_population_rate.is_finite());
+            assert!(diagnostics.mean_population_rate >= 0.0);
+            assert!(diagnostics.max_population_rate >= diagnostics.mean_population_rate);
+            assert_eq!(diagnostics.population_rates.exp, observed.net.rate("EXP"));
+            assert_eq!(diagnostics.population_rates.prox, observed.net.rate("PROX"));
+            assert_eq!(diagnostics.population_rates.mot, observed.net.rate("MOT"));
+            assert_eq!(diagnostics.population_rates.tch, observed.net.rate("TCH"));
+            assert_eq!(diagnostics.population_rates.vib, observed.net.rate("VIB"));
+            assert_eq!(diagnostics.population_rates.loom, observed.net.rate("LOOM"));
+            assert_eq!(diagnostics.population_rates.hab, observed.net.rate("HAB"));
+            assert_eq!(diagnostics.population_rates.nov, observed.net.rate("NOV"));
+            assert_eq!(diagnostics.population_rates.kc, observed.net.rate("KC"));
+            assert_eq!(diagnostics.population_rates.valp, observed.net.rate("VALP"));
+            assert_eq!(diagnostics.population_rates.valn, observed.net.rate("VALN"));
+            assert_eq!(
+                diagnostics.population_rates.mbon_a,
+                observed.net.rate("MBON_A")
+            );
+            assert_eq!(
+                diagnostics.population_rates.mbon_v,
+                observed.net.rate("MBON_V")
+            );
+            assert_eq!(diagnostics.population_rates.att, observed.net.rate("ATT"));
+            assert_eq!(diagnostics.population_rates.rest, observed.net.rate("REST"));
+        }
+
+        assert_eq!(observed.snapshot(), control.snapshot());
+    }
+
+    #[test]
+    fn diagnostics_report_the_enforced_classical_and_operant_weight_bounds() {
+        let brain = MorphBrain::new(0x00B0_A1D5, None).unwrap();
+        let mut state = brain.snapshot();
+        for (index, weight) in state.plastic_weights.iter_mut().enumerate() {
+            *weight = if index % 2 == 0 { -100.0 } else { 100.0 };
+        }
+        for (index, weight) in state.operant_weights.iter_mut().enumerate() {
+            *weight = if index % 2 == 0 { -100.0 } else { 100.0 };
+        }
+        let restored = MorphBrain::new(0x00B0_A1D5, Some(state)).unwrap();
+        let diagnostics = restored.diagnostics();
+
+        assert_eq!(
+            diagnostics.classical_weights.count,
+            restored.plasticity.classical_weights.len()
+        );
+        assert_eq!(
+            diagnostics.operant_weights.count,
+            restored.plasticity.operant_weights.len()
+        );
+        assert!(diagnostics.classical_weights.minimum > 0.0);
+        assert!(diagnostics.operant_weights.minimum > 0.0);
+        assert!(
+            diagnostics.classical_weights.relative_minimum
+                >= diagnostics.classical_weights.relative_lower_bound - 1.0e-6
+        );
+        assert!(
+            diagnostics.classical_weights.relative_maximum
+                <= diagnostics.classical_weights.relative_upper_bound + 1.0e-6
+        );
+        assert!(
+            diagnostics.operant_weights.relative_minimum
+                >= diagnostics.operant_weights.relative_lower_bound - 1.0e-6
+        );
+        assert!(
+            diagnostics.operant_weights.relative_maximum
+                <= diagnostics.operant_weights.relative_upper_bound + 1.0e-6
         );
     }
 

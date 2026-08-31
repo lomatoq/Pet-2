@@ -154,7 +154,9 @@ impl LifeState {
 
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.drives.is_finite()
+        self.genome.is_valid()
+            && self.development.is_valid_for_genome(&self.genome)
+            && self.drives.is_finite()
             && self.affect.is_finite()
             && self.action_elapsed_seconds.is_finite()
             && self.action_cooldowns.iter().all(|value| value.is_finite())

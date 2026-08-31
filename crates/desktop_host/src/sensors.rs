@@ -31,6 +31,9 @@ pub struct DesktopSnapshot {
     pub idle_seconds: Option<f32>,
     pub active_application: Option<ApplicationInfo>,
     pub active_window: Option<RectI>,
+    /// Visible top-level windows in front-to-back stacking order. Platform
+    /// adapters must preserve this order through privacy reduction so covered
+    /// edges cannot become active affordances or collision surfaces.
     pub visible_surfaces: Vec<DesktopSurface>,
 }
 
