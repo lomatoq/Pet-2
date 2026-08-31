@@ -1,6 +1,6 @@
 # Project Memory — Pet 2
 
-Updated: 2026-08-26
+Updated: 2026-08-31
 
 Current gate: living-desktop habitat candidate ready for independent regression review
 
@@ -8,7 +8,7 @@ Current branch: `codex/pet2-living-desktop-habitat`
 
 Base: `3504403462d37ce6e0199c12f83ee32ab6ba0a62`
 
-Packaged implementation checkpoint: `59ae70b`
+Packaged implementation checkpoint: `d6e6435`
 
 ## Product truth
 
@@ -64,7 +64,7 @@ Packaged implementation checkpoint: `59ae70b`
 
 - Formatting passes.
 - Strict workspace/all-target/all-feature Clippy passes with warnings denied.
-- Full workspace suite: 305 passed, 3 intentionally ignored long production replays, 0 failed.
+- Full workspace/all-target suite: 311 passed, 3 intentionally ignored long production replays, 0 failed.
 - All three ignored optimized liquid production replays pass independently: 10×120-second idle, 60-second adversarial pointer, and presentation-independent fixed-120 replay at 30/60/144 Hz.
 - All 18 Habitat Lab scenarios are deterministic, finite, bounded, and pass.
 - Final packaged 10-second headless smoke passes with one canonical object and ecology hash `8123284623903296375`.
@@ -72,10 +72,13 @@ Packaged implementation checkpoint: `59ae70b`
 - A fresh release 24-hour/345,600-tick simulation exits 0, writes all three state files, and validates ecology hash `12888705924936098925`.
 - The 24-hour run found and then verified the fix for stale den-slot ownership. Object exit/store commands now share one slot-clearing invariant.
 - The user-observed top-edge orb pin was reproduced from saved position `[0.36860466, 0.0]` and fixed with radius-aware feasible contact separation. Unit and 240-tick runtime replays pass.
+- A later live replay exposed the separate multi-monitor failure at `[0.52105993, 0.9730903]`: a stationary maximized window occupying one monitor expelled an already embedded orb toward the virtual-desktop bottom. Static frame-start embedding is now pass-through, fresh swept crossings and moving windows remain physical, and a zero-velocity radius-boundary state receives one deterministic inward recovery impulse.
+- A simple pointer press no longer snaps or cancels motion. Drag requires 4 physical pixels, preserves the contact offset, follows with bounded spring response, clamps the center by radius, and releases bounded velocity.
+- The semantic face now follows the permanent carrier center plus its authored upright offset; rotating face-weighted material affects support/confidence but cannot orbit the face.
 - Flagship EpisodeDirector p95 is 0.1 µs; object physics p95 is 0.4 µs.
 - Conservative peak working set during the 24-hour release run is 18.43 MiB against the <150 MB target.
-- Final three-run Morph p95 median is 368.2 µs versus the 382.0 µs published baseline, a 3.61% improvement and within the +10% no-regression budget.
-- Candidate Pet size is 6,582,784 bytes, +3.4685%; Body Lab is +0.0993%; new Habitat Lab is 583,680 bytes.
+- Final three-run Morph p95 median is 404.5 µs versus the 382.0 µs published baseline, a 5.89% regression and within the +10% no-regression budget.
+- Candidate Pet size is 6,583,296 bytes, +3.4766%; Body Lab is +0.0993%; new Habitat Lab is 583,680 bytes; candidate ZIP is 6,435,560 bytes.
 - Windows release/package/smoke gates pass. A macOS cross-build from Windows is blocked by unavailable `libclang.dll` for `coreaudio-sys`; no macOS runtime claim is made.
 
 ## Visual evidence
@@ -83,14 +86,14 @@ Packaged implementation checkpoint: `59ae70b`
 - Deterministic SVG/JSON pairs exist for the flagship story, orb offer/play, den store/restart/retrieve, window squeeze/escape, morsel acceptance, shared attention, skill transfer, window bounce, and trapped help.
 - The flagship and window-bounce SVGs were rasterized and inspected for safe gaps, labels, paths, contact normals, candidate panels, timeline readability, clipping, and privacy disclosure.
 - A live Windows capture verified the transparent always-on-top overlay and procedural PET/material, and exposed the top-edge orb pin.
-- The exact post-fix replay passes automatically, but the second live capture was stopped by the user's Escape. Do not claim post-fix live visual confirmation until an independent reviewer repeats it.
+- The intermediate live replay exposed the one-monitor-maximized-window residual. The final `d6e6435` deterministic replays pass, but the final live capture was stopped by the user's Escape before observation. Do not claim final live visual confirmation until an independent reviewer repeats it.
 
 ## Candidate package hashes
 
-- `Pet2.exe`: `07020247338812511FC5A8ECB2885D0D6BD3D75B7F1705CF70943A7D4BBA5BBD`
-- `BodyLab.exe`: `1C643C5A1460E2240C1939BC83A75A08F82BD678C2EB502A54C1B6636F3F3455`
-- `HabitatLab.exe`: `523AD983A874E2B3DE92665BD01323FED1411DDD1E535C235348BA64129EBD5E`
-- `Pet2-windows-x64.zip`: `61FC03A159DFB1BA53BBFA418F37280EFFA1280383D49E25F72026F9A6168816`
+- `Pet2.exe`: `CBF8B78168919C0EC426AC5464920A58D8593554E043ECE432FF136FED41D337`
+- `BodyLab.exe`: `3316EB79C9D94E5A49D1E355C3C9799AABFB8F6C7585C116BA3E5972FFFD7C25`
+- `HabitatLab.exe`: `A999F1EA0B7EAE852674C36F0ABB6852EEC3429424791F6A37AE00F8510439EC`
+- `Pet2-windows-x64.zip`: `51694E930468721744F0B330FB81CA6D503F8AB8B94D1EB66ECC42AFA33BF5F7`
 
 ## Remaining review sequence
 

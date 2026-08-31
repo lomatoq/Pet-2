@@ -2,6 +2,7 @@
 
 ID: HAB-ORB-2026-08-26
 Date: 2026-08-26
+Updated: 2026-08-31
 Owner: Pet 2
 Status: adopt
 
@@ -86,7 +87,7 @@ Disable habitat candidates and retain exact LifeCore intent pass-through.
 - Visual/player evidence: live Windows overlay rendered the habitat without an opaque host; Habitat Lab shows independent PET/orb trails and den state.
 - Variance/worst case: 30/60/144 Hz presentation produced identical object state; 8 Hz moving-window spam stayed finite and contact bounded.
 - Quality concessions: collision geometry is circle/AABB rather than a pixel contour.
-- Unexpected findings: live QA exposed PET↔orb contact clamping the center to `y=0`; the radius-aware feasible escape solver and two regressions now prevent recurrence.
+- Unexpected findings: live QA first exposed PET↔orb contact clamping the center to `y=0`, then exposed a distinct multi-monitor case where a stationary maximized window saved the orb at `[0.52105993, 0.9730903]` with zero velocity. Radius-aware PET separation, stationary frame-start-embedding pass-through, radius-boundary recovery, and dedicated fullscreen/one-monitor regressions now cover both causal failures while swept thin-window and moving-window collisions remain active.
 
 ## Decision
 

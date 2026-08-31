@@ -94,6 +94,12 @@ bounded mimesis library. It persists separately in `ecology-state.json` with an
 atomic previous snapshot. It stores no pixels, typed text, audio, window titles,
 native handles, or OS object identifiers.
 
+The orb uses a `4 px` drag threshold: clicking does not snap or stop it, while
+dragging preserves the grab offset, follows with bounded spring response, and
+releases physical velocity. Stationary windows only collide on a fresh swept
+crossing, so a maximized window cannot expel an already embedded orb to a screen
+edge; moving windows still transfer bounded impulse.
+
 The overlay is click-through outside the projected procedural silhouette and
 interactive habitat objects. These in-window controls never install global
 keyboard hooks:

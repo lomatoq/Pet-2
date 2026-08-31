@@ -132,7 +132,7 @@ Windows profile path: `%LOCALAPPDATA%\lomatoq\Pet 2\data\liquid-tuning.json`; ac
 - Strong semantic attention moves the complete facial mask toward the selected fixation (maximum offset `0.085`) and adds a bounded head-turn roll (maximum `0.15 rad`). Authority is attention confidence/commitment plus curiosity, novelty, and social focus; raw cursor velocity cannot turn the head.
 - Real body flight contributes a second continuous presentation cue from actual screen velocity: up/left/right travel visibly shifts and slightly rolls the whole face, then the same analytic tracker returns the target to exact `0°` after arrival. This cue never applies a particle force.
 - Engagement uses hysteresis. Bounded seeded variation is sampled only when a meaningful fixation changes, so a held focus stays calm and separate attention episodes do not replay one obvious sine loop.
-- Neutral semantic roll is exactly `0°`. Neutral X follows the symmetry center of the permanent face-carrier component; authored `Face origin X` remains an explicit additive bias, and Body Lab provides `Center face horizontally` to set that bias to zero.
+- Neutral semantic roll is exactly `0°`. The neutral origin follows the center of the permanent face-carrier component plus the authored upright face offset; rotating face-weighted material controls support/confidence but cannot make the semantic face orbit. Authored `Face origin X/Y` remain explicit additive biases, and Body Lab provides `Center face horizontally` to set X bias to zero.
 - The closed mouth uses six smooth spans; each brow uses four. Positive mouth curve is a smile, negative is a frown.
 - Every brow control point is clamped above the full eye boundary plus its soft stroke, so extreme tension/raise/asymmetry cannot paint a brow over an eye.
 - Mouth curvature leads valence; inner/outer brow shape and eyelid tension disambiguate fear, frustration, shyness, boredom, and surprise; cheek glow reinforces delight/affection.
@@ -168,6 +168,7 @@ Windows profile path: `%LOCALAPPDATA%\lomatoq\Pet 2\data\liquid-tuning.json`; ac
 - Pointer physics remains fixed at `120 Hz`; press adds only one O(`96`) field pass and never changes XPBD iterations or solver lane.
 - Pointer/audio-only presentation stays at `60 Hz`, avoiding the previous press-triggered doubling of a full-virtual-desktop swapchain. Only real screen flight enters `120 Hz`, with `12 px/s` enter and `8 px/s` exit hysteresis.
 - Win32 cursor hit testing arms before contact using a bounded velocity-aware margin and retains state across the edge. A captured drag always wins; the first far released sample restores click-through. Native window styles therefore do not chatter at the silhouette or switch for the first time on mouse-down.
+- Orb capture has a `4 px` physical drag threshold. A click preserves position, lifecycle, and velocity; an active drag preserves the initial grab offset, follows with a bounded spring response, clamps the center by the rendered radius, and releases only bounded physical velocity.
 
 ## Tuning and persistence contract
 
