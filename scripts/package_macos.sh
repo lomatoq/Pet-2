@@ -10,6 +10,7 @@ case "${target%%-*}" in
 esac
 package_root="$(mktemp -d "${TMPDIR:-/tmp}/pet2-package.XXXXXX")"
 trap 'case "$package_root" in *pet2-package.*) rm -rf "$package_root" ;; esac' EXIT
+codesign_identity="${PET2_CODESIGN_IDENTITY:--}"
 
 dist_root="$workspace/dist"
 payload="$package_root/$package_name"
@@ -60,10 +61,12 @@ chmod +x \
   "$payload/tools/HabitatLab" \
   "$payload/Pet2-Dev.command"
 
-# A stable ad-hoc identity makes macOS privacy consent survive local rebuilds.
-codesign --force --deep --sign - "$pet_app"
-codesign --force --deep --sign - "$lab_app"
-codesign --force --deep --sign - "$habitat_app"
+if [[ "$codesign_identity" == "-" ]]; then
+  echo "warning: ad-hoc signing does not preserve macOS privacy identity across changed builds" >&2
+fi
+codesign --force --deep --sign "$codesign_identity" "$pet_app"
+codesign --force --deep --sign "$codesign_identity" "$lab_app"
+codesign --force --deep --sign "$codesign_identity" "$habitat_app"
 
 dist_payload="$dist_root/$package_name"
 archive="$dist_root/$package_name.zip"
@@ -73,6 +76,5 @@ if [[ -e "$dist_payload" ]]; then
     *) echo "refusing to replace unexpected path: $dist_payload" >&2; exit 1 ;;
   esac
 fi
-ditto "$payload" "$dist_payload"
 ditto -c -k --sequesterRsrc --keepParent "$payload" "$archive"
 printf '%s\n' "$archive"
