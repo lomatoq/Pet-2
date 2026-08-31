@@ -90,10 +90,11 @@ kept under `Application Support/Pet 2/Habitat Lab`.
 Packaging leaves only the ZIP archive in `dist`; the installed applications are
 therefore not duplicated in Spotlight or Launchpad by an unpacked build tree.
 For privacy permission continuity across releases, package with an installed
-code-signing identity, for example
-`PET2_CODESIGN_IDENTITY="Developer ID Application: …" bash scripts/package_macos.sh`.
-Ad-hoc signing remains the CI/local fallback but cannot promise stable TCC
-identity after executable contents change.
+Developer ID Application identity. The packaging script selects one
+automatically when available, or accepts an explicit
+`PET2_CODESIGN_IDENTITY="Developer ID Application: …"` override. Ad-hoc signing
+remains the CI/local fallback but cannot promise stable TCC identity after
+executable contents change.
 
 The checked-in ICO and ICNS packaging assets are reproducible with
 `scripts/generate_icons.ps1`; they are not loaded by the organism at runtime.

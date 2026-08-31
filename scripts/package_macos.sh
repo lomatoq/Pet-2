@@ -10,7 +10,15 @@ case "${target%%-*}" in
 esac
 package_root="$(mktemp -d "${TMPDIR:-/tmp}/pet2-package.XXXXXX")"
 trap 'case "$package_root" in *pet2-package.*) rm -rf "$package_root" ;; esac' EXIT
-codesign_identity="${PET2_CODESIGN_IDENTITY:--}"
+codesign_identity="${PET2_CODESIGN_IDENTITY:-}"
+if [[ -z "$codesign_identity" ]]; then
+  codesign_identity="$(
+    security find-identity -v -p codesigning 2>/dev/null \
+      | sed -n 's/^[[:space:]]*[0-9]*) \([0-9A-F]\{40\}\) "Developer ID Application:.*$/\1/p' \
+      | head -n 1
+  )"
+fi
+codesign_identity="${codesign_identity:--}"
 
 dist_root="$workspace/dist"
 payload="$package_root/$package_name"
