@@ -6,11 +6,9 @@ target="${PET2_MACOS_TARGET:-aarch64-apple-darwin}"
 case "${target%%-*}" in
   aarch64)
     package_name="Pet2-macos-arm64"
-    swift_target="arm64-apple-macosx13.0"
     ;;
   x86_64)
     package_name="Pet2-macos-x64"
-    swift_target="x86_64-apple-macosx13.0"
     ;;
   *) echo "unsupported macOS target: $target" >&2; exit 1 ;;
 esac
@@ -52,14 +50,8 @@ cp "$workspace/config/default.json" "$pet_app/Contents/Resources/default.json"
 cp "$workspace/target/$target/release/body_lab" "$lab_app/Contents/MacOS/BodyLab"
 cp "$workspace/assets/macos/BodyLab-Info.plist" "$lab_app/Contents/Info.plist"
 
-xcrun --sdk macosx swiftc \
-  -target "$swift_target" \
-  -O \
-  -framework AppKit \
-  -framework WebKit \
-  "$workspace/assets/macos/HabitatLab.swift" \
-  -o "$habitat_app/Contents/MacOS/HabitatLab"
-cp "$workspace/target/$target/release/habitat_lab" "$habitat_app/Contents/Resources/HabitatLabRunner"
+cp "$workspace/assets/macos/HabitatLabLauncher" "$habitat_app/Contents/MacOS/HabitatLab"
+cp "$workspace/target/$target/release/body_lab" "$habitat_app/Contents/Resources/BodyLabMonitor"
 cp "$workspace/assets/macos/HabitatLab-Info.plist" "$habitat_app/Contents/Info.plist"
 
 if [[ -f "$workspace/assets/macos/AppIcon.icns" ]]; then
@@ -77,7 +69,7 @@ chmod +x \
   "$pet_app/Contents/MacOS/Pet2" \
   "$lab_app/Contents/MacOS/BodyLab" \
   "$habitat_app/Contents/MacOS/HabitatLab" \
-  "$habitat_app/Contents/Resources/HabitatLabRunner" \
+  "$habitat_app/Contents/Resources/BodyLabMonitor" \
   "$payload/tools/HabitatLab" \
   "$payload/Pet2-Dev.command"
 

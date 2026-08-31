@@ -82,11 +82,12 @@ bash ./scripts/package_macos.sh
 The macOS archive contains `Pet2.app`, `Body Lab.app`, `Habitat Lab.app`, the
 deterministic `tools/HabitatLab` runner, and `Pet2-Dev.command`. Double-click the
 latter to start Pet 2 with live telemetry and open Body Lab on its Live Brain
-view. The standalone Habitat Lab bundle keeps the same cross-platform scenario
-engine and has its own regular macOS application identity. Opening it runs the
-canonical habitat story in a persistent native window, with scenario, seed and
-duration controls plus an embedded visual report. JSON evidence is kept under
-`Application Support/Pet 2/Habitat Lab`.
+view. `Habitat Lab.app` is the macOS equivalent of Windows `Pet2-Dev.cmd`: it
+restarts the installed Pet in bounded 5 Hz telemetry mode and keeps the Live
+Brain panel open. That panel shows realtime desktop position, movement, final
+gaze, visual-saliency target, cursor/orb context, decisions, drives, and visible
+body response. The deterministic cross-platform scenario runner remains in
+`tools/HabitatLab`.
 
 Packaging leaves only the ZIP archive in `dist`; the installed applications are
 therefore not duplicated in Spotlight or Launchpad by an unpacked build tree.
