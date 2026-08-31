@@ -4006,6 +4006,10 @@ fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningPro
     let reference = approved_production_liquid_tuning(profile.seed);
     let stale_body = profile.render_mode != BodyRenderMode::ParticlePbf;
     let stale_material = profile.material.variant != MaterialVariant::CinematicJelly;
+    let has_legacy_outer_glow = profile.material.halo == 0.09
+        && profile.compositor.shadow_feather == 64.0
+        && profile.compositor.shadow_opacity == 0.31
+        && profile.compositor.shadow_color == [1.0, 1.0, 1.0];
     if stale_body {
         profile.render_mode = BodyRenderMode::ParticlePbf;
         profile.pbf = reference.pbf;
@@ -4015,6 +4019,12 @@ fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningPro
     }
     if stale_material {
         profile.material = reference.material;
+    }
+    if has_legacy_outer_glow {
+        profile.material.halo = reference.material.halo;
+        profile.compositor.shadow_feather = reference.compositor.shadow_feather;
+        profile.compositor.shadow_opacity = reference.compositor.shadow_opacity;
+        profile.compositor.shadow_color = reference.compositor.shadow_color;
     }
     profile
 }
@@ -4066,7 +4076,7 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.direct_scatter = 0.55;
     profile.material.transmission_hue_preservation = 0.25;
     profile.material.internal_flow = 0.12;
-    profile.material.halo = 0.09;
+    profile.material.halo = 0.045;
     profile.material.opacity = 0.6;
     profile.material.cinematic_smoothing = 0.07;
     profile.material.internal_orb_count = 6;
@@ -4120,9 +4130,9 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.compositor.render_scale = 2;
     profile.compositor.shadow_horizontal_offset = 0.0;
     profile.compositor.shadow_vertical_offset = 0.0;
-    profile.compositor.shadow_feather = 64.0;
-    profile.compositor.shadow_opacity = 0.31;
-    profile.compositor.shadow_color = [1.0, 1.0, 1.0];
+    profile.compositor.shadow_feather = 28.0;
+    profile.compositor.shadow_opacity = 0.12;
+    profile.compositor.shadow_color = [0.58, 0.62, 0.68];
     profile.compositor.exposure = 1.0;
     profile
 }
@@ -5450,8 +5460,37 @@ mod tests {
         assert_eq!(applied.material.variant, MaterialVariant::CinematicJelly);
         assert_eq!(applied.material.primary_hsv, [0.0, 0.0, 0.0]);
         assert_eq!(applied.material.opacity, 0.6);
+        assert_eq!(applied.material.halo, 0.045);
+        assert_eq!(applied.compositor.shadow_feather, 28.0);
+        assert_eq!(applied.compositor.shadow_opacity, 0.12);
         assert_eq!(applied.pbf.flight_stretch, 1.9);
         assert_eq!(persisted, applied);
+        assert_eq!(body.tuning_profile(), &applied);
+    }
+
+    #[test]
+    fn legacy_thick_outer_glow_is_softened_without_resetting_other_tuning() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let genome = lifecore::Genome::from_seed(0xB0D3);
+        let mut legacy = approved_production_liquid_tuning(genome.identity_seed);
+        legacy.material.halo = 0.09;
+        legacy.compositor.shadow_feather = 64.0;
+        legacy.compositor.shadow_opacity = 0.31;
+        legacy.compositor.shadow_color = [1.0, 1.0, 1.0];
+        legacy.pbf.viscosity = 0.041;
+        store.save_liquid_tuning(&legacy).unwrap();
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+
+        let applied = load_migrate_apply_liquid_tuning(&store, &mut body)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(applied.material.halo, 0.045);
+        assert_eq!(applied.compositor.shadow_feather, 28.0);
+        assert_eq!(applied.compositor.shadow_opacity, 0.12);
+        assert_eq!(applied.compositor.shadow_color, [0.58, 0.62, 0.68]);
+        assert_eq!(applied.pbf.viscosity, 0.041);
         assert_eq!(body.tuning_profile(), &applied);
     }
 
