@@ -67,14 +67,14 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // proximity changes. The shader reconstructs the requested idle/active rates.
         let ripple_phase = time * 0.20 + activity_integral * 0.35;
         let particle_time = time + activity_integral * 0.35;
-        let wave_a = sin((warped_r * 3.20 + ripple_phase) * TAU);
-        let wave_b = sin((warped_r * 5.05 + ripple_phase * 1.31 + 1.73) * TAU);
+        let wave_a = sin((warped_r * 2.18 + ripple_phase) * TAU);
+        let wave_b = sin((warped_r * 3.42 + ripple_phase * 1.31 + 1.73) * TAU);
         let wave = wave_a * 0.72 + wave_b * 0.28;
-        let ripple_ridge = smoothstep(0.48, 0.94, wave);
+        let ripple_ridge = smoothstep(0.08, 0.80, wave);
         let ripple_alpha = ripple_ridge
             * field_mask
             * (0.32 + center_density * 0.68)
-            * mix(0.012, 0.033, activity);
+            * mix(0.014, 0.035, activity);
 
         // TODO: sample the renderer's existing desktop backdrop here once its bind
         // group is exposed to the ecology overlay. Keep the local one-draw-call
@@ -83,6 +83,11 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let refract_alpha = 0.0;
 
         let tint = vec3<f32>(0.88, 0.95, 1.00);
+        let ripple_tint = mix(
+            tint,
+            vec3<f32>(0.72, 0.58, 1.00),
+            mix(0.24, 0.34, activity),
+        );
         let tint_alpha = field_mask
             * (0.20 + center_density * 0.80)
             * mix(0.018, 0.043, activity);
@@ -132,7 +137,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             * mix(0.004, 0.018, activity);
         let light_alpha = tint_alpha + ripple_alpha + particle_alpha + center_glow;
         let alpha = saturate(refract_alpha + light_alpha * (1.0 - refract_alpha));
-        let light_rgb = tint * (tint_alpha + ripple_alpha + center_glow) + particle_rgb;
+        let light_rgb = tint * (tint_alpha + center_glow)
+            + ripple_tint * ripple_alpha
+            + particle_rgb;
         let rgb = refracted * refract_alpha + light_rgb * (1.0 - refract_alpha);
         return vec4<f32>(rgb, alpha);
     }

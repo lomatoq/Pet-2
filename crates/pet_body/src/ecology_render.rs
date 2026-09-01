@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3, Vec4};
-use pet_ecology::{EcologyState, ObjectKind, ObjectLifecycle};
+use pet_ecology::{EcologyState, ObjectKind, ObjectLifecycle, stored_orb_hover_offset};
 use wgpu::util::DeviceExt;
 
 const MAX_ECOLOGY_INSTANCES: usize = 9;
@@ -167,41 +167,46 @@ impl EcologyRenderer {
                 continue;
             }
             let stored_in_den = object.lifecycle == ObjectLifecycle::StoredInDen;
-            let stored_scale = if stored_in_den { 0.86 } else { 1.0 };
+            let den_distance_px = Vec2::new(
+                (object.position.x - state.den.anchor.x) * aspect,
+                object.position.y - state.den.anchor.y,
+            )
+            .length()
+                * pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX;
+            let den_visual_blend = if object.kind == ObjectKind::Orb {
+                if stored_in_den {
+                    1.0
+                } else {
+                    1.0 - smoothstep(24.0, 105.0, den_distance_px)
+                }
+            } else {
+                0.0
+            };
+            let den_scale = 1.0 - den_visual_blend * 0.14;
             let radius_y = object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX
                 * 2.0
-                * stored_scale;
+                * den_scale;
             let rgb = hsv_to_rgb(object.hue, object.saturation, object.value);
-            let seed_phase = (object.id as u32) as f32 * 0.000_13 * std::f32::consts::TAU;
-            let (hover_x, hover_y) = if stored_in_den {
-                (
-                    (time_seconds * std::f32::consts::TAU / 3.83 + seed_phase).sin() * 6.0,
-                    (time_seconds * std::f32::consts::TAU / 5.17 + seed_phase * 1.7).sin() * 4.0,
-                )
+            let hover_offset = if stored_in_den {
+                stored_orb_hover_offset(object.id, time_seconds, aspect)
             } else {
-                (0.0, 0.0)
+                Vec2::ZERO
             };
             instances[count] = EcologyInstance {
                 center_radius: [
-                    object.position.x * 2.0 - 1.0
-                        + hover_x * 2.0 / (pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * aspect),
-                    1.0 - object.position.y * 2.0
-                        + hover_y * 2.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX,
+                    (object.position.x + hover_offset.x) * 2.0 - 1.0,
+                    1.0 - (object.position.y + hover_offset.y) * 2.0,
                     radius_y / aspect,
                     radius_y,
                 ],
-                color: [rgb.x, rgb.y, rgb.z, if stored_in_den { 0.94 } else { 0.96 }],
+                color: [rgb.x, rgb.y, rgb.z, 0.96 - den_visual_blend * 0.02],
                 material: [
                     if object.kind == ObjectKind::Orb {
                         0.0
                     } else {
                         2.0
                     },
-                    if stored_in_den {
-                        (object.glow * 1.10).clamp(0.0, 1.0)
-                    } else {
-                        object.glow
-                    },
+                    (object.glow * (1.0 + den_visual_blend * 0.10)).clamp(0.0, 1.0),
                     object.wear,
                     time_seconds + (object.id as u32) as f32 * 0.000_13,
                 ],
