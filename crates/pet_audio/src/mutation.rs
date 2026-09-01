@@ -25,6 +25,7 @@ mod tests {
             confidence: 0.8,
             attachment: 0.4,
             rhythm_intervals: [0.0; 8],
+            phenotype: Default::default(),
         }
     }
 

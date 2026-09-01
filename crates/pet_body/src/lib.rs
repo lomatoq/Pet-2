@@ -43,16 +43,19 @@ pub use renderer::{
     RendererCaptureError, RendererError, ReviewBackground,
 };
 pub use tuning::{
-    AnalyticTuning, BodyRenderMode, CompositorTuning, DropletTuning, FaceTuning, InteractionTuning,
-    LIQUID_TUNING_SCHEMA_VERSION, LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialTuning,
-    MaterialVariant, PbfTuning, TopologyConstraintMode, TuningProfileError,
+    AnalyticTuning, BodyRenderMode, ColorSourceMode, CompositorTuning, DropletTuning, FaceTuning,
+    InteractionTuning, LIQUID_TUNING_SCHEMA_VERSION, LiquidTuningAcknowledgement,
+    LiquidTuningProfile, MaterialTuning, MaterialVariant, PbfTuning, TopologyConstraintMode,
+    TuningProfileError,
 };
 pub use visual_traits::DerivedVisualTraits;
 
 use glam::{Vec2, Vec3};
 use lifecore::{
-    AffectState, BodyFeedback, BodyGenome, BodyIntent, EmbodiedInteractionFrame, Genome,
-    PoseIntent, SensorFrame,
+    AffectState, BodyContactFeedbackV2, BodyEnvironmentFeedbackV2, BodyFeedback, BodyFeedbackV2,
+    BodyFluidFeedbackV2, BodyGenome, BodyIntent, BodyMotionFeedbackV2, BodyShapeFeedbackV2,
+    BodyTopologyFeedbackV2, ComponentLifecycle, EfferenceCopyV2, EmbodiedInteractionFrame,
+    FastPhenotypeActuation, Genome, MaterialRuntimeActuation, PoseIntent, SensorFrame,
 };
 use pet_ecology::EmbodiedEnvironmentFrame;
 
@@ -77,6 +80,25 @@ fn blend_hsv_hue(base: Vec3, target_hue: f32, blend: f32) -> Vec3 {
     let blend = unit(blend);
     let delta = (target_hue.rem_euclid(1.0) - base.x + 0.5).rem_euclid(1.0) - 0.5;
     Vec3::new((base.x + delta * blend).rem_euclid(1.0), base.y, base.z)
+}
+
+fn blend_hsv_identity(genome: Vec3, authored: Vec3, genome_weight: f32) -> Vec3 {
+    let genome_weight = unit(genome_weight);
+    let authored_weight = 1.0 - genome_weight;
+    let hue_delta = (authored.x - genome.x + 0.5).rem_euclid(1.0) - 0.5;
+    Vec3::new(
+        (genome.x + hue_delta * authored_weight).rem_euclid(1.0),
+        genome.y * genome_weight + authored.y * authored_weight,
+        genome.z * genome_weight + authored.z * authored_weight,
+    )
+}
+
+fn apply_hsv_runtime(base: Vec3, runtime: MaterialRuntimeActuation, glow: bool) -> Vec3 {
+    Vec3::new(
+        (base.x + runtime.hue_shift_turns.clamp(-0.0222, 0.0222)).rem_euclid(1.0),
+        (base.y + runtime.saturation_delta.clamp(-0.14, 0.08)).clamp(0.0, 1.0),
+        (base.z + runtime.value_delta.clamp(-0.12, 0.12)).clamp(if glow { 0.12 } else { 0.0 }, 1.0),
+    )
 }
 
 /// Screen-space bounds produced from the same filtered liquid instances that the
@@ -137,6 +159,7 @@ pub struct ProceduralBody {
     occlusion_mode: OcclusionMode,
     occlusion_edge: f32,
     ecology_visual_effect: EcologyVisualEffect,
+    fast_phenotype: FastPhenotypeActuation,
 }
 
 impl ProceduralBody {
@@ -165,6 +188,7 @@ impl ProceduralBody {
             occlusion_mode: OcclusionMode::Front,
             occlusion_edge: 0.0,
             ecology_visual_effect: EcologyVisualEffect::default(),
+            fast_phenotype: FastPhenotypeActuation::default(),
         };
         body.apply_tuning_profile(tuning)
             .expect("the built-in liquid tuning profile is valid");
@@ -213,6 +237,197 @@ impl ProceduralBody {
 
     pub fn set_ecology_visual_effect(&mut self, effect: EcologyVisualEffect) {
         self.ecology_visual_effect = effect.bounded();
+    }
+
+    /// Installs bounded state multipliers for the next body tick. Authored
+    /// profile and structural solver settings remain untouched.
+    pub fn set_fast_phenotype_actuation(&mut self, actuation: FastPhenotypeActuation) {
+        self.fast_phenotype = if actuation.is_finite() {
+            actuation
+        } else {
+            FastPhenotypeActuation::default()
+        };
+        self.embodiment
+            .liquid
+            .set_runtime_actuation(self.fast_phenotype.pbf);
+        self.embodiment.set_nervous_system_actuation(
+            self.fast_phenotype.face,
+            self.fast_phenotype.visual_physiology,
+        );
+        let mut analytic = self.tuning.analytic;
+        analytic.modal_response = (analytic.modal_response
+            * self.fast_phenotype.analytic.modal_response_multiplier)
+            .clamp(0.0, 3.0);
+        analytic.modal_frequency = (analytic.modal_frequency
+            * self.fast_phenotype.analytic.modal_frequency_multiplier)
+            .clamp(0.25, 2.5);
+        analytic.modal_damping = (analytic.modal_damping
+            * self.fast_phenotype.analytic.modal_damping_multiplier)
+            .clamp(0.15, 3.0);
+        analytic.modal_amplitude = (analytic.modal_amplitude
+            * self.fast_phenotype.analytic.modal_amplitude_multiplier)
+            .clamp(0.0, 2.0);
+        self.embodiment.modal_dynamics.set_tuning(analytic);
+    }
+
+    #[must_use]
+    pub fn fast_phenotype_actuation(&self) -> &FastPhenotypeActuation {
+        &self.fast_phenotype
+    }
+
+    /// Builds the immutable felt-body frame from authoritative body/PBF state.
+    /// `previous` is used only for jerk; cognition consumes this frame next tick.
+    #[must_use]
+    pub fn body_feedback_v2(
+        &self,
+        intent: &BodyIntent,
+        sensors: &SensorFrame,
+        previous: Option<&BodyFeedbackV2>,
+        frame_id: u64,
+    ) -> BodyFeedbackV2 {
+        let legacy = &self.simulation.feedback;
+        let interaction = self.embodied_interaction_frame();
+        let material = interaction.material;
+        let diagnostics = self.embodiment.liquid.diagnostics();
+        let contact = interaction.contact;
+        let observed =
+            &interaction.components[..usize::from(interaction.component_observation_count)];
+        let contact_component = contact
+            .active
+            .then(|| {
+                observed
+                    .iter()
+                    .min_by(|left, right| {
+                        left.center_local
+                            .distance(contact.point_local)
+                            .total_cmp(&right.center_local.distance(contact.point_local))
+                    })
+                    .map(|component| component.component_id)
+            })
+            .flatten();
+        let largest_fragment = observed
+            .iter()
+            .map(|component| component.mass_fraction)
+            .fold(0.0_f32, f32::max);
+        let main_component = observed
+            .iter()
+            .max_by(|left, right| left.mass_fraction.total_cmp(&right.mass_fraction));
+        let merge_progress = observed
+            .iter()
+            .filter(|component| {
+                matches!(
+                    component.lifecycle,
+                    ComponentLifecycle::Returning | ComponentLifecycle::Merging
+                )
+            })
+            .map(|component| 1.0 - unit(component.distance_to_main))
+            .fold(0.0_f32, f32::max);
+        let position = legacy.world_position;
+        let edge_distance = position
+            .x
+            .min(1.0 - position.x)
+            .min(position.y)
+            .min(1.0 - position.y);
+        let previous_acceleration = previous.map_or(Vec2::ZERO, |frame| frame.motion.acceleration);
+        let intended_velocity = (intent.target_position - position).normalize_or_zero()
+            * intent.desired_speed.clamp(0.0, 1.0);
+        let actual_velocity = legacy.velocity.clamp_length_max(1.0);
+        let length_ratio = diagnostics.stretch_ratio.clamp(0.5, 1.8);
+        let width_ratio = (1.0 / length_ratio.max(0.01)).clamp(0.5, 1.8);
+        let actual_shape = Vec3::new(
+            length_ratio - 1.0,
+            width_ratio - 1.0,
+            unit(1.0 - material.deformation_energy) - 0.5,
+        );
+        let mut frame = BodyFeedbackV2 {
+            frame_id,
+            contact: BodyContactFeedbackV2 {
+                component_id: contact_component,
+                point_world: contact.point_world,
+                point_local: contact.point_local,
+                normal: contact.normal_local,
+                area: contact.area_fraction,
+                pressure: contact.effective_pressure,
+                tangential_speed: unit(contact.relative_velocity_local.length() / 8.0),
+                duration: contact.contact_seconds,
+                contact_count: u16::from(contact.active),
+                user_force_estimate: (contact.relative_velocity_local * contact.effective_pressure
+                    / 8.0)
+                    .clamp_length_max(1.0),
+            },
+            shape: BodyShapeFeedbackV2 {
+                body_area_ratio: (1.0 + material.mass_conservation_error).clamp(0.5, 1.5),
+                body_length_ratio: length_ratio,
+                body_width_ratio: width_ratio,
+                roundness: unit(1.0 - material.deformation_energy),
+                deformation_energy: material.deformation_energy,
+                maximum_strain: unit(material.maximum_strain),
+                neck_tension: material.neck_tension,
+                center_of_mass_offset: main_component
+                    .map_or(Vec2::ZERO, |component| component.center_local),
+                orientation_radians: diagnostics.orientation,
+                angular_velocity: (diagnostics.rigid_angular_velocity / 8.0).clamp(-1.0, 1.0),
+            },
+            fluid: BodyFluidFeedbackV2 {
+                slosh_energy: material.slosh_energy,
+                internal_relative_speed: unit(material.internal_relative_speed / 8.0),
+                pressure_variance: unit(material.deformation_rate.abs() / 8.0),
+                settle_error: unit(diagnostics.density_error),
+            },
+            topology: BodyTopologyFeedbackV2 {
+                connected_components: u16::from(material.component_count.max(1)),
+                detached_mass_fraction: material.detached_mass_fraction,
+                largest_fragment_fraction: largest_fragment,
+                budget_remaining: material.topology_budget_remaining,
+                merge_progress,
+                recovery_active: interaction.recovery_event.is_some()
+                    || observed.iter().any(|component| {
+                        matches!(
+                            component.lifecycle,
+                            ComponentLifecycle::Returning
+                                | ComponentLifecycle::Merging
+                                | ComponentLifecycle::DeterministicRecovery
+                        )
+                    }),
+            },
+            motion: BodyMotionFeedbackV2 {
+                world_position: position,
+                velocity: actual_velocity,
+                acceleration: legacy.acceleration.clamp_length_max(1.0),
+                jerk: (legacy.acceleration.clamp_length_max(1.0) - previous_acceleration)
+                    .clamp_length_max(1.0),
+                grounded: legacy.grounded,
+                clinging: legacy.clinging,
+                collision_impulse: legacy
+                    .collision
+                    .as_ref()
+                    .map_or(0.0, |event| unit(event.intensity)),
+            },
+            efference_copy: EfferenceCopyV2 {
+                intended_velocity,
+                intended_turn: intent.facing_direction.clamp(-1.0, 1.0),
+                intended_shape_delta: Vec3::new(
+                    self.fast_phenotype.analytic.body_length_scale - 1.0,
+                    self.fast_phenotype.analytic.body_width_scale - 1.0,
+                    self.fast_phenotype.analytic.roundness_bias,
+                ),
+                actual_velocity,
+                actual_turn: (diagnostics.rigid_angular_velocity / 8.0).clamp(-1.0, 1.0),
+                actual_shape_delta: actual_shape,
+            },
+            environment: BodyEnvironmentFeedbackV2 {
+                distance_to_screen_edge: unit(edge_distance * 2.0),
+                clipped_fraction: unit((0.03 - edge_distance).max(0.0) / 0.03),
+                available_motion_radius: unit(edge_distance * 2.0),
+                cursor_distance: sensors.cursor_distance_to_pet.clamp(0.0, 1.0),
+                cursor_loom_rate: unit(sensors.cursor_approach_speed),
+                user_present: sensors.user_presence.unwrap_or(0.0) > 0.05,
+                seconds_since_interaction: sensors.user_idle_seconds.max(0.0),
+            },
+            ..BodyFeedbackV2::default()
+        };
+        frame.sanitize();
+        frame
     }
 
     /// Compatibility update for headless callers that do not yet provide the full
@@ -282,6 +497,16 @@ impl ProceduralBody {
             self.tuning.face,
             voice,
             dt,
+        );
+        self.embodiment.liquid.set_face_attention_pose(
+            (self.embodiment.pose.face_attention_offset
+                + self.fast_phenotype.face.translation_offset)
+                .clamp_length_max(0.082),
+            (self.embodiment.pose.face_attention_roll + self.fast_phenotype.face.semantic_roll)
+                .clamp(
+                    -self.tuning.face.maximum_roll_radians,
+                    self.tuning.face.maximum_roll_radians,
+                ),
         );
         match intent.pose {
             PoseIntent::Clinging => {
@@ -557,29 +782,40 @@ impl ProceduralBody {
         let profile = &self.tuning;
         let material = profile.material;
         let cinematic = material.variant == MaterialVariant::CinematicJelly;
-        let primary_hsv = if material.override_genome_colors {
-            Vec3::from_array(material.primary_hsv)
-        } else {
-            genome.body.primary_color_hsv
+        let fast = &self.fast_phenotype;
+        let palette = |genome_hsv: Vec3, authored_hsv: [f32; 3]| match material.color_source_mode {
+            ColorSourceMode::Authored => Vec3::from_array(authored_hsv),
+            ColorSourceMode::Genome => genome_hsv,
+            ColorSourceMode::GenomeAuthoredBlend => blend_hsv_identity(
+                genome_hsv,
+                Vec3::from_array(authored_hsv),
+                material.genome_color_blend,
+            ),
         };
-        let secondary_hsv = if material.override_genome_colors {
-            Vec3::from_array(material.secondary_hsv)
-        } else {
-            genome.body.secondary_color_hsv
-        };
-        let glow_hsv = if material.override_genome_colors {
-            Vec3::from_array(material.glow_hsv)
-        } else {
-            genome.body.glow_color_hsv
-        };
+        let primary_hsv = palette(genome.body.primary_color_hsv, material.primary_hsv);
+        let secondary_hsv = palette(genome.body.secondary_color_hsv, material.secondary_hsv);
+        let glow_hsv = palette(genome.body.glow_color_hsv, material.glow_hsv);
         let effect = self.ecology_visual_effect;
-        let primary_hsv = blend_hsv_hue(primary_hsv, effect.hue, effect.color_blend);
-        let secondary_hsv = blend_hsv_hue(secondary_hsv, effect.hue, effect.color_blend * 0.78);
-        let glow_hsv = blend_hsv_hue(glow_hsv, effect.hue, effect.color_blend);
+        let primary_hsv = apply_hsv_runtime(
+            blend_hsv_hue(primary_hsv, effect.hue, effect.color_blend),
+            fast.material,
+            false,
+        );
+        let secondary_hsv = apply_hsv_runtime(
+            blend_hsv_hue(secondary_hsv, effect.hue, effect.color_blend * 0.78),
+            fast.material,
+            false,
+        );
+        let mut glow_hsv = apply_hsv_runtime(
+            blend_hsv_hue(glow_hsv, effect.hue, effect.color_blend),
+            fast.material,
+            true,
+        );
+        glow_hsv.z = glow_hsv.z.max(0.12);
         RenderParameters {
             render_mode: profile.render_mode,
             render_scale: profile.compositor.render_scale,
-            presentation_scale: self.presentation_scale,
+            presentation_scale: self.presentation_scale * fast.apparent_scale,
             presentation_offset: self.presentation_offset,
             debug_view: DebugView::Material,
             time: self.animation.time,
@@ -587,9 +823,15 @@ impl ProceduralBody {
             glow: (self.expression.current.body_glow * genome.body.bioluminescence
                 + effect.glow_boost * 0.34)
                 .clamp(0.0, 1.0),
-            body_length: genome.body.body_length * profile.analytic.body_length_scale,
-            body_width: genome.body.body_width * profile.analytic.body_width_scale,
-            body_roundness: (genome.body.body_roundness + profile.analytic.roundness_bias)
+            body_length: genome.body.body_length
+                * profile.analytic.body_length_scale
+                * fast.analytic.body_length_scale,
+            body_width: genome.body.body_width
+                * profile.analytic.body_width_scale
+                * fast.analytic.body_width_scale,
+            body_roundness: (genome.body.body_roundness
+                + profile.analytic.roundness_bias
+                + fast.analytic.roundness_bias)
                 .clamp(0.0, 1.0),
             head_ratio: genome.body.head_ratio,
             eye_size: if cinematic {
@@ -597,6 +839,7 @@ impl ProceduralBody {
             } else {
                 genome.body.eye_size
             } * profile.face.eye_size_scale
+                * fast.face.scale_multiplier
                 * pose.eye_scale.clamp(0.88, 1.18),
             eye_spacing: if cinematic {
                 BODY_LAB_EYE_SPACING
@@ -608,7 +851,10 @@ impl ProceduralBody {
             } else {
                 genome.body.pupil_ratio
             } * profile.face.pupil_scale,
-            softness: (genome.body.softness + profile.analytic.softness_bias).clamp(0.0, 1.0),
+            softness: (genome.body.softness
+                + profile.analytic.softness_bias
+                + fast.analytic.softness_bias)
+                .clamp(0.0, 1.0),
             tail_length: genome.body.tail_length,
             tail_thickness: genome.body.tail_thickness,
             ear_fin_size: genome.body.ear_fin_size,
@@ -649,18 +895,31 @@ impl ProceduralBody {
             pattern_contrast: (genome.body.pattern_contrast * (1.0 - effect.contrast_reduction))
                 .max(0.18),
             pattern_seed: genome.body.pattern_seed,
-            pulse: physiology.pulse,
-            shell_opacity: (material.opacity - effect.translucency_boost * 0.34).clamp(0.62, 1.0),
-            inner_density: physiology.inner_density,
-            translucency: (material.translucency + effect.translucency_boost).clamp(0.0, 1.0),
-            core_glow: (physiology.core_glow * material.emission + effect.glow_boost * 0.42)
+            pulse: unit(physiology.pulse * 0.55 + fast.visual_physiology.pulse_amplitude * 0.45),
+            shell_opacity: ((material.opacity - effect.translucency_boost * 0.34)
+                * fast.visual_physiology.shell_opacity_multiplier)
+                .clamp(0.62, 1.0),
+            inner_density: (physiology.inner_density
+                * fast.visual_physiology.inner_density_multiplier)
                 .clamp(0.0, 2.0),
-            halo: material.halo,
-            iris_activity: physiology.iris_activity,
-            eye_wetness: physiology.eye_wetness,
-            flow_strength: material.internal_flow,
+            translucency: (material.translucency
+                + effect.translucency_boost
+                + fast.visual_physiology.translucency_delta)
+                .clamp(0.0, 1.0),
+            core_glow: (physiology.core_glow
+                * material.emission
+                * fast.visual_physiology.core_glow_multiplier
+                + effect.glow_boost * 0.42)
+                .clamp(0.0, 2.0),
+            halo: (material.halo * fast.visual_physiology.halo_multiplier).clamp(0.0, 2.0),
+            iris_activity: unit(physiology.iris_activity * fast.visual_physiology.iris_activity),
+            eye_wetness: unit(physiology.eye_wetness * (0.65 + fast.visual_physiology.eye_wetness)),
+            flow_strength: (material.internal_flow.max(0.16)
+                * fast.visual_physiology.flow_strength_multiplier)
+                .clamp(0.0, 0.32),
             flow_scale: traits.flow_scale,
-            flow_speed: physiology.flow_speed,
+            flow_speed: (physiology.flow_speed * fast.visual_physiology.flow_speed_multiplier)
+                .clamp(0.0, 3.0),
             flow_phase: physiology.flow_phase,
             flow_warp: traits.flow_warp,
             core_size: traits.core_size,
@@ -689,9 +948,9 @@ impl ProceduralBody {
             } else {
                 traits.iris_contrast
             },
-            droplet_energy: physiology.droplet_energy,
-            droplet_cohesion: physiology.droplet_cohesion,
-            droplet_spread: physiology.droplet_spread,
+            droplet_energy: fast.visual_physiology.droplet_energy,
+            droplet_cohesion: fast.visual_physiology.droplet_cohesion,
+            droplet_spread: fast.visual_physiology.droplet_spread,
             droplets: self.embodiment.droplets.render_states(),
             liquid: self.embodiment.liquid.render_state(),
             material_absorption: material.absorption,
@@ -705,7 +964,8 @@ impl ProceduralBody {
             material_broad_specular_power: material.broad_specular_power,
             material_tight_specular: material.tight_specular,
             material_tight_specular_power: material.tight_specular_power,
-            material_emission: material.emission,
+            material_emission: (material.emission * fast.material.emission_multiplier)
+                .clamp(0.0, 4.0),
             material_fresnel_f0: material.fresnel_f0,
             material_core_level: material.core_level,
             material_thickness_gamma: material.thickness_gamma,
@@ -715,14 +975,18 @@ impl ProceduralBody {
             material_ambient_scatter: material.ambient_scatter,
             material_direct_scatter: material.direct_scatter,
             material_transmission_hue_preservation: material.transmission_hue_preservation,
-            material_opacity: material.opacity,
+            material_opacity: (material.opacity * fast.material.opacity_multiplier).clamp(0.0, 1.0),
             material_variant: material.variant,
             material_cinematic_smoothing: material.cinematic_smoothing,
             material_internal_orb_count: material.internal_orb_count,
-            material_internal_orb_intensity: material.internal_orb_intensity,
+            material_internal_orb_intensity: (material.internal_orb_intensity
+                * fast.material.internal_orb_intensity_multiplier)
+                .clamp(0.0, 3.0),
             material_internal_orb_size: material.internal_orb_size,
             material_internal_orb_halo: material.internal_orb_halo,
-            material_internal_orb_speed: material.internal_orb_speed,
+            material_internal_orb_speed: (material.internal_orb_speed
+                * fast.material.internal_orb_speed_multiplier)
+                .clamp(0.0, 4.0),
             material_internal_orb_depth: material.internal_orb_depth,
             material_internal_orb_spread: material.internal_orb_spread,
             material_studio_intensity: material.studio_intensity,
@@ -734,17 +998,25 @@ impl ProceduralBody {
             material_edge_light_width: material.edge_light_width,
             material_caustic_strength: material.caustic_strength,
             material_caustic_scale: material.caustic_scale,
-            material_caustic_speed: material.caustic_speed,
+            material_caustic_speed: (material.caustic_speed
+                * fast.material.caustic_speed_multiplier)
+                .clamp(0.0, 4.0),
             material_caustic_dispersion: material.caustic_dispersion,
             material_rounded_highlight_strength: material.rounded_highlight_strength,
             material_highlight_tint: material.highlight_tint,
             material_soul_glow_count: material.soul_glow_count,
-            material_soul_glow_strength: material.soul_glow_strength,
+            material_soul_glow_strength: (material.soul_glow_strength
+                * fast.material.soul_glow_strength_multiplier)
+                .clamp(0.0, 4.0),
             material_soul_glow_size: material.soul_glow_size,
             material_soul_glow_speed: material.soul_glow_speed,
-            material_soul_glow_pulse: material.soul_glow_pulse,
+            material_soul_glow_pulse: (material.soul_glow_pulse
+                * fast.material.soul_glow_pulse_multiplier)
+                .clamp(0.0, 4.0),
             material_soul_glow_feather: material.soul_glow_feather,
-            material_bloom_strength: material.bloom_strength,
+            material_bloom_strength: (material.bloom_strength.max(0.10)
+                * fast.material.bloom_multiplier)
+                .clamp(0.0, 0.24),
             liquid_iso_threshold: profile.pbf.iso_threshold,
             face_visible: profile.face.visible,
             face_eye_highlight_scale: profile.face.eye_highlight_scale,
@@ -1039,7 +1311,7 @@ mod tests {
         assert_eq!(parameters.material_absorption, 0.31);
         assert_eq!(parameters.material_refraction, 1.27);
         assert_eq!(parameters.material_rim_strength, 0.83);
-        assert_eq!(parameters.flow_strength, 1.17);
+        assert_eq!(parameters.flow_strength, 0.32);
         assert_eq!(parameters.halo, 0.19);
         assert_eq!(parameters.material_pseudo_depth, 0.29);
         assert_eq!(parameters.material_variant, MaterialVariant::CurrentSafe);
@@ -1066,6 +1338,78 @@ mod tests {
                 < 1.0e-4
         );
         assert_eq!(parameters.occlusion_mode, OcclusionMode::Front);
+    }
+
+    #[test]
+    fn fast_phenotype_changes_runtime_channels_without_touching_structural_locks() {
+        let genome = Genome::from_seed(73);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        let structural = (
+            body.tuning.pbf.fixed_hz,
+            body.tuning.pbf.particle_count,
+            body.tuning.pbf.substeps,
+            body.tuning.pbf.density_iterations,
+            body.tuning.pbf.maximum_speed,
+        );
+        let baseline = body.render_parameters(&genome, 0.4);
+        let mut fast = FastPhenotypeActuation::default();
+        fast.analytic.body_length_scale = 1.05;
+        fast.analytic.modal_amplitude_multiplier = 1.32;
+        fast.material.emission_multiplier = 1.35;
+        fast.material.hue_shift_turns = 0.02;
+        fast.visual_physiology.pulse_amplitude = 0.9;
+        fast.visual_physiology.droplet_energy = 0.85;
+        fast.apparent_scale = 1.04;
+        body.set_fast_phenotype_actuation(fast);
+        body.embodied_update(
+            &intent(LocomotionMode::Hover, Vec2::splat(0.5)),
+            &SensorFrame::default(),
+            AffectState::default(),
+            VisualMindInput::default(),
+            VoiceVisualState::default(),
+            1.0 / 120.0,
+        );
+        let effective = body.render_parameters(&genome, 0.4);
+
+        assert!(effective.body_length > baseline.body_length);
+        assert!(effective.material_emission > baseline.material_emission);
+        assert_ne!(effective.primary_hsv, baseline.primary_hsv);
+        assert!(effective.pulse > baseline.pulse);
+        assert_eq!(body.embodiment.physiology.pose.droplet_energy, 0.85);
+        assert_eq!(
+            (
+                body.tuning.pbf.fixed_hz,
+                body.tuning.pbf.particle_count,
+                body.tuning.pbf.substeps,
+                body.tuning.pbf.density_iterations,
+                body.tuning.pbf.maximum_speed,
+            ),
+            structural
+        );
+    }
+
+    #[test]
+    fn body_feedback_v2_is_authoritative_bounded_and_carries_efference_copy() {
+        let genome = Genome::from_seed(79);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        let intent = intent(LocomotionMode::Seek, Vec2::new(0.8, 0.2));
+        let sensors = SensorFrame {
+            cursor_position: Vec2::new(0.7, 0.3),
+            cursor_distance_to_pet: 0.25,
+            user_presence: Some(1.0),
+            ..SensorFrame::default()
+        };
+        body.fixed_update(&genome, &intent, &sensors, 1.0 / 120.0);
+        let frame = body.body_feedback_v2(&intent, &sensors, None, 17);
+
+        assert_eq!(frame.frame_id, 17);
+        assert!(frame.is_valid());
+        assert!(frame.efference_copy.intended_velocity.length() > 0.0);
+        assert_eq!(
+            frame.motion.world_position,
+            body.simulation.feedback.world_position
+        );
+        assert!(frame.environment.user_present);
     }
 
     #[test]
@@ -1130,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn particle_projection_and_face_are_genome_invariant_lab_defaults() {
+    fn particle_projection_and_face_stay_stable_while_blend_preserves_genome_color_identity() {
         let lab_genome = Genome::from_seed(42);
         let production_genome = Genome::from_seed(5_784_121_873_664_838_231);
         let mut lab = ProceduralBody::generate(&lab_genome).unwrap();
@@ -1156,9 +1500,13 @@ mod tests {
             production_parameters.pupil_ratio,
             lab_parameters.pupil_ratio
         );
-        assert_eq!(
+        assert_ne!(
             production_parameters.primary_hsv,
             lab_parameters.primary_hsv
+        );
+        assert_eq!(
+            lab.tuning_profile().material.color_source_mode,
+            ColorSourceMode::GenomeAuthoredBlend
         );
     }
 

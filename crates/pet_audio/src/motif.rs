@@ -43,6 +43,7 @@ pub struct PreparedSyllable {
 
 impl PreparedSyllable {
     fn prepare(value: &Syllable, seed: u64, family: VocalFamily, request: &VocalRequest) -> Self {
+        let phenotype = request.phenotype;
         let mut gesture = value.gesture;
         gesture.pressure_peak = (gesture.pressure_peak
             * (0.92 + request.arousal.clamp(0.0, 1.0) * 0.16)
@@ -66,6 +67,18 @@ impl PreparedSyllable {
             .clamp(0.0, 1.0);
         gesture.body_excitation =
             (gesture.body_excitation + request.attachment.clamp(0.0, 1.0) * 0.08).clamp(0.0, 1.0);
+        // `enabled` gates spontaneous call initiation, not the physical voice
+        // phenotype of a call that another behavior owner has already issued.
+        gesture.open_quotient =
+            (gesture.open_quotient + phenotype.breathiness_delta * 0.18).clamp(0.30, 0.82);
+        gesture.constriction =
+            (gesture.constriction + phenotype.roughness_delta * 0.16).clamp(0.0, 1.0);
+        gesture.frontness =
+            (gesture.frontness + phenotype.brightness_delta * 0.18).clamp(-1.0, 1.0);
+        gesture.instability = (gesture.instability
+            + phenotype.roughness_delta * 0.25
+            + phenotype.effort_noise * 0.18)
+            .clamp(0.0, 1.0);
         match request.gesture {
             VoiceGesture::PurrHum => {
                 gesture.pressure_peak *= 0.72;
@@ -107,11 +120,16 @@ impl PreparedSyllable {
             pitch_peak: value.pitch_peak,
             pitch_end: value.pitch_end,
             amplitude: value.amplitude,
-            noisiness: value.noisiness,
+            noisiness: (value.noisiness
+                + phenotype.breathiness_delta.max(0.0) * 0.30
+                + phenotype.roughness_delta.max(0.0) * 0.18)
+                .clamp(0.0, 1.0),
             click: value.click,
             mouth_open: value.mouth_open,
-            trill_amount: value.trill_amount,
-            vibrato_amount: value.vibrato_amount,
+            trill_amount: (value.trill_amount + phenotype.trill_amount * 0.35).clamp(0.0, 1.0),
+            vibrato_amount: (value.vibrato_amount
+                * phenotype.pitch_variation_multiplier.clamp(0.65, 1.35))
+            .clamp(0.0, 1.0),
             gesture,
             prosody: ProsodyCurve::from_targets(
                 value.pitch_start,
@@ -121,6 +139,7 @@ impl PreparedSyllable {
                 family,
                 request.style,
                 request.valence,
+                phenotype.phrase_contour,
             ),
         }
     }
@@ -160,6 +179,9 @@ pub struct VoiceCommand {
     pub fatigue: f32,
     pub confidence: f32,
     pub attachment: f32,
+    pub attack_multiplier: f32,
+    pub release_multiplier: f32,
+    pub breath_phase_lock: f32,
     pub maximum_loudness: f32,
     pub room_mix: f32,
 }
@@ -205,6 +227,14 @@ impl VoiceCommand {
         }
         let identity = identity_register(request.style, request.gesture);
         let room_unit = seeded_unit(performance_seed ^ 0x91e1_0da5_c79e_7b1d);
+        let phenotype = request.phenotype;
+        let mut anatomy = voice.anatomy;
+        let formant = phenotype.formant_scale_multiplier.clamp(0.94, 1.06);
+        anatomy.tract_length = (anatomy.tract_length / formant).clamp(0.0, 1.0);
+        anatomy.glottal_leak =
+            (anatomy.glottal_leak + phenotype.breathiness_delta * 0.20).clamp(0.0, 1.0);
+        anatomy.instability_susceptibility =
+            (anatomy.instability_susceptibility + phenotype.roughness_delta * 0.22).clamp(0.0, 1.0);
         Self {
             request_id: request.performance_seed,
             motif_id: motif.id,
@@ -217,16 +247,17 @@ impl VoiceCommand {
                 .clamp(identity.minimum_f0, identity.maximum_f0),
             minimum_f0_hz: MINIMUM_F0_HZ,
             maximum_f0_hz: MAXIMUM_F0_HZ,
-            anatomy: voice.anatomy,
-            brightness: voice.brightness.clamp(0.0, 1.0),
-            breathiness: voice.breathiness.clamp(0.0, 1.0),
-            roughness: voice.roughness.clamp(0.0, 1.0),
-            gain: (request.gain * 1.65).clamp(0.0, 0.62),
+            anatomy,
+            brightness: (voice.brightness + phenotype.brightness_delta).clamp(0.0, 1.0),
+            breathiness: (voice.breathiness + phenotype.breathiness_delta).clamp(0.0, 1.0),
+            roughness: (voice.roughness + phenotype.roughness_delta).clamp(0.0, 1.0),
+            gain: (request.gain * 1.65).clamp(0.0, voice.maximum_loudness),
             pan: request.pan.clamp(-1.0, 1.0),
             pitch_scale: request.pitch_scale.clamp(0.62, 1.48),
             tempo_scale: request.tempo_scale.clamp(0.50, 1.80),
             stress: request.stress.clamp(0.0, 1.0),
             purr: request.purr
+                || phenotype.purr_amount >= 0.55
                 || request.style == VocalStyle::Purr
                 || request.gesture == VoiceGesture::PurrHum,
             purr_rate: voice.purr_rate.clamp(22.0, 31.0),
@@ -237,7 +268,10 @@ impl VoiceCommand {
             fatigue: request.fatigue.clamp(0.0, 1.0),
             confidence: request.confidence.clamp(0.0, 1.0),
             attachment: request.attachment.clamp(0.0, 1.0),
-            maximum_loudness: 0.76,
+            attack_multiplier: phenotype.attack_multiplier.clamp(0.62, 1.35),
+            release_multiplier: phenotype.release_multiplier.clamp(0.65, 1.45),
+            breath_phase_lock: phenotype.breath_phase_lock.clamp(0.0, 1.0),
+            maximum_loudness: voice.maximum_loudness,
             room_mix: 0.015 + room_unit * 0.025,
         }
     }
@@ -494,6 +528,9 @@ impl SynthVoice {
             (0.76 + command.gain * 0.42).clamp(0.72, 1.05),
             command.arousal,
             command.fatigue,
+            command.attack_multiplier,
+            command.release_multiplier,
+            command.breath_phase_lock,
             physical_impulse,
             self.last_glottal_openness,
             self.tract_back_pressure,
@@ -823,6 +860,7 @@ mod tests {
             confidence: 0.8,
             attachment: 0.5,
             rhythm_intervals: [0.0; 8],
+            phenotype: Default::default(),
         }
     }
 
@@ -868,6 +906,38 @@ mod tests {
             .map(|requested| (*requested - 1.0).powi(2))
             .sum::<f32>();
         assert!(covariance / (actual_energy * requested_energy).sqrt() >= 0.85);
+    }
+
+    #[test]
+    fn continuous_voice_phenotype_shapes_an_existing_call_even_when_gate_is_closed() {
+        let voice = lifecore::Genome::from_seed(45).voice;
+        let motif = lifecore::generate_initial_motifs(&voice)[0].clone();
+        let neutral = VoiceCommand::prepare(
+            &voice,
+            &motif,
+            &request(motif.id, VocalStyle::SocialContact),
+        );
+        let mut shaped_request = request(motif.id, VocalStyle::SocialContact);
+        shaped_request.phenotype = lifecore::VoicePhenotypeActuation {
+            enabled: false,
+            formant_scale_multiplier: 1.06,
+            breathiness_delta: 0.18,
+            attack_multiplier: 0.62,
+            release_multiplier: 1.45,
+            breath_phase_lock: 0.9,
+            phrase_contour: lifecore::PhraseContourWeights {
+                curiosity_question: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let shaped = VoiceCommand::prepare(&voice, &motif, &shaped_request);
+        assert!(shaped.anatomy.tract_length < neutral.anatomy.tract_length);
+        assert!(shaped.anatomy.glottal_leak > neutral.anatomy.glottal_leak);
+        assert_eq!(shaped.attack_multiplier, 0.62);
+        assert_eq!(shaped.release_multiplier, 1.45);
+        assert_eq!(shaped.breath_phase_lock, 0.9);
+        assert!(shaped.syllables[0].pitch_ratio(0.95) > neutral.syllables[0].pitch_ratio(0.95));
     }
 
     #[test]

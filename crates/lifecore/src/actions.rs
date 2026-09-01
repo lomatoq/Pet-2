@@ -969,6 +969,10 @@ pub struct VocalRequest {
     /// `pet_audio` and no raw input timing history is retained.
     #[serde(default)]
     pub rhythm_intervals: [f32; 8],
+    /// Ephemeral, bounded prosody deltas from the nervous-system phenotype.
+    /// Identity and hard loudness limits remain owned by `VoiceGenome`.
+    #[serde(default)]
+    pub phenotype: crate::VoicePhenotypeActuation,
 }
 
 /// The semantic reason the mind wants to vocalize.

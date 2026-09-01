@@ -704,6 +704,7 @@ impl ApplicationHandler for BodyLab {
                         confidence: 0.8,
                         attachment: 0.4,
                         rhythm_intervals: [0.0; 8],
+                        phenotype: Default::default(),
                     };
                     if let Err(error) = audio.enqueue(&self.genome.voice, motif, &request) {
                         runtime.audio_error = Some(error.to_string());
@@ -2431,6 +2432,8 @@ fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
                         live_morph_and_activity(&mut columns[0], latest);
                         live_vita_and_fusion(&mut columns[1], latest);
                     });
+                    ui.separator();
+                    live_nervous_system(ui, latest);
                     ui.separator();
                     live_learning_memory_social(ui, latest);
                     live_raw_json(ui, latest);
@@ -4363,6 +4366,107 @@ fn live_learning_memory_social(ui: &mut egui::Ui, latest: &Value) {
                     });
                 }
             }
+        });
+}
+
+fn live_nervous_system(ui: &mut egui::Ui, latest: &Value) {
+    let Some(nervous) = latest.pointer("/details/nervous_system") else {
+        ui.small("R12 nervous-system telemetry is unavailable in this frame.");
+        return;
+    };
+    CollapsingHeader::new("Brain ↔ body nervous system (R12)")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.small(
+                "authoritative BodyFeedbackV2 → felt/appraisal/emotion → bounded actuation → next body tick",
+            );
+            ui.columns(2, |columns| {
+                if let Some(felt) = nervous.get("felt_state_v1") {
+                    columns[0].strong("FeltStateV1");
+                    scalar_table(&mut columns[0], "live_r12_felt", felt, 40);
+                }
+                if let Some(emotions) = nervous.get("emotional_readouts") {
+                    columns[1].strong("Continuous emotional readouts");
+                    scalar_table(&mut columns[1], "live_r12_emotions", emotions, 40);
+                }
+            });
+            if let Some(derived) = nervous.get("derived") {
+                CollapsingHeader::new("Derived axes + Morph somatic input")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        scalar_table(ui, "live_r12_derived", derived, 40);
+                        if let Some(morph) = nervous.get("morph_somatic_input") {
+                            scalar_table(ui, "live_r12_morph_input", morph, 32);
+                        }
+                    });
+            }
+            let trace = nervous
+                .pointer("/fast_actuation/trace")
+                .and_then(Value::as_array);
+            CollapsingHeader::new(format!(
+                "Per-target causal trace ({})",
+                trace.map_or(0, Vec::len)
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                let Some(trace) = trace else {
+                    ui.small("No actuation trace in this frame.");
+                    return;
+                };
+                for (index, record) in trace.iter().enumerate() {
+                    let target = record
+                        .get("target_path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown target");
+                    let coupling = record
+                        .get("coupling_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown coupling");
+                    let raw = record.get("raw_target").and_then(Value::as_f64).unwrap_or(0.0);
+                    let filtered = record
+                        .get("filtered_value")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let effective = record
+                        .get("effective_value")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    CollapsingHeader::new(format!(
+                        "{target}  {raw:.3} → {filtered:.3} → {effective:.3}"
+                    ))
+                    .id_salt(("r12_trace", index, target))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.monospace(format!("coupling: {coupling}"));
+                        ui.monospace(format!(
+                            "clamp: [{}, {}] · τ rise/fall: {} / {} s · reason: {}",
+                            record.get("clamp_min").map_or("—".into(), Value::to_string),
+                            record.get("clamp_max").map_or("—".into(), Value::to_string),
+                            record.get("rise_tau_seconds").map_or("—".into(), Value::to_string),
+                            record.get("fall_tau_seconds").map_or("—".into(), Value::to_string),
+                            record
+                                .get("clamp_reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("—")
+                        ));
+                        if let Some(component) = record
+                            .get("component_id_if_local")
+                            .filter(|value| !value.is_null())
+                        {
+                            ui.monospace(format!("localized component: {component}"));
+                        }
+                        ui.label(
+                            record
+                                .get("formula")
+                                .and_then(Value::as_str)
+                                .unwrap_or("compiled formula unavailable"),
+                        );
+                        if let Some(sources) = record.get("source_terms") {
+                            scalar_table(ui, "live_r12_trace_sources", sources, 32);
+                        }
+                    });
+                }
+            });
         });
 }
 

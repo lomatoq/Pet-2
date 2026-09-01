@@ -1,4 +1,4 @@
-use lifecore::{VocalFamily, VocalStyle};
+use lifecore::{PhraseContourWeights, VocalFamily, VocalStyle};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ProsodyCurve {
@@ -24,13 +24,24 @@ impl ProsodyCurve {
         family: VocalFamily,
         style: VocalStyle,
         valence: f32,
+        contour: PhraseContourWeights,
     ) -> Self {
         let peak_time = (0.24 + seeded_unit(seed ^ 0x31) * 0.39).clamp(0.24, 0.63);
         let inflection = (peak_time + 0.16 + seeded_unit(seed ^ 0x52) * 0.18).clamp(0.62, 0.90);
         let onset = (0.09 + seeded_unit(seed ^ 0x73) * 0.11).min(peak_time - 0.04);
         let start = start.max(0.01).log2();
-        let peak = peak.max(0.01).log2();
-        let end = end.max(0.01).log2();
+        let mut peak = peak.max(0.01).log2();
+        let mut end = end.max(0.01).log2();
+        let joy_rise = contour.joy_rise.clamp(0.0, 1.0);
+        let sadness_fall = contour.sadness_fall.clamp(0.0, 1.0);
+        let curiosity_question = contour.curiosity_question.clamp(0.0, 1.0);
+        let protest_firm = contour.protest_firm.clamp(0.0, 1.0);
+        let calm_level = contour.calm_level.clamp(0.0, 1.0);
+        peak += joy_rise * 0.060 + curiosity_question * 0.075;
+        end += curiosity_question * 0.056 - sadness_fall * 0.070;
+        end += (start + protest_firm * 0.050 - end) * protest_firm * 0.35;
+        peak += (start - peak) * calm_level * 0.45;
+        end += (start - end) * calm_level * 0.45;
         let family_bias = match family {
             VocalFamily::QuestionWhine | VocalFamily::SoftContact => 0.035,
             VocalFamily::FrustratedGrunt => -0.045,
@@ -105,6 +116,7 @@ mod tests {
             VocalFamily::QuestionWhine,
             VocalStyle::AttentionCall,
             0.2,
+            PhraseContourWeights::default(),
         );
         let values: Vec<_> = (0..101).map(|i| curve.sample(i as f32 / 100.0)).collect();
         assert!(values.iter().all(|value| (0.8..=1.3).contains(value)));
@@ -115,5 +127,33 @@ mod tests {
             .unwrap()
             .0;
         assert_ne!(peak, 50);
+    }
+
+    #[test]
+    fn felt_phrase_contour_changes_the_audible_trajectory() {
+        let base = ProsodyCurve::from_targets(
+            1.0,
+            1.0,
+            1.0,
+            51,
+            VocalFamily::SoftContact,
+            VocalStyle::SocialContact,
+            0.0,
+            PhraseContourWeights::default(),
+        );
+        let curious = ProsodyCurve::from_targets(
+            1.0,
+            1.0,
+            1.0,
+            51,
+            VocalFamily::SoftContact,
+            VocalStyle::SocialContact,
+            0.0,
+            PhraseContourWeights {
+                curiosity_question: 1.0,
+                ..PhraseContourWeights::default()
+            },
+        );
+        assert!(curious.sample(0.95) > base.sample(0.95));
     }
 }

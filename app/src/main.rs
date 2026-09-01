@@ -6,6 +6,7 @@
 
 mod ecology_runtime;
 mod evolution_runner;
+mod nervous_system_runtime;
 mod pointer_replay_runner;
 #[allow(dead_code)]
 mod replay;
@@ -44,6 +45,7 @@ use lifecore::{
     stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
+use nervous_system_runtime::NervousSystemRuntime;
 use pet_audio::{
     AudioCallbackLevels, AudioEngine, AudioVisualFeedback, BodyVoiceAnalyzer, SelectedOutputConfig,
     global_body_voice_bridge,
@@ -105,7 +107,7 @@ const PRODUCTION_RENDER_SCALE: u32 = 1;
 const DEBUG_LOG_INTERVAL: f32 = 1.0;
 const DEV_MODE_LOG_INTERVAL: f32 = 0.20;
 const LAB_CONTROL_POLL_INTERVAL_SECONDS: f32 = 0.10;
-const CAUSAL_TELEMETRY_SCHEMA_VERSION: u32 = 3;
+const CAUSAL_TELEMETRY_SCHEMA_VERSION: u32 = 4;
 const TELEMETRY_RECENT_MEMORY_LIMIT: usize = 16;
 const TELEMETRY_EPISODE_MEMORY_LIMIT: usize = 16;
 
@@ -1586,6 +1588,7 @@ struct PetRuntime {
     background_luminance: f32,
     background_contrast: f32,
     expression_director: ExpressionDirector,
+    nervous_system: NervousSystemRuntime,
     vocal_arbiter: VocalArbiter,
     last_phrase: Option<lifecore::CreaturePhrase>,
     overlay_move_microseconds: f64,
@@ -2135,6 +2138,9 @@ impl PetApplication {
                 voice,
                 body_dt,
             );
+            runtime
+                .nervous_system
+                .observe_body(&runtime.body, &runtime.intent, &body_sensors);
             runtime.body_accumulator -= body_dt;
             physics_steps += 1;
         }
@@ -2176,8 +2182,31 @@ impl PetApplication {
             .background_timings
             .observe(runtime.background_capture_microseconds as f32 / 1_000.0);
         synchronize_audio_learning(runtime);
+        runtime.nervous_system.observe_voice(
+            runtime.audio.visual_feedback(),
+            runtime.audio.callback_levels(),
+            &runtime.life.state.genome.voice,
+        );
+        runtime.nervous_system.set_selected_salience(
+            runtime
+                .vita
+                .visual_attention_target()
+                .map_or(0.0, |target| target.score),
+        );
         while runtime.life_accumulator >= LIFE_DT {
             let tick_started = Instant::now();
+            let soft_touch_pressure_max = runtime
+                .body
+                .tuning_profile()
+                .interaction
+                .soft_touch_pressure_max;
+            runtime.nervous_system.prepare_cognition_tick(
+                &mut runtime.life,
+                &mut runtime.vita,
+                &mut runtime.morph,
+                soft_touch_pressure_max,
+                LIFE_DT,
+            );
             // Lab drive pulses are an observational experiment layer, never a
             // second homeostasis owner. Morph sees a reversible overlay on the
             // pre-LifeCore state, then LifeCore advances from its exact natural
@@ -2208,6 +2237,7 @@ impl PetApplication {
                 if let Some(signature) = signature {
                     stage_gesture_convention(runtime, &mut event, signature);
                 }
+                runtime.nervous_system.observe_gesture(&event);
                 let interaction_tuning = runtime.body.tuning_profile().interaction;
                 if let Some(plan) = runtime.life.observe_embodied_gesture_with_tuning(
                     event,
@@ -2251,7 +2281,7 @@ impl PetApplication {
                 Some(morph_output),
                 LIFE_DT,
             );
-            runtime.sensors.interaction_actuation = runtime.vita.interaction_actuation();
+            let vita_interaction = runtime.vita.interaction_actuation();
             let vita_gaze = resolved_intent.gaze_target;
             output.body_intent = resolved_intent;
             let ecology_output = runtime.ecology.resolve_intent(
@@ -2298,6 +2328,25 @@ impl PetApplication {
                 runtime.sensors.pet_dragged,
             );
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
+            let phenotype = runtime.nervous_system.resolve_actuation(
+                &runtime.life,
+                &runtime.vita,
+                &runtime.morph,
+                vita_interaction,
+                soft_touch_pressure_max,
+                LIFE_DT,
+            );
+            phenotype.apply_to_intent(
+                &mut output.body_intent,
+                &runtime.sensors,
+                runtime.body.simulation.feedback.world_position,
+            );
+            // The nervous action blend can move the semantic target after the
+            // ecology projection, so enforce the monitor-union invariant once
+            // more at the final intent boundary.
+            project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
+            runtime.sensors.interaction_actuation = phenotype.interaction;
+            runtime.body.set_fast_phenotype_actuation(phenotype);
             runtime.brain_tick_microseconds = tick_started.elapsed().as_secs_f64() * 1_000_000.0;
             runtime.last_debug = Some(output.debug.clone());
             runtime.last_vita = vita_output;
@@ -2417,6 +2466,9 @@ impl PetApplication {
                 let lab_interventions =
                     lab_interventions_telemetry_json(&runtime.lab_interventions, Instant::now());
                 let body_interaction = body_interaction_telemetry_json(runtime);
+                let nervous_snapshot = runtime.nervous_system.snapshot();
+                let nervous_body_feedback = runtime.nervous_system.body_feedback();
+                let nervous_actuation = runtime.nervous_system.actuation();
                 let mutation_history_count = runtime.life.state.development.mutation_history.len();
                 let latest_mutation = runtime
                     .life
@@ -2587,6 +2639,16 @@ impl PetApplication {
                     "morph_diagnostics": morph_diagnostics,
                     "lab_interventions": lab_interventions,
                     "body_interaction": body_interaction,
+                    "nervous_system": {
+                        "body_feedback_v2": nervous_body_feedback,
+                        "derived": nervous_snapshot.derived,
+                        "felt_state_v1": nervous_snapshot.felt,
+                        "emotional_readouts": nervous_snapshot.emotions,
+                        "morph_somatic_input": nervous_snapshot.morph_sensors,
+                        "source_frame_id": nervous_snapshot.source_frame_id,
+                        "source_episode_id": nervous_snapshot.source_episode_id,
+                        "fast_actuation": nervous_actuation,
+                    },
                     "fusion": serde_json::Value::Null,
                     "intent_pose": format!("{:?}", runtime.intent.pose),
                     "gaze_mode": format!("{:?}", runtime.body.embodiment.pose.gaze_mode),
@@ -2995,6 +3057,7 @@ impl ApplicationHandler for PetApplication {
             background_luminance: 0.5,
             background_contrast: 0.0,
             expression_director: ExpressionDirector::default(),
+            nervous_system: NervousSystemRuntime::default(),
             vocal_arbiter: VocalArbiter::default(),
             last_phrase: None,
             overlay_move_microseconds: 0.0,
@@ -4533,7 +4596,13 @@ fn request_ecology_voice(
     runtime.life.request_vocalization(trigger, &runtime.sensors)
 }
 
-fn enqueue_vocal_candidate(runtime: &mut PetRuntime, request: lifecore::VocalRequest) {
+fn enqueue_vocal_candidate(runtime: &mut PetRuntime, mut request: lifecore::VocalRequest) {
+    let voice = runtime.life.state.genome.voice.clone();
+    runtime
+        .nervous_system
+        .actuation()
+        .voice
+        .apply_to_request(&mut request, &voice);
     let request_id = request.performance_seed;
     let living = LivingStateFrame::from_life(&runtime.life.state);
     let Some(request) = runtime.vocal_arbiter.admit(
@@ -4555,7 +4624,6 @@ fn enqueue_vocal_candidate(runtime: &mut PetRuntime, request: lifecore::VocalReq
         runtime.life.cancel_vocal_request(request.performance_seed);
         return;
     };
-    let voice = runtime.life.state.genome.voice.clone();
     if !runtime.audio.enqueue(&voice, &motif, &request) {
         runtime.life.cancel_vocal_request(request.performance_seed);
     }
@@ -5828,6 +5896,7 @@ mod tests {
             confidence: 0.8,
             attachment: 0.4,
             rhythm_intervals: [0.0; 8],
+            phenotype: Default::default(),
         };
         assert!(manager.enqueue(&voice, &first_motif, &first_request));
         assert!(matches!(

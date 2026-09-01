@@ -36,6 +36,9 @@ impl BreathPressureController {
         performance_gain: f32,
         arousal: f32,
         fatigue: f32,
+        attack_multiplier: f32,
+        release_multiplier: f32,
+        breath_phase_lock: f32,
         physical_impulse: f32,
         glottal_open_area: f32,
         tract_back_pressure: f32,
@@ -43,7 +46,9 @@ impl BreathPressureController {
     ) -> BreathFrame {
         let progress = progress.clamp(0.0, 1.0);
         let fatigue = fatigue.clamp(0.0, 1.0);
-        let prelude_end = (0.045 + (1.0 - gesture.adduction) * 0.035).clamp(0.035, 0.09);
+        let phase_lock = breath_phase_lock.clamp(0.0, 1.0);
+        let prelude_end = ((0.045 + (1.0 - gesture.adduction) * 0.035) * (1.0 - phase_lock * 0.30))
+            .clamp(0.025, 0.09);
         let release_start = (0.72 + gesture.pressure_peak * 0.14).clamp(0.68, 0.88);
         let phase_pressure = if progress < prelude_end {
             0.12 + 0.48 * (progress / prelude_end)
@@ -63,10 +68,12 @@ impl BreathPressureController {
             * phase_pressure
             + physical_impulse.clamp(0.0, 1.0) * 0.13)
             .clamp(0.0, 1.25);
-        let attack_tau =
-            (0.010 + (1.0 - gesture.pressure_peak) * 0.026 + fatigue * 0.018).clamp(0.008, 0.055);
-        let release_tau =
-            (0.042 + fatigue * 0.070 + anatomy.tract_compliance * 0.018).clamp(0.035, 0.135);
+        let attack_tau = ((0.010 + (1.0 - gesture.pressure_peak) * 0.026 + fatigue * 0.018)
+            * attack_multiplier.clamp(0.62, 1.35))
+        .clamp(0.006, 0.075);
+        let release_tau = ((0.042 + fatigue * 0.070 + anatomy.tract_compliance * 0.018)
+            * release_multiplier.clamp(0.65, 1.45))
+        .clamp(0.025, 0.180);
         let tau = if p_target > self.lung_pressure {
             attack_tau
         } else {
@@ -120,6 +127,9 @@ mod tests {
                 anatomy,
                 0.8,
                 0.3,
+                0.0,
+                1.0,
+                1.0,
                 0.0,
                 0.0,
                 0.5,

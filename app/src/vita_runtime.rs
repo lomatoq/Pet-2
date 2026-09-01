@@ -2,8 +2,8 @@ use std::{fmt, str::FromStr};
 
 use glam::Vec2;
 use lifecore::{
-    ActionId, BodyFeedback, BodyIntent, EmbodiedGestureEvent, FeedbackEvent,
-    InteractionBodyActuation, InteractionGazeTarget, InteractionResponsePlan,
+    ActionId, BodyFeedback, BodyIntent, EmbodiedGestureEvent, EpisodeContextV1, FeedbackEvent,
+    FeltStateV1, InteractionBodyActuation, InteractionGazeTarget, InteractionResponsePlan,
     InteractionTurnRuntime, InteractionTurnState, LifeState, LocomotionMode, PoseIntent,
     SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame, VitaState, apply_emotion_to_expression,
 };
@@ -276,6 +276,13 @@ pub struct VitaRuntime {
 }
 
 impl VitaRuntime {
+    /// Integrates the previous authoritative body's somatic evidence before
+    /// the next appraisal/intent resolution. Keeping this call on the app's
+    /// single simulation thread preserves the N -> N+1 feedback invariant.
+    pub fn integrate_felt_state(&mut self, felt: FeltStateV1, episode: EpisodeContextV1, dt: f32) {
+        self.mind.integrate_felt_state(felt, episode, dt);
+    }
+
     pub fn set_embodied_gesture_tuning(&mut self, tuning: EmbodiedGestureClassifierTuning) {
         self.perception.set_embodied_gesture_tuning(tuning);
     }

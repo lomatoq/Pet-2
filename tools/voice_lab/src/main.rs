@@ -463,6 +463,7 @@ fn scenario_request(spec: ScenarioSpec, motif_id: u64, index: usize) -> VocalReq
         confidence: spec.confidence,
         attachment: spec.attachment,
         rhythm_intervals,
+        phenotype: Default::default(),
     }
 }
 

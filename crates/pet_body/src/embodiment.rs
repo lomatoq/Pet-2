@@ -1,6 +1,7 @@
 use glam::Vec2;
 use lifecore::{
-    AffectState, BodyFeedback, BodyGenome, BodyIntent, InteractionTarget, PoseIntent, SensorFrame,
+    AffectState, BodyFeedback, BodyGenome, BodyIntent, FaceRuntimeActuation, InteractionTarget,
+    PoseIntent, SensorFrame, VisualPhysiologyActuation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +133,8 @@ pub struct EmbodiedRuntime {
     motion_response_scale: f32,
     motion_acceleration_limit: f32,
     previous_world_position: Option<Vec2>,
+    runtime_face: FaceRuntimeActuation,
+    runtime_visual: VisualPhysiologyActuation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +205,18 @@ impl EmbodiedRuntime {
             motion_response_scale: 1.0,
             motion_acceleration_limit: 8.0,
             previous_world_position: None,
+            runtime_face: FaceRuntimeActuation::default(),
+            runtime_visual: VisualPhysiologyActuation::default(),
         }
+    }
+
+    pub fn set_nervous_system_actuation(
+        &mut self,
+        face: FaceRuntimeActuation,
+        visual: VisualPhysiologyActuation,
+    ) {
+        self.runtime_face = face;
+        self.runtime_visual = visual;
     }
 
     pub fn set_world_to_body_scale(&mut self, scale: Vec2) {
@@ -289,11 +303,17 @@ impl EmbodiedRuntime {
         feedback: &BodyFeedback,
         affect: AffectState,
         expression: lifecore::ExpressionState,
-        face_tuning: FaceTuning,
+        mut face_tuning: FaceTuning,
         voice: VoiceVisualState,
         dt: f32,
     ) {
         mind.sanitize();
+        face_tuning.microsaccade_amount = (face_tuning.microsaccade_amount
+            * self.runtime_face.microsaccade_amount_multiplier)
+            .clamp(0.0, 2.0);
+        face_tuning.microsaccade_rate = (face_tuning.microsaccade_rate
+            * self.runtime_face.microsaccade_rate_multiplier)
+            .clamp(0.01, 2.0);
         let dt = dt.clamp(0.0, 0.05);
         self.elapsed += dt;
         self.slow_blink_cooldown = (self.slow_blink_cooldown - dt).max(0.0);
@@ -422,6 +442,10 @@ impl EmbodiedRuntime {
         self.pose.audio_envelope = smooth(self.pose.audio_envelope, voice.envelope, 28.0, dt);
         self.pose.purr = smooth(self.pose.purr, voice.purr, 18.0, dt);
         self.physiology.update(visual_traits, mind, dt);
+        self.physiology.pose.droplet_energy = self.runtime_visual.droplet_energy.clamp(0.0, 1.0);
+        self.physiology.pose.droplet_spread = self.runtime_visual.droplet_spread.clamp(0.0, 1.0);
+        self.physiology.pose.droplet_cohesion =
+            self.runtime_visual.droplet_cohesion.clamp(0.0, 1.0);
         let normalized_displacement = self
             .previous_world_position
             .map_or(Vec2::ZERO, |previous| feedback.world_position - previous);
@@ -823,7 +847,8 @@ impl EmbodiedRuntime {
                     BlinkKind::WinkRight
                 });
                 self.wink_cooldown = 10.0;
-            } else if self.blink_clock >= self.next_blink
+            } else if self.blink_clock
+                >= self.next_blink / self.runtime_face.blink_rate_multiplier.clamp(0.55, 1.55)
                 || neural_urge
                 || self.saccade_strength > 0.72
             {

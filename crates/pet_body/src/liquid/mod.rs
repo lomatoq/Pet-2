@@ -23,7 +23,10 @@ mod xpbd;
 use std::{array, f32::consts::TAU};
 
 use glam::Vec2;
-use lifecore::{BodyFeedback, BodyGenome, BodyIntent, EmbodiedInteractionFrame, SensorFrame};
+use lifecore::{
+    BodyFeedback, BodyGenome, BodyIntent, EmbodiedInteractionFrame, PbfRuntimeActuation,
+    SensorFrame,
+};
 use pet_ecology::EmbodiedEnvironmentFrame;
 
 use crate::{
@@ -288,6 +291,7 @@ pub struct LiquidMorphRuntime {
     interaction_tuning: InteractionTuning,
     pending_structural_tuning: Option<PendingLiquidTuning>,
     environment: EmbodiedEnvironmentFrame,
+    runtime_actuation: PbfRuntimeActuation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -375,6 +379,7 @@ impl LiquidMorphRuntime {
             interaction_tuning: InteractionTuning::default(),
             pending_structural_tuning: None,
             environment: EmbodiedEnvironmentFrame::default(),
+            runtime_actuation: PbfRuntimeActuation::default(),
         };
         runtime.snap_render_proxies();
         runtime
@@ -479,6 +484,70 @@ impl LiquidMorphRuntime {
 
     pub fn set_embodied_environment(&mut self, environment: &EmbodiedEnvironmentFrame) {
         self.environment = environment.clone();
+    }
+
+    pub fn set_runtime_actuation(&mut self, actuation: PbfRuntimeActuation) {
+        self.runtime_actuation = sanitize_runtime_actuation(actuation);
+    }
+
+    fn effective_material_parameters(&self) -> MaterialParameters {
+        let mut parameters = MaterialParameters::from_tuning(self.tuning);
+        parameters.viscosity *= self.runtime_actuation.viscosity_multiplier;
+        parameters.surface_tension *= self.runtime_actuation.surface_tension_multiplier;
+        parameters
+    }
+
+    fn effective_density_compliance(&self) -> f32 {
+        self.tuning.density_compliance * self.runtime_actuation.density_compliance_multiplier
+    }
+
+    fn effective_flight_inertia(&self) -> f32 {
+        self.tuning.flight_inertia * self.runtime_actuation.flight_inertia_multiplier
+    }
+
+    fn effective_flight_stretch(&self) -> f32 {
+        self.tuning.flight_stretch * self.runtime_actuation.flight_stretch_multiplier
+    }
+
+    fn effective_flight_damping(&self) -> f32 {
+        self.tuning.flight_damping * self.runtime_actuation.flight_damping_multiplier
+    }
+
+    fn effective_flight_max_lag(&self) -> f32 {
+        self.tuning.flight_max_lag * self.runtime_actuation.flight_max_lag_multiplier
+    }
+
+    fn effective_angular_damping(&self) -> f32 {
+        self.tuning.angular_damping * self.runtime_actuation.angular_damping_multiplier
+    }
+
+    fn effective_motor_gain(&self) -> f32 {
+        self.tuning.motor_gain * self.runtime_actuation.motor_gain_multiplier
+    }
+
+    fn effective_shape_recovery(&self) -> f32 {
+        (self.tuning.shape_recovery + self.runtime_actuation.shape_recovery_delta).clamp(0.0, 1.5)
+    }
+
+    fn effective_upright_stabilization(&self) -> f32 {
+        (self.tuning.upright_stabilization + self.runtime_actuation.upright_stabilization_delta)
+            .clamp(0.0, 5.0)
+    }
+
+    fn effective_idle_breath_amplitude(&self) -> f32 {
+        self.tuning.idle_breath_amplitude * self.runtime_actuation.idle_breath_amplitude_multiplier
+    }
+
+    fn effective_idle_breath_speed(&self) -> f32 {
+        self.tuning.idle_breath_speed * self.runtime_actuation.idle_breath_speed_multiplier
+    }
+
+    fn effective_idle_lean_angle(&self) -> f32 {
+        self.tuning.idle_lean_angle * self.runtime_actuation.idle_lean_angle_multiplier
+    }
+
+    fn effective_idle_lean_rate(&self) -> f32 {
+        self.tuning.idle_lean_rate * self.runtime_actuation.idle_lean_rate_multiplier
     }
 
     /// Supplies the brain-authored target for the complete permanent face
@@ -594,7 +663,10 @@ impl LiquidMorphRuntime {
         // Schema 16 has exactly one authoritative physics lane. The cinematic
         // material may alter shaders and lighting, never real mass or topology.
         self.idle_fragments.fill(IdleFragment::default());
-        let parameters = MaterialParameters::from_tuning(self.tuning);
+        let parameters = self.effective_material_parameters();
+        let effective_flight_inertia = self.effective_flight_inertia();
+        let effective_flight_damping = self.effective_flight_damping();
+        let effective_density_compliance = self.effective_density_compliance();
         let spacing = PARTICLE_SPACING * self.tuning.spacing_scale;
         let kernel_radius = KERNEL_RADIUS * self.tuning.kernel_radius_scale;
         self.update_flight_field_shape(motion, dt);
@@ -609,9 +681,9 @@ impl LiquidMorphRuntime {
                 // Preserve the authored v15 return-strength feel while changing
                 // its meaning from a component servo to a continuous well.
                 well_acceleration: parameters.character_field_strength * (3.0 / 0.34),
-                inertia_scale: self.tuning.flight_inertia,
+                inertia_scale: effective_flight_inertia,
                 maximum_inertial_acceleration: 6.0,
-                velocity_damping: (self.tuning.flight_damping * 0.75).clamp(0.0, 3.5),
+                velocity_damping: (effective_flight_damping * 0.75).clamp(0.0, 3.5),
                 flight_axis: self.flight_field_axis,
                 flight_aspect: self.flight_field_aspect,
             },
@@ -747,7 +819,7 @@ impl LiquidMorphRuntime {
             DensityConstraintParameters {
                 rest_density: self.rest_density,
                 kernel_radius,
-                compliance: self.tuning.density_compliance
+                compliance: effective_density_compliance
                     * (1.0 + sensors.interaction_actuation.compliance_delta * 2.0)
                         .clamp(0.50, 1.50),
                 // Akinci cohesion owns free-surface regularization. Reapplying
@@ -957,7 +1029,13 @@ impl LiquidMorphRuntime {
             self.tuning.substeps
         };
         let sub_dt = dt / substeps as f32;
-        let parameters = MaterialParameters::from_tuning(self.tuning);
+        let parameters = self.effective_material_parameters();
+        let effective_motor_gain = self.effective_motor_gain();
+        let effective_flight_inertia = self.effective_flight_inertia();
+        let effective_flight_stretch = self.effective_flight_stretch();
+        let effective_flight_damping = self.effective_flight_damping();
+        let effective_flight_max_lag = self.effective_flight_max_lag();
+        let effective_angular_damping = self.effective_angular_damping();
         let spacing = PARTICLE_SPACING * self.tuning.spacing_scale;
         let kernel_radius = KERNEL_RADIUS * self.tuning.kernel_radius_scale;
         let grab_parameters = GrabParameters {
@@ -1000,12 +1078,12 @@ impl LiquidMorphRuntime {
                 self.components,
                 morph,
                 mind,
-                self.tuning.motor_gain,
-                self.tuning.flight_inertia,
-                self.tuning.flight_stretch,
-                self.tuning.flight_damping,
-                self.tuning.flight_max_lag,
-                self.tuning.angular_damping,
+                effective_motor_gain,
+                effective_flight_inertia,
+                effective_flight_stretch,
+                effective_flight_damping,
+                effective_flight_max_lag,
+                effective_angular_damping,
                 self.navigation_anchor_strength,
                 self.cinematic_features,
             );
@@ -1084,7 +1162,7 @@ impl LiquidMorphRuntime {
                 &mut self.particles,
                 self.particle_count,
                 self.components.main_component,
-                self.tuning.shape_recovery,
+                self.effective_shape_recovery(),
                 relaxation,
             );
             self.apply_local_containment_forces(kernel_radius);
@@ -1249,7 +1327,7 @@ impl LiquidMorphRuntime {
             self.flight_field_axis = Vec2::from_angle(next_angle);
         }
 
-        let authored_stretch = self.tuning.flight_stretch.clamp(0.0, 2.0);
+        let authored_stretch = self.effective_flight_stretch().clamp(0.0, 2.0);
         let target_aspect = (1.0 + drive * authored_stretch * 0.36).clamp(1.0, 1.34);
         let aspect_rate = 3.5 + drive * 3.5;
         self.flight_field_aspect +=
@@ -1474,7 +1552,7 @@ impl LiquidMorphRuntime {
     }
 
     fn apply_idle_breathing(&mut self, breath: f32, external_drive: f32, _dt: f32) {
-        let amplitude = self.tuning.idle_breath_amplitude;
+        let amplitude = self.effective_idle_breath_amplitude();
         if amplitude <= 1.0e-5 || self.material_grab.is_active() {
             return;
         }
@@ -1486,7 +1564,7 @@ impl LiquidMorphRuntime {
         // The material mode owns the deliberately slow 5–8 s silhouette cycle;
         // physiology only phase-modulates it so emotion remains causal without
         // turning calm breathing into a fast global scale pulse.
-        let material_wave = (self.elapsed * 0.92 * self.tuning.idle_breath_speed
+        let material_wave = (self.elapsed * 0.92 * self.effective_idle_breath_speed()
             + self.seed_phase * 1.9
             + pose_wave * 0.16)
             .sin();
@@ -2149,7 +2227,7 @@ impl LiquidMorphRuntime {
     }
 
     fn stabilize_main_orientation(&mut self, dt: f32, target_angle: f32) {
-        let strength = self.tuning.upright_stabilization;
+        let strength = self.effective_upright_stabilization();
         if strength <= 0.0 {
             return;
         }
@@ -2184,7 +2262,7 @@ impl LiquidMorphRuntime {
         // vorticity, slosh and shear survive, so this is an orientation gauge rather
         // than a freeze or a screen-space pin.
         let angular_velocity = self.main_component_angular_velocity();
-        let spin_decay = 1.0 - (-(strength + self.tuning.angular_damping * 24.0) * dt).exp();
+        let spin_decay = 1.0 - (-(strength + self.effective_angular_damping() * 24.0) * dt).exp();
         for particle in &mut self.particles[..self.particle_count] {
             if particle.component_id != self.components.main_component {
                 continue;
@@ -2248,7 +2326,7 @@ impl LiquidMorphRuntime {
                 self.lean_target = 0.0;
                 self.lean_phase_elapsed += dt;
                 if self.lean_phase_elapsed >= self.lean_phase_duration
-                    && self.tuning.idle_lean_angle > 1.0e-6
+                    && self.effective_idle_lean_angle() > 1.0e-6
                 {
                     let signed =
                         deterministic_unit(self.seed, self.lean_sequence, 0x1EA1) * 2.0 - 1.0;
@@ -2257,14 +2335,14 @@ impl LiquidMorphRuntime {
                         1.0,
                         deterministic_unit(self.seed, self.lean_sequence, 0x1EB3),
                     );
-                    self.idle_lean_goal = signed * magnitude * self.tuning.idle_lean_angle;
+                    self.idle_lean_goal = signed * magnitude * self.effective_idle_lean_angle();
                     self.lean_phase = LeanPhase::IdleLean;
                     self.lean_phase_elapsed = 0.0;
                     self.lean_phase_duration = lerp(
                         0.18,
                         0.32,
                         deterministic_unit(self.seed, self.lean_sequence, 0x1EC7),
-                    ) / self.tuning.idle_lean_rate.max(0.03);
+                    ) / self.effective_idle_lean_rate().max(0.03);
                     self.lean_sequence = self.lean_sequence.wrapping_add(1);
                 }
             }
@@ -2977,6 +3055,45 @@ impl MaterialParameters {
             surface_tension: tuning.surface_tension,
             character_field_strength: tuning.return_strength,
         }
+    }
+}
+
+fn sanitize_runtime_actuation(mut value: PbfRuntimeActuation) -> PbfRuntimeActuation {
+    value.density_compliance_multiplier =
+        finite_range(value.density_compliance_multiplier, 0.75, 1.25, 1.0);
+    value.viscosity_multiplier = finite_range(value.viscosity_multiplier, 0.78, 1.30, 1.0);
+    value.surface_tension_multiplier =
+        finite_range(value.surface_tension_multiplier, 0.80, 1.25, 1.0);
+    value.flight_inertia_multiplier =
+        finite_range(value.flight_inertia_multiplier, 0.85, 1.20, 1.0);
+    value.flight_stretch_multiplier =
+        finite_range(value.flight_stretch_multiplier, 0.85, 1.22, 1.0);
+    value.flight_damping_multiplier =
+        finite_range(value.flight_damping_multiplier, 0.82, 1.28, 1.0);
+    value.flight_max_lag_multiplier =
+        finite_range(value.flight_max_lag_multiplier, 0.90, 1.18, 1.0);
+    value.angular_damping_multiplier =
+        finite_range(value.angular_damping_multiplier, 0.82, 1.30, 1.0);
+    value.motor_gain_multiplier = finite_range(value.motor_gain_multiplier, 0.72, 1.16, 1.0);
+    value.shape_recovery_delta = finite_range(value.shape_recovery_delta, 0.0, 0.42, 0.0);
+    value.upright_stabilization_delta =
+        finite_range(value.upright_stabilization_delta, 0.0, 0.34, 0.0);
+    value.idle_breath_amplitude_multiplier =
+        finite_range(value.idle_breath_amplitude_multiplier, 0.65, 1.45, 1.0);
+    value.idle_breath_speed_multiplier =
+        finite_range(value.idle_breath_speed_multiplier, 0.55, 1.65, 1.0);
+    value.idle_lean_angle_multiplier =
+        finite_range(value.idle_lean_angle_multiplier, 0.65, 1.25, 1.0);
+    value.idle_lean_rate_multiplier =
+        finite_range(value.idle_lean_rate_multiplier, 0.55, 1.35, 1.0);
+    value
+}
+
+fn finite_range(value: f32, minimum: f32, maximum: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(minimum, maximum)
+    } else {
+        fallback
     }
 }
 

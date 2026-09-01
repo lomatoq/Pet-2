@@ -1,6 +1,6 @@
 {
-  "schema_version": 17,
-  "profile_revision": 11,
+  "schema_version": 18,
+  "profile_revision": 12,
   "name": "Black copy",
   "seed": 42,
   "render_mode": "particle_pbf",
@@ -136,7 +136,9 @@
   },
   "material": {
     "variant": "cinematic_jelly",
-    "override_genome_colors": true,
+    "override_genome_colors": false,
+    "color_source_mode": "genome_authored_blend",
+    "genome_color_blend": 0.65,
     "primary_hsv": [0.2, 0.0, 0.0],
     "secondary_hsv": [0.0, 0.39, 0.0],
     "glow_hsv": [0.0, 0.0, 0.06],

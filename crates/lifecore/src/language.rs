@@ -827,6 +827,7 @@ mod tests {
             confidence: 0.8,
             attachment: 0.4,
             rhythm_intervals: [0.0; 8],
+            phenotype: crate::VoicePhenotypeActuation::default(),
         };
         let mut arbiter = VocalArbiter::default();
         assert!(arbiter.admit(request.clone(), 1.0, true).is_none());

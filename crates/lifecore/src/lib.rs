@@ -11,10 +11,13 @@ mod development;
 mod drives;
 mod genome;
 mod interaction;
+mod interoception;
 mod language;
 mod memory;
 mod microbrain;
 mod persistence;
+mod phenotype;
+mod phenotype_director;
 mod vita;
 
 use std::{array, collections::VecDeque};
@@ -31,10 +34,13 @@ pub use development::*;
 pub use drives::*;
 pub use genome::*;
 pub use interaction::*;
+pub use interoception::*;
 pub use language::*;
 pub use memory::*;
 pub use microbrain::*;
 pub use persistence::*;
+pub use phenotype::*;
+pub use phenotype_director::*;
 pub use vita::*;
 
 pub const LIFECORE_HZ: f32 = 20.0;
@@ -111,6 +117,23 @@ pub struct LifeCore {
 }
 
 impl LifeCore {
+    /// Applies the previous immutable body's felt-state evidence before the
+    /// normal LifeCore tick. Renderers never receive mutable access to drives.
+    pub fn integrate_felt_state(
+        &mut self,
+        snapshot: InteroceptionSnapshot,
+        episode: EpisodeContextV1,
+        dt: f32,
+    ) {
+        self.state
+            .development
+            .integrate_nervous_evidence(snapshot, episode, dt);
+        self.state
+            .drives
+            .integrate_felt_state(snapshot.felt, snapshot.derived, episode, dt);
+        self.state.affect.integrate_felt_state(snapshot.felt, dt);
+    }
+
     /// Advances only calendar/homeostatic opportunity during an explicitly
     /// approximate quiet interval. It never ticks the brain, contextual
     /// bandits, interaction variants, user models, success counters, or
@@ -347,6 +370,12 @@ impl LifeCore {
         learning_openness: f32,
     ) -> Option<InteractionResponsePlan> {
         event.sanitize();
+        self.state.development.note_embodied_gesture(
+            event.classification.episode_id,
+            event.classification.kind,
+            event.boundary,
+            event.classification.ended,
+        );
         let boundary = event.boundary != GestureBoundaryEvent::None;
         if (!event.classification.committed && !boundary)
             || event.classification.episode_id == 0
@@ -501,6 +530,7 @@ impl LifeCore {
     }
 
     pub fn consolidate_sleep(&mut self) {
+        self.state.development.note_sleep_consolidation();
         self.memories.consolidate();
         self.brain.consolidate();
         self.repair_vocal_repertoire();
@@ -1081,6 +1111,7 @@ impl LifeCore {
             } else {
                 [0.0; 8]
             },
+            phenotype: VoicePhenotypeActuation::default(),
         })
     }
 

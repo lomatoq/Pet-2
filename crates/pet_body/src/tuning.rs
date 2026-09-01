@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 17;
+pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 18;
 const OLDEST_MIGRATABLE_LIQUID_TUNING_SCHEMA_VERSION: u32 = 6;
 
 /// Approved Body Lab seed-42 palette. Cinematic intentionally uses this authored
@@ -27,6 +27,15 @@ pub enum MaterialVariant {
     #[default]
     CurrentSafe,
     CinematicJelly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorSourceMode {
+    Authored,
+    Genome,
+    #[default]
+    GenomeAuthoredBlend,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +229,9 @@ pub struct MaterialTuning {
     #[serde(default = "safe_material_variant")]
     pub variant: MaterialVariant,
     pub override_genome_colors: bool,
+    pub color_source_mode: ColorSourceMode,
+    /// Weight of inherited Genome color in the circular-HSV identity blend.
+    pub genome_color_blend: f32,
     pub primary_hsv: [f32; 3],
     pub secondary_hsv: [f32; 3],
     pub glow_hsv: [f32; 3],
@@ -362,7 +374,7 @@ impl LiquidTuningProfile {
             // so loading a file cannot silently change its look.
             self.material.variant = MaterialVariant::CurrentSafe;
             self.schema_version = LIQUID_TUNING_SCHEMA_VERSION;
-        } else if (9..=16).contains(&self.schema_version) {
+        } else if (9..=17).contains(&self.schema_version) {
             // Cinematic profiles already opted into their material. Schemas 10
             // through 15 preserve the selected material lane. Schema 16 replaces
             // the unstable mode-switched solver settings below without touching
@@ -380,7 +392,15 @@ impl LiquidTuningProfile {
             self.material.secondary_hsv = BODY_LAB_SECONDARY_HSV;
             self.material.glow_hsv = BODY_LAB_GLOW_HSV;
         }
-        if source_schema < LIQUID_TUNING_SCHEMA_VERSION {
+        if source_schema <= 17 {
+            self.material.color_source_mode = if self.material.override_genome_colors {
+                ColorSourceMode::GenomeAuthoredBlend
+            } else {
+                ColorSourceMode::Genome
+            };
+            self.material.genome_color_blend = 0.65;
+        }
+        if source_schema < 17 {
             self.pbf.apply_v16_solver_defaults();
         }
         self.name = self.name.trim().chars().take(64).collect();
@@ -722,6 +742,8 @@ impl Default for MaterialTuning {
         Self {
             variant: MaterialVariant::CinematicJelly,
             override_genome_colors: true,
+            color_source_mode: ColorSourceMode::GenomeAuthoredBlend,
+            genome_color_blend: 0.65,
             primary_hsv: BODY_LAB_PRIMARY_HSV,
             secondary_hsv: BODY_LAB_SECONDARY_HSV,
             glow_hsv: BODY_LAB_GLOW_HSV,
@@ -784,6 +806,7 @@ impl Default for MaterialTuning {
 
 impl MaterialTuning {
     fn sanitize(&mut self) {
+        self.genome_color_blend = bounded(self.genome_color_blend, 0.0, 1.0, 0.65);
         sanitize_hsv(&mut self.primary_hsv);
         sanitize_hsv(&mut self.secondary_hsv);
         sanitize_hsv(&mut self.glow_hsv);
@@ -965,9 +988,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_sixteen_defaults_select_the_single_stable_solver_lane() {
+    fn schema_eighteen_defaults_keep_the_single_stable_solver_lane() {
         let pbf = PbfTuning::default();
-        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 17);
+        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 18);
         assert_eq!(pbf.substeps, 1);
         assert_eq!(pbf.impact_substeps, 1);
         assert_eq!(pbf.density_iterations, 6);
@@ -981,6 +1004,22 @@ mod tests {
         assert_eq!(pbf.idle_fragment_size, 0.0);
         assert_eq!(pbf.idle_bud_pull_strength, 0.0);
         assert_eq!(pbf.pinch_bounce, 0.0);
+    }
+
+    #[test]
+    fn schema_seventeen_authored_override_migrates_to_identity_blend() {
+        let mut profile = LiquidTuningProfile::for_seed(42);
+        profile.schema_version = 17;
+        profile.material.override_genome_colors = true;
+        profile.material.color_source_mode = ColorSourceMode::Authored;
+        profile.material.genome_color_blend = 0.0;
+        let migrated = profile.sanitized().expect("schema 17 migration");
+        assert_eq!(migrated.schema_version, 18);
+        assert_eq!(
+            migrated.material.color_source_mode,
+            ColorSourceMode::GenomeAuthoredBlend
+        );
+        assert_eq!(migrated.material.genome_color_blend, 0.65);
     }
 
     #[test]
