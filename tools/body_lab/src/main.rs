@@ -34,7 +34,7 @@ use winit::{
     event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowId, WindowLevel},
+    window::{Window, WindowId},
 };
 
 const FRAME: Duration = Duration::from_micros(16_667);
@@ -71,15 +71,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Body Lab\n\n  --live-pet       Start in Live Brain (telemetry.jsonl, rotated history, legacy events.jsonl fallback)\n  --data-dir PATH  Use the same overridden Pet 2 data directory\n\n  F12 switches Liquid Body Lab ↔ Live Brain"
+                    "Pet2 Dev Console\n\n  --live-pet       Start on Perception with live telemetry\n  --data-dir PATH  Use the same overridden Pet 2 data directory\n\n  F1–F4 switch Character, Perception, Behavior, and Diagnostics"
                 );
                 return Ok(());
             }
-            _ => return Err(format!("unknown Body Lab option: {argument}").into()),
+            _ => return Err(format!("unknown Pet2 Dev Console option: {argument}").into()),
         }
     }
-    // Discover the Pet store even when Body Lab is the initial view. F12 can
-    // then switch to the live monitor without restarting either surface.
+    // One console owns both the authored character preview and live telemetry.
     let store = data_dir
         .as_deref()
         .map(StateStore::at)
@@ -97,17 +96,41 @@ struct BodyLab {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LabView {
-    Body,
-    Live,
+enum DevPanel {
+    Character,
+    Perception,
+    Behavior,
+    Diagnostics,
 }
 
-impl LabView {
-    fn toggled(self) -> Self {
+impl DevPanel {
+    const ALL: [Self; 4] = [
+        Self::Character,
+        Self::Perception,
+        Self::Behavior,
+        Self::Diagnostics,
+    ];
+
+    const fn label(self) -> &'static str {
         match self {
-            Self::Body => Self::Live,
-            Self::Live => Self::Body,
+            Self::Character => "Character",
+            Self::Perception => "Perception",
+            Self::Behavior => "Behavior",
+            Self::Diagnostics => "Diagnostics",
         }
+    }
+
+    const fn shortcut(self) -> &'static str {
+        match self {
+            Self::Character => "F1",
+            Self::Perception => "F2",
+            Self::Behavior => "F3",
+            Self::Diagnostics => "F4",
+        }
+    }
+
+    const fn is_live(self) -> bool {
+        !matches!(self, Self::Character)
     }
 }
 
@@ -134,9 +157,7 @@ struct LabRuntime {
     audio: Option<AudioEngine>,
     audio_error: Option<String>,
     voice_preview_counter: u64,
-    view: LabView,
-    body_window_size: LogicalSize<f64>,
-    live_window_size: LogicalSize<f64>,
+    panel: DevPanel,
     live_monitor: Option<LivePetMonitor>,
 }
 
@@ -320,30 +341,17 @@ impl ApplicationHandler for BodyLab {
         if self.runtime.is_some() {
             return;
         }
-        let live_pet = self.start_live;
         let window = match event_loop.create_window(
             Window::default_attributes()
-                .with_title(if live_pet {
-                    "PET-2 Live Brain — causal dev panel"
-                } else {
-                    "PET-2 Liquid Body Lab — zero-G soft fields"
-                })
-                .with_inner_size(if live_pet {
-                    LogicalSize::new(1_040.0, 900.0)
-                } else {
-                    LogicalSize::new(1_180.0, 820.0)
-                })
+                .with_title("Pet2 Dev Console")
+                .with_inner_size(LogicalSize::new(1_180.0, 880.0))
+                .with_min_inner_size(LogicalSize::new(880.0, 640.0))
                 .with_position(LogicalPosition::new(32.0, 48.0))
-                .with_resizable(true)
-                .with_window_level(if live_pet {
-                    WindowLevel::AlwaysOnTop
-                } else {
-                    WindowLevel::Normal
-                }),
+                .with_resizable(true),
         ) {
             Ok(window) => Arc::new(window),
             Err(error) => {
-                eprintln!("could not create Body Lab window: {error}");
+                eprintln!("could not create Pet2 Dev Console window: {error}");
                 event_loop.exit();
                 return;
             }
@@ -369,7 +377,7 @@ impl ApplicationHandler for BodyLab {
                 profile = saved;
             }
         }
-        // Production migration is deliberately Current / Safe. Body Lab is the
+        // Production migration is deliberately Current / Safe. Dev Console is the
         // opt-in experiment surface, so the first launch after schema migration
         // opens Cinematic Jelly while keeping the incumbent one click away.
         if migrated_material_preview {
@@ -524,13 +532,11 @@ impl ApplicationHandler for BodyLab {
             audio,
             audio_error,
             voice_preview_counter: 0,
-            view: if live_pet {
-                LabView::Live
+            panel: if self.start_live {
+                DevPanel::Perception
             } else {
-                LabView::Body
+                DevPanel::Character
             },
-            body_window_size: LogicalSize::new(1_180.0, 820.0),
-            live_window_size: LogicalSize::new(1_040.0, 900.0),
             live_monitor,
         });
     }
@@ -547,7 +553,7 @@ impl ApplicationHandler for BodyLab {
         let wall_dt = (now - runtime.last_update).as_secs_f32().clamp(0.0, 0.05);
         runtime.last_update = now;
         runtime.next_frame = now
-            + if runtime.view == LabView::Live {
+            + if runtime.panel.is_live() {
                 Duration::from_micros(33_333)
             } else {
                 FRAME
@@ -555,7 +561,7 @@ impl ApplicationHandler for BodyLab {
         if let Some(monitor) = runtime.live_monitor.as_mut() {
             monitor.poll();
         }
-        if runtime.view == LabView::Live {
+        if runtime.panel.is_live() {
             runtime.window.request_redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
             return;
@@ -681,13 +687,6 @@ impl ApplicationHandler for BodyLab {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
                 WindowEvent::Resized(size) => {
-                    if size.width > 0 && size.height > 0 {
-                        let logical = size.to_logical(runtime.window.scale_factor());
-                        match runtime.view {
-                            LabView::Body => runtime.body_window_size = logical,
-                            LabView::Live => runtime.live_window_size = logical,
-                        }
-                    }
                     runtime.renderer.resize(size);
                     sync_preview_viewport(
                         &mut runtime.body,
@@ -702,32 +701,32 @@ impl ApplicationHandler for BodyLab {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         match code {
                             KeyCode::Escape => event_loop.exit(),
-                            KeyCode::F12 => {
-                                runtime.view = runtime.view.toggled();
-                                update_window_for_view(runtime);
-                            }
-                            KeyCode::Space if runtime.view == LabView::Live => {
+                            KeyCode::F1 => runtime.panel = DevPanel::Character,
+                            KeyCode::F2 => runtime.panel = DevPanel::Perception,
+                            KeyCode::F3 => runtime.panel = DevPanel::Behavior,
+                            KeyCode::F4 => runtime.panel = DevPanel::Diagnostics,
+                            KeyCode::Space if runtime.panel.is_live() => {
                                 if let Some(monitor) = runtime.live_monitor.as_mut() {
                                     monitor.toggle_playback();
                                 }
                             }
-                            KeyCode::ArrowLeft if runtime.view == LabView::Live => {
+                            KeyCode::ArrowLeft if runtime.panel.is_live() => {
                                 if let Some(monitor) = runtime.live_monitor.as_mut() {
                                     monitor.select_previous();
                                 }
                             }
-                            KeyCode::ArrowRight if runtime.view == LabView::Live => {
+                            KeyCode::ArrowRight if runtime.panel.is_live() => {
                                 if let Some(monitor) = runtime.live_monitor.as_mut() {
                                     monitor.select_next();
                                 }
                             }
                             KeyCode::Space
-                                if runtime.view == LabView::Body && !response.consumed =>
+                                if runtime.panel == DevPanel::Character && !response.consumed =>
                             {
                                 runtime.ui.playing = !runtime.ui.playing;
                             }
                             KeyCode::KeyR
-                                if runtime.view == LabView::Body && !response.consumed =>
+                                if runtime.panel == DevPanel::Character && !response.consumed =>
                             {
                                 runtime.ui.reset_requested = true;
                             }
@@ -740,26 +739,6 @@ impl ApplicationHandler for BodyLab {
             }
         }
     }
-}
-
-fn update_window_for_view(runtime: &mut LabRuntime) {
-    match runtime.view {
-        LabView::Body => {
-            runtime
-                .window
-                .set_title("PET-2 Liquid Body Lab — zero-G soft fields");
-            runtime.window.set_window_level(WindowLevel::Normal);
-            let _ = runtime.window.request_inner_size(runtime.body_window_size);
-        }
-        LabView::Live => {
-            runtime
-                .window
-                .set_title("PET-2 Live Brain — causal dev panel");
-            runtime.window.set_window_level(WindowLevel::AlwaysOnTop);
-            let _ = runtime.window.request_inner_size(runtime.live_window_size);
-        }
-    }
-    runtime.window.request_redraw();
 }
 
 fn sync_preview_space(body: &mut ProceduralBody, size: PhysicalSize<u32>) {
@@ -1082,29 +1061,34 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     let diagnostics = runtime.body.embodiment.liquid.diagnostics();
     let raw_input = runtime.egui_state.take_egui_input(runtime.window.as_ref());
     let egui_context = runtime.egui_context.clone();
-    let output = egui_context.run(raw_input, |context| match runtime.view {
-        LabView::Live => {
-            if let Some(monitor) = runtime.live_monitor.as_mut() {
-                show_live_pet(context, monitor);
-            } else {
-                show_live_pet_unavailable(context);
+    let mut selected_panel = runtime.panel;
+    let output = egui_context.run(raw_input, |context| {
+        dev_console_navigation(context, &mut selected_panel, runtime.live_monitor.as_ref());
+        match selected_panel {
+            DevPanel::Character => {
+                runtime.ui.show(
+                    context,
+                    diagnostics,
+                    runtime.body.embodiment.pose.pupil_size,
+                    runtime.body.embodiment.pose.pupil_asymmetry,
+                    runtime.fps,
+                    runtime.p95_frame_ms,
+                );
+            }
+            panel => {
+                if let Some(monitor) = runtime.live_monitor.as_mut() {
+                    show_live_panel(context, monitor, panel);
+                } else {
+                    show_live_pet_unavailable(context);
+                }
             }
         }
-        LabView::Body => {
-            runtime.ui.show(
-                context,
-                diagnostics,
-                runtime.body.embodiment.pose.pupil_size,
-                runtime.body.embodiment.pose.pupil_asymmetry,
-                runtime.fps,
-                runtime.p95_frame_ms,
-            );
-        }
     });
+    runtime.panel = selected_panel;
     runtime
         .egui_state
         .handle_platform_output(runtime.window.as_ref(), output.platform_output);
-    if runtime.view == LabView::Body
+    if runtime.panel == DevPanel::Character
         && let Err(error) = apply_preview_profile(runtime)
     {
         runtime.ui.status = format!("Liquid profile rejected: {error}");
@@ -1138,7 +1122,7 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
         let callbacks = egui_renderer.update_buffers(device, queue, encoder, &paint_jobs, &screen);
         debug_assert!(callbacks.is_empty());
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Body Lab egui overlay"),
+            label: Some("Pet2 Dev Console egui overlay"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 depth_slice: None,
@@ -1215,7 +1199,7 @@ impl LivePetMonitor {
                 .map_or(0, |control| control.command_id),
             pending_command_id: None,
             pending_command_sent_at: None,
-            control_status: "No intervention sent from this Body Lab session.".into(),
+            control_status: "No intervention sent from this Dev Console session.".into(),
             evolution_scrub: EvolutionScrubState::default(),
             canonical_evolution: CanonicalEvolutionCache::default(),
             last_state_poll: Instant::now() - Duration::from_secs(2),
@@ -1238,7 +1222,7 @@ impl LivePetMonitor {
         let telemetry_available =
             self.telemetry_path.exists() || self.telemetry_previous_path.exists();
         if telemetry_available && self.using_legacy {
-            // The canonical bounded stream may appear after Body Lab starts.
+            // The canonical bounded stream may appear after Dev Console starts.
             // Prefer it immediately and drop only the in-memory legacy copy;
             // no log on disk is ever changed here.
             self.using_legacy = false;
@@ -1703,103 +1687,296 @@ fn is_telemetry_frame(event: &Value) -> bool {
         || event.get("kind").is_none() && event.get("details").is_some_and(Value::is_object)
 }
 
+fn dev_console_navigation(
+    context: &Context,
+    selected: &mut DevPanel,
+    monitor: Option<&LivePetMonitor>,
+) {
+    egui::TopBottomPanel::top("dev_console_navigation")
+        .frame(
+            egui::Frame::default()
+                .fill(egui::Color32::from_rgb(16, 20, 29))
+                .inner_margin(egui::Margin::symmetric(14, 10)),
+        )
+        .show(context, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Pet2 Dev Console");
+                ui.add_space(10.0);
+                for panel in DevPanel::ALL {
+                    let label = format!("{}  {}", panel.shortcut(), panel.label());
+                    ui.selectable_value(selected, panel, label);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let live = monitor
+                        .and_then(LivePetMonitor::stale_seconds)
+                        .is_some_and(|seconds| seconds <= 1.2);
+                    ui.colored_label(
+                        if live {
+                            egui::Color32::from_rgb(105, 232, 172)
+                        } else {
+                            egui::Color32::from_rgb(255, 190, 92)
+                        },
+                        if live { "● LIVE" } else { "● OFFLINE" },
+                    );
+                });
+            });
+        });
+}
+
 fn show_live_pet_unavailable(context: &Context) {
     egui::CentralPanel::default().show(context, |ui| {
-        ui.heading("PET-2 Live Brain");
-        ui.label("Pet data directory is unavailable; telemetry cannot be discovered.");
-        ui.label("Press F12 to return to Liquid Body Lab.");
+        ui.heading("Live data unavailable");
+        ui.label("The Pet2 data directory could not be discovered.");
+        ui.label("Character editing remains available in F1 Character.");
     });
 }
 
-fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
+fn show_live_panel(context: &Context, monitor: &mut LivePetMonitor, panel: DevPanel) {
     egui::CentralPanel::default()
         .frame(egui::Frame::default().fill(egui::Color32::from_rgb(12, 15, 22)))
         .show(context, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("PET-2 Live Brain");
-                let stale = monitor.stale_seconds().is_none_or(|seconds| seconds > 1.2);
-                ui.colored_label(
-                    if stale {
-                        egui::Color32::from_rgb(255, 118, 105)
-                    } else {
-                        egui::Color32::from_rgb(105, 232, 172)
-                    },
-                    if stale { "OFFLINE / STALE" } else { "LIVE" },
-                );
-            });
-            ui.label("perception → arbitration → intent → motor → body / object");
-            ui.small(format!(
-                "{} · F12: Liquid Body Lab ↔ Live Brain",
-                monitor.active_path().display()
-            ));
+            ui.heading(panel.label());
+            ui.small(panel_description(panel));
             ui.small(&monitor.status);
-            live_timeline(ui, monitor);
-            ui.separator();
-            live_controlled_intervention(ui, monitor);
-            ui.separator();
-
             let stale_seconds = monitor.stale_seconds();
-            let selected_frame = monitor.selected;
-            let Some(latest) = monitor.frames.get(selected_frame) else {
+            if panel == DevPanel::Diagnostics {
+                live_timeline(ui, monitor);
+                ui.separator();
+            }
+            if panel == DevPanel::Behavior {
+                live_behavior_controls(ui, monitor);
+                ui.separator();
+            }
+            let Some(latest) = monitor.selected_frame().cloned() else {
                 ui.add_space(20.0);
                 ui.heading("Waiting for the organism");
-                ui.label("Close the normal Pet 2 instance, then run Pet2-Dev.cmd.");
+                ui.label("Start Pet2 Dev Console from the installed application.");
                 ui.label(
                     "No screen captures/pixel buffers, typed text, raw audio, or native window IDs are stored; legacy numeric desktop coordinates remain.",
                 );
                 return;
             };
-
-            for (severity, message) in live_blockers(latest, stale_seconds) {
-                let color = match severity {
-                    2 => egui::Color32::from_rgb(255, 105, 96),
-                    1 => egui::Color32::from_rgb(255, 190, 92),
-                    _ => egui::Color32::from_rgb(108, 224, 166),
-                };
-                egui::Frame::default()
-                    .fill(color.gamma_multiply(0.13))
-                    .corner_radius(5.0)
-                    .inner_margin(egui::Margin::same(7))
-                    .show(ui, |ui| {
-                        ui.colored_label(color, message);
-                    });
-                ui.add_space(3.0);
-            }
-
-            live_attention_map(ui, latest);
-            live_chart(ui, &monitor.history, Some(monitor.selected));
-            ui.separator();
+            live_now_summary(ui, &latest);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.columns(2, |columns| {
-                        live_perception_and_decision(&mut columns[0], latest);
-                        live_motor_and_body(&mut columns[1], latest);
-                    });
-                    ui.separator();
-                    ui.columns(2, |columns| {
-                        live_drives(&mut columns[0], latest);
-                        live_orb_and_performance(&mut columns[1], latest);
-                    });
-                    ui.separator();
-                    live_candidates(ui, latest);
-                    ui.separator();
-                    live_identity_and_evolution(
-                        ui,
-                        latest,
-                        &monitor.canonical_evolution,
-                        &mut monitor.evolution_scrub,
-                    );
-                    ui.separator();
-                    ui.columns(2, |columns| {
-                        live_morph_and_activity(&mut columns[0], latest);
-                        live_vita_and_fusion(&mut columns[1], latest);
-                    });
-                    ui.separator();
-                    live_learning_memory_social(ui, latest);
-                    live_raw_json(ui, latest);
+                .show(ui, |ui| match panel {
+                    DevPanel::Perception => {
+                        live_attention_map(ui, &latest);
+                        ui.separator();
+                        ui.columns(2, |columns| {
+                            live_perception_and_decision(&mut columns[0], &latest);
+                            live_drives(&mut columns[1], &latest);
+                        });
+                    }
+                    DevPanel::Behavior => {
+                        ui.columns(2, |columns| {
+                            live_drives(&mut columns[0], &latest);
+                            live_perception_and_decision(&mut columns[1], &latest);
+                        });
+                        ui.separator();
+                        live_candidates(ui, &latest);
+                        ui.separator();
+                        live_learning_memory_social(ui, &latest);
+                    }
+                    DevPanel::Diagnostics => {
+                        for (severity, message) in live_blockers(&latest, stale_seconds) {
+                            live_status_card(ui, severity, &message);
+                        }
+                        live_chart(ui, &monitor.history, Some(monitor.selected));
+                        ui.separator();
+                        ui.columns(2, |columns| {
+                            live_motor_and_body(&mut columns[0], &latest);
+                            live_orb_and_performance(&mut columns[1], &latest);
+                        });
+                        ui.separator();
+                        live_candidates(ui, &latest);
+                        ui.separator();
+                        live_identity_and_evolution(
+                            ui,
+                            &latest,
+                            &monitor.canonical_evolution,
+                            &mut monitor.evolution_scrub,
+                        );
+                        ui.separator();
+                        ui.columns(2, |columns| {
+                            live_morph_and_activity(&mut columns[0], &latest);
+                            live_vita_and_fusion(&mut columns[1], &latest);
+                        });
+                        ui.separator();
+                        live_raw_json(ui, &latest);
+                    }
+                    DevPanel::Character => {}
                 });
         });
+}
+
+fn panel_description(panel: DevPanel) -> &'static str {
+    match panel {
+        DevPanel::Character => "Appearance, liquid physics, face, voice, and preview scenarios.",
+        DevPanel::Perception => {
+            "What the organism notices, what currently owns its gaze, and its coarse desktop model."
+        }
+        DevPanel::Behavior => {
+            "Current motivation, action arbitration, and temporary safe behavior tuning."
+        }
+        DevPanel::Diagnostics => {
+            "Replay, causal blockers, motor/body performance, learning, and raw telemetry."
+        }
+    }
+}
+
+fn live_status_card(ui: &mut egui::Ui, severity: u8, message: &str) {
+    let color = match severity {
+        2 => egui::Color32::from_rgb(255, 105, 96),
+        1 => egui::Color32::from_rgb(255, 190, 92),
+        _ => egui::Color32::from_rgb(108, 224, 166),
+    };
+    egui::Frame::default()
+        .fill(color.gamma_multiply(0.13))
+        .corner_radius(5.0)
+        .inner_margin(egui::Margin::same(7))
+        .show(ui, |ui| {
+            ui.colored_label(color, message);
+        });
+    ui.add_space(3.0);
+}
+
+fn live_now_summary(ui: &mut egui::Ui, latest: &Value) {
+    let action = text(latest, "/details/action");
+    let goal = text(latest, "/details/ecology/active_goal");
+    let attention = text(latest, "/details/gaze/attention_kind");
+    let gaze_owner = text(latest, "/details/gaze/source");
+    let gaze_target = format_vector(latest, "/details/gaze/intent_world_target");
+    let explanation = interest_explanation(latest);
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(20, 27, 39))
+        .corner_radius(7.0)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.columns(4, |columns| {
+                columns[0].small("DOING");
+                columns[0].strong(if goal.is_empty() { &action } else { &goal });
+                columns[1].small("INTEREST");
+                columns[1].strong(if attention.is_empty() {
+                    "None"
+                } else {
+                    &attention
+                });
+                columns[2].small("LOOKING");
+                columns[2].strong(gaze_target);
+                columns[3].small("GAZE OWNER");
+                columns[3].strong(if gaze_owner.is_empty() {
+                    "—"
+                } else {
+                    &gaze_owner
+                });
+            });
+            ui.add_space(6.0);
+            ui.label(explanation);
+        });
+    ui.add_space(8.0);
+}
+
+fn interest_explanation(latest: &Value) -> String {
+    let goal = text(latest, "/details/ecology/active_goal");
+    let attention = text(latest, "/details/gaze/attention_kind");
+    let saliency = text(latest, "/details/ecology/saliency_kind");
+    let reason = text(latest, "/details/ecology/reason");
+    let typing = number(latest, "/details/typing_rate_hz").unwrap_or(0.0);
+    let scroll = number(latest, "/details/scroll_velocity")
+        .unwrap_or(0.0)
+        .abs();
+    if goal == "SleepInDen" {
+        return "Rest owns behavior; passive window motion and typing are deliberately suppressed."
+            .into();
+    }
+    if !saliency.is_empty() {
+        return format!(
+            "A coarse visual region ({saliency}) is competing for attention; reaction reason: {reason}."
+        );
+    }
+    if attention == "Typing" || typing > 0.35 {
+        return format!(
+            "A typing burst was noticed at {typing:.1} Hz, but it remains a soft cue rather than a movement command."
+        );
+    }
+    if attention == "Scroll" || scroll > 0.08 {
+        return format!(
+            "Scroll/motion energy ({scroll:.2}) was noticed and will habituate if it continues."
+        );
+    }
+    if attention == "Window" {
+        return "A window boundary won a rare environmental glance; stable large windows remain background."
+            .into();
+    }
+    if attention == "Cursor" {
+        return "The cursor currently wins the attention competition; it may still be ignored if distant or calm."
+            .into();
+    }
+    if goal.is_empty() {
+        "No external stimulus owns behavior; the organism is following its internal state.".into()
+    } else {
+        format!("{goal} currently owns behavior because of {reason}.")
+    }
+}
+
+fn live_behavior_controls(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
+    ui.strong("Temporary behavior presets");
+    ui.small("These change motivation for a bounded time and never overwrite personality or learned state.");
+    let enabled = monitor.can_send_control();
+    let mut command = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(enabled, egui::Button::new("Explore more"))
+            .clicked()
+        {
+            command = Some(LabControlCommand::DrivePulse {
+                drive: LabDrive::Curiosity,
+                delta: 0.35,
+                duration_seconds: 20.0,
+            });
+        }
+        if ui
+            .add_enabled(enabled, egui::Button::new("More playful"))
+            .clicked()
+        {
+            command = Some(LabControlCommand::DrivePulse {
+                drive: LabDrive::Play,
+                delta: 0.32,
+                duration_seconds: 20.0,
+            });
+        }
+        if ui
+            .add_enabled(enabled, egui::Button::new("More social"))
+            .clicked()
+        {
+            command = Some(LabControlCommand::DrivePulse {
+                drive: LabDrive::Social,
+                delta: 0.28,
+                duration_seconds: 20.0,
+            });
+        }
+        if ui
+            .add_enabled(enabled, egui::Button::new("Calm down"))
+            .clicked()
+        {
+            command = Some(LabControlCommand::DrivePulse {
+                drive: LabDrive::Sleep,
+                delta: 0.28,
+                duration_seconds: 20.0,
+            });
+        }
+        if ui
+            .add_enabled(enabled, egui::Button::new("Natural state"))
+            .clicked()
+        {
+            command = Some(LabControlCommand::ClearDrivePulses);
+        }
+    });
+    if let Some(command) = command {
+        monitor.send_control(command);
+    }
+    live_controlled_intervention(ui, monitor);
 }
 
 fn live_timeline(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
@@ -1876,8 +2053,8 @@ fn live_timeline(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
 }
 
 fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
-    CollapsingHeader::new("Controlled intervention")
-        .default_open(false)
+    CollapsingHeader::new("Fine behavior controls")
+        .default_open(true)
         .show(ui, |ui| {
             let enabled = monitor.can_send_control();
             ui.label(
@@ -3813,8 +3990,8 @@ impl LabUi {
             .min_width(330.0)
             .resizable(true)
             .show(context, |ui| {
-                ui.heading("PET-2 Liquid Body Lab");
-                ui.label("Zero-G soft-field liquid · finite cohesion · no fixed particle tethers");
+                ui.heading("Character editor");
+                ui.label("Appearance, liquid motion, face, voice, and preview scenarios");
                 ui.separator();
                 self.transport(ui);
                 ui.separator();
@@ -4067,7 +4244,7 @@ impl LabUi {
     fn selected_preset_description(&self) -> String {
         match &self.selected_preset {
             PresetSelection::AuthoredCurrent => {
-                "The profile that was active when Body Lab opened; kept intact as the first choice."
+                "The profile that was active when Dev Console opened; kept intact as the first choice."
                     .to_owned()
             }
             PresetSelection::MoonlitGlass => {
@@ -5377,9 +5554,9 @@ mod tests {
         let current_directory = workspace.join("builds").join("current");
         fs::create_dir_all(&current_directory).unwrap();
         let current_exe = current_directory.join(if cfg!(windows) {
-            "Body Lab.exe"
+            "Pet2 Dev Console.exe"
         } else {
-            "Body Lab"
+            "Pet2 Dev Console"
         });
         let canonical = current_directory.join(canonical_pet_executable_name());
         File::create(&canonical).unwrap();
@@ -5734,5 +5911,41 @@ mod tests {
         let after_clock_rollback = next_lab_command_id(1, 1, prior);
         assert_eq!(after_clock_rollback, prior + 1);
         assert_ne!(after_clock_rollback, 0);
+    }
+
+    #[test]
+    fn dev_console_has_four_clear_panels_and_only_character_is_offline() {
+        assert_eq!(DevPanel::ALL.len(), 4);
+        assert_eq!(DevPanel::Character.label(), "Character");
+        assert_eq!(DevPanel::Perception.label(), "Perception");
+        assert_eq!(DevPanel::Behavior.label(), "Behavior");
+        assert_eq!(DevPanel::Diagnostics.label(), "Diagnostics");
+        assert!(!DevPanel::Character.is_live());
+        assert!(DevPanel::ALL[1..].iter().all(|panel| panel.is_live()));
+    }
+
+    #[test]
+    fn interest_summary_explains_sleep_typing_and_window_glances() {
+        let sleeping = serde_json::json!({
+            "details": {"ecology": {"active_goal": "SleepInDen"}}
+        });
+        assert!(interest_explanation(&sleeping).contains("Rest owns behavior"));
+
+        let typing = serde_json::json!({
+            "details": {
+                "gaze": {"attention_kind": "Typing"},
+                "typing_rate_hz": 4.5,
+                "ecology": {}
+            }
+        });
+        assert!(interest_explanation(&typing).contains("soft cue"));
+
+        let window = serde_json::json!({
+            "details": {
+                "gaze": {"attention_kind": "Window"},
+                "ecology": {}
+            }
+        });
+        assert!(interest_explanation(&window).contains("background"));
     }
 }

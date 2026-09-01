@@ -18,11 +18,11 @@ New-Item -ItemType Directory -Force -Path (Join-Path $dist 'config') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'licenses') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'tools') | Out-Null
 Copy-Item -Force (Join-Path $workspace "target/$Target/release/pet2.exe") (Join-Path $dist 'Pet2.exe')
-Copy-Item -Force (Join-Path $workspace "target/$Target/release/body_lab.exe") (Join-Path $dist 'BodyLab.exe')
+Copy-Item -Force (Join-Path $workspace "target/$Target/release/body_lab.exe") (Join-Path $dist 'Pet2 Dev Console.exe')
 Copy-Item -Force (Join-Path $workspace "target/$Target/release/habitat_lab.exe") (Join-Path $dist 'tools/HabitatLab.exe')
 Copy-Item -Force (Join-Path $workspace 'README.md') (Join-Path $dist 'README.txt')
 Copy-Item -Force (Join-Path $workspace 'LICENSE') (Join-Path $dist 'licenses/LICENSE')
 Copy-Item -Force (Join-Path $workspace 'config/default.json') (Join-Path $dist 'config/default.json')
-Set-Content -Encoding ascii -Path (Join-Path $dist 'Pet2-Dev.cmd') -Value @('@echo off', 'start "" "%~dp0Pet2.exe" --dev-mode', 'start "" "%~dp0BodyLab.exe" --live-pet')
+Set-Content -Encoding ascii -Path (Join-Path $dist 'Pet2-Dev.cmd') -Value @('@echo off', 'start "" "%~dp0Pet2.exe" --dev-mode', 'start "" "%~dp0Pet2 Dev Console.exe" --live-pet')
 Compress-Archive -Force -Path (Join-Path $dist '*') -DestinationPath $archive
 Write-Output $archive

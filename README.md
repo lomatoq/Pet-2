@@ -8,7 +8,7 @@ are required.
 > Status: v0.1 living-desktop habitat slice. The repository implements the portable
 > LifeCore, procedural body and voice, a persistent object ecology, multi-step
 > behavior episodes, native overlay/sensor adapters, versioned persistence,
-> deterministic Habitat Lab, packaging, and Windows/macOS CI. Windows and macOS
+> deterministic habitat scenarios, packaging, and Windows/macOS CI. Windows and macOS
 > share the same visual feature extraction, simulation, persistence, and tools;
 > only native capture, overlay, input, audio, and packaging remain platform-specific.
 
@@ -61,7 +61,7 @@ crates/pet_ecology   portable objects, den, metabolism, skills, physics, and epi
 crates/pet_perception reduced window, gesture, rhythm, and 16x9 visual affordances
 crates/desktop_host  platform contract, sensors, coordinates, overlay, storage
 app                  desktop runtime and state import/export CLI
-tools/body_lab       liquid tuning plus the live brain, telemetry, and evolution monitor
+tools/body_lab       unified Dev Console: character, perception, behavior, diagnostics
 tools/habitat_lab    developer-only deterministic scenario runner and SVG/JSON evidence
 ```
 
@@ -79,14 +79,13 @@ bash ./scripts/build_macos.sh
 bash ./scripts/package_macos.sh
 ```
 
-The macOS archive contains `Pet2.app`, `Body Lab.app`, `Habitat Lab.app`, the
-deterministic `tools/HabitatLab` runner, and `Pet2-Dev.command`. Double-click the
-latter to start Pet 2 with live telemetry and open Body Lab on its Live Brain
-view. `Habitat Lab.app` is the macOS equivalent of Windows `Pet2-Dev.cmd`: it
-restarts the installed Pet in bounded 5 Hz telemetry mode and keeps the Live
-Brain panel open. That panel shows realtime desktop position, movement, final
-gaze, visual-saliency target, cursor/orb context, decisions, drives, and visible
-body response. Its attention map also renders the same privacy-safe `8x5`
+The macOS archive contains `Pet2.app`, one `Pet2 Dev Console.app`, the
+deterministic `tools/HabitatLab` runner, and `Pet2-Dev.command`. Opening Dev
+Console restarts the installed Pet in bounded 5 Hz telemetry mode. Its normal,
+minimizable window contains four panels: Character, Perception, Behavior, and
+Diagnostics. They expose realtime desktop position, final gaze, visual-saliency
+target, decisions, drives, safe temporary behavior controls, body response,
+replay, and raw diagnostics. The Perception map renders the same privacy-safe `8x5`
 brightness/color/motion approximation consumed by the organism, plus anonymous
 window rectangles. It never exposes window titles, typed text, native window
 identifiers, screenshots, or pixel buffers. The deterministic cross-platform
@@ -158,20 +157,19 @@ keyboard hooks:
 - `Cmd/Win + Alt + N`: apply negative debug reward.
 - `Cmd/Win + Alt + D`: toggle bounded causal telemetry logging.
 
-## Body Lab and live brain monitor
+## Pet2 Dev Console
 
-Both packages keep the same companion tool: `BodyLab.exe` on Windows and
-`Body Lab.app` on macOS. Run `Pet2-Dev.cmd` or `Pet2-Dev.command` to start Pet 2
-with 5 Hz causal telemetry and open Body Lab directly on its Live Brain view.
+Both packages keep one companion tool: `Pet2 Dev Console.exe` on Windows and
+`Pet2 Dev Console.app` on macOS. Run `Pet2-Dev.cmd`, `Pet2-Dev.command`, or the
+application itself to start Pet 2 with 5 Hz causal telemetry.
 If a normal Pet 2 instance is already running, close it first because the
 desktop organism is single-instance on both platforms.
 
-Inside Body Lab, `F12` switches the same window between Liquid Body Lab and Live
-Brain. In Live Brain, `Space`, the arrow keys, the timeline slider, and the
-playback-rate buttons replay the captured state. This rewinds the observation,
-not the running organism. The live view follows attention, decisions, drives,
-affect, body and object motion, Morph/VITA/Fusion state, learning, identity, and
-exact bounded mutation checkpoints.
+`F1`–`F4` switch Character, Perception, Behavior, and Diagnostics. Diagnostics
+uses `Space`, arrow keys, the timeline slider, and playback-rate buttons to
+replay captured state. This rewinds the observation, not the running organism.
+The console follows attention, decisions, drives, affect, body/object motion,
+Morph/VITA/Fusion state, learning, identity, and bounded mutation checkpoints.
 
 Telemetry is written to an 8 MiB `telemetry.jsonl` plus one rotated previous
 file. The older semantic `events.jsonl` is not truncated or rotated and no

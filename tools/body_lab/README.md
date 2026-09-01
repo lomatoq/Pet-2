@@ -1,25 +1,25 @@
-# PET-2 Liquid Body Lab
+# Pet2 Dev Console
 
-Run the liquid editor with:
+Run the unified console with:
 
 ```powershell
 cargo run -p body_lab
 ```
 
-Start on the live organism monitor with:
+Start directly on live perception with:
 
 ```powershell
 cargo run -p pet2 -- --dev-mode
 cargo run -p body_lab -- --live-pet
 ```
 
-`F12` switches the same window between Liquid Body Lab and Live Brain without
-discarding either view's state. In Live Brain, `Space` plays or pauses the
-captured timeline, the left/right arrows step frames, and the slider and speed
-buttons scrub the bounded history. Replay changes only what the monitor shows;
-it never rolls back the running organism.
+`F1`–`F4` switch Character, Perception, Behavior, and Diagnostics without
+discarding panel state. In Diagnostics, `Space` plays or pauses the captured
+timeline, the left/right arrows step frames, and the slider and speed buttons
+scrub bounded history. Replay changes only what the console shows; it never
+rolls back the running organism.
 
-Live Brain reads `telemetry.jsonl` and its single rotated previous file, falling
+Dev Console reads `telemetry.jsonl` and its single rotated previous file, falling
 back to legacy `events.jsonl` when no bounded stream exists. Its typed Lab
 controls can issue expiring attention cues and drive pulses, clear pulses, set
 focus mode, or apply an explicit learning reward. Controls are enabled only
@@ -38,7 +38,7 @@ The single preview is the conserved soft-field particle liquid from the research
 specification. The analytic fallback is intentionally not shown: every visible
 control edits this exact preview, including while playback is paused.
 
-The panel exposes:
+Character exposes:
 
 - fixed-step soft-field physics, viscosity, cohesion, zero-G drag, and reconstruction;
 - component separation/re-merge, inertia, return behavior, breathing, bounded idle lean,

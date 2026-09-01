@@ -4,15 +4,15 @@ set -euo pipefail
 contents="$(cd "$(dirname "$0")/.." && pwd)"
 package_root="$(cd "$contents/../.." && pwd)"
 pet_app="$package_root/Pet2.app"
-monitor="$contents/Resources/BodyLabMonitor"
+console="$contents/Resources/DevConsole"
 
 if [[ ! -d "$pet_app" ]]; then
-  echo "Pet2.app must be installed beside Habitat Lab.app" >&2
+  echo "Pet2.app must be installed beside Pet2 Dev Console.app" >&2
   exit 1
 fi
 
-# Match the Windows Pet2-Dev launcher: replace a normal single-instance Pet
-# with the telemetry-enabled runtime, then keep the live monitor in this app.
+# Replace the normal single-instance Pet with the same signed application in
+# bounded telemetry mode. The console itself remains a normal macOS window.
 osascript -e 'tell application id "io.lomatoq.pet2" to quit' >/dev/null 2>&1 || true
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if ! pgrep -x Pet2 >/dev/null; then
@@ -26,4 +26,4 @@ fi
 
 open -n "$pet_app" --args --dev-mode
 sleep 1
-exec "$monitor" --live-pet
+exec "$console" --live-pet
