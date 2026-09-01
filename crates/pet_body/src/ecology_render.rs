@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
-use glam::{Vec3, Vec4};
-use pet_ecology::{DenEdge, EcologyState, ObjectKind, ObjectLifecycle};
+use glam::{Vec2, Vec3, Vec4};
+use pet_ecology::{EcologyState, ObjectKind, ObjectLifecycle};
 use wgpu::util::DeviceExt;
 
 const MAX_ECOLOGY_INSTANCES: usize = 9;
@@ -16,6 +16,9 @@ struct EcologyInstance {
 pub struct EcologyRenderer {
     pipeline: wgpu::RenderPipeline,
     instance_buffer: wgpu::Buffer,
+    den_activity: f32,
+    den_activity_integral_seconds: f32,
+    last_time_seconds: Option<f32>,
 }
 
 impl EcologyRenderer {
@@ -87,6 +90,9 @@ impl EcologyRenderer {
         Self {
             pipeline,
             instance_buffer,
+            den_activity: 0.0,
+            den_activity_integral_seconds: 0.0,
+            last_time_seconds: None,
         }
     }
 
@@ -104,11 +110,46 @@ impl EcologyRenderer {
         } else {
             16.0 / 9.0
         };
+        let time_seconds = if time_seconds.is_finite() {
+            time_seconds
+        } else {
+            self.last_time_seconds.unwrap_or(0.0)
+        };
+        let dt = self
+            .last_time_seconds
+            .map_or(0.0, |last| (time_seconds - last).clamp(0.0, 0.05));
+        self.last_time_seconds = Some(time_seconds);
+
+        let nearest_orb_distance_px = state
+            .objects
+            .iter()
+            .filter(|object| {
+                object.kind == ObjectKind::Orb && object.lifecycle != ObjectLifecycle::Consumed
+            })
+            .map(|orb| {
+                let delta = Vec2::new(
+                    (orb.position.x - state.den.anchor.x) * aspect,
+                    orb.position.y - state.den.anchor.y,
+                );
+                delta.length() * pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX
+            })
+            .fold(f32::INFINITY, f32::min);
+        let target_activity = if nearest_orb_distance_px.is_finite() {
+            1.0 - smoothstep(90.0, 180.0, nearest_orb_distance_px)
+        } else {
+            0.0
+        };
+        let response_seconds = 0.20;
+        let response_alpha = 1.0 - (-dt / response_seconds).exp();
+        self.den_activity += (target_activity - self.den_activity) * response_alpha;
+        self.den_activity = self.den_activity.clamp(0.0, 1.0);
+        self.den_activity_integral_seconds += self.den_activity * dt;
+
         let mut instances = [EcologyInstance::default(); MAX_ECOLOGY_INSTANCES];
         let mut count = 0_usize;
 
         let den_radius_y = 105.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * 2.0;
-        let den_color = Vec4::new(0.33, 0.20, 0.58, 0.72);
+        let den_color = Vec4::new(0.88, 0.95, 1.0, self.den_activity_integral_seconds);
         instances[count] = EcologyInstance {
             center_radius: [
                 state.den.anchor.x * 2.0 - 1.0,
@@ -117,12 +158,7 @@ impl EcologyRenderer {
                 den_radius_y * state.den.size_scale,
             ],
             color: den_color.to_array(),
-            material: [
-                1.0,
-                den_edge_code(state.den.edge),
-                state.den.familiarity,
-                time_seconds,
-            ],
+            material: [1.0, self.den_activity, state.den.familiarity, time_seconds],
         };
         count += 1;
 
@@ -130,39 +166,42 @@ impl EcologyRenderer {
             if count >= MAX_ECOLOGY_INSTANCES || object.lifecycle == ObjectLifecycle::Consumed {
                 continue;
             }
-            let stored_scale = if object.lifecycle == ObjectLifecycle::StoredInDen {
-                0.62
-            } else {
-                1.0
-            };
+            let stored_in_den = object.lifecycle == ObjectLifecycle::StoredInDen;
+            let stored_scale = if stored_in_den { 0.86 } else { 1.0 };
             let radius_y = object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX
                 * 2.0
                 * stored_scale;
             let rgb = hsv_to_rgb(object.hue, object.saturation, object.value);
+            let seed_phase = (object.id as u32) as f32 * 0.000_13 * std::f32::consts::TAU;
+            let (hover_x, hover_y) = if stored_in_den {
+                (
+                    (time_seconds * std::f32::consts::TAU / 3.83 + seed_phase).sin() * 6.0,
+                    (time_seconds * std::f32::consts::TAU / 5.17 + seed_phase * 1.7).sin() * 4.0,
+                )
+            } else {
+                (0.0, 0.0)
+            };
             instances[count] = EcologyInstance {
                 center_radius: [
-                    object.position.x * 2.0 - 1.0,
-                    1.0 - object.position.y * 2.0,
+                    object.position.x * 2.0 - 1.0
+                        + hover_x * 2.0 / (pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * aspect),
+                    1.0 - object.position.y * 2.0
+                        + hover_y * 2.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX,
                     radius_y / aspect,
                     radius_y,
                 ],
-                color: [
-                    rgb.x,
-                    rgb.y,
-                    rgb.z,
-                    if object.lifecycle == ObjectLifecycle::StoredInDen {
-                        0.74
-                    } else {
-                        0.96
-                    },
-                ],
+                color: [rgb.x, rgb.y, rgb.z, if stored_in_den { 0.94 } else { 0.96 }],
                 material: [
                     if object.kind == ObjectKind::Orb {
                         0.0
                     } else {
                         2.0
                     },
-                    object.glow,
+                    if stored_in_den {
+                        (object.glow * 1.10).clamp(0.0, 1.0)
+                    } else {
+                        object.glow
+                    },
                     object.wear,
                     time_seconds + (object.id as u32) as f32 * 0.000_13,
                 ],
@@ -198,13 +237,9 @@ impl EcologyRenderer {
     }
 }
 
-fn den_edge_code(edge: DenEdge) -> f32 {
-    match edge {
-        DenEdge::Left => 0.0,
-        DenEdge::Right => 1.0,
-        DenEdge::Top => 2.0,
-        DenEdge::Bottom => 3.0,
-    }
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> Vec3 {
