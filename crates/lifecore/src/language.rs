@@ -1,8 +1,9 @@
+use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     ActionId, AffectState, BodyFeedback, Drives, InteractionGazeTarget, InteractionReasonCode,
-    InteractionResponsePlan, LifeState, SensorFrame, VocalRequest, VocalTrigger,
+    InteractionResponsePlan, LifeState, Rect, SensorFrame, VocalRequest, VocalTrigger,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +19,46 @@ pub enum SocialIntent {
     Boundary,
     Alarm,
     Relief,
+}
+
+impl SocialIntent {
+    pub const ALL: [Self; 9] = [
+        Self::Notice,
+        Self::Contact,
+        Self::Acknowledge,
+        Self::Invite,
+        Self::Query,
+        Self::Effort,
+        Self::Boundary,
+        Self::Alarm,
+        Self::Relief,
+    ];
+
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    #[must_use]
+    pub const fn for_trigger(trigger: VocalTrigger) -> Self {
+        match trigger {
+            VocalTrigger::VisualNotice | VocalTrigger::FoodInspect => Self::Notice,
+            VocalTrigger::SoftTouch | VocalTrigger::Action(ActionId::Purr) => Self::Contact,
+            VocalTrigger::RhythmEcho | VocalTrigger::FoodAccepted => Self::Acknowledge,
+            VocalTrigger::ToyOffer
+            | VocalTrigger::PlayfulRelease
+            | VocalTrigger::Action(ActionId::Chirp | ActionId::MimicClickRhythm) => Self::Invite,
+            VocalTrigger::NeedHelp => Self::Query,
+            VocalTrigger::MissAndRetry | VocalTrigger::FragmentHelped => Self::Effort,
+            VocalTrigger::CalmBoundary | VocalTrigger::FoodRefused => Self::Boundary,
+            VocalTrigger::PhysicalStartle | VocalTrigger::ComponentDetached => Self::Alarm,
+            VocalTrigger::CatchSuccess
+            | VocalTrigger::ComponentRemerged
+            | VocalTrigger::HomeReturn
+            | VocalTrigger::SkillMastered => Self::Relief,
+            VocalTrigger::Action(_) => Self::Acknowledge,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +95,110 @@ impl VoiceGesture {
             | VocalTrigger::SoftTouch
             | VocalTrigger::PlayfulRelease => Self::WarmChuff,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VocalLexeme {
+    pub intent: SocialIntent,
+    pub gesture: VoiceGesture,
+    pub timing_scale: f32,
+    pub rhythm_bias: f32,
+    pub confidence: f32,
+    pub positive_examples: u32,
+    pub negative_examples: u32,
+    pub updates: u32,
+}
+
+impl VocalLexeme {
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.timing_scale.is_finite()
+            && (0.88..=1.12).contains(&self.timing_scale)
+            && self.rhythm_bias.is_finite()
+            && (-0.12..=0.12).contains(&self.rhythm_bias)
+            && self.confidence.is_finite()
+            && (0.0..=1.0).contains(&self.confidence)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VocalLexiconState {
+    pub schema_version: u32,
+    pub entries: [VocalLexeme; 9],
+    pub update_count: u32,
+    pub last_updated_episode: u64,
+}
+
+impl Default for VocalLexiconState {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            entries: SocialIntent::ALL.map(|intent| VocalLexeme {
+                intent,
+                gesture: default_gesture(intent),
+                timing_scale: 1.0,
+                rhythm_bias: 0.0,
+                confidence: 0.0,
+                positive_examples: 0,
+                negative_examples: 0,
+                updates: 0,
+            }),
+            update_count: 0,
+            last_updated_episode: 0,
+        }
+    }
+}
+
+impl VocalLexiconState {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.schema_version == 1
+            && self
+                .entries
+                .iter()
+                .enumerate()
+                .all(|(index, entry)| entry.intent.index() == index && entry.is_valid())
+    }
+
+    #[must_use]
+    pub const fn entry(&self, intent: SocialIntent) -> VocalLexeme {
+        self.entries[intent.index()]
+    }
+
+    /// Learns only bounded timing/rhythm convention. Timbre and semantic
+    /// gesture stay identity-owned; no microphone or raw waveform is involved.
+    pub fn update_social_timing(&mut self, intent: SocialIntent, episode_id: u64, reward: f32) {
+        if episode_id == 0 || episode_id == self.last_updated_episode || !reward.is_finite() {
+            return;
+        }
+        let entry = &mut self.entries[intent.index()];
+        let reward = reward.clamp(-1.0, 1.0);
+        let rate = 0.018 * (1.0 - entry.confidence * 0.35);
+        entry.timing_scale = (entry.timing_scale + reward * rate * 0.20).clamp(0.88, 1.12);
+        entry.rhythm_bias = (entry.rhythm_bias + reward * rate * 0.12).clamp(-0.12, 0.12);
+        entry.confidence = (entry.confidence + rate * 0.5).clamp(0.0, 1.0);
+        if reward >= 0.0 {
+            entry.positive_examples = entry.positive_examples.saturating_add(1);
+        } else {
+            entry.negative_examples = entry.negative_examples.saturating_add(1);
+        }
+        entry.updates = entry.updates.saturating_add(1);
+        self.update_count = self.update_count.saturating_add(1);
+        self.last_updated_episode = episode_id;
+    }
+}
+
+const fn default_gesture(intent: SocialIntent) -> VoiceGesture {
+    match intent {
+        SocialIntent::Notice | SocialIntent::Contact | SocialIntent::Acknowledge => {
+            VoiceGesture::WarmChuff
+        }
+        SocialIntent::Invite | SocialIntent::Query => VoiceGesture::MewWhine,
+        SocialIntent::Effort | SocialIntent::Boundary => VoiceGesture::LowRumble,
+        SocialIntent::Alarm => VoiceGesture::ClippedPulse,
+        SocialIntent::Relief => VoiceGesture::ReliefExhale,
     }
 }
 
@@ -126,6 +271,237 @@ impl PhysicalExpressionContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldEntityKind {
+    #[default]
+    Viewer,
+    Cursor,
+    Contact,
+    BodyComponent,
+    Surface,
+    ProceduralObject,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldAffordance {
+    #[default]
+    Observe,
+    Approach,
+    Touch,
+    Help,
+    Land,
+    Play,
+    Avoid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WorldEntity {
+    pub id: u64,
+    pub kind: WorldEntityKind,
+    pub bbox: Rect,
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub confidence: f32,
+    pub novelty: f32,
+    pub familiarity: f32,
+    pub salience: f32,
+    pub affordance: WorldAffordance,
+    pub affordances: [WorldAffordance; 4],
+    pub affordance_count: u8,
+    pub last_seen_seconds: f64,
+}
+
+impl Default for WorldEntity {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            kind: WorldEntityKind::Viewer,
+            bbox: Rect::default(),
+            position: Vec2::splat(0.5),
+            velocity: Vec2::ZERO,
+            confidence: 0.0,
+            novelty: 0.0,
+            familiarity: 0.0,
+            salience: 0.0,
+            affordance: WorldAffordance::Observe,
+            affordances: [WorldAffordance::Observe; 4],
+            affordance_count: 1,
+            last_seen_seconds: 0.0,
+        }
+    }
+}
+
+impl WorldEntity {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn point(
+        id: u64,
+        kind: WorldEntityKind,
+        position: Vec2,
+        velocity: Vec2,
+        confidence: f32,
+        salience: f32,
+        affordance: WorldAffordance,
+        last_seen_seconds: f64,
+    ) -> Self {
+        let position = position.clamp(Vec2::ZERO, Vec2::ONE);
+        Self {
+            id,
+            kind,
+            bbox: Rect {
+                minimum: (position - Vec2::splat(0.005)).clamp(Vec2::ZERO, Vec2::ONE),
+                maximum: (position + Vec2::splat(0.005)).clamp(Vec2::ZERO, Vec2::ONE),
+            },
+            position,
+            velocity: if velocity.is_finite() {
+                velocity.clamp_length_max(4.0)
+            } else {
+                Vec2::ZERO
+            },
+            confidence: confidence.clamp(0.0, 1.0),
+            salience: salience.clamp(0.0, 1.0),
+            affordance,
+            affordances: [affordance; 4],
+            affordance_count: 1,
+            last_seen_seconds: last_seen_seconds.max(0.0),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WorldModelFrame {
+    pub entities: [WorldEntity; 8],
+    pub entity_count: u8,
+    pub audience_present: bool,
+    pub audience_attention: f32,
+}
+
+impl Default for WorldModelFrame {
+    fn default() -> Self {
+        Self {
+            entities: [WorldEntity::default(); 8],
+            entity_count: 0,
+            audience_present: false,
+            audience_attention: 0.0,
+        }
+    }
+}
+
+impl WorldModelFrame {
+    #[must_use]
+    pub fn from_frames(sensors: &SensorFrame, body: &BodyFeedback) -> Self {
+        let mut world = Self {
+            audience_present: sensors.user_presence.unwrap_or(0.0) >= 0.2,
+            audience_attention: sensors
+                .user_availability
+                .unwrap_or_else(|| u8::from(sensors.user_idle_seconds < 45.0) as f32)
+                .clamp(0.0, 1.0),
+            ..Self::default()
+        };
+        world.observe(WorldEntity::point(
+            1,
+            WorldEntityKind::Cursor,
+            sensors.cursor_position,
+            sensors.cursor_velocity,
+            1.0,
+            (1.0 - sensors.cursor_distance_to_pet).clamp(0.0, 1.0),
+            if sensors.embodied_interaction.contact.active {
+                WorldAffordance::Touch
+            } else {
+                WorldAffordance::Approach
+            },
+            sensors.timestamp,
+        ));
+        if world.audience_present {
+            world.observe(WorldEntity::point(
+                2,
+                WorldEntityKind::Viewer,
+                Vec2::splat(0.5),
+                Vec2::ZERO,
+                world.audience_attention,
+                world.audience_attention,
+                WorldAffordance::Observe,
+                sensors.timestamp,
+            ));
+        }
+        if sensors.embodied_interaction.contact.active {
+            world.observe(WorldEntity::point(
+                3,
+                WorldEntityKind::Contact,
+                sensors.embodied_interaction.contact.point_world,
+                sensors.embodied_interaction.contact.relative_velocity_local,
+                1.0,
+                1.0,
+                WorldAffordance::Touch,
+                sensors.timestamp,
+            ));
+        }
+        for component in sensors.embodied_interaction.components
+            [..usize::from(sensors.embodied_interaction.component_observation_count)]
+            .iter()
+        {
+            world.observe(WorldEntity::point(
+                100 + u64::from(component.component_id),
+                WorldEntityKind::BodyComponent,
+                component.center_world,
+                Vec2::ZERO,
+                1.0,
+                (component.mass_fraction + component.distance_to_main * 0.25).clamp(0.0, 1.0),
+                WorldAffordance::Help,
+                sensors.timestamp,
+            ));
+        }
+        for (index, surface) in sensors.visible_surfaces.iter().enumerate() {
+            let position = (surface.rect.minimum + surface.rect.maximum) * 0.5;
+            let mut entity = WorldEntity::point(
+                500 + index as u64,
+                WorldEntityKind::Surface,
+                position,
+                Vec2::ZERO,
+                0.9,
+                0.3,
+                WorldAffordance::Land,
+                sensors.timestamp,
+            );
+            entity.bbox = surface.rect;
+            world.observe(entity);
+        }
+        if body.current_surface.is_some() {
+            world.observe(WorldEntity::point(
+                4,
+                WorldEntityKind::Surface,
+                body.world_position,
+                body.velocity,
+                1.0,
+                0.4,
+                WorldAffordance::Land,
+                sensors.timestamp,
+            ));
+        }
+        world
+    }
+
+    pub fn observe(&mut self, entity: WorldEntity) {
+        let index = usize::from(self.entity_count);
+        if index < self.entities.len() {
+            self.entities[index] = entity;
+            self.entity_count = self.entity_count.saturating_add(1);
+        }
+    }
+
+    #[must_use]
+    pub fn most_salient_object(&self) -> Option<WorldEntity> {
+        self.entities[..usize::from(self.entity_count)]
+            .iter()
+            .copied()
+            .filter(|entity| entity.kind == WorldEntityKind::ProceduralObject)
+            .max_by(|left, right| left.salience.total_cmp(&right.salience))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CreaturePhrase {
     pub phrase_id: u64,
@@ -136,6 +512,7 @@ pub struct CreaturePhrase {
     pub physical: PhysicalExpressionContext,
     pub priority: u8,
     pub quiet_suppressed: bool,
+    pub audience_effect: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -165,9 +542,20 @@ impl ExpressionDirector {
     #[must_use]
     pub fn direct(
         &mut self,
+        plan: InteractionResponsePlan,
+        living: LivingStateFrame,
+        physical: PhysicalExpressionContext,
+    ) -> CreaturePhrase {
+        self.direct_world(plan, living, physical, WorldModelFrame::default())
+    }
+
+    #[must_use]
+    pub fn direct_world(
+        &mut self,
         mut plan: InteractionResponsePlan,
         living: LivingStateFrame,
         physical: PhysicalExpressionContext,
+        world: WorldModelFrame,
     ) -> CreaturePhrase {
         let intent = social_intent(plan.reason);
         let priority = intent_priority(intent);
@@ -200,23 +588,44 @@ impl ExpressionDirector {
         };
         plan.expression.effort = effort.max(load);
         plan.expression.relief = relief * (1.0 - load);
+        let audience_effect = if world.audience_present {
+            world.audience_attention * (0.35 + living.affect.attachment * 0.45)
+        } else {
+            0.0
+        };
         plan.expression.amplitude =
-            (0.72 + living.affect.arousal * 0.22 + load * 0.28).clamp(0.55, 1.18);
+            (0.72 + living.affect.arousal * 0.22 + load * 0.28 + audience_effect * 0.08)
+                .clamp(0.55, 1.18);
         plan.body.local_pulse = plan
             .body
             .local_pulse
             .max((physical.slosh_energy * 0.012).clamp(0.0, 0.018));
         plan.body.recoil = plan.body.recoil.max((load * 0.055).clamp(0.0, 0.07));
+        plan.body.lean = (plan.body.lean
+            + (living.affect.attachment - 0.5) * world.audience_attention * 0.045)
+            .clamp(-0.08, 0.08);
         if intent == SocialIntent::Boundary {
             plan.body.resistance = plan.body.resistance.max(0.62);
             plan.body.cooperation = 0.0;
             plan.gaze = InteractionGazeTarget::Away;
         } else if intent == SocialIntent::Alarm {
             plan.gaze = InteractionGazeTarget::Cursor;
-        } else if intent == SocialIntent::Relief {
+        } else if matches!(intent, SocialIntent::Notice | SocialIntent::Query)
+            && let Some(entity) = world.most_salient_object()
+        {
+            plan.gaze = InteractionGazeTarget::world_entity(entity.id, entity.position);
+        } else if intent == SocialIntent::Relief
+            || (audience_effect > 0.35
+                && matches!(
+                    intent,
+                    SocialIntent::Acknowledge | SocialIntent::Invite | SocialIntent::Contact
+                ))
+        {
             plan.gaze = InteractionGazeTarget::Viewer;
         }
-        plan.onset_seconds = plan.onset_seconds.clamp(0.04, 0.18);
+        plan.onset_seconds = (plan.onset_seconds
+            * (1.18 - living.affect.attachment * 0.30 + living.affect.stress * 0.12))
+            .clamp(0.04, 0.18);
         plan.hold_seconds = (0.80 + living.affect.attachment * 0.45 + load * 0.35).clamp(0.80, 2.0);
         plan.release_seconds = plan.release_seconds.clamp(0.18, 0.60);
         let quiet_suppressed = living.quiet_preferred && priority < 220;
@@ -234,6 +643,7 @@ impl ExpressionDirector {
             physical,
             priority,
             quiet_suppressed,
+            audience_effect,
         };
         self.active = Some(ActivePhrase {
             phrase,
@@ -419,5 +829,78 @@ mod tests {
         boundary.gesture = VoiceGesture::LowRumble;
         boundary.priority = 240;
         assert!(arbiter.admit(boundary, 1.0, true).is_some());
+    }
+
+    #[test]
+    fn audience_presence_changes_gaze_without_inventing_an_entity() {
+        let mut director = ExpressionDirector::default();
+        let life = LifeState::new(crate::Genome::from_seed(11));
+        let phrase = director.direct_world(
+            plan(
+                InteractionReasonCode::GentleContact,
+                VocalTrigger::SoftTouch,
+            ),
+            LivingStateFrame::from_life(&life),
+            PhysicalExpressionContext::default(),
+            WorldModelFrame {
+                audience_present: true,
+                audience_attention: 1.0,
+                ..WorldModelFrame::default()
+            },
+        );
+        assert!(phrase.audience_effect > 0.35);
+        assert_eq!(phrase.plan.gaze, InteractionGazeTarget::Viewer);
+    }
+
+    #[test]
+    fn query_gaze_references_the_observed_world_object() {
+        let mut director = ExpressionDirector::default();
+        let life = LifeState::new(crate::Genome::from_seed(12));
+        let mut world = WorldModelFrame::default();
+        world.observe(WorldEntity::point(
+            77,
+            WorldEntityKind::ProceduralObject,
+            Vec2::new(0.72, 0.31),
+            Vec2::ZERO,
+            1.0,
+            0.9,
+            WorldAffordance::Help,
+            2.0,
+        ));
+        let phrase = director.direct_world(
+            plan(
+                InteractionReasonCode::CuriousInspection,
+                VocalTrigger::NeedHelp,
+            ),
+            LivingStateFrame::from_life(&life),
+            PhysicalExpressionContext::default(),
+            world,
+        );
+        let InteractionGazeTarget::WorldEntity { id, .. } = phrase.plan.gaze else {
+            panic!("query did not retain a world-object referent")
+        };
+        assert_eq!(id, 77);
+        assert!(
+            phrase
+                .plan
+                .gaze
+                .world_position()
+                .is_some_and(|position| position.distance(Vec2::new(0.72, 0.31)) < 2.0e-5)
+        );
+    }
+
+    #[test]
+    fn lexicon_learning_is_bounded_and_changes_timing_not_identity() {
+        let mut lexicon = VocalLexiconState::default();
+        let gesture_before = lexicon.entry(SocialIntent::Invite).gesture;
+        for episode in 1..=2_000 {
+            lexicon.update_social_timing(SocialIntent::Invite, episode, 1.0);
+        }
+        let learned = lexicon.entry(SocialIntent::Invite);
+        assert!(lexicon.is_valid());
+        assert_eq!(learned.gesture, gesture_before);
+        assert_eq!(learned.timing_scale, 1.12);
+        assert!(learned.rhythm_bias <= 0.12);
+        assert_eq!(lexicon.update_count, 2_000);
     }
 }

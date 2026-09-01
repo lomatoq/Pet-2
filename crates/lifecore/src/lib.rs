@@ -373,10 +373,10 @@ impl LifeCore {
             self.state.successful_interactions,
             self.state.interactions.recent_boundary_events,
         );
-        let variant = select_interaction_variant(
-            &self.state.interactions.variants,
-            event.classification.episode_id,
-        );
+        // Schema-2 kept a four-arm ± expression scaler. The living-language
+        // path uses one semantically directed plan and learns its lexicon
+        // timing instead of making the face microscopically larger/smaller.
+        let variant = 1;
         let response_id = self.state.interactions.next_response_id;
         self.state.interactions.next_response_id = response_id.saturating_add(1).max(1);
         let mut plan = interaction_response_plan(
@@ -468,14 +468,15 @@ impl LifeCore {
             InteractionOutcomeKind::FragmentRemerged => 0.75,
         } * outcome.confidence;
         if reward != 0.0 {
-            let learning_rate =
-                self.state.genome.temperament.adaptability * 0.04 * credit.learning_openness;
-            self.state.interactions.variants.update(
-                credit.episode_id,
-                usize::from(credit.variant),
-                reward,
-                learning_rate,
-            );
+            let intent = self
+                .state
+                .interactions
+                .last_response_plan
+                .map(|plan| social_intent(plan.reason))
+                .unwrap_or_default();
+            self.state
+                .vocal_lexicon
+                .update_social_timing(intent, credit.episode_id, reward);
         }
         if matches!(
             outcome.kind,
@@ -611,6 +612,7 @@ impl LifeCore {
         self.state.successful_interactions = 0;
         self.state.recent_reward = 0.0;
         self.state.vocal_motifs = generate_initial_motifs(&self.state.genome.voice);
+        self.state.vocal_lexicon = VocalLexiconState::default();
         self.state.selected_motif_id = None;
         self.state.recent_vocalizations.clear();
         self.state.pending_vocal_credit = None;
@@ -685,6 +687,8 @@ impl LifeCore {
             elapsed_seconds: 0.0,
             response_window_seconds: delivery.response_window_seconds,
             penalize_if_ignored: delivery.penalize_if_ignored,
+            social_intent: delivery.social_intent,
+            episode_id: delivery.episode_id,
         });
         true
     }
@@ -971,6 +975,8 @@ impl LifeCore {
             context: *context,
             response_window_seconds,
             penalize_if_ignored: trigger.expects_response(),
+            social_intent: SocialIntent::for_trigger(trigger),
+            episode_id: self.state.interactions.last_responded_episode,
         });
         let affect = self.state.affect;
         let fatigue = self.state.drives.sleep;
@@ -1026,6 +1032,10 @@ impl LifeCore {
             + physical.material.slosh_energy * 0.24
             + (1.0 - physical.material.topology_budget_remaining) * 0.18)
             .clamp(0.0, 0.55);
+        let lexeme = self
+            .state
+            .vocal_lexicon
+            .entry(SocialIntent::for_trigger(trigger));
         Some(VocalRequest {
             motif_id,
             performance_seed,
@@ -1045,11 +1055,12 @@ impl LifeCore {
             tempo_scale: (style_tempo
                 * (1.0 + affect.arousal * 0.18 - fatigue * 0.20)
                 * (1.0 + tangential_speed * 0.16)
-                * performance_tempo)
+                * performance_tempo
+                * lexeme.timing_scale)
                 .clamp(0.62, 1.48),
             stress: affect.stress.max(physical_stress).clamp(0.0, 1.0),
             purr,
-            gesture: VoiceGesture::for_trigger(trigger),
+            gesture: lexeme.gesture,
             priority: trigger.priority(),
             rhythm_intervals: if trigger == VocalTrigger::RhythmEcho {
                 sensors.recent_click_rhythm.map(|interval| {
@@ -1123,6 +1134,11 @@ impl LifeCore {
     }
 
     fn update_vocal_motif_from_credit(&mut self, credit: &PendingVocalCredit, reward: f32) {
+        self.state.vocal_lexicon.update_social_timing(
+            credit.social_intent,
+            credit.episode_id,
+            reward,
+        );
         if let Some(motif) = self
             .state
             .vocal_motifs
@@ -1271,19 +1287,6 @@ pub fn stable_hash_bytes(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-fn select_interaction_variant(bandit: &InteractionVariantBandit, episode_id: u64) -> u8 {
-    let rotation = episode_id as usize % MAX_INTERACTION_VARIANTS;
-    (0..MAX_INTERACTION_VARIANTS)
-        .map(|offset| (rotation + offset) % MAX_INTERACTION_VARIANTS)
-        .max_by(|left, right| {
-            bandit.variants[*left]
-                .value
-                .total_cmp(&bandit.variants[*right].value)
-                .then_with(|| right.cmp(left))
-        })
-        .unwrap_or(0) as u8
 }
 
 fn build_brain_inputs(
@@ -2479,6 +2482,13 @@ mod tests {
         let snapshot = core.snapshot();
         let current_json = serde_json::to_string(&snapshot.state).unwrap();
         let legacy_json = current_json
+            .replace(
+                &format!(
+                    "\"vocal_lexicon\":{},",
+                    serde_json::to_string(&snapshot.state.vocal_lexicon).unwrap()
+                ),
+                "",
+            )
             .replace("\"recent_vocalizations\":[],", "")
             .replace("\"pending_vocal_credit\":null,", "")
             .replace("\"pending_vocal_delivery\":null,", "")
@@ -2500,7 +2510,8 @@ mod tests {
         assert!(restored.state.recent_vocalizations.is_empty());
         assert!(restored.state.pending_vocal_credit.is_none());
         assert!(restored.state.pending_vocal_delivery.is_none());
-        assert_eq!(restored.snapshot().schema_version, 2);
+        assert_eq!(restored.snapshot().schema_version, 3);
+        assert_eq!(restored.state.vocal_lexicon, VocalLexiconState::default());
     }
 
     #[test]

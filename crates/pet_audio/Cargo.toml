@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["living-voice"]
+living-voice = []
+legacy-voice-fallback = []
+
 [dependencies]
 cpal.workspace = true
 lifecore = { path = "../lifecore" }

@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::{
     AudioCallbackLevels, AudioVisualBridge, AudioVisualFeedback, COMMAND_CAPACITY, SpscRing,
-    SynthVoice, VoiceCommand, global_visual_bridge,
+    SynthVoice, VoiceCommand, VoiceSynthesisStyle, global_visual_bridge,
 };
 
 const ERROR_CAPACITY: usize = 8;
@@ -266,7 +266,33 @@ pub fn render_motif(
     channels: u16,
     format: OfflineSampleFormat,
 ) -> OfflinePcm {
-    let command = VoiceCommand::prepare(voice, motif, request);
+    render_motif_style(
+        voice,
+        motif,
+        request,
+        sample_rate,
+        channels,
+        format,
+        if cfg!(feature = "legacy-voice-fallback") {
+            VoiceSynthesisStyle::Legacy
+        } else {
+            VoiceSynthesisStyle::LivingMammalian
+        },
+    )
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn render_motif_style(
+    voice: &VoiceGenome,
+    motif: &VocalMotif,
+    request: &VocalRequest,
+    sample_rate: u32,
+    channels: u16,
+    format: OfflineSampleFormat,
+    style: VoiceSynthesisStyle,
+) -> OfflinePcm {
+    let command = VoiceCommand::prepare_style(voice, motif, request, style);
     let commands = Arc::new(SpscRing::new());
     commands
         .push(command)

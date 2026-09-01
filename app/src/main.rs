@@ -40,7 +40,8 @@ use lifecore::{
     ActionId, BodyIntent, CollisionEvent, DebugState, Drives, EmbodiedGestureEvent,
     EmbodiedGestureKind, ExpressionDirector, ExpressionState, FeedbackEvent, Genome,
     GestureBoundaryEvent, LIFECORE_HZ, LifeCore, LivingStateFrame, LocomotionMode, PoseIntent,
-    SensorFrame, VitaOutput, VocalArbiter, VocalTrigger, stable_hash_bytes,
+    SensorFrame, VitaOutput, VocalArbiter, VocalTrigger, persisted_life_snapshot_hash,
+    stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
 use pet_audio::{AudioCallbackLevels, AudioEngine, AudioVisualFeedback, SelectedOutputConfig};
@@ -49,6 +50,8 @@ use pet_body::{
     LiquidTuningProfile, MaterialVariant, ProceduralBody, RenderOutcome, Renderer, VisualMindInput,
     VoiceVisualState,
 };
+#[cfg(not(feature = "legacy-expression-fallback"))]
+use pet_ecology::ObjectLifecycle;
 use pet_ecology::{
     ActionSignature, ConventionOutcome, EcologyOutcome, EcologyVocalTrigger, EpisodeGoal,
     EpisodePhase, GestureConventionMeaning, GestureSignature, MorselProfile, ObjectKind,
@@ -312,6 +315,7 @@ impl Arguments {
 
 struct PreparedState {
     life: LifeCore,
+    loaded_life_state_hash: u64,
     position: PersistedPetPosition,
     vita: VitaRuntime,
     morph: MorphBrain,
@@ -838,6 +842,10 @@ fn prepare_state(
     } else {
         store.load_state()?
     };
+    let persisted_loaded_hash = saved
+        .as_ref()
+        .map(|saved| persisted_life_snapshot_hash(&saved.life))
+        .transpose()?;
     let (mut life, position, vita_state) = if let Some(saved) = saved {
         (LifeCore::restore(saved.life)?, saved.position, saved.vita)
     } else {
@@ -866,8 +874,11 @@ fn prepare_state(
         vita.reset_learning(identity_seed);
     }
     life.set_focus_mode(arguments.focus_mode);
+    let loaded_life_state_hash =
+        persisted_loaded_hash.map_or_else(|| persisted_life_snapshot_hash(&life.snapshot()), Ok)?;
     Ok(PreparedState {
         life,
+        loaded_life_state_hash,
         position,
         vita,
         morph,
@@ -879,6 +890,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     let brain_mode = arguments.brain_mode;
     let PreparedState {
         mut life,
+        loaded_life_state_hash: _,
         position,
         mut vita,
         mut morph,
@@ -2567,6 +2579,7 @@ impl PetApplication {
                     "intent_pose": format!("{:?}", runtime.intent.pose),
                     "gaze_mode": format!("{:?}", runtime.body.embodiment.pose.gaze_mode),
                     "living_language": runtime.last_phrase,
+                    "vocal_lexicon": &runtime.life.state.vocal_lexicon,
                     "gaze": {
                         "source": runtime.gaze_trace.source.as_str(),
                         "lifecore_target": runtime.gaze_trace.lifecore_target.map(|target| target.to_array()),
@@ -2900,9 +2913,7 @@ impl ApplicationHandler for PetApplication {
         let runtime_started = Instant::now();
         let runtime_started_unix_ms = unix_time_millis(SystemTime::now());
         let last_morph = prepared.morph.last_output();
-        let loaded_life_state_hash = serde_json::to_vec(&prepared.life.snapshot())
-            .map(|bytes| stable_hash_bytes(&bytes))
-            .unwrap_or(0);
+        let loaded_life_state_hash = prepared.loaded_life_state_hash;
         let loaded_genome_hash = prepared.life.state.genome.stable_hash();
         self.runtime = Some(PetRuntime {
             window,
@@ -4432,7 +4443,37 @@ fn coordinate_interaction_response(
         &runtime.sensors,
         &runtime.body.simulation.feedback,
     );
-    let phrase = runtime.expression_director.direct(plan, living, physical);
+    let mut world =
+        lifecore::WorldModelFrame::from_frames(&runtime.sensors, &runtime.body.simulation.feedback);
+    for object in runtime.ecology.state().objects.iter().filter(|object| {
+        !matches!(
+            object.lifecycle,
+            ObjectLifecycle::Consumed | ObjectLifecycle::StoredInDen
+        )
+    }) {
+        let affordance = if object.kind == ObjectKind::Orb {
+            lifecore::WorldAffordance::Play
+        } else {
+            lifecore::WorldAffordance::Approach
+        };
+        let mut entity = lifecore::WorldEntity::point(
+            object.id,
+            lifecore::WorldEntityKind::ProceduralObject,
+            object.position,
+            object.velocity,
+            1.0,
+            (object.novelty * 0.46 + object.familiarity * 0.18 + object.velocity.length() * 0.20)
+                .clamp(0.0, 1.0),
+            affordance,
+            runtime.sensors.timestamp,
+        );
+        entity.novelty = object.novelty;
+        entity.familiarity = object.familiarity;
+        world.observe(entity);
+    }
+    let phrase = runtime
+        .expression_director
+        .direct_world(plan, living, physical, world);
     runtime.last_phrase = Some(phrase);
     phrase.plan
 }

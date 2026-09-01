@@ -20,7 +20,7 @@ use lifecore::{
     BodyIntent, EmbodiedGestureKind, ExpressionDirector, ExpressionState, FeedbackEvent,
     InteractionOutcome, InteractionOutcomeKind, InteractionTurnState, LifeCore, LifeSnapshot,
     LivingStateFrame, LocomotionMode, PhysicalExpressionContext, PoseIntent, SensorFrame,
-    VitaState, stable_hash_bytes,
+    VitaState, persisted_life_snapshot_hash,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphWorldInput};
 use pet_audio::{OfflinePcm, OfflineSampleFormat, export_debug_wav, render_motif};
@@ -415,6 +415,7 @@ pub(crate) fn run(
 
     let PreparedState {
         life,
+        loaded_life_state_hash: _,
         position,
         vita,
         morph,
@@ -516,7 +517,7 @@ pub(crate) fn run(
         safe_boundary_episodes: primary.safe_boundary_episodes,
         sleep_consolidations: primary.sleep_consolidations,
         gesture_distribution: primary.summary.gesture_distribution.clone(),
-        interaction_variant_updates: primary.summary.interaction_variant_updates,
+        lexicon_updates: primary.summary.lexicon_updates,
         convention_updates: 0,
         audio: primary.summary.audio.clone(),
         telemetry_samples: primary.summary.telemetry_samples,
@@ -614,7 +615,7 @@ fn run_replicate(
     let mut telemetry_samples = 0_u64;
     let mut completed_episodes = 0_u32;
     let initial_recovery_count = body.embodiment.liquid.diagnostics().recovery_count;
-    let initial_variant_updates = variant_updates(&life);
+    let initial_lexicon_updates = lexicon_updates(&life);
     let audio_before = progress.progress.audio_render_count;
     let learning_before = progress.progress.learning_update_count;
     let mut audio = OfflineAudioRecorder::new(audio_directory.to_owned(), replicate_index);
@@ -685,7 +686,7 @@ fn run_replicate(
         progress.progress.audio_render_count =
             audio_before.saturating_add(audio.summary.rendered_count);
         progress.progress.learning_update_count = learning_before
-            .saturating_add(variant_updates(&life).saturating_sub(initial_variant_updates));
+            .saturating_add(lexicon_updates(&life).saturating_sub(initial_lexicon_updates));
         progress.write();
         capture_checkpoints(
             &life,
@@ -753,8 +754,7 @@ fn run_replicate(
     }
     invariants.passed = invariants.failures.is_empty();
 
-    let interaction_variant_updates =
-        variant_updates(&life).saturating_sub(initial_variant_updates);
+    let lexicon_updates = lexicon_updates(&life).saturating_sub(initial_lexicon_updates);
     let interaction_closed = life.state.interactions.pending_credit.is_none()
         && vita.interaction_turn().state == InteractionTurnState::Idle;
     if !interaction_closed {
@@ -786,8 +786,7 @@ fn run_replicate(
     let final_life_state_hash = life_hash(&life)?;
     let audio = audio.finish();
     progress.progress.audio_render_count = audio_before.saturating_add(audio.rendered_count);
-    progress.progress.learning_update_count =
-        learning_before.saturating_add(interaction_variant_updates);
+    progress.progress.learning_update_count = learning_before.saturating_add(lexicon_updates);
     let summary = EvolutionReplicateSummary {
         replicate_index,
         seed,
@@ -795,7 +794,7 @@ fn run_replicate(
         final_generation: life.state.genome.generation,
         final_genome_hash: life.state.genome.stable_hash(),
         final_life_state_hash,
-        interaction_variant_updates,
+        lexicon_updates,
         audio,
         telemetry_samples,
         gesture_distribution,
@@ -978,10 +977,11 @@ fn run_episode(
                     interaction_tuning.turn_cooldown_seconds,
                     interaction_tuning.learning_openness,
                 ) {
-                    let phrase = expression_director.direct(
+                    let phrase = expression_director.direct_world(
                         plan,
                         LivingStateFrame::from_life(&life.state),
                         PhysicalExpressionContext::from_frames(sensors, &body.simulation.feedback),
+                        lifecore::WorldModelFrame::from_frames(sensors, &body.simulation.feedback),
                     );
                     let plan = phrase.plan;
                     if !responded_episodes.insert(plan.episode_id) {
@@ -1322,18 +1322,12 @@ fn capture_checkpoints(
     Ok(())
 }
 
-fn variant_updates(life: &LifeCore) -> u32 {
-    life.state
-        .interactions
-        .variants
-        .variants
-        .iter()
-        .map(|variant| variant.updates)
-        .sum()
+fn lexicon_updates(life: &LifeCore) -> u32 {
+    life.state.vocal_lexicon.update_count
 }
 
 fn life_hash(life: &LifeCore) -> Result<u64, serde_json::Error> {
-    serde_json::to_vec(&life.snapshot()).map(|bytes| stable_hash_bytes(&bytes))
+    persisted_life_snapshot_hash(&life.snapshot())
 }
 
 fn persist_accepted_state(
@@ -1632,6 +1626,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored.gesture_conventions, ecology.gesture_conventions);
-        assert_eq!(result.summary.interaction_variant_updates, 0);
+        assert_eq!(result.summary.lexicon_updates, 0);
     }
 }

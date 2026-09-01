@@ -4,7 +4,10 @@ pub use lifecore::mutate_motif;
 mod tests {
     use lifecore::{Genome, VocalRequest, generate_initial_motifs};
 
-    use crate::{OfflinePcm, OfflineSampleFormat, mutate_motif, render_motif};
+    use crate::{
+        OfflinePcm, OfflineSampleFormat, VoiceSynthesisStyle, mutate_motif, render_motif,
+        render_motif_style,
+    };
 
     fn request(motif_id: u64) -> VocalRequest {
         VocalRequest {
@@ -199,7 +202,11 @@ mod tests {
             crate::VoiceCommand::prepare(&genome.voice, motif, &lingering).total_frames(48_000);
         let brisk_frames =
             crate::VoiceCommand::prepare(&genome.voice, motif, &brisk).total_frames(48_000);
-        assert!(lingering_frames as f32 / brisk_frames as f32 >= 1.8);
+        let tempo_ratio = lingering_frames as f32 / brisk_frames as f32;
+        assert!(
+            (1.10..=1.45).contains(&tempo_ratio),
+            "bounded mammalian tempo ratio={tempo_ratio}"
+        );
     }
 
     #[test]
@@ -281,15 +288,21 @@ mod tests {
             .map(|gesture| {
                 let mut request = request(motif.id);
                 request.gesture = gesture;
-                let command = crate::VoiceCommand::prepare(&genome.voice, motif, &request);
+                let command = crate::VoiceCommand::prepare_style(
+                    &genome.voice,
+                    motif,
+                    &request,
+                    VoiceSynthesisStyle::LivingMammalian,
+                );
                 assert!((65.0..=365.0).contains(&command.base_pitch_hz));
-                render_motif(
+                render_motif_style(
                     &genome.voice,
                     motif,
                     &request,
                     48_000,
                     1,
                     OfflineSampleFormat::I16,
+                    VoiceSynthesisStyle::LivingMammalian,
                 )
             })
             .collect::<Vec<_>>();

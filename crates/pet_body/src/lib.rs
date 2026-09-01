@@ -39,8 +39,8 @@ pub use physiology::{
     EyeAutonomicModifiers, VisualMindInput, VisualPhysiologyPose, VisualPhysiologyRuntime,
 };
 pub use renderer::{
-    DebugView, OcclusionMode, RenderOutcome, RenderParameters, Renderer, RendererError,
-    ReviewBackground,
+    CapturedFrame, DebugView, OcclusionMode, RenderOutcome, RenderParameters, Renderer,
+    RendererCaptureError, RendererError, ReviewBackground,
 };
 pub use tuning::{
     AnalyticTuning, BodyRenderMode, CompositorTuning, DropletTuning, FaceTuning, InteractionTuning,

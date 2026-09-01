@@ -13,8 +13,17 @@ use crate::{
 pub const MAX_SYLLABLES: usize = 6;
 pub const COMMAND_CAPACITY: usize = 32;
 const ROOM_TAIL_MS: f32 = 36.0;
-const MIN_CALL_FUNDAMENTAL_HZ: f32 = 65.0;
-const MAX_CALL_FUNDAMENTAL_HZ: f32 = 620.0;
+const LIVING_MIN_FUNDAMENTAL_HZ: f32 = 65.0;
+const LIVING_MAX_FUNDAMENTAL_HZ: f32 = 620.0;
+const LEGACY_MIN_FUNDAMENTAL_HZ: f32 = 260.0;
+const LEGACY_MAX_FUNDAMENTAL_HZ: f32 = 8_000.0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VoiceSynthesisStyle {
+    #[default]
+    LivingMammalian,
+    Legacy,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PreparedSyllable {
@@ -79,6 +88,8 @@ pub struct VoiceCommand {
     pub purr: bool,
     pub gesture: VoiceGesture,
     pub glottal_tension: f32,
+    pub minimum_f0_hz: f32,
+    pub maximum_f0_hz: f32,
     pub maximum_loudness: f32,
     pub spectral_drift: f32,
     pub formant_drift: f32,
@@ -88,6 +99,19 @@ pub struct VoiceCommand {
 impl VoiceCommand {
     #[must_use]
     pub fn prepare(voice: &VoiceGenome, motif: &VocalMotif, request: &VocalRequest) -> Self {
+        #[cfg(feature = "legacy-voice-fallback")]
+        return Self::prepare_style(voice, motif, request, VoiceSynthesisStyle::Legacy);
+        #[cfg(not(feature = "legacy-voice-fallback"))]
+        Self::prepare_style(voice, motif, request, VoiceSynthesisStyle::LivingMammalian)
+    }
+
+    #[must_use]
+    pub fn prepare_style(
+        voice: &VoiceGenome,
+        motif: &VocalMotif,
+        request: &VocalRequest,
+        style: VoiceSynthesisStyle,
+    ) -> Self {
         let mut syllables = [PreparedSyllable::default(); MAX_SYLLABLES];
         for (target, source) in syllables.iter_mut().zip(&motif.syllables) {
             *target = PreparedSyllable::from(source);
@@ -120,7 +144,7 @@ impl VoiceCommand {
         let envelope_drift = seeded_signed(performance_seed ^ 0xC13F_A9A9_02A6_328F);
         let room_unit = seeded_unit(performance_seed ^ 0x91E1_0DA5_C79E_7B1D);
         let gesture = gesture_profile(request.gesture);
-        Self {
+        let mut command = Self {
             request_id: request.performance_seed,
             motif_id: motif.id,
             seed: splitmix64(performance_seed),
@@ -160,13 +184,62 @@ impl VoiceCommand {
             purr: request.purr || request.gesture == VoiceGesture::PurrHum,
             gesture: request.gesture,
             glottal_tension: gesture.glottal_tension,
+            minimum_f0_hz: LIVING_MIN_FUNDAMENTAL_HZ,
+            maximum_f0_hz: LIVING_MAX_FUNDAMENTAL_HZ,
             // Genome loudness already shaped `request.gain`; this is only a
             // transparent safety ceiling, not a second compressor.
             maximum_loudness: 0.68,
             spectral_drift,
             formant_drift,
             room_mix: 0.015 + room_unit * 0.020,
+        };
+        if style == VoiceSynthesisStyle::Legacy {
+            command.base_pitch_hz = voice.base_pitch_hz.clamp(320.0, 720.0);
+            command.breathiness = voice.breathiness;
+            command.roughness = voice.roughness;
+            command.brightness = voice.brightness;
+            command.formant_scale = voice.formant_scale;
+            command.click_amount = voice.click_amount;
+            command.purr = request.purr;
+            command.glottal_tension = 0.0;
+            command.minimum_f0_hz = LEGACY_MIN_FUNDAMENTAL_HZ;
+            command.maximum_f0_hz = LEGACY_MAX_FUNDAMENTAL_HZ;
+        } else if rhythm_interval_count == 0 {
+            // Mammalian social units are slow enough to read as breath/voice
+            // gestures instead of a chirp sequence. Explicit click rhythms keep
+            // their measured timing and bypass this semantic-unit pacing.
+            let unit_limit = match command.gesture {
+                VoiceGesture::WarmChuff | VoiceGesture::MewWhine => 3,
+                VoiceGesture::PurrHum
+                | VoiceGesture::LowRumble
+                | VoiceGesture::ClippedPulse
+                | VoiceGesture::ReliefExhale => 2,
+            };
+            command.syllable_count = command.syllable_count.min(unit_limit);
+            let count = usize::from(command.syllable_count);
+            for (index, syllable) in command.syllables[..count].iter_mut().enumerate() {
+                syllable.duration_ms = syllable.duration_ms.max(180.0);
+                if index + 1 < count {
+                    syllable.gap_after_ms = syllable.gap_after_ms.max(70.0);
+                } else {
+                    syllable.gap_after_ms = 0.0;
+                }
+            }
+            let content_ms = command.syllables[..count]
+                .iter()
+                .map(|syllable| syllable.duration_ms + syllable.gap_after_ms)
+                .sum::<f32>();
+            let target_rate_hz = (2.45 + (command.tempo_scale - 1.0) * 0.65).clamp(2.05, 2.90);
+            let target_content_ms =
+                (1_000.0 * count as f32 / target_rate_hz - ROOM_TAIL_MS).max(240.0);
+            let scale =
+                target_content_ms * command.tempo_scale.max(0.1) / content_ms.max(f32::EPSILON);
+            for syllable in &mut command.syllables[..count] {
+                syllable.duration_ms *= scale;
+                syllable.gap_after_ms *= scale;
+            }
         }
+        command
     }
 
     #[must_use]
@@ -406,7 +479,7 @@ impl SynthVoice {
             * pitch_contour
             * command.pitch_scale
             * (1.0 + vibrato + trill + organic_jitter).clamp(0.75, 1.25))
-        .clamp(MIN_CALL_FUNDAMENTAL_HZ, MAX_CALL_FUNDAMENTAL_HZ);
+        .clamp(command.minimum_f0_hz, command.maximum_f0_hz);
         // Bounded glottal source: tension shifts energy from the soft
         // triangle/sine pair toward the band-limited closing pulse. The
         // downstream resonators remain the vocal tract (source-filter split).
@@ -678,7 +751,12 @@ mod tests {
             priority: 128,
             rhythm_intervals: [0.0; 8],
         };
-        let command = VoiceCommand::prepare(&voice, &motif, &request);
+        let command = VoiceCommand::prepare_style(
+            &voice,
+            &motif,
+            &request,
+            VoiceSynthesisStyle::LivingMammalian,
+        );
         assert_eq!(command.base_pitch_hz, 120.0);
         assert_eq!(command.purr_rate, 24.0);
         assert_eq!(command.gesture, lifecore::VoiceGesture::PurrHum);
@@ -727,6 +805,37 @@ mod tests {
             .sum::<f32>();
         let correlation = covariance / (actual_energy * requested_energy).sqrt();
         assert!(correlation >= 0.85, "correlation={correlation}");
+    }
+
+    #[test]
+    fn mammalian_semantic_units_use_slow_social_timing() {
+        let voice = lifecore::Genome::from_seed(43).voice;
+        let motif = lifecore::generate_initial_motifs(&voice)
+            .into_iter()
+            .max_by_key(|motif| motif.syllables.len())
+            .expect("generated motif");
+        let request = VocalRequest {
+            performance_seed: 19,
+            motif_id: motif.id,
+            gain: 0.2,
+            pan: 0.0,
+            pitch_scale: 1.0,
+            tempo_scale: 1.15,
+            stress: 0.0,
+            purr: false,
+            gesture: lifecore::VoiceGesture::MewWhine,
+            priority: 150,
+            rhythm_intervals: [0.0; 8],
+        };
+        let command = VoiceCommand::prepare_style(
+            &voice,
+            &motif,
+            &request,
+            VoiceSynthesisStyle::LivingMammalian,
+        );
+        let seconds = command.total_frames(48_000) as f32 / 48_000.0;
+        let unit_rate = f32::from(command.syllable_count) / seconds;
+        assert!((2.0..=3.1).contains(&unit_rate), "unit_rate={unit_rate}");
     }
 
     #[test]

@@ -494,7 +494,36 @@ pub enum InteractionGazeTarget {
     MainComponent,
     DetachedComponent(u8),
     MergePoint,
+    WorldEntity {
+        id: u64,
+        position_q16: [u16; 2],
+    },
     Away,
+}
+
+impl InteractionGazeTarget {
+    #[must_use]
+    pub fn world_entity(id: u64, position: Vec2) -> Self {
+        let position = position.clamp(Vec2::ZERO, Vec2::ONE);
+        Self::WorldEntity {
+            id,
+            position_q16: [
+                (position.x * f32::from(u16::MAX)).round() as u16,
+                (position.y * f32::from(u16::MAX)).round() as u16,
+            ],
+        }
+    }
+
+    #[must_use]
+    pub fn world_position(self) -> Option<Vec2> {
+        let Self::WorldEntity { position_q16, .. } = self else {
+            return None;
+        };
+        Some(Vec2::new(
+            f32::from(position_q16[0]) / f32::from(u16::MAX),
+            f32::from(position_q16[1]) / f32::from(u16::MAX),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -1038,7 +1067,7 @@ pub fn interaction_response_plan(
     event: EmbodiedGestureEvent,
     appraisal: InteractionAppraisal,
     response_id: u64,
-    variant: u8,
+    _variant: u8,
     response_amplitude: f32,
     await_user_seconds: f32,
     cooldown_seconds: f32,
@@ -1227,8 +1256,7 @@ pub fn interaction_response_plan(
             }
         }
     }
-    let variant_modulation = [0.94, 1.0, 1.06, 0.88][usize::from(variant % 4)];
-    let response_scale = response_amplitude.clamp(0.25, 1.25) * variant_modulation;
+    let response_scale = response_amplitude.clamp(0.25, 1.25);
     expression.amplitude *= response_scale;
     plan.body.compliance_delta *= response_scale;
     plan.body.cohesion_delta *= response_scale;

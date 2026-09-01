@@ -5,11 +5,11 @@ use thiserror::Error;
 
 use crate::{
     ACTION_COUNT, ActionId, AffectState, BodyFeedback, ContextualBandit, DevelopmentState, Drives,
-    Genome, MemorySystem, MicroBrain, PendingAttention, PersistentInteractionState, VocalMotif,
-    generate_initial_motifs,
+    Genome, MemorySystem, MicroBrain, PendingAttention, PersistentInteractionState,
+    VocalLexiconState, VocalMotif, generate_initial_motifs,
 };
 
-pub const LIFE_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const LIFE_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentVocalization {
@@ -24,6 +24,10 @@ pub struct PendingVocalCredit {
     pub elapsed_seconds: f32,
     pub response_window_seconds: f32,
     pub penalize_if_ignored: bool,
+    #[serde(default)]
+    pub social_intent: crate::SocialIntent,
+    #[serde(default)]
+    pub episode_id: u64,
 }
 
 /// A performance selected by the mind but not yet confirmed audible by the
@@ -37,6 +41,10 @@ pub struct PendingVocalDelivery {
     pub context: [f32; 16],
     pub response_window_seconds: f32,
     pub penalize_if_ignored: bool,
+    #[serde(default)]
+    pub social_intent: crate::SocialIntent,
+    #[serde(default)]
+    pub episode_id: u64,
 }
 
 impl PendingVocalDelivery {
@@ -109,6 +117,8 @@ pub struct LifeState {
     pub recent_reward: f32,
     pub focus_mode: bool,
     pub vocal_motifs: Vec<VocalMotif>,
+    #[serde(default)]
+    pub vocal_lexicon: VocalLexiconState,
     pub selected_motif_id: Option<u64>,
     #[serde(default)]
     pub recent_vocalizations: VecDeque<RecentVocalization>,
@@ -144,6 +154,7 @@ impl LifeState {
             recent_reward: 0.0,
             focus_mode: false,
             vocal_motifs,
+            vocal_lexicon: VocalLexiconState::default(),
             selected_motif_id: None,
             recent_vocalizations: VecDeque::new(),
             pending_vocal_credit: None,
@@ -179,6 +190,7 @@ impl LifeState {
                         .iter()
                         .all(|weight| weight.is_finite())
             })
+            && self.vocal_lexicon.is_valid()
             && self.recent_vocalizations.len() <= 4
             && self.pending_vocal_credit.as_ref().is_none_or(|credit| {
                 credit.is_valid()
@@ -220,7 +232,7 @@ pub struct LifeSnapshot {
 
 impl LifeSnapshot {
     pub fn validate(&self) -> Result<(), LifeError> {
-        if self.schema_version != 1 && self.schema_version != LIFE_SNAPSHOT_SCHEMA_VERSION {
+        if !matches!(self.schema_version, 1 | 2 | LIFE_SNAPSHOT_SCHEMA_VERSION) {
             return Err(LifeError::UnsupportedSchema {
                 found: self.schema_version,
                 expected: LIFE_SNAPSHOT_SCHEMA_VERSION,
@@ -250,10 +262,38 @@ impl LifeSnapshot {
     }
 }
 
+/// Hashes the storage-normalized representation of a Life snapshot.
+///
+/// Serde defaults and numeric representations can make the first encoding of
+/// an in-memory value differ from the representation obtained after loading it
+/// back. Promotion receipts must describe the state a runtime can actually
+/// load, so the hash deliberately includes one JSON round trip.
+pub fn persisted_life_snapshot_hash(snapshot: &LifeSnapshot) -> Result<u64, serde_json::Error> {
+    let encoded = serde_json::to_vec(snapshot)?;
+    let normalized: LifeSnapshot = serde_json::from_slice(&encoded)?;
+    let normalized = serde_json::to_vec(&normalized)?;
+    Ok(crate::stable_hash_bytes(&normalized))
+}
+
 #[derive(Debug, Error)]
 pub enum LifeError {
     #[error("unsupported LifeSnapshot schema {found}; expected {expected}")]
     UnsupportedSchema { found: u32, expected: u32 },
     #[error("invalid LifeSnapshot: {0}")]
     InvalidState(&'static str),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Genome, LifeCore};
+
+    #[test]
+    fn persisted_hash_survives_a_json_storage_round_trip() {
+        let snapshot = LifeCore::new(Genome::from_seed(91), 92).snapshot();
+        let expected = persisted_life_snapshot_hash(&snapshot).unwrap();
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let loaded: LifeSnapshot = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(persisted_life_snapshot_hash(&loaded).unwrap(), expected);
+    }
 }

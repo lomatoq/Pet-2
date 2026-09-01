@@ -10,10 +10,11 @@ use std::{
 };
 
 use desktop_host::{
-    EVOLUTION_CONFIG_SCHEMA_VERSION, EvolutionConfig, EvolutionOutcomeModel, EvolutionPersistence,
-    EvolutionPolicy, EvolutionPreset, EvolutionProgress, EvolutionRunReport,
-    LAB_CONTROL_SCHEMA_VERSION, LabControlCommand, LabControlEnvelope, LabDrive, LabGesture,
-    PortablePetState, QuietAdvanceMode, RuntimeLoadAcknowledgement, RuntimeLoadStatus, StateStore,
+    EVOLUTION_CONFIG_SCHEMA_VERSION, EVOLUTION_REPORT_SCHEMA_VERSION, EvolutionConfig,
+    EvolutionOutcomeModel, EvolutionPersistence, EvolutionPolicy, EvolutionPreset,
+    EvolutionProgress, EvolutionRunReport, LAB_CONTROL_SCHEMA_VERSION, LabControlCommand,
+    LabControlEnvelope, LabDrive, LabGesture, PortablePetState, QuietAdvanceMode,
+    RuntimeLoadAcknowledgement, RuntimeLoadStatus, StateStore,
 };
 use egui::{CollapsingHeader, Context, DragValue, Sense, Slider};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor, wgpu};
@@ -66,6 +67,7 @@ const BACKGROUNDS: [ReviewBackground; 6] = [
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut live_pet = false;
     let mut data_dir = None;
+    let mut promote_report = None;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -75,9 +77,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     arguments.next().ok_or("--data-dir requires a path")?,
                 ));
             }
+            "--promote-report" => {
+                promote_report = Some(PathBuf::from(
+                    arguments.next().ok_or("--promote-report requires a path")?,
+                ));
+            }
             "--help" | "-h" => {
                 println!(
-                    "Body Lab\n\n  --live-pet       Start in Live Brain (telemetry.jsonl, rotated history, legacy events.jsonl fallback)\n  --data-dir PATH  Use the same overridden Pet 2 data directory\n\n  F12 switches Liquid Body Lab ↔ Live Brain"
+                    "Body Lab\n\n  --live-pet            Start in Live Brain (telemetry.jsonl, rotated history, legacy events.jsonl fallback)\n  --data-dir PATH       Use the same overridden Pet 2 data directory\n  --promote-report PATH Promote one validated fork and require a live loaded-hash acknowledgement\n\n  F12 switches Liquid Body Lab ↔ Live Brain"
                 );
                 return Ok(());
             }
@@ -90,6 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_deref()
         .map(StateStore::at)
         .or_else(|| StateStore::discover().ok());
+    if let Some(report_path) = promote_report {
+        let store = store.ok_or("Pet 2 data directory is unavailable")?;
+        return promote_report_cli(&store, &report_path).map_err(Into::into);
+    }
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut BodyLab::new(SEED, store, live_pet))?;
     Ok(())
@@ -1997,6 +2008,71 @@ struct PromotionBundle {
     body: BodyMaterialSnapshot,
 }
 
+fn promote_report_cli(store: &StateStore, report_path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(report_path)
+        .map_err(|error| format!("cannot inspect {}: {error}", report_path.display()))?;
+    if metadata.len() > 32 * 1024 * 1024 {
+        return Err("evolution report exceeds the 32 MiB promotion cap".to_owned());
+    }
+    let report: EvolutionRunReport = serde_json::from_reader(
+        File::open(report_path)
+            .map_err(|error| format!("cannot open {}: {error}", report_path.display()))?,
+    )
+    .map_err(|error| format!("cannot parse {}: {error}", report_path.display()))?;
+    if report.schema_version != EVOLUTION_REPORT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported evolution report schema {}; expected {}",
+            report.schema_version, EVOLUTION_REPORT_SCHEMA_VERSION
+        ));
+    }
+    report
+        .config
+        .validate()
+        .map_err(|error| error.to_string())?;
+    if !report.invariants.passed || !report.status.starts_with("completed") {
+        return Err("promotion requires a completed report with passing invariants".to_owned());
+    }
+    let fork = report
+        .persisted_state
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or("promotion report has no persisted fork")?;
+    let expected_hash = report.final_life_state_hash;
+    let old_pid = stop_live_runtime_for_promotion(store)?;
+    let backup = promote_validated_fork(store, &fork, expected_hash)?;
+    match launch_desktop_pet_at(store).and_then(|(executable, pid)| {
+        let acknowledgement =
+            wait_for_loaded_hash(store, expected_hash, old_pid, Duration::from_secs(12))?;
+        Ok((executable, pid, acknowledgement))
+    }) {
+        Ok((executable, pid, acknowledgement)) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "promoted_and_acknowledged",
+                    "report": report_path,
+                    "fork": fork,
+                    "recovery_backup": backup,
+                    "executable": executable,
+                    "pid": pid,
+                    "active_loaded_life_state_hash": format!("{:016x}", acknowledgement.loaded_life_state_hash),
+                    "active_loaded_genome_hash": format!("{:016x}", acknowledgement.loaded_genome_hash),
+                    "acknowledged_unix_ms": acknowledgement.updated_unix_ms,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let rollback = restore_bundle(store, &StateStore::at(&backup), true);
+            let _ = launch_desktop_pet_at(store);
+            Err(format!(
+                "promotion acknowledgement failed and live state was rolled back: {error}; rollback={rollback:?}"
+            ))
+        }
+    }
+}
+
 fn load_promotion_bundle(store: &StateStore) -> Result<PromotionBundle, String> {
     let portable = store
         .load_state()
@@ -2077,11 +2153,12 @@ fn promote_validated_fork(
     }
     let fork = StateStore::at(&fork_path);
     let incoming = load_promotion_bundle(&fork)?;
-    let incoming_hash = lifecore::stable_hash_bytes(
-        &serde_json::to_vec(&incoming.portable.life).map_err(|error| error.to_string())?,
-    );
+    let incoming_hash = lifecore::persisted_life_snapshot_hash(&incoming.portable.life)
+        .map_err(|error| error.to_string())?;
     if incoming_hash != report_hash {
-        return Err("fork Life snapshot hash does not match the validated report".to_owned());
+        return Err(format!(
+            "fork Life snapshot hash does not match the validated report: fork={incoming_hash:016x}, report={report_hash:016x}"
+        ));
     }
     let current = load_promotion_bundle(live)?;
     let backup_path = live
@@ -2600,7 +2677,7 @@ fn accelerated_learning_panel(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
                 );
                 ui.small(format!(
                     "learning updates {} · PCM renders {} ({} WAV) · convention updates {} · consolidations {} · eligible {} · state {:016x} · genome {:016x}",
-                    report.interaction_variant_updates,
+                    report.lexicon_updates,
                     report.audio.rendered_count,
                     report.audio.exported_wav_count,
                     report.convention_updates,
@@ -6206,8 +6283,14 @@ fn launch_desktop_pet_at(store: &StateStore) -> Result<(PathBuf, u32), String> {
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let executable = resolve_pet_executable(&current_exe, &workspace_root)?;
+    let data_root = fs::canonicalize(&store.paths.root).map_err(|error| {
+        format!(
+            "cannot resolve promoted data directory {}: {error}",
+            store.paths.root.display()
+        )
+    })?;
     let mut command = Command::new(&executable);
-    command.arg("--data-dir").arg(&store.paths.root);
+    command.arg("--data-dir").arg(data_root);
     if let Some(parent) = executable.parent() {
         command.current_dir(parent);
     }
@@ -6243,7 +6326,17 @@ fn stop_live_runtime_for_promotion(store: &StateStore) -> Result<Option<u32>, St
             && ack.pid == running.pid
             && ack.status == RuntimeLoadStatus::Stopped
         {
-            return Ok(Some(running.pid));
+            let exit_deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < exit_deadline {
+                if process_has_exited(running.pid)? {
+                    return Ok(Some(running.pid));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return Err(format!(
+                "live Pet PID {} acknowledged stop but did not release the process within 3 s",
+                running.pid
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -6251,6 +6344,57 @@ fn stop_live_runtime_for_promotion(store: &StateStore) -> Result<Option<u32>, St
         "live Pet PID {} did not acknowledge a graceful stop within 10 s",
         running.pid
     ))
+}
+
+#[cfg(windows)]
+fn process_has_exited(pid: u32) -> Result<bool, String> {
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    // SAFETY: the handle is opened only for synchronization, checked for null,
+    // observed without mutation, and closed on every successful open path.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(true);
+        }
+        return Err(format!("cannot query Pet process {pid}: {error}"));
+    }
+    // SAFETY: `handle` is a live synchronization handle owned by this function.
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    // SAFETY: `handle` was returned by OpenProcess and is closed exactly once.
+    let close_result = unsafe { CloseHandle(handle) };
+    if close_result == 0 {
+        return Err(format!(
+            "cannot close synchronization handle for Pet process {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    match wait {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(format!(
+            "cannot wait on Pet process {pid}: {}",
+            std::io::Error::last_os_error()
+        )),
+        other => Err(format!(
+            "unexpected wait status {other:#x} for Pet process {pid}"
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn process_has_exited(pid: u32) -> Result<bool, String> {
+    Ok(!Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map_err(|error| format!("cannot query Pet process {pid}: {error}"))?
+        .success())
 }
 
 fn wait_for_loaded_hash(
@@ -6458,7 +6602,7 @@ mod tests {
         store
             .save_body_state(&body.body_material_snapshot())
             .unwrap();
-        let hash = lifecore::stable_hash_bytes(&serde_json::to_vec(&portable.life).unwrap());
+        let hash = lifecore::persisted_life_snapshot_hash(&portable.life).unwrap();
         (store, hash)
     }
 

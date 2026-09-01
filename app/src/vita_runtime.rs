@@ -564,6 +564,7 @@ impl VitaRuntime {
                 .iter()
                 .find(|component| component.component_id == id)
                 .map(|component| component.center_world),
+            target @ InteractionGazeTarget::WorldEntity { .. } => target.world_position(),
             InteractionGazeTarget::Away => Some(
                 (body.world_position
                     + (body.world_position - sensors.cursor_position).normalize_or_zero() * 0.18)
