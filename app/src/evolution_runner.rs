@@ -1553,6 +1553,22 @@ mod tests {
     }
 
     #[test]
+    fn ten_day_one_hour_preset_is_valid_bounded_and_non_destructive() {
+        let config: EvolutionConfig =
+            serde_json::from_str(include_str!("../../config/evolution/ten-day-one-hour.json"))
+                .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.simulated_hours, 240.0);
+        assert_eq!(config.scheduled_episode_count(), 360);
+        assert_eq!(config.replicate_count, 1);
+        assert_eq!(config.quiet_advance, QuietAdvanceMode::CalendarOnly);
+        assert!(config.persistent_learning);
+        assert_eq!(config.evolution_policy, EvolutionPolicy::EligibleMaxOne);
+        assert_eq!(config.maximum_generations, 1);
+        assert_eq!(config.persistence, EvolutionPersistence::Fork);
+    }
+
+    #[test]
     fn synthetic_curriculum_cannot_write_user_specific_conventions() {
         use pet_ecology::{ActionSignature, GestureConventionMeaning, GestureSignature};
 

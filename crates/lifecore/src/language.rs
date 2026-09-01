@@ -820,6 +820,12 @@ mod tests {
             purr: false,
             gesture: VoiceGesture::WarmChuff,
             priority: 150,
+            style: crate::VocalStyle::SocialContact,
+            valence: 0.0,
+            arousal: 0.2,
+            fatigue: 0.0,
+            confidence: 0.8,
+            attachment: 0.4,
             rhythm_intervals: [0.0; 8],
         };
         let mut arbiter = VocalArbiter::default();

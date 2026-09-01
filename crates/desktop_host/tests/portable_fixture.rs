@@ -2,7 +2,7 @@ use desktop_host::{
     DisplayTopology, MonitorId, MonitorInfo, PhysicalDesktopPoint, PortablePetState, RectI,
     StateStore,
 };
-use lifecore::{LifeCore, stable_hash_bytes};
+use lifecore::LifeCore;
 use pet_body::ProceduralBody;
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/portable_pet_state_v1.json");
@@ -11,25 +11,44 @@ const FIXTURE: &str = include_str!("../../../tests/fixtures/portable_pet_state_v
 fn portable_fixture_restores_without_native_handles_or_identity_drift() {
     let state: PortablePetState = serde_json::from_str(FIXTURE).expect("fixture JSON decodes");
     state.validate().expect("fixture validates");
-    assert_eq!(
-        state.life.state.genome.stable_hash(),
-        8_908_234_949_124_875_802
+    let legacy_identity = (
+        state.life.state.genome.identity_seed,
+        state.life.state.genome.lineage_id,
+        state.life.state.genome.generation,
+        state.life.state.genome.body.clone(),
+        state.life.state.genome.temperament.clone(),
+        state.life.state.genome.brain.clone(),
     );
 
     let restored = LifeCore::restore(state.life.clone()).expect("LifeCore restores");
     let restored_snapshot = restored.snapshot();
     let mut migrated_snapshot = state.life.clone();
+    migrated_snapshot.repair_additive_voice_schema();
     migrated_snapshot.schema_version = lifecore::LIFE_SNAPSHOT_SCHEMA_VERSION;
-    assert_eq!(restored_snapshot, migrated_snapshot);
+    let mut normalized_restored = restored_snapshot.clone();
+    normalized_restored.state.vocal_motifs = migrated_snapshot.state.vocal_motifs.clone();
+    assert_eq!(normalized_restored, migrated_snapshot);
     assert_eq!(
-        stable_hash_bytes(
-            &serde_json::to_vec(&restored_snapshot.state.vocal_motifs)
-                .expect("voice motifs encode")
+        (
+            restored_snapshot.state.genome.identity_seed,
+            restored_snapshot.state.genome.lineage_id,
+            restored_snapshot.state.genome.generation,
+            restored_snapshot.state.genome.body.clone(),
+            restored_snapshot.state.genome.temperament.clone(),
+            restored_snapshot.state.genome.brain.clone(),
         ),
-        stable_hash_bytes(
-            &serde_json::to_vec(&state.life.state.vocal_motifs).expect("fixture motifs encode")
-        )
+        legacy_identity
     );
+    for legacy_motif in &migrated_snapshot.state.vocal_motifs {
+        assert_eq!(
+            restored_snapshot
+                .state
+                .vocal_motifs
+                .iter()
+                .find(|motif| motif.id == legacy_motif.id),
+            Some(legacy_motif)
+        );
+    }
     assert_eq!(
         restored_snapshot.memories.short_term.len(),
         state.life.memories.short_term.len()

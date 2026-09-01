@@ -543,6 +543,7 @@ impl LiquidMorphRuntime {
         if dt <= f32::EPSILON {
             return;
         }
+        self.keep_detached_mass_in_desktop_frame(motion.presentation_displacement);
         if self.component_lifecycle.is_stable()
             && let Some(pending) = self.pending_structural_tuning.take()
         {
@@ -1366,6 +1367,32 @@ impl LiquidMorphRuntime {
             .any(|particle| {
                 (particle.render_position - self.body_origin).distance(local_point) <= radius
             })
+    }
+
+    /// The renderer presents every particle relative to the moving body root.
+    /// Main-component mass is meant to inherit that root motion, while a real
+    /// detached component is free material in desktop space. Counter-translating
+    /// all of its position buffers prevents the presentation transform from
+    /// kinematically parenting a released parcel back to the body.
+    fn keep_detached_mass_in_desktop_frame(&mut self, presentation_displacement: Vec2) {
+        if self.components.component_count <= 1
+            || !presentation_displacement.is_finite()
+            || presentation_displacement.length_squared() <= f32::EPSILON
+        {
+            return;
+        }
+        let displacement = presentation_displacement.clamp_length_max(0.48);
+        let main_component = self.components.main_component;
+        for (index, particle) in self.particles[..self.particle_count].iter_mut().enumerate() {
+            if particle.component_id == main_component {
+                continue;
+            }
+            particle.position -= displacement;
+            particle.previous_position -= displacement;
+            particle.predicted_position -= displacement;
+            particle.render_position -= displacement;
+            self.presentation_recovery_from[index].0 -= displacement;
+        }
     }
 
     fn damp_free_flight(&mut self, dt: f32, viscosity: f32) {

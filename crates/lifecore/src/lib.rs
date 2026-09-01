@@ -566,8 +566,12 @@ impl LifeCore {
     }
 
     pub fn restore(mut snapshot: LifeSnapshot) -> Result<Self, LifeError> {
-        // Validate the on-disk shape before applying the narrow v1 lineage
-        // migration, then validate the normalized state again.
+        // Voice anatomy and motor gestures are additive schema fields. Repair
+        // them deterministically before strict validation so old identities
+        // load without accepting arbitrary invalid data.
+        snapshot.repair_additive_voice_schema();
+        // Validate the normalized on-disk shape before applying the narrow v1
+        // lineage migration, then validate the state again.
         snapshot.validate()?;
         snapshot
             .state
@@ -980,46 +984,46 @@ impl LifeCore {
         });
         let affect = self.state.affect;
         let fatigue = self.state.drives.sleep;
-        let (style_pitch, style_tempo, style_gain, purr) = match trigger {
-            VocalTrigger::Action(ActionId::Purr) => (0.86, 0.82, 0.74, true),
-            VocalTrigger::Action(ActionId::MimicClickRhythm) => (1.02, 1.12, 0.90, false),
-            VocalTrigger::Action(ActionId::Chirp) => (1.08, 1.06, 1.0, false),
-            VocalTrigger::Action(_) => (1.0, 1.0, 0.88, false),
-            VocalTrigger::ToyOffer => (1.05, 0.96, 0.85, false),
-            VocalTrigger::CatchSuccess => (1.12, 1.18, 0.94, false),
-            VocalTrigger::MissAndRetry => (0.94, 0.92, 0.78, false),
-            VocalTrigger::NeedHelp => (1.08, 0.88, 0.88, false),
-            VocalTrigger::FoodInspect => (0.98, 0.92, 0.74, false),
-            VocalTrigger::FoodAccepted => (1.06, 1.05, 0.82, false),
-            VocalTrigger::FoodRefused => (0.90, 0.86, 0.68, false),
-            VocalTrigger::HomeReturn => (0.88, 0.78, 0.65, true),
-            VocalTrigger::SkillMastered => (1.15, 1.14, 0.92, false),
-            VocalTrigger::RhythmEcho => (1.02, 1.0, 0.90, false),
-            VocalTrigger::VisualNotice => (1.10, 0.84, 0.80, false),
-            VocalTrigger::SoftTouch => (0.98, 0.82, 0.55, true),
-            VocalTrigger::PhysicalStartle => (1.12, 1.18, 0.65, false),
-            VocalTrigger::PlayfulRelease => (1.10, 1.10, 0.75, false),
-            VocalTrigger::CalmBoundary => (0.88, 0.78, 0.55, false),
-            VocalTrigger::ComponentDetached => (1.05, 1.05, 0.65, false),
-            VocalTrigger::ComponentRemerged => (0.96, 0.86, 0.60, true),
-            VocalTrigger::FragmentHelped => (1.02, 0.95, 0.65, false),
+        let (style, style_pitch, style_tempo, style_gain, purr) = match trigger {
+            VocalTrigger::Action(ActionId::Purr) => (VocalStyle::Purr, 0.86, 0.82, 0.74, true),
+            VocalTrigger::Action(ActionId::MimicClickRhythm) => {
+                (VocalStyle::RhythmMimic, 1.02, 1.12, 0.90, false)
+            }
+            VocalTrigger::Action(ActionId::Chirp) => {
+                (VocalStyle::SocialContact, 1.08, 1.06, 1.0, false)
+            }
+            VocalTrigger::Action(_) => (VocalStyle::SocialContact, 1.0, 1.0, 0.88, false),
+            VocalTrigger::ToyOffer | VocalTrigger::CatchSuccess | VocalTrigger::PlayfulRelease => {
+                (VocalStyle::PlayInvite, 1.08, 1.08, 0.86, false)
+            }
+            VocalTrigger::MissAndRetry | VocalTrigger::FoodRefused | VocalTrigger::CalmBoundary => {
+                (VocalStyle::Frustrated, 0.91, 0.86, 0.68, false)
+            }
+            VocalTrigger::NeedHelp | VocalTrigger::VisualNotice => {
+                (VocalStyle::AttentionCall, 1.09, 0.86, 0.84, false)
+            }
+            VocalTrigger::FoodInspect => (VocalStyle::SocialContact, 0.98, 0.92, 0.74, false),
+            VocalTrigger::FoodAccepted | VocalTrigger::HomeReturn => {
+                (VocalStyle::ContentMurmur, 0.92, 0.82, 0.70, true)
+            }
+            VocalTrigger::SkillMastered => (VocalStyle::PlayInvite, 1.15, 1.14, 0.92, false),
+            VocalTrigger::RhythmEcho => (VocalStyle::RhythmMimic, 1.02, 1.0, 0.90, false),
+            VocalTrigger::SoftTouch => (VocalStyle::TouchResponse, 0.98, 0.82, 0.55, true),
+            VocalTrigger::PhysicalStartle | VocalTrigger::ComponentDetached => {
+                (VocalStyle::Startle, 1.10, 1.15, 0.65, false)
+            }
+            VocalTrigger::ComponentRemerged | VocalTrigger::FragmentHelped => {
+                (VocalStyle::ContentMurmur, 0.98, 0.90, 0.62, true)
+            }
         };
         let physical = sensors.embodied_interaction;
         let radial = physical.contact.point_local.normalize_or_zero();
-        let outward_speed = physical
-            .contact
-            .relative_velocity_local
-            .dot(radial)
-            .max(0.0)
-            .clamp(0.0, 1.0);
         let tangential_speed = physical
             .contact
             .relative_velocity_local
             .perp_dot(radial)
             .abs()
             .clamp(0.0, 1.0);
-        let release_overshoot = (physical.contact.pointer_speed / 4.0).clamp(0.0, 1.0);
-        let stretch_pitch = 2.0_f32.powf((outward_speed * 4.0) / 12.0);
         let resolving_interval = if matches!(
             trigger,
             VocalTrigger::ComponentRemerged | VocalTrigger::FragmentHelped
@@ -1047,8 +1051,6 @@ impl LifeCore {
             pan: (sensors.cursor_position.x * 2.0 - 1.0).clamp(-0.8, 0.8),
             pitch_scale: (style_pitch
                 * (1.0 + affect.arousal * 0.12 - fatigue * 0.10)
-                * stretch_pitch
-                * (1.0 + release_overshoot * 0.05)
                 * resolving_interval
                 * performance_pitch)
                 .clamp(0.70, 1.38),
@@ -1062,6 +1064,12 @@ impl LifeCore {
             purr,
             gesture: lexeme.gesture,
             priority: trigger.priority(),
+            style,
+            valence: affect.valence.clamp(-1.0, 1.0),
+            arousal: affect.arousal.clamp(0.0, 1.0),
+            fatigue: fatigue.clamp(0.0, 1.0),
+            confidence: (1.0 - affect.stress * 0.55).clamp(0.0, 1.0),
+            attachment: affect.attachment.clamp(0.0, 1.0),
             rhythm_intervals: if trigger == VocalTrigger::RhythmEcho {
                 sensors.recent_click_rhythm.map(|interval| {
                     if interval.is_finite() && interval > 0.0 {
@@ -1711,7 +1719,67 @@ fn motif_style_score(motif: &VocalMotif, trigger: VocalTrigger, affect: AffectSt
         .map(|((value, target), weight)| (value - target).powi(2) * weight)
         .sum::<f32>()
         / weights.iter().sum::<f32>();
-    (1.0 - weighted_distance.sqrt() * 1.55).clamp(-1.0, 1.0)
+    let gesture_signature = [
+        mean(|syllable| syllable.gesture.pressure_peak),
+        mean(|syllable| syllable.gesture.adduction),
+        mean(|syllable| syllable.gesture.nasality),
+        mean(|syllable| syllable.gesture.constriction),
+        mean(|syllable| syllable.gesture.instability),
+    ];
+    let gesture_target = match trigger {
+        VocalTrigger::Action(ActionId::Purr)
+        | VocalTrigger::HomeReturn
+        | VocalTrigger::SoftTouch
+        | VocalTrigger::ComponentRemerged => [0.34, 0.48, 0.62, 0.28, 0.08],
+        VocalTrigger::PhysicalStartle | VocalTrigger::ComponentDetached => {
+            [0.90, 0.76, 0.05, 0.32, 0.58]
+        }
+        VocalTrigger::FoodRefused | VocalTrigger::CalmBoundary => [0.72, 0.76, 0.22, 0.64, 0.34],
+        VocalTrigger::Action(ActionId::MimicClickRhythm) | VocalTrigger::RhythmEcho => {
+            [0.62, 0.64, 0.10, 0.32, 0.12]
+        }
+        _ => [0.58, 0.54, 0.18, 0.18, 0.10],
+    };
+    let gesture_error = gesture_signature
+        .iter()
+        .zip(gesture_target)
+        .map(|(value, target)| (value - target).powi(2))
+        .sum::<f32>()
+        / gesture_signature.len() as f32;
+    let family_match = match trigger {
+        VocalTrigger::Action(ActionId::Purr) => motif.family == VocalFamily::Purr,
+        VocalTrigger::Action(ActionId::MimicClickRhythm) | VocalTrigger::RhythmEcho => {
+            motif.family == VocalFamily::RhythmMimic
+        }
+        VocalTrigger::PhysicalStartle | VocalTrigger::ComponentDetached => {
+            motif.family == VocalFamily::StartleSqueak
+        }
+        VocalTrigger::FoodRefused | VocalTrigger::CalmBoundary => {
+            motif.family == VocalFamily::FrustratedGrunt
+        }
+        VocalTrigger::SoftTouch | VocalTrigger::HomeReturn | VocalTrigger::ComponentRemerged => {
+            matches!(motif.family, VocalFamily::ContentMurmur | VocalFamily::Purr)
+        }
+        VocalTrigger::ToyOffer | VocalTrigger::CatchSuccess | VocalTrigger::PlayfulRelease => {
+            matches!(
+                motif.family,
+                VocalFamily::PlayYip | VocalFamily::PlayfulTrill
+            )
+        }
+        VocalTrigger::NeedHelp | VocalTrigger::VisualNotice => {
+            matches!(
+                motif.family,
+                VocalFamily::QuestionWhine | VocalFamily::AttentionCall
+            )
+        }
+        _ => matches!(
+            motif.family,
+            VocalFamily::SoftContact | VocalFamily::QuestionWhine
+        ),
+    };
+    (1.0 - weighted_distance.sqrt() * 1.15 - gesture_error.sqrt() * 0.75
+        + if family_match { 0.22 } else { 0.0 })
+    .clamp(-1.0, 1.0)
 }
 
 fn motif_value(motif: &VocalMotif) -> f32 {
@@ -1720,7 +1788,7 @@ fn motif_value(motif: &VocalMotif) -> f32 {
 }
 
 fn motif_distance(left: &VocalMotif, right: &VocalMotif) -> f32 {
-    if left.syllables.len() != right.syllables.len() {
+    if left.family != right.family || left.syllables.len() != right.syllables.len() {
         return 1.0;
     }
     let total = left
@@ -1731,6 +1799,7 @@ fn motif_distance(left: &VocalMotif, right: &VocalMotif) -> f32 {
             (a.duration_ms - b.duration_ms).abs() / 500.0
                 + (a.pitch_peak - b.pitch_peak).abs()
                 + (a.gap_after_ms - b.gap_after_ms).abs() / 300.0
+                + gesture_distance(a.gesture, b.gesture)
         })
         .sum::<f32>();
     total / left.syllables.len().max(1) as f32

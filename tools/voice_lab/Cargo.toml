@@ -1,0 +1,13 @@
+[package]
+name = "voice_lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+lifecore = { path = "../../crates/lifecore" }
+pet_audio = { path = "../../crates/pet_audio" }
+serde.workspace = true
+serde_json.workspace = true

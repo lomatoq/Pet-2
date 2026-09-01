@@ -697,6 +697,12 @@ impl ApplicationHandler for BodyLab {
                         purr: false,
                         gesture: lifecore::VoiceGesture::WarmChuff,
                         priority: 128,
+                        style: lifecore::VocalStyle::SocialContact,
+                        valence: 0.2,
+                        arousal: 0.3,
+                        fatigue: 0.0,
+                        confidence: 0.8,
+                        attachment: 0.4,
                         rhythm_intervals: [0.0; 8],
                     };
                     if let Err(error) = audio.enqueue(&self.genome.voice, motif, &request) {

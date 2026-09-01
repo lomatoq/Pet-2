@@ -190,6 +190,112 @@ impl BrainGenome {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceAnatomy {
+    pub schema: u8,
+    pub fold_mass: f32,
+    pub neutral_tension: f32,
+    pub resting_adduction: f32,
+    pub glottal_leak: f32,
+    pub tract_length: f32,
+    pub tract_compliance: f32,
+    pub oral_loss: f32,
+    pub nasal_capacity: f32,
+    pub body_coupling: f32,
+    pub instability_susceptibility: f32,
+    pub source_feedback: f32,
+}
+
+impl Default for VoiceAnatomy {
+    fn default() -> Self {
+        Self {
+            schema: 0,
+            fold_mass: 0.0,
+            neutral_tension: 0.0,
+            resting_adduction: 0.0,
+            glottal_leak: 0.0,
+            tract_length: 0.0,
+            tract_compliance: 0.0,
+            oral_loss: 0.0,
+            nasal_capacity: 0.0,
+            body_coupling: 0.0,
+            instability_susceptibility: 0.0,
+            source_feedback: 0.0,
+        }
+    }
+}
+
+impl VoiceAnatomy {
+    fn from_identity(
+        voice_seed: u64,
+        base_pitch_hz: f32,
+        formant_scale: f32,
+        formant_spacing: f32,
+        mouth_resonance: f32,
+        roughness: f32,
+        breathiness: f32,
+    ) -> Self {
+        let seeded = |channel: u64| seeded_unit(voice_seed ^ channel);
+        let low_pitch_mass = ((800.0 - base_pitch_hz.clamp(220.0, 800.0)) / 580.0).clamp(0.0, 1.0);
+        let tract_length = ((1.60 - formant_scale.clamp(0.55, 1.60)) / 1.05).clamp(0.0, 1.0);
+        Self {
+            schema: 1,
+            fold_mass: unit(0.18 + low_pitch_mass * 0.66 + (seeded(0x11) - 0.5) * 0.12),
+            neutral_tension: unit(
+                0.34 + (1.0 - low_pitch_mass) * 0.42 + (seeded(0x22) - 0.5) * 0.10,
+            ),
+            resting_adduction: unit(0.38 + mouth_resonance * 0.30 + (seeded(0x33) - 0.5) * 0.12),
+            glottal_leak: unit(0.06 + breathiness * 0.52 + (seeded(0x44) - 0.5) * 0.08),
+            tract_length: unit(tract_length * 0.82 + seeded(0x55) * 0.18),
+            tract_compliance: unit(0.28 + (1.0 - mouth_resonance) * 0.34 + seeded(0x66) * 0.22),
+            oral_loss: unit(
+                0.18 + (1.0 - formant_spacing.clamp(0.60, 1.50) / 1.50) * 0.26
+                    + seeded(0x77) * 0.18,
+            ),
+            nasal_capacity: unit(0.12 + breathiness * 0.30 + seeded(0x88) * 0.28),
+            body_coupling: unit(0.34 + mouth_resonance * 0.38 + seeded(0x99) * 0.18),
+            instability_susceptibility: unit(0.08 + roughness * 0.62 + seeded(0xaa) * 0.16),
+            source_feedback: (0.035 + mouth_resonance * 0.085 + seeded(0xbb) * 0.035)
+                .clamp(0.02, 0.18),
+        }
+    }
+
+    fn clamp_all(&mut self) {
+        self.schema = 1;
+        self.fold_mass = unit(self.fold_mass);
+        self.neutral_tension = unit(self.neutral_tension);
+        self.resting_adduction = unit(self.resting_adduction);
+        self.glottal_leak = unit(self.glottal_leak);
+        self.tract_length = unit(self.tract_length);
+        self.tract_compliance = unit(self.tract_compliance);
+        self.oral_loss = unit(self.oral_loss);
+        self.nasal_capacity = unit(self.nasal_capacity);
+        self.body_coupling = unit(self.body_coupling);
+        self.instability_susceptibility = unit(self.instability_susceptibility);
+        self.source_feedback = self.source_feedback.clamp(0.02, 0.18);
+    }
+
+    fn is_valid(self) -> bool {
+        self.schema == 1
+            && [
+                self.fold_mass,
+                self.neutral_tension,
+                self.resting_adduction,
+                self.glottal_leak,
+                self.tract_length,
+                self.tract_compliance,
+                self.oral_loss,
+                self.nasal_capacity,
+                self.body_coupling,
+                self.instability_susceptibility,
+            ]
+            .into_iter()
+            .all(unit_value)
+            && finite_in_range(self.source_feedback, 0.02, 0.18)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VoiceGenome {
     pub base_pitch_hz: f32,
@@ -211,6 +317,8 @@ pub struct VoiceGenome {
     pub phrase_speed: f32,
     pub maximum_loudness: f32,
     pub voice_seed: u64,
+    #[serde(default)]
+    pub anatomy: VoiceAnatomy,
 }
 
 impl VoiceGenome {
@@ -222,7 +330,8 @@ impl VoiceGenome {
             range(rng, 0.01, 0.10),
         ];
         normalize_mix(&mut harmonic_mix);
-        Self {
+        let voice_seed = rng.next_u64();
+        let mut voice = Self {
             // New identities start in the common audible cat-call / small-dog
             // whine band. Higher syllable contours still reach excited squeaks.
             base_pitch_hz: range(rng, 340.0, 620.0),
@@ -243,11 +352,31 @@ impl VoiceGenome {
             purr_rate: range(rng, 25.0, 30.0),
             phrase_speed: range(rng, 0.75, 1.35),
             maximum_loudness: range(rng, 0.14, 0.34),
-            voice_seed: rng.next_u64(),
+            voice_seed,
+            anatomy: VoiceAnatomy::default(),
+        };
+        voice.repair_anatomy();
+        voice
+    }
+
+    /// Additive migration for snapshots created before embodied voice anatomy.
+    pub fn repair_anatomy(&mut self) {
+        if self.anatomy.schema == 1 && self.anatomy.is_valid() {
+            return;
         }
+        self.anatomy = VoiceAnatomy::from_identity(
+            self.voice_seed,
+            self.base_pitch_hz,
+            self.formant_scale,
+            self.formant_spacing,
+            self.mouth_resonance,
+            self.roughness,
+            self.breathiness,
+        );
     }
 
     pub(crate) fn clamp_all(&mut self) {
+        self.repair_anatomy();
         self.base_pitch_hz = self.base_pitch_hz.clamp(220.0, 800.0);
         self.pitch_range_octaves = self.pitch_range_octaves.clamp(0.3, 2.0);
         for harmonic in &mut self.harmonic_mix {
@@ -269,6 +398,7 @@ impl VoiceGenome {
         self.purr_rate = self.purr_rate.clamp(20.0, 38.0);
         self.phrase_speed = self.phrase_speed.clamp(0.5, 1.8);
         self.maximum_loudness = self.maximum_loudness.clamp(0.05, 0.5);
+        self.anatomy.clamp_all();
     }
 
     fn is_valid(&self) -> bool {
@@ -296,6 +426,7 @@ impl VoiceGenome {
             && finite_in_range(self.purr_rate, 20.0, 38.0)
             && finite_in_range(self.phrase_speed, 0.5, 1.8)
             && finite_in_range(self.maximum_loudness, 0.05, 0.5)
+            && self.anatomy.is_valid()
     }
 }
 
@@ -453,6 +584,18 @@ fn centered_unit(rng: &mut impl RngCore) -> f32 {
 
 fn unit(value: f32) -> f32 {
     value.clamp(0.0, 1.0)
+}
+
+fn seeded_unit(seed: u64) -> f32 {
+    let mixed = splitmix64(seed);
+    ((mixed >> 40) as u32) as f32 / 0x00ff_ffff as f32
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn normalize_mix(mix: &mut [f32; 4]) {

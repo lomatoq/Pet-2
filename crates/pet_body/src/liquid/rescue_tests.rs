@@ -207,6 +207,19 @@ fn topology_signature(runtime: &LiquidMorphRuntime) -> Vec<usize> {
     signature
 }
 
+fn component_render_center(runtime: &LiquidMorphRuntime, component_id: u8) -> Vec2 {
+    let render = runtime.render_state();
+    let selected = render.particles[..render.particle_count]
+        .iter()
+        .filter(|particle| particle.component_id == component_id)
+        .collect::<Vec<_>>();
+    selected
+        .iter()
+        .map(|particle| particle.position)
+        .sum::<Vec2>()
+        / selected.len().max(1) as f32
+}
+
 fn bidirectional_particle_set_distance(
     first: &LiquidMorphRuntime,
     second: &LiquidMorphRuntime,
@@ -406,6 +419,87 @@ fn sharp_flick_raises_release_speed_and_slosh_without_fake_hold() {
     assert!(peak_speed >= 1.0, "release speed={peak_speed}");
     assert!(peak_slosh >= 0.015, "slosh={peak_slosh}");
     assert_eq!(runtime.diagnostics().recovery_count, 0);
+}
+
+#[test]
+fn real_detached_mass_keeps_desktop_position_when_body_root_translates() {
+    let (genome, mut runtime) = migrated_runtime(0xD37A_0B1E);
+    settle(&mut runtime, &genome, 1.0);
+
+    // Build one viable eight-particle parcel without involving any authored
+    // presentation fragment. The face carrier stays in the main component.
+    let detached_start = runtime.particle_count - 8;
+    for (offset, particle) in runtime.particles[detached_start..runtime.particle_count]
+        .iter_mut()
+        .enumerate()
+    {
+        let local = Vec2::new(
+            0.72 + (offset % 4) as f32 * 0.052,
+            -0.052 + (offset / 4) as f32 * 0.052,
+        );
+        particle.position = local;
+        particle.previous_position = local;
+        particle.predicted_position = local;
+        particle.render_position = local;
+        particle.velocity = Vec2::ZERO;
+    }
+    let spacing = PARTICLE_SPACING * runtime.tuning.spacing_scale;
+    let kernel_radius = KERNEL_RADIUS * runtime.tuning.kernel_radius_scale;
+    let component_spacing = component_graph_spacing(
+        spacing,
+        kernel_radius,
+        runtime.tuning.iso_threshold,
+        runtime.cinematic_features,
+    );
+    runtime.components = assign_components(
+        &mut runtime.particles,
+        runtime.particle_count,
+        component_spacing,
+        runtime.tuning.component_link_radius_scale,
+    );
+    runtime.snap_render_proxies();
+    assert_eq!(runtime.components.component_count, 2);
+    assert_eq!(runtime.components.detached_mass, 8.0);
+
+    let main_component = runtime.components.main_component;
+    let detached_component = runtime.particles[detached_start].component_id;
+    assert_ne!(detached_component, main_component);
+    let main_before = component_render_center(&runtime, main_component);
+    let detached_before = component_render_center(&runtime, detached_component);
+    let body_displacement = Vec2::new(0.12, -0.035);
+
+    step(
+        &mut runtime,
+        &genome,
+        &SensorFrame {
+            pointer_released: true,
+            ..SensorFrame::default()
+        },
+        &BodyFeedback {
+            world_position: Vec2::new(0.5, 0.5) + body_displacement,
+            ..BodyFeedback::default()
+        },
+        DropletMotion {
+            displacement: body_displacement,
+            presentation_displacement: body_displacement,
+            world_to_body_scale: Vec2::ONE,
+            ..DropletMotion::default()
+        },
+    );
+
+    assert_eq!(runtime.components.component_count, 2);
+    let main_world_step =
+        component_render_center(&runtime, main_component) + body_displacement - main_before;
+    let detached_world_step =
+        component_render_center(&runtime, detached_component) + body_displacement - detached_before;
+    assert!(
+        main_world_step.distance(body_displacement) < 0.02,
+        "main body did not follow its presentation root: {main_world_step:?}"
+    );
+    assert!(
+        detached_world_step.length() < 0.02,
+        "free material inherited the body root translation: {detached_world_step:?}"
+    );
 }
 
 #[test]

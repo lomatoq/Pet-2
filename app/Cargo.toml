@@ -9,7 +9,7 @@ build = "build.rs"
 [features]
 default = ["living-language"]
 living-language = []
-legacy-expression-fallback = ["pet_audio/legacy-voice-fallback"]
+legacy-expression-fallback = []
 
 [dependencies]
 desktop_host = { path = "../crates/desktop_host" }

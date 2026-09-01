@@ -1,29 +1,28 @@
 use std::sync::Arc;
 
-use lifecore::{Syllable, VocalMotif, VocalRequest, VoiceGenome, VoiceGesture};
+use lifecore::{
+    BodyVoiceFrame, Syllable, VocalFamily, VocalGesture, VocalMotif, VocalRequest, VocalStyle,
+    VoiceAnatomy, VoiceGenome, VoiceGesture,
+};
 
 use crate::{
-    AudioVisualBridge, AudioVisualFeedback,
-    envelope::amplitude_envelope,
-    filter::{DcBlocker, EarlyReflections, OnePoleLowPass, Resonator, soft_limit},
-    oscillator::{NoiseSource, Oscillator},
+    AudioVisualBridge, AudioVisualFeedback, BodyVoiceBridge, VoiceDiagnostics,
+    body_resonance::LiquidBodyResonance,
+    breath::BreathPressureController,
+    filter::{DcBlocker, EarlyReflections, OnePoleLowPass, soft_limit},
+    glottis::HybridLfGlottis,
+    noise::NoiseSource,
+    prosody::ProsodyCurve,
     ring::SpscRing,
+    tract::DynamicTract,
 };
 
 pub const MAX_SYLLABLES: usize = 6;
 pub const COMMAND_CAPACITY: usize = 32;
-const ROOM_TAIL_MS: f32 = 36.0;
-const LIVING_MIN_FUNDAMENTAL_HZ: f32 = 65.0;
-const LIVING_MAX_FUNDAMENTAL_HZ: f32 = 620.0;
-const LEGACY_MIN_FUNDAMENTAL_HZ: f32 = 260.0;
-const LEGACY_MAX_FUNDAMENTAL_HZ: f32 = 8_000.0;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum VoiceSynthesisStyle {
-    #[default]
-    LivingMammalian,
-    Legacy,
-}
+const ROOM_TAIL_MS: f32 = 72.0;
+const MINIMUM_F0_HZ: f32 = 85.0;
+const MAXIMUM_F0_HZ: f32 = 1_600.0;
+const CONTROL_RATE_HZ: f32 = 400.0;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PreparedSyllable {
@@ -38,10 +37,69 @@ pub struct PreparedSyllable {
     pub mouth_open: f32,
     pub trill_amount: f32,
     pub vibrato_amount: f32,
+    pub gesture: VocalGesture,
+    prosody: ProsodyCurve,
 }
 
-impl From<&Syllable> for PreparedSyllable {
-    fn from(value: &Syllable) -> Self {
+impl PreparedSyllable {
+    fn prepare(value: &Syllable, seed: u64, family: VocalFamily, request: &VocalRequest) -> Self {
+        let mut gesture = value.gesture;
+        gesture.pressure_peak = (gesture.pressure_peak
+            * (0.92 + request.arousal.clamp(0.0, 1.0) * 0.16)
+            * (1.0 - request.fatigue.clamp(0.0, 1.0) * 0.34))
+            .clamp(0.0, 1.0);
+        gesture.adduction = (gesture.adduction + request.arousal.clamp(0.0, 1.0) * 0.07
+            - request.fatigue.clamp(0.0, 1.0) * 0.05)
+            .clamp(0.0, 1.0);
+        gesture.open_quotient = (gesture.open_quotient
+            + request.valence.clamp(-1.0, 1.0) * 0.035
+            + request.fatigue.clamp(0.0, 1.0) * 0.045)
+            .clamp(0.30, 0.82);
+        gesture.constriction = (gesture.constriction - request.valence.clamp(-1.0, 1.0) * 0.05
+            + request.stress.clamp(0.0, 1.0) * 0.10)
+            .clamp(0.0, 1.0);
+        gesture.nasality =
+            (gesture.nasality + request.fatigue.clamp(0.0, 1.0) * 0.12).clamp(0.0, 1.0);
+        gesture.instability = (gesture.instability
+            + request.stress.clamp(0.0, 1.0) * 0.24
+            + (1.0 - request.confidence.clamp(0.0, 1.0)) * 0.12)
+            .clamp(0.0, 1.0);
+        gesture.body_excitation =
+            (gesture.body_excitation + request.attachment.clamp(0.0, 1.0) * 0.08).clamp(0.0, 1.0);
+        match request.gesture {
+            VoiceGesture::PurrHum => {
+                gesture.pressure_peak *= 0.72;
+                gesture.nasality += 0.24;
+                gesture.body_excitation += 0.24;
+                gesture.constriction += 0.10;
+            }
+            VoiceGesture::WarmChuff => {
+                gesture.open_quotient += 0.04;
+                gesture.body_excitation += 0.08;
+            }
+            VoiceGesture::MewWhine => {
+                gesture.frontness += 0.20;
+                gesture.pressure_peak += 0.08;
+                gesture.constriction -= 0.06;
+            }
+            VoiceGesture::LowRumble => {
+                gesture.adduction += 0.14;
+                gesture.constriction += 0.20;
+                gesture.body_excitation += 0.18;
+            }
+            VoiceGesture::ClippedPulse => {
+                gesture.adduction += 0.18;
+                gesture.closure_sharpness += 0.24;
+                gesture.open_quotient -= 0.08;
+            }
+            VoiceGesture::ReliefExhale => {
+                gesture.pressure_peak *= 0.68;
+                gesture.open_quotient += 0.10;
+                gesture.adduction -= 0.12;
+                gesture.nasality += 0.08;
+            }
+        }
+        gesture.sanitize();
         Self {
             duration_ms: value.duration_ms,
             gap_after_ms: value.gap_after_ms,
@@ -54,7 +112,22 @@ impl From<&Syllable> for PreparedSyllable {
             mouth_open: value.mouth_open,
             trill_amount: value.trill_amount,
             vibrato_amount: value.vibrato_amount,
+            gesture,
+            prosody: ProsodyCurve::from_targets(
+                value.pitch_start,
+                value.pitch_peak,
+                value.pitch_end,
+                seed,
+                family,
+                request.style,
+                request.valence,
+            ),
         }
+    }
+
+    #[must_use]
+    pub fn pitch_ratio(&self, progress: f32) -> f32 {
+        self.prosody.sample(progress)
     }
 }
 
@@ -63,58 +136,46 @@ pub struct VoiceCommand {
     pub request_id: u64,
     pub motif_id: u64,
     pub seed: u64,
+    pub family: VocalFamily,
     pub syllable_count: u8,
     pub syllables: [PreparedSyllable; MAX_SYLLABLES],
     pub base_pitch_hz: f32,
-    pub harmonic_mix: [f32; 4],
+    pub minimum_f0_hz: f32,
+    pub maximum_f0_hz: f32,
+    pub anatomy: VoiceAnatomy,
+    pub brightness: f32,
     pub breathiness: f32,
     pub roughness: f32,
-    pub brightness: f32,
-    pub formant_scale: f32,
-    pub formant_spacing: f32,
-    pub mouth_resonance: f32,
-    pub vibrato_rate: f32,
-    pub vibrato_depth: f32,
-    pub trill_rate: f32,
-    pub attack_ms: f32,
-    pub release_ms: f32,
-    pub click_amount: f32,
-    pub purr_rate: f32,
     pub gain: f32,
     pub pan: f32,
     pub pitch_scale: f32,
     pub tempo_scale: f32,
     pub stress: f32,
     pub purr: bool,
+    pub purr_rate: f32,
     pub gesture: VoiceGesture,
-    pub glottal_tension: f32,
-    pub minimum_f0_hz: f32,
-    pub maximum_f0_hz: f32,
+    pub style: VocalStyle,
+    pub valence: f32,
+    pub arousal: f32,
+    pub fatigue: f32,
+    pub confidence: f32,
+    pub attachment: f32,
     pub maximum_loudness: f32,
-    pub spectral_drift: f32,
-    pub formant_drift: f32,
     pub room_mix: f32,
 }
 
 impl VoiceCommand {
     #[must_use]
     pub fn prepare(voice: &VoiceGenome, motif: &VocalMotif, request: &VocalRequest) -> Self {
-        #[cfg(feature = "legacy-voice-fallback")]
-        return Self::prepare_style(voice, motif, request, VoiceSynthesisStyle::Legacy);
-        #[cfg(not(feature = "legacy-voice-fallback"))]
-        Self::prepare_style(voice, motif, request, VoiceSynthesisStyle::LivingMammalian)
-    }
-
-    #[must_use]
-    pub fn prepare_style(
-        voice: &VoiceGenome,
-        motif: &VocalMotif,
-        request: &VocalRequest,
-        style: VoiceSynthesisStyle,
-    ) -> Self {
+        let performance_seed = request.performance_seed ^ motif.seed.rotate_left(17);
         let mut syllables = [PreparedSyllable::default(); MAX_SYLLABLES];
-        for (target, source) in syllables.iter_mut().zip(&motif.syllables) {
-            *target = PreparedSyllable::from(source);
+        for (index, (target, source)) in syllables.iter_mut().zip(&motif.syllables).enumerate() {
+            *target = PreparedSyllable::prepare(
+                source,
+                performance_seed ^ index as u64,
+                motif.family,
+                request,
+            );
         }
         let rhythm_interval_count = request
             .rhythm_intervals
@@ -122,124 +183,63 @@ impl VoiceCommand {
             .position(|interval| !interval.is_finite() || *interval <= 0.0)
             .unwrap_or(request.rhythm_intervals.len())
             .min(MAX_SYLLABLES.saturating_sub(1));
+        let mut syllable_count = motif.syllables.len().min(MAX_SYLLABLES);
         if rhythm_interval_count > 0 && !motif.syllables.is_empty() {
-            for (index, syllable) in syllables
-                .iter_mut()
-                .enumerate()
-                .take(rhythm_interval_count + 1)
-            {
-                *syllable = PreparedSyllable::from(&motif.syllables[index % motif.syllables.len()]);
-                syllable.duration_ms = syllable.duration_ms.clamp(55.0, 88.0);
+            syllable_count = rhythm_interval_count + 1;
+            for (index, target) in syllables.iter_mut().enumerate().take(syllable_count) {
+                let source = &motif.syllables[index % motif.syllables.len()];
+                *target = PreparedSyllable::prepare(
+                    source,
+                    performance_seed ^ index as u64,
+                    VocalFamily::RhythmMimic,
+                    request,
+                );
+                target.duration_ms = target.duration_ms.clamp(55.0, 92.0);
                 if index < rhythm_interval_count {
                     let onset_ms = 220.0 * request.rhythm_intervals[index].clamp(0.1, 4.0);
-                    syllable.gap_after_ms = (onset_ms - syllable.duration_ms).clamp(4.0, 792.0);
+                    target.gap_after_ms = (onset_ms - target.duration_ms).clamp(4.0, 792.0);
                 } else {
-                    syllable.gap_after_ms = 0.0;
+                    target.gap_after_ms = 0.0;
                 }
             }
         }
-        let performance_seed = request.performance_seed ^ motif.seed.rotate_left(17);
-        let spectral_drift = seeded_signed(performance_seed ^ 0xA24B_AED4_963E_E407);
-        let formant_drift = seeded_signed(performance_seed ^ 0x9FB2_1C65_1E98_DF25);
-        let envelope_drift = seeded_signed(performance_seed ^ 0xC13F_A9A9_02A6_328F);
-        let room_unit = seeded_unit(performance_seed ^ 0x91E1_0DA5_C79E_7B1D);
-        let gesture = gesture_profile(request.gesture);
-        let mut command = Self {
+        let identity = identity_register(request.style, request.gesture);
+        let room_unit = seeded_unit(performance_seed ^ 0x91e1_0da5_c79e_7b1d);
+        Self {
             request_id: request.performance_seed,
             motif_id: motif.id,
             seed: splitmix64(performance_seed),
-            syllable_count: if rhythm_interval_count > 0 {
-                rhythm_interval_count.saturating_add(1) as u8
-            } else {
-                motif.syllables.len().min(MAX_SYLLABLES) as u8
-            },
+            family: motif.family,
+            syllable_count: syllable_count as u8,
             syllables,
-            // A stable genome identity is projected into a gesture-specific
-            // mammalian register. No semantic class is encoded as a melody.
             base_pitch_hz: voice
                 .base_pitch_hz
-                .clamp(gesture.minimum_f0, gesture.maximum_f0),
-            harmonic_mix: softened_harmonic_mix(voice.harmonic_mix),
-            breathiness: (voice.breathiness + gesture.breathiness).clamp(0.0, 0.9),
-            roughness: (voice.roughness + gesture.roughness).clamp(0.0, 0.9),
-            brightness: (voice.brightness * gesture.brightness).clamp(0.0, 1.0),
-            formant_scale: voice.formant_scale * gesture.formant_scale,
-            formant_spacing: voice.formant_spacing,
-            mouth_resonance: voice.mouth_resonance,
-            vibrato_rate: voice.vibrato_rate,
-            vibrato_depth: voice.vibrato_depth,
-            trill_rate: voice.trill_rate,
-            attack_ms: voice.attack_ms * (1.0 + envelope_drift * 0.18),
-            release_ms: voice.release_ms * (1.0 - envelope_drift * 0.22),
-            click_amount: voice.click_amount * gesture.articulation,
-            // Purr is amplitude texture, never a directly audible pure tone.
-            purr_rate: voice.purr_rate.clamp(24.0, 32.0),
-            // Keep rendition dynamics audible. The previous hard 0.45 floor
-            // collapsed almost every quiet/normal request onto one loudness.
-            gain: (request.gain * 2.0).clamp(0.08, 0.62),
-            pan: request.pan,
-            pitch_scale: request.pitch_scale,
-            tempo_scale: request.tempo_scale,
-            stress: request.stress,
-            purr: request.purr || request.gesture == VoiceGesture::PurrHum,
+                .clamp(identity.minimum_f0, identity.maximum_f0),
+            minimum_f0_hz: MINIMUM_F0_HZ,
+            maximum_f0_hz: MAXIMUM_F0_HZ,
+            anatomy: voice.anatomy,
+            brightness: voice.brightness.clamp(0.0, 1.0),
+            breathiness: voice.breathiness.clamp(0.0, 1.0),
+            roughness: voice.roughness.clamp(0.0, 1.0),
+            gain: (request.gain * 1.65).clamp(0.0, 0.62),
+            pan: request.pan.clamp(-1.0, 1.0),
+            pitch_scale: request.pitch_scale.clamp(0.62, 1.48),
+            tempo_scale: request.tempo_scale.clamp(0.50, 1.80),
+            stress: request.stress.clamp(0.0, 1.0),
+            purr: request.purr
+                || request.style == VocalStyle::Purr
+                || request.gesture == VoiceGesture::PurrHum,
+            purr_rate: voice.purr_rate.clamp(22.0, 31.0),
             gesture: request.gesture,
-            glottal_tension: gesture.glottal_tension,
-            minimum_f0_hz: LIVING_MIN_FUNDAMENTAL_HZ,
-            maximum_f0_hz: LIVING_MAX_FUNDAMENTAL_HZ,
-            // Genome loudness already shaped `request.gain`; this is only a
-            // transparent safety ceiling, not a second compressor.
-            maximum_loudness: 0.68,
-            spectral_drift,
-            formant_drift,
-            room_mix: 0.015 + room_unit * 0.020,
-        };
-        if style == VoiceSynthesisStyle::Legacy {
-            command.base_pitch_hz = voice.base_pitch_hz.clamp(320.0, 720.0);
-            command.breathiness = voice.breathiness;
-            command.roughness = voice.roughness;
-            command.brightness = voice.brightness;
-            command.formant_scale = voice.formant_scale;
-            command.click_amount = voice.click_amount;
-            command.purr = request.purr;
-            command.glottal_tension = 0.0;
-            command.minimum_f0_hz = LEGACY_MIN_FUNDAMENTAL_HZ;
-            command.maximum_f0_hz = LEGACY_MAX_FUNDAMENTAL_HZ;
-        } else if rhythm_interval_count == 0 {
-            // Mammalian social units are slow enough to read as breath/voice
-            // gestures instead of a chirp sequence. Explicit click rhythms keep
-            // their measured timing and bypass this semantic-unit pacing.
-            let unit_limit = match command.gesture {
-                VoiceGesture::WarmChuff | VoiceGesture::MewWhine => 3,
-                VoiceGesture::PurrHum
-                | VoiceGesture::LowRumble
-                | VoiceGesture::ClippedPulse
-                | VoiceGesture::ReliefExhale => 2,
-            };
-            command.syllable_count = command.syllable_count.min(unit_limit);
-            let count = usize::from(command.syllable_count);
-            for (index, syllable) in command.syllables[..count].iter_mut().enumerate() {
-                syllable.duration_ms = syllable.duration_ms.max(180.0);
-                if index + 1 < count {
-                    syllable.gap_after_ms = syllable.gap_after_ms.max(70.0);
-                } else {
-                    syllable.gap_after_ms = 0.0;
-                }
-            }
-            let content_ms = command.syllables[..count]
-                .iter()
-                .map(|syllable| syllable.duration_ms + syllable.gap_after_ms)
-                .sum::<f32>();
-            let target_rate_hz = (2.45 + (command.tempo_scale - 1.0) * 0.65).clamp(2.05, 2.90);
-            let target_content_ms =
-                (1_000.0 * count as f32 / target_rate_hz - ROOM_TAIL_MS).max(240.0);
-            let scale =
-                target_content_ms * command.tempo_scale.max(0.1) / content_ms.max(f32::EPSILON);
-            for syllable in &mut command.syllables[..count] {
-                syllable.duration_ms *= scale;
-                syllable.gap_after_ms *= scale;
-            }
+            style: request.style,
+            valence: request.valence.clamp(-1.0, 1.0),
+            arousal: request.arousal.clamp(0.0, 1.0),
+            fatigue: request.fatigue.clamp(0.0, 1.0),
+            confidence: request.confidence.clamp(0.0, 1.0),
+            attachment: request.attachment.clamp(0.0, 1.0),
+            maximum_loudness: 0.76,
+            room_mix: 0.015 + room_unit * 0.025,
         }
-        command
     }
 
     #[must_use]
@@ -247,10 +247,9 @@ impl VoiceCommand {
         self.syllables[..usize::from(self.syllable_count)]
             .iter()
             .map(|syllable| {
-                let tempo = self.tempo_scale.max(0.1);
-                milliseconds_to_frames(syllable.duration_ms / tempo, sample_rate as f32)
+                milliseconds_to_frames(syllable.duration_ms / self.tempo_scale, sample_rate as f32)
                     + milliseconds_to_frames_allow_zero(
-                        syllable.gap_after_ms / tempo,
+                        syllable.gap_after_ms / self.tempo_scale,
                         sample_rate as f32,
                     )
             })
@@ -260,78 +259,30 @@ impl VoiceCommand {
 }
 
 #[derive(Clone, Copy)]
-struct GestureProfile {
+struct IdentityRegister {
     minimum_f0: f32,
     maximum_f0: f32,
-    formant_scale: f32,
-    breathiness: f32,
-    roughness: f32,
-    brightness: f32,
-    articulation: f32,
-    glottal_tension: f32,
 }
 
-const fn gesture_profile(gesture: VoiceGesture) -> GestureProfile {
-    match gesture {
-        VoiceGesture::PurrHum => GestureProfile {
-            minimum_f0: 82.0,
-            maximum_f0: 148.0,
-            formant_scale: 0.72,
-            breathiness: 0.02,
-            roughness: 0.18,
-            brightness: 0.46,
-            articulation: 0.08,
-            glottal_tension: 0.34,
+const fn identity_register(style: VocalStyle, gesture: VoiceGesture) -> IdentityRegister {
+    match (style, gesture) {
+        (VocalStyle::Purr | VocalStyle::ContentMurmur, _) | (_, VoiceGesture::PurrHum) => {
+            IdentityRegister {
+                minimum_f0: 180.0,
+                maximum_f0: 420.0,
+            }
+        }
+        (VocalStyle::Startle, _) => IdentityRegister {
+            minimum_f0: 300.0,
+            maximum_f0: 800.0,
         },
-        VoiceGesture::WarmChuff => GestureProfile {
-            minimum_f0: 118.0,
-            maximum_f0: 255.0,
-            formant_scale: 0.84,
-            breathiness: 0.16,
-            roughness: 0.08,
-            brightness: 0.62,
-            articulation: 0.28,
-            glottal_tension: 0.48,
+        (VocalStyle::Frustrated, _) | (_, VoiceGesture::LowRumble) => IdentityRegister {
+            minimum_f0: 180.0,
+            maximum_f0: 420.0,
         },
-        VoiceGesture::MewWhine => GestureProfile {
-            minimum_f0: 165.0,
-            maximum_f0: 365.0,
-            formant_scale: 0.94,
-            breathiness: 0.06,
-            roughness: 0.02,
-            brightness: 0.68,
-            articulation: 0.18,
-            glottal_tension: 0.62,
-        },
-        VoiceGesture::LowRumble => GestureProfile {
-            minimum_f0: 68.0,
-            maximum_f0: 126.0,
-            formant_scale: 0.66,
-            breathiness: 0.02,
-            roughness: 0.34,
-            brightness: 0.34,
-            articulation: 0.06,
-            glottal_tension: 0.74,
-        },
-        VoiceGesture::ClippedPulse => GestureProfile {
-            minimum_f0: 112.0,
-            maximum_f0: 285.0,
-            formant_scale: 0.80,
-            breathiness: 0.08,
-            roughness: 0.20,
-            brightness: 0.72,
-            articulation: 0.72,
-            glottal_tension: 0.80,
-        },
-        VoiceGesture::ReliefExhale => GestureProfile {
-            minimum_f0: 88.0,
-            maximum_f0: 175.0,
-            formant_scale: 0.76,
-            breathiness: 0.34,
-            roughness: 0.02,
-            brightness: 0.42,
-            articulation: 0.02,
-            glottal_tension: 0.20,
+        _ => IdentityRegister {
+            minimum_f0: 220.0,
+            maximum_f0: 720.0,
         },
     }
 }
@@ -339,37 +290,53 @@ const fn gesture_profile(gesture: VoiceGesture) -> GestureProfile {
 pub struct SynthVoice {
     commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
     feedback: Arc<AudioVisualBridge>,
+    body_bridge: Arc<BodyVoiceBridge>,
     sample_rate: f32,
     current: Option<VoiceCommand>,
     syllable_index: usize,
     frame_in_syllable: usize,
     gap_frames_remaining: usize,
-    oscillator: Oscillator,
-    noise: NoiseSource,
-    modulation_noise: NoiseSource,
-    formants: [Resonator; 3],
-    tone_lowpass: OnePoleLowPass,
+    tail_frames_remaining: usize,
+    breath: BreathPressureController,
+    glottis: HybridLfGlottis,
+    tract: DynamicTract,
+    body_resonance: LiquidBodyResonance,
+    aspiration_noise: NoiseSource,
+    constriction_noise: NoiseSource,
+    cycle_noise: NoiseSource,
+    slosh_noise: NoiseSource,
+    purr_noise: NoiseSource,
+    spectral_tilt: OnePoleLowPass,
     voice_low_cut: OnePoleLowPass,
-    breath_low_cut: OnePoleLowPass,
-    breath_high_cut: OnePoleLowPass,
-    modulation_lowpass: OnePoleLowPass,
     dc_blocker: DcBlocker,
     room: EarlyReflections,
-    vibrato_phase: f32,
-    trill_phase: f32,
-    purr_phase: f32,
-    purr_secondary_phase: f32,
-    tail_frames_remaining: usize,
+    body_target: BodyVoiceFrame,
+    body_current: BodyVoiceFrame,
+    control_interval: usize,
+    control_countdown: usize,
+    tract_back_pressure: f32,
+    last_glottal_openness: f32,
+    emitted_energy: f32,
+    purr_frames_until_event: usize,
+    purr_closure_remaining: usize,
+    purr_closure_total: usize,
+    purr_aspiration_remaining: usize,
+    purr_aspiration_total: usize,
+    purr_event_amplitude: f32,
+    purr_group_remaining: usize,
+    purr_group_exhale: bool,
+    diagnostics: VoiceDiagnostics,
     last_pan: f32,
 }
 
 impl SynthVoice {
     #[must_use]
     pub fn new(commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>, sample_rate: u32) -> Self {
-        Self::with_feedback(
+        Self::with_bridges(
             commands,
             sample_rate,
             Arc::new(AudioVisualBridge::default()),
+            Arc::new(BodyVoiceBridge::default()),
         )
     }
 
@@ -379,40 +346,79 @@ impl SynthVoice {
         sample_rate: u32,
         feedback: Arc<AudioVisualBridge>,
     ) -> Self {
+        Self::with_bridges(
+            commands,
+            sample_rate,
+            feedback,
+            Arc::new(BodyVoiceBridge::default()),
+        )
+    }
+
+    #[must_use]
+    pub fn with_bridges(
+        commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
+        sample_rate: u32,
+        feedback: Arc<AudioVisualBridge>,
+        body_bridge: Arc<BodyVoiceBridge>,
+    ) -> Self {
         let sample_rate = sample_rate.max(1) as f32;
         Self {
             commands,
             feedback,
+            body_bridge,
             sample_rate,
             current: None,
             syllable_index: 0,
             frame_in_syllable: 0,
             gap_frames_remaining: 0,
-            oscillator: Oscillator::default(),
-            noise: NoiseSource::new(1),
-            modulation_noise: NoiseSource::new(2),
-            formants: [Resonator::default(); 3],
-            tone_lowpass: OnePoleLowPass::default(),
+            tail_frames_remaining: 0,
+            breath: BreathPressureController::default(),
+            glottis: HybridLfGlottis::new(sample_rate),
+            tract: DynamicTract::new(sample_rate),
+            body_resonance: LiquidBodyResonance::new(sample_rate),
+            aspiration_noise: NoiseSource::new(1),
+            constriction_noise: NoiseSource::new(2),
+            cycle_noise: NoiseSource::new(3),
+            slosh_noise: NoiseSource::new(4),
+            purr_noise: NoiseSource::new(5),
+            spectral_tilt: OnePoleLowPass::default(),
             voice_low_cut: OnePoleLowPass::default(),
-            breath_low_cut: OnePoleLowPass::default(),
-            breath_high_cut: OnePoleLowPass::default(),
-            modulation_lowpass: OnePoleLowPass::default(),
             dc_blocker: DcBlocker::default(),
             room: EarlyReflections::new(sample_rate),
-            vibrato_phase: 0.0,
-            trill_phase: 0.0,
-            purr_phase: 0.0,
-            purr_secondary_phase: 0.0,
-            tail_frames_remaining: 0,
+            body_target: BodyVoiceFrame::default(),
+            body_current: BodyVoiceFrame::default(),
+            control_interval: (sample_rate / CONTROL_RATE_HZ).round().max(1.0) as usize,
+            control_countdown: 0,
+            tract_back_pressure: 0.0,
+            last_glottal_openness: 0.55,
+            emitted_energy: 0.0,
+            purr_frames_until_event: 0,
+            purr_closure_remaining: 0,
+            purr_closure_total: 1,
+            purr_aspiration_remaining: 0,
+            purr_aspiration_total: 1,
+            purr_event_amplitude: 0.0,
+            purr_group_remaining: 0,
+            purr_group_exhale: true,
+            diagnostics: VoiceDiagnostics::default(),
             last_pan: 0.0,
         }
+    }
+
+    pub fn begin_callback(&mut self) {
+        self.body_target = self.body_bridge.snapshot_or(self.body_target);
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> VoiceDiagnostics {
+        self.diagnostics.normalized()
     }
 
     pub fn next_stereo_frame(&mut self) -> [f32; 2] {
         if self.current.is_none() {
             if self.tail_frames_remaining > 0 {
                 self.tail_frames_remaining -= 1;
-                let frame = self.post_process(0.0, self.last_pan, 0.68);
+                let frame = self.render_unvoiced_tail(self.last_pan, 0.76);
                 if self.tail_frames_remaining == 0 {
                     self.feedback.clear();
                 }
@@ -426,8 +432,9 @@ impl SynthVoice {
         }
         if self.gap_frames_remaining > 0 {
             self.gap_frames_remaining -= 1;
-            self.publish_feedback(0.0, 0.0, 0.0, 0.0);
-            return self.render_silence_frame();
+            self.publish_feedback(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0);
+            let command = self.current.expect("gap belongs to active command");
+            return self.render_unvoiced_tail(command.pan, command.maximum_loudness);
         }
         let command = self.current.expect("command is active");
         if self.syllable_index >= usize::from(command.syllable_count) {
@@ -448,341 +455,398 @@ impl SynthVoice {
             self.syllable_index += 1;
             self.frame_in_syllable = 0;
             if self.syllable_index < usize::from(command.syllable_count) {
-                self.configure_formants(command.syllables[self.syllable_index]);
+                self.breath.begin_syllable();
+                self.control_countdown = 0;
             }
-            self.publish_feedback(0.0, 0.0, 0.0, 0.0);
+            self.publish_feedback(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0);
             return self.next_stereo_frame();
         }
-
         let progress = self.frame_in_syllable as f32 / total_frames.saturating_sub(1).max(1) as f32;
-        let pitch_contour = if progress < 0.5 {
-            smooth_lerp(syllable.pitch_start, syllable.pitch_peak, progress * 2.0)
-        } else {
-            smooth_lerp(
-                syllable.pitch_peak,
-                syllable.pitch_end,
-                (progress - 0.5) * 2.0,
-            )
-        };
-        self.vibrato_phase = (self.vibrato_phase + command.vibrato_rate / self.sample_rate).fract();
-        self.trill_phase = (self.trill_phase + command.trill_rate / self.sample_rate).fract();
-        let vibrato = (self.vibrato_phase * std::f32::consts::TAU).sin()
-            * command.vibrato_depth
-            * syllable.vibrato_amount;
-        let trill =
-            (self.trill_phase * std::f32::consts::TAU).sin() * 0.030 * syllable.trill_amount;
-        let modulation = self
-            .modulation_lowpass
-            .process(self.modulation_noise.sample(0.0));
-        let organic_jitter = modulation * (command.stress * 0.010 + command.roughness * 0.006);
-        let frequency = (command.base_pitch_hz
-            * pitch_contour
+        self.body_current = smooth_body_frame(self.body_current, self.body_target, 0.0025);
+        if self.control_countdown == 0 {
+            self.tract
+                .set_targets(syllable.gesture, syllable.mouth_open, self.body_current);
+            self.body_resonance
+                .set_targets(self.body_current, syllable.gesture);
+            self.control_countdown = self.control_interval;
+            self.diagnostics.observe_control();
+        }
+        self.control_countdown = self.control_countdown.saturating_sub(1);
+        let (purr_closure, purr_aspiration, purr_body, purr_energy) = self.process_purr(command);
+        let mut gesture = syllable.gesture;
+        gesture.adduction = (gesture.adduction + purr_closure * 0.28).clamp(0.0, 1.0);
+        gesture.nasality =
+            (gesture.nasality + if self.purr_group_exhale { 0.02 } else { 0.08 }).clamp(0.0, 1.0);
+        let physical_impulse = (self.body_current.collision_impulse * 0.30
+            + self.body_current.contact_impulse * 0.24
+            + self.body_current.release_impulse * 0.18
+            + self.body_current.detach_impulse * 0.22
+            + self.body_current.remerge_impulse * 0.20
+            + purr_closure * 0.10)
+            .clamp(0.0, 1.0);
+        let breath = self.breath.process(
+            progress,
+            gesture,
+            command.anatomy,
+            // Performance gain is an acoustic output control, not the animal's
+            // entire available lung pressure.  Keep the pressure gesture alive
+            // at quiet listening levels and let `command.gain` act once below.
+            (0.76 + command.gain * 0.42).clamp(0.72, 1.05),
+            command.arousal,
+            command.fatigue,
+            physical_impulse,
+            self.last_glottal_openness,
+            self.tract_back_pressure,
+            1.0 / self.sample_rate,
+        );
+        self.diagnostics.observe_pressure(breath.pressure);
+        let body_tension = 1.0 + self.body_current.stretch * 0.025;
+        let target_f0 = (command.base_pitch_hz
             * command.pitch_scale
-            * (1.0 + vibrato + trill + organic_jitter).clamp(0.75, 1.25))
-        .clamp(command.minimum_f0_hz, command.maximum_f0_hz);
-        // Bounded glottal source: tension shifts energy from the soft
-        // triangle/sine pair toward the band-limited closing pulse. The
-        // downstream resonators remain the vocal tract (source-filter split).
-        let tension = command.glottal_tension.clamp(0.0, 1.0);
-        let glottal_mix = [
-            command.harmonic_mix[0] * (1.0 - tension * 0.32),
-            command.harmonic_mix[1] * (1.0 - tension * 0.42),
-            command.harmonic_mix[2] + tension * 0.18,
-            command.harmonic_mix[3] * (0.65 + tension * 0.35),
-        ];
-        let primary = self
-            .oscillator
-            .sample(frequency, self.sample_rate, glottal_mix);
-        // Two almost-identical oscillators created a perfectly periodic beat
-        // that listeners heard as computer hum. Roughness now comes from the
-        // already band-limited aspiration path and bounded aperiodic jitter.
-        let voiced = self.tone_lowpass.process(primary);
-        let noisiness = (command.breathiness + syllable.noisiness * 0.65 + command.stress * 0.12)
-            .clamp(0.0, 0.78);
-        let raw_noise = self.noise.sample(command.brightness);
-        let breath_high = raw_noise - self.breath_low_cut.process(raw_noise);
-        let breath = self.breath_high_cut.process(breath_high);
-        let burst_frames = milliseconds_to_frames(5.0, self.sample_rate);
-        let burst_progress = self.frame_in_syllable as f32 / burst_frames.max(1) as f32;
-        let articulation = if burst_progress < 1.0 {
-            breath
-                * (command.click_amount + syllable.click).clamp(0.0, 1.4)
-                * 0.22
-                * (std::f32::consts::PI * burst_progress).sin()
-        } else {
-            0.0
-        };
-        let purr = if command.purr {
-            self.purr_phase = (self.purr_phase + command.purr_rate / self.sample_rate).fract();
-            self.purr_secondary_phase =
-                (self.purr_secondary_phase + command.purr_rate * 0.47 / self.sample_rate).fract();
-            0.84 + 0.10 * (self.purr_phase * std::f32::consts::TAU).sin()
-                + 0.06 * (self.purr_secondary_phase * std::f32::consts::TAU).sin()
-        } else {
-            1.0
-        };
-        let attack_frames = milliseconds_to_frames(command.attack_ms, self.sample_rate);
-        let release_frames = milliseconds_to_frames(command.release_ms, self.sample_rate);
-        let envelope = amplitude_envelope(
-            self.frame_in_syllable,
-            total_frames,
-            attack_frames,
-            release_frames,
+            * syllable.pitch_ratio(progress)
+            * body_tension)
+            .clamp(command.minimum_f0_hz, command.maximum_f0_hz);
+        let instability = (gesture.instability
+            + command.stress * 0.22
+            + command.roughness * 0.12
+            + self.body_current.bond_strain * 0.30
+            + self.body_current.material_stress * 0.16
+            + command.anatomy.instability_susceptibility * 0.12)
+            .clamp(0.0, 1.0);
+        let glottal = self.glottis.process(
+            target_f0,
+            breath.pressure,
+            breath.capture,
+            gesture,
+            instability,
+            self.tract_back_pressure,
+            &mut self.cycle_noise,
         );
+        if glottal.cycle_boundary {
+            self.diagnostics
+                .observe_cycle(glottal.f0_hz, glottal.regime);
+        }
+        self.last_glottal_openness = glottal.openness;
+        let aspiration = self.aspiration_noise.colored(command.brightness)
+            * (breath.aspiration * glottal.aspiration_gate
+                + purr_aspiration
+                + syllable.noisiness * breath.airflow * 0.08);
+        let turbulence = self.constriction_noise.colored(command.brightness)
+            * breath.airflow
+            * (0.30 + gesture.constriction * 0.70);
+        let tract = self
+            .tract
+            .process(glottal.excitation, aspiration, turbulence);
+        self.tract_back_pressure = tract.back_pressure;
+        let body = self.body_resonance.process(
+            tract.output + purr_body * 0.045,
+            self.body_current,
+            self.slosh_noise.colored(0.38),
+        );
+        let raw =
+            (tract.output + body.signal) * command.gain * syllable.amplitude.clamp(0.0, 1.0) * 4.0;
         self.frame_in_syllable += 1;
-
-        self.publish_feedback(
-            envelope,
-            syllable.mouth_open,
-            frequency / command.base_pitch_hz.max(1.0),
-            noisiness,
+        let mono = self.post_process_mono(raw, command.maximum_loudness);
+        self.emitted_energy += (mono.abs() - self.emitted_energy) * 0.035;
+        self.diagnostics.observe_signal(
+            mono,
+            tract.oral_output,
+            tract.nasal_output,
+            body.energy,
+            tract.coefficient_delta,
         );
-
-        let source = (voiced * (1.0 - noisiness * 0.25) + breath * noisiness * 0.30 + articulation)
-            * envelope
-            * syllable.amplitude
-            * purr;
-        let resonated = self
-            .formants
-            .iter_mut()
-            .enumerate()
-            .map(|(index, formant)| formant.process(source) * [0.55, 0.30, 0.15][index])
-            .sum::<f32>();
-        let formant_mix = 0.09 + command.mouth_resonance.clamp(0.0, 1.0) * 0.13;
-        let mono = (source * (1.0 - formant_mix) + resonated * formant_mix) * command.gain;
-        self.post_process(mono, command.pan, command.maximum_loudness)
+        self.publish_feedback(
+            self.emitted_energy,
+            breath.pressure,
+            glottal.openness,
+            tract.mouth_aperture,
+            glottal.f0_hz / command.base_pitch_hz.max(1.0),
+            breath.aspiration,
+            body.energy,
+            purr_energy,
+            glottal.regime as u8,
+        );
+        pan(mono, command.pan)
     }
 
     fn start_command(&mut self, command: VoiceCommand) {
         self.feedback.publish_started_request(command.request_id);
-        self.noise.reseed(command.seed);
-        self.modulation_noise
-            .reseed(command.seed ^ 0xD6E8_FEB8_6659_FD93);
         self.current = Some(command);
         self.syllable_index = 0;
         self.frame_in_syllable = 0;
         self.gap_frames_remaining = 0;
         self.tail_frames_remaining = 0;
         self.last_pan = command.pan;
-        self.oscillator
-            .set_phase(seeded_unit(command.seed ^ 0x243F_6A88_85A3_08D3));
-        self.vibrato_phase = seeded_unit(command.seed ^ 0xA076_1D64_78BD_642F);
-        self.trill_phase = seeded_unit(command.seed ^ 0xE703_7ED1_A0B4_28DB);
-        self.purr_phase = seeded_unit(command.seed ^ 0x8EBC_6AF0_9C88_C6E3);
-        self.purr_secondary_phase = seeded_unit(command.seed ^ 0x5899_65CC_7537_4CC3);
-        let tone_cutoff = (4_800.0 + command.brightness.clamp(0.0, 1.0) * 3_600.0)
-            * (1.0 + command.spectral_drift * 0.10);
-        let breath_cutoff = (4_500.0 + command.brightness.clamp(0.0, 1.0) * 3_000.0)
-            * (1.0 + command.spectral_drift * 0.08);
-        self.tone_lowpass.configure(tone_cutoff, self.sample_rate);
-        self.voice_low_cut.configure(190.0, self.sample_rate);
-        self.breath_low_cut.configure(520.0, self.sample_rate);
-        self.breath_high_cut
-            .configure(breath_cutoff, self.sample_rate);
-        self.modulation_lowpass.configure(18.0, self.sample_rate);
-        self.dc_blocker.configure(24.0, self.sample_rate);
-        self.tone_lowpass.reset();
+        self.breath.reset();
+        self.breath.begin_syllable();
+        self.glottis.reset(
+            command.anatomy,
+            seeded_unit(command.seed ^ 0x243f_6a88_85a3_08d3),
+        );
+        self.tract.reset(command.anatomy);
+        self.body_resonance.reset(command.anatomy);
+        self.aspiration_noise.reseed(command.seed ^ 0x11);
+        self.constriction_noise.reseed(command.seed ^ 0x22);
+        self.cycle_noise.reseed(command.seed ^ 0x33);
+        self.slosh_noise.reseed(command.seed ^ 0x44);
+        self.purr_noise.reseed(command.seed ^ 0x55);
+        self.spectral_tilt
+            .configure(4_800.0 + command.brightness * 1_200.0, self.sample_rate);
+        self.spectral_tilt.reset();
+        self.voice_low_cut.configure(
+            if matches!(command.style, VocalStyle::Purr | VocalStyle::ContentMurmur) {
+                42.0
+            } else {
+                58.0
+            },
+            self.sample_rate,
+        );
         self.voice_low_cut.reset();
-        self.breath_low_cut.reset();
-        self.breath_high_cut.reset();
-        self.modulation_lowpass.reset();
+        self.dc_blocker.configure(18.0, self.sample_rate);
         self.dc_blocker.reset();
         self.room.reset();
         self.room.configure(command.room_mix);
-        for formant in &mut self.formants {
-            formant.reset();
+        self.control_countdown = 0;
+        self.tract_back_pressure = 0.0;
+        self.last_glottal_openness = 0.55;
+        self.emitted_energy = 0.0;
+        self.purr_frames_until_event = 0;
+        self.purr_closure_remaining = 0;
+        self.purr_aspiration_remaining = 0;
+        self.purr_group_remaining = 0;
+        self.purr_group_exhale = true;
+        self.publish_feedback(0.0, 0.0, 0.0, 0.0, 1.0, command.breathiness, 0.0, 0.0, 0);
+    }
+
+    fn process_purr(&mut self, command: VoiceCommand) -> (f32, f32, f32, f32) {
+        if !command.purr {
+            return (0.0, 0.0, 0.0, 0.0);
         }
-        if command.syllable_count > 0 {
-            self.configure_formants(command.syllables[0]);
+        if self.purr_group_remaining == 0 {
+            self.purr_group_exhale = !self.purr_group_exhale;
+            let seconds = 0.6 + self.purr_noise.white().abs() * 0.8;
+            self.purr_group_remaining = (seconds * self.sample_rate) as usize;
         }
-        self.publish_feedback(0.0, 0.0, 1.0, command.breathiness);
+        self.purr_group_remaining = self.purr_group_remaining.saturating_sub(1);
+        if self.purr_frames_until_event == 0 {
+            let interval_jitter =
+                1.0 + self.purr_noise.white() * 0.09 + self.purr_noise.correlated(0.46) * 0.025;
+            self.purr_frames_until_event = (self.sample_rate / command.purr_rate.max(1.0)
+                * interval_jitter)
+                .round()
+                .max(1.0) as usize;
+            self.purr_closure_total =
+                milliseconds_to_frames(2.0 + self.purr_noise.white().abs() * 4.0, self.sample_rate);
+            self.purr_closure_remaining = self.purr_closure_total;
+            self.purr_aspiration_total = milliseconds_to_frames(
+                8.0 + self.purr_noise.white().abs() * 17.0,
+                self.sample_rate,
+            );
+            self.purr_aspiration_remaining = self.purr_aspiration_total;
+            self.purr_event_amplitude =
+                (0.58 + self.purr_noise.white() * 0.16 + command.attachment * 0.08)
+                    .clamp(0.35, 0.82);
+            self.diagnostics.observe_purr_event(self.sample_rate);
+        }
+        self.purr_frames_until_event = self.purr_frames_until_event.saturating_sub(1);
+        let closure = pulse_shape(self.purr_closure_remaining, self.purr_closure_total)
+            * self.purr_event_amplitude;
+        let aspiration = pulse_shape(self.purr_aspiration_remaining, self.purr_aspiration_total)
+            * self.purr_event_amplitude
+            * if self.purr_group_exhale { 0.16 } else { 0.11 };
+        self.purr_closure_remaining = self.purr_closure_remaining.saturating_sub(1);
+        self.purr_aspiration_remaining = self.purr_aspiration_remaining.saturating_sub(1);
+        (
+            closure,
+            aspiration,
+            closure * 0.72,
+            closure.max(aspiration * 2.0),
+        )
     }
 
-    fn configure_formants(&mut self, syllable: PreparedSyllable) {
-        let command = self.current.expect("formants need an active command");
-        let openness = syllable.mouth_open.clamp(0.0, 1.0);
-        let base = [680.0, 1_480.0, 2_460.0];
-        for (index, formant) in self.formants.iter_mut().enumerate() {
-            let frequency = base[index]
-                * command.formant_scale
-                * (1.0 + index as f32 * (command.formant_spacing - 1.0) * 0.35)
-                * (0.86 + openness * 0.28)
-                * (1.0 + command.formant_drift * 0.020);
-            let resonance = command.mouth_resonance.clamp(0.0, 1.0);
-            // Wider resonances shape a moving vocal tract without ringing like
-            // narrow electronic filters between syllables.
-            let bandwidth = [270.0, 390.0, 520.0][index] * (1.08 - resonance * 0.12);
-            formant.configure(frequency, bandwidth, self.sample_rate);
+    fn render_unvoiced_tail(&mut self, pan_value: f32, maximum_loudness: f32) -> [f32; 2] {
+        let tract = self.tract.process(0.0, 0.0, 0.0);
+        let body = self.body_resonance.process(
+            tract.output,
+            self.body_current,
+            self.slosh_noise.colored(0.28) * 0.05,
+        );
+        let mono = self.post_process_mono(tract.output + body.signal, maximum_loudness);
+        self.diagnostics.observe_signal(
+            mono,
+            tract.oral_output,
+            tract.nasal_output,
+            body.energy,
+            tract.coefficient_delta,
+        );
+        pan(mono, pan_value)
+    }
+
+    fn post_process_mono(&mut self, mono: f32, maximum_loudness: f32) -> f32 {
+        let tilted = self.spectral_tilt.process(mono);
+        let high_passed = tilted - self.voice_low_cut.process(tilted);
+        let blocked = self.dc_blocker.process(high_passed);
+        let saturated = blocked / (1.0 + blocked.abs() * 0.12);
+        let room = self.room.process(saturated);
+        let output = soft_limit(room, maximum_loudness.clamp(0.72, 0.78));
+        if output.is_finite() {
+            output
+        } else {
+            self.diagnostics.observe_non_finite_reset();
+            0.0
         }
     }
 
-    fn render_silence_frame(&mut self) -> [f32; 2] {
-        let command = self.current.expect("gap belongs to an active command");
-        // A speech resonator ringing through every authored gap was the other
-        // persistent pitched tone. Only the tiny natural room tail may bridge a
-        // gap; the vocal tract itself receives silence.
-        self.post_process(0.0, command.pan, command.maximum_loudness)
-    }
-
-    fn post_process(&mut self, mono: f32, pan: f32, maximum_loudness: f32) -> [f32; 2] {
-        let mono = mono - self.voice_low_cut.process(mono);
-        let mono = self.dc_blocker.process(mono);
-        let mono = self.room.process(mono);
-        let mono = soft_limit(mono, maximum_loudness.min(0.78));
-        let pan = pan.clamp(-1.0, 1.0);
-        let left = mono * ((1.0 - pan) * 0.5).sqrt();
-        let right = mono * ((1.0 + pan) * 0.5).sqrt();
-        [left, right]
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn publish_feedback(
         &self,
-        envelope: f32,
-        mouth_open: f32,
+        emitted_energy: f32,
+        breath_pressure: f32,
+        glottal_openness: f32,
+        mouth_aperture: f32,
         pitch_normalized: f32,
-        noisiness: f32,
+        aspiration: f32,
+        body_resonance_energy: f32,
+        purr_event_energy: f32,
+        phonation_regime: u8,
     ) {
         let Some(command) = self.current else {
             self.feedback.clear();
             return;
         };
         self.feedback.publish(AudioVisualFeedback {
-            active: true,
+            active: emitted_energy > 0.000_1 || breath_pressure > 0.02,
             request_id: command.request_id,
             motif_id: command.motif_id,
             syllable_index: self.syllable_index.min(u8::MAX as usize) as u8,
-            envelope: envelope.clamp(0.0, 1.0),
-            mouth_open: mouth_open.clamp(0.0, 1.0),
+            emitted_energy: emitted_energy.clamp(0.0, 1.0),
+            breath_pressure: breath_pressure.clamp(0.0, 1.0),
+            glottal_openness: glottal_openness.clamp(0.0, 1.0),
+            mouth_aperture: mouth_aperture.clamp(0.0, 1.0),
             pitch_normalized: pitch_normalized.clamp(0.25, 4.0),
-            noisiness: noisiness.clamp(0.0, 1.0),
-            purr: if command.purr { 1.0 } else { 0.0 },
+            aspiration: aspiration.clamp(0.0, 1.0),
+            body_resonance_energy: body_resonance_energy.clamp(0.0, 1.0),
+            purr_event_energy: purr_event_energy.clamp(0.0, 1.0),
+            phonation_regime,
+            envelope: emitted_energy.clamp(0.0, 1.0),
+            mouth_open: mouth_aperture.clamp(0.0, 1.0),
+            noisiness: aspiration.clamp(0.0, 1.0),
+            purr: purr_event_energy.clamp(0.0, 1.0),
         });
     }
 }
 
+fn smooth_body_frame(
+    current: BodyVoiceFrame,
+    target: BodyVoiceFrame,
+    amount: f32,
+) -> BodyVoiceFrame {
+    let smooth = |a: f32, b: f32| a + (b - a) * amount;
+    BodyVoiceFrame {
+        main_mass_ratio: smooth(current.main_mass_ratio, target.main_mass_ratio),
+        detached_mass_ratio: smooth(current.detached_mass_ratio, target.detached_mass_ratio),
+        component_count: target.component_count,
+        shape_aspect_ratio: smooth(current.shape_aspect_ratio, target.shape_aspect_ratio),
+        stretch: smooth(current.stretch, target.stretch),
+        compression: smooth(current.compression, target.compression),
+        bond_strain: smooth(current.bond_strain, target.bond_strain),
+        material_stress: smooth(current.material_stress, target.material_stress),
+        contact_area: smooth(current.contact_area, target.contact_area),
+        slosh_energy: smooth(current.slosh_energy, target.slosh_energy),
+        internal_speed: smooth(current.internal_speed, target.internal_speed),
+        collision_impulse: smooth(current.collision_impulse, target.collision_impulse),
+        contact_impulse: smooth(current.contact_impulse, target.contact_impulse),
+        release_impulse: smooth(current.release_impulse, target.release_impulse),
+        detach_impulse: smooth(current.detach_impulse, target.detach_impulse),
+        remerge_impulse: smooth(current.remerge_impulse, target.remerge_impulse),
+    }
+    .sanitized()
+}
+
+fn pulse_shape(remaining: usize, total: usize) -> f32 {
+    if remaining == 0 || total == 0 {
+        return 0.0;
+    }
+    let progress = 1.0 - remaining as f32 / total as f32;
+    (4.0 * progress * (1.0 - progress)).clamp(0.0, 1.0)
+}
+
+fn pan(mono: f32, pan: f32) -> [f32; 2] {
+    let pan = pan.clamp(-1.0, 1.0);
+    [
+        mono * ((1.0 - pan) * 0.5).sqrt(),
+        mono * ((1.0 + pan) * 0.5).sqrt(),
+    ]
+}
+
 fn milliseconds_to_frames(milliseconds: f32, sample_rate: f32) -> usize {
-    (milliseconds.max(0.0) * sample_rate / 1000.0)
+    (milliseconds.max(0.0) * sample_rate / 1_000.0)
         .round()
         .max(1.0) as usize
 }
 
 fn milliseconds_to_frames_allow_zero(milliseconds: f32, sample_rate: f32) -> usize {
-    (milliseconds.max(0.0) * sample_rate / 1000.0).round() as usize
-}
-
-fn smooth_lerp(a: f32, b: f32, t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    let t = t * t * (3.0 - 2.0 * t);
-    a + (b - a) * t
+    (milliseconds.max(0.0) * sample_rate / 1_000.0).round() as usize
 }
 
 fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
 
 fn seeded_unit(seed: u64) -> f32 {
-    let bits = (splitmix64(seed) >> 40) as u32;
-    bits as f32 / 0xFF_FFFF as f32
-}
-
-fn seeded_signed(seed: u64) -> f32 {
-    seeded_unit(seed) * 2.0 - 1.0
-}
-
-fn softened_harmonic_mix(mut mix: [f32; 4]) -> [f32; 4] {
-    for value in &mut mix {
-        if !value.is_finite() {
-            *value = 0.0;
-        }
-        *value = value.max(0.0);
-    }
-    // Pulse-rich sources read as a cheap buzzer at desktop volume. Preserve a
-    // little animal rasp but move most energy into the continuous sine source.
-    if mix[2] > 0.035 {
-        let removed = mix[2] - 0.035;
-        mix[2] = 0.035;
-        mix[0] += removed;
-    }
-    let digital = mix[1] + mix[2];
-    if digital > 0.12 {
-        let retained = 0.12 / digital;
-        let removed = digital - 0.12;
-        mix[1] *= retained;
-        mix[2] *= retained;
-        mix[0] += removed * 0.90;
-        mix[3] += removed * 0.10;
-    }
-    let sum = mix.iter().sum::<f32>();
-    if sum <= f32::EPSILON {
-        return [1.0, 0.0, 0.0, 0.0];
-    }
-    for value in &mut mix {
-        *value /= sum;
-    }
-    mix
+    ((splitmix64(seed) >> 40) as u32) as f32 / 0x00ff_ffff as f32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn prepared_calls_use_the_selected_mammalian_register() {
-        let mut voice = lifecore::Genome::from_seed(41).voice;
-        voice.base_pitch_hz = 120.0;
-        voice.purr_rate = 12.0;
-        let motif = lifecore::generate_initial_motifs(&voice)
-            .into_iter()
-            .next()
-            .expect("generated motif");
-        let request = VocalRequest {
+    fn request(motif_id: u64, style: VocalStyle) -> VocalRequest {
+        VocalRequest {
+            motif_id,
             performance_seed: 17,
-            motif_id: motif.id,
-            gain: 0.2,
+            gain: 0.24,
             pan: 0.0,
             pitch_scale: 1.0,
             tempo_scale: 1.0,
             stress: 0.0,
-            purr: true,
-            gesture: lifecore::VoiceGesture::PurrHum,
+            purr: style == VocalStyle::Purr,
+            gesture: VoiceGesture::WarmChuff,
             priority: 128,
+            style,
+            valence: 0.3,
+            arousal: 0.25,
+            fatigue: 0.0,
+            confidence: 0.8,
+            attachment: 0.5,
             rhythm_intervals: [0.0; 8],
-        };
-        let command = VoiceCommand::prepare_style(
+        }
+    }
+
+    #[test]
+    fn prepared_calls_use_bounded_mammalian_register() {
+        let mut voice = lifecore::Genome::from_seed(41).voice;
+        voice.base_pitch_hz = 120.0;
+        let motif = lifecore::generate_initial_motifs(&voice)[0].clone();
+        let command = VoiceCommand::prepare(
             &voice,
             &motif,
-            &request,
-            VoiceSynthesisStyle::LivingMammalian,
+            &request(motif.id, VocalStyle::SocialContact),
         );
-        assert_eq!(command.base_pitch_hz, 120.0);
-        assert_eq!(command.purr_rate, 24.0);
-        assert_eq!(command.gesture, lifecore::VoiceGesture::PurrHum);
+        assert_eq!(command.base_pitch_hz, 220.0);
+        assert_eq!(command.minimum_f0_hz, 85.0);
+        assert_eq!(command.maximum_f0_hz, 1_600.0);
     }
 
     #[test]
     fn grounded_rhythm_request_shapes_inter_onset_intervals() {
         let voice = lifecore::Genome::from_seed(42).voice;
-        let motif = lifecore::generate_initial_motifs(&voice)
-            .into_iter()
-            .next()
-            .expect("generated motif");
-        let requested = [0.50, 1.00, 0.75, 1.75, 0.0, 0.0, 0.0, 0.0];
-        let request = VocalRequest {
-            performance_seed: 18,
-            motif_id: motif.id,
-            gain: 0.2,
-            pan: 0.0,
-            pitch_scale: 1.0,
-            tempo_scale: 1.0,
-            stress: 0.0,
-            purr: false,
-            gesture: lifecore::VoiceGesture::WarmChuff,
-            priority: 128,
-            rhythm_intervals: requested,
-        };
+        let motif = lifecore::generate_initial_motifs(&voice)[0].clone();
+        let mut request = request(motif.id, VocalStyle::RhythmMimic);
+        request.rhythm_intervals = [0.50, 1.00, 0.75, 1.75, 0.0, 0.0, 0.0, 0.0];
         let command = VoiceCommand::prepare(&voice, &motif, &request);
         assert_eq!(command.syllable_count, 5);
         let actual = std::array::from_fn::<_, 4, _>(|index| {
@@ -791,7 +855,7 @@ mod tests {
         let mean_actual = actual.iter().sum::<f32>() / actual.len() as f32;
         let covariance = actual
             .iter()
-            .zip(requested)
+            .zip(request.rhythm_intervals)
             .take(4)
             .map(|(actual, requested)| (*actual - mean_actual) * (requested - 1.0))
             .sum::<f32>();
@@ -799,50 +863,30 @@ mod tests {
             .iter()
             .map(|actual| (*actual - mean_actual).powi(2))
             .sum::<f32>();
-        let requested_energy = requested[..4]
+        let requested_energy = request.rhythm_intervals[..4]
             .iter()
             .map(|requested| (*requested - 1.0).powi(2))
             .sum::<f32>();
-        let correlation = covariance / (actual_energy * requested_energy).sqrt();
-        assert!(correlation >= 0.85, "correlation={correlation}");
+        assert!(covariance / (actual_energy * requested_energy).sqrt() >= 0.85);
     }
 
     #[test]
-    fn mammalian_semantic_units_use_slow_social_timing() {
+    fn purr_is_irregular_event_excitation_not_final_bus_amplitude_modulation() {
         let voice = lifecore::Genome::from_seed(43).voice;
         let motif = lifecore::generate_initial_motifs(&voice)
             .into_iter()
-            .max_by_key(|motif| motif.syllables.len())
-            .expect("generated motif");
-        let request = VocalRequest {
-            performance_seed: 19,
-            motif_id: motif.id,
-            gain: 0.2,
-            pan: 0.0,
-            pitch_scale: 1.0,
-            tempo_scale: 1.15,
-            stress: 0.0,
-            purr: false,
-            gesture: lifecore::VoiceGesture::MewWhine,
-            priority: 150,
-            rhythm_intervals: [0.0; 8],
-        };
-        let command = VoiceCommand::prepare_style(
-            &voice,
-            &motif,
-            &request,
-            VoiceSynthesisStyle::LivingMammalian,
-        );
-        let seconds = command.total_frames(48_000) as f32 / 48_000.0;
-        let unit_rate = f32::from(command.syllable_count) / seconds;
-        assert!((2.0..=3.1).contains(&unit_rate), "unit_rate={unit_rate}");
-    }
-
-    #[test]
-    fn buzzy_waveform_energy_is_strictly_bounded() {
-        let mix = softened_harmonic_mix([0.1, 0.4, 0.4, 0.1]);
-        assert!(mix[2] <= 0.035_001);
-        assert!(mix[1] + mix[2] <= 0.120_001);
-        assert!((mix.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+            .find(|motif| motif.family == VocalFamily::Purr)
+            .unwrap();
+        let command = VoiceCommand::prepare(&voice, &motif, &request(motif.id, VocalStyle::Purr));
+        let commands = Arc::new(SpscRing::new());
+        commands.push(command).unwrap();
+        let mut synth = SynthVoice::new(commands, 48_000);
+        for _ in 0..command.total_frames(48_000) {
+            let frame = synth.next_stereo_frame();
+            assert!(frame.into_iter().all(f32::is_finite));
+        }
+        let diagnostics = synth.diagnostics();
+        assert!(diagnostics.purr_event_count > 2);
+        assert!(diagnostics.purr_interval_cv > 0.005);
     }
 }

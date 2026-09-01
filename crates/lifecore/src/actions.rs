@@ -751,6 +751,190 @@ pub struct BodyIntent {
     pub interaction_target: Option<InteractionTarget>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VocalStyle {
+    #[default]
+    SocialContact,
+    TouchResponse,
+    PlayInvite,
+    AttentionCall,
+    ContentMurmur,
+    Purr,
+    RhythmMimic,
+    Startle,
+    Frustrated,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VocalFamily {
+    #[default]
+    SoftContact,
+    QuestionWhine,
+    PlayYip,
+    AttentionCall,
+    ContentMurmur,
+    Purr,
+    StartleSqueak,
+    FrustratedGrunt,
+    RhythmMimic,
+    PlayfulTrill,
+}
+
+impl VocalFamily {
+    pub const ALL: [Self; 10] = [
+        Self::SoftContact,
+        Self::QuestionWhine,
+        Self::PlayYip,
+        Self::AttentionCall,
+        Self::ContentMurmur,
+        Self::Purr,
+        Self::StartleSqueak,
+        Self::FrustratedGrunt,
+        Self::RhythmMimic,
+        Self::PlayfulTrill,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VocalGesture {
+    pub pressure_peak: f32,
+    pub adduction: f32,
+    pub open_quotient: f32,
+    pub closure_sharpness: f32,
+    pub frontness: f32,
+    pub tongue_height: f32,
+    pub lip_rounding: f32,
+    pub constriction: f32,
+    pub nasality: f32,
+    pub instability: f32,
+    pub body_excitation: f32,
+}
+
+impl Default for VocalGesture {
+    fn default() -> Self {
+        Self {
+            pressure_peak: 0.55,
+            adduction: 0.52,
+            open_quotient: 0.58,
+            closure_sharpness: 0.46,
+            frontness: 0.0,
+            tongue_height: 0.0,
+            lip_rounding: 0.30,
+            constriction: 0.20,
+            nasality: 0.16,
+            instability: 0.08,
+            body_excitation: 0.42,
+        }
+    }
+}
+
+impl VocalGesture {
+    pub fn sanitize(&mut self) {
+        self.pressure_peak = unit(self.pressure_peak);
+        self.adduction = unit(self.adduction);
+        self.open_quotient = self.open_quotient.clamp(0.30, 0.82);
+        self.closure_sharpness = unit(self.closure_sharpness);
+        self.frontness = self.frontness.clamp(-1.0, 1.0);
+        self.tongue_height = self.tongue_height.clamp(-1.0, 1.0);
+        self.lip_rounding = unit(self.lip_rounding);
+        self.constriction = unit(self.constriction);
+        self.nasality = unit(self.nasality);
+        self.instability = unit(self.instability);
+        self.body_excitation = unit(self.body_excitation);
+    }
+
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        let mut sanitized = self;
+        sanitized.sanitize();
+        sanitized == self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BodyVoiceFrame {
+    pub main_mass_ratio: f32,
+    pub detached_mass_ratio: f32,
+    pub component_count: u8,
+    pub shape_aspect_ratio: f32,
+    pub stretch: f32,
+    pub compression: f32,
+    pub bond_strain: f32,
+    pub material_stress: f32,
+    pub contact_area: f32,
+    pub slosh_energy: f32,
+    pub internal_speed: f32,
+    pub collision_impulse: f32,
+    pub contact_impulse: f32,
+    pub release_impulse: f32,
+    pub detach_impulse: f32,
+    pub remerge_impulse: f32,
+}
+
+impl Default for BodyVoiceFrame {
+    fn default() -> Self {
+        Self {
+            main_mass_ratio: 1.0,
+            detached_mass_ratio: 0.0,
+            component_count: 1,
+            shape_aspect_ratio: 1.0,
+            stretch: 0.0,
+            compression: 0.0,
+            bond_strain: 0.0,
+            material_stress: 0.0,
+            contact_area: 0.0,
+            slosh_energy: 0.0,
+            internal_speed: 0.0,
+            collision_impulse: 0.0,
+            contact_impulse: 0.0,
+            release_impulse: 0.0,
+            detach_impulse: 0.0,
+            remerge_impulse: 0.0,
+        }
+    }
+}
+
+impl BodyVoiceFrame {
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        let finite_unit = |value: f32| {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        self.main_mass_ratio = finite_unit(self.main_mass_ratio);
+        self.detached_mass_ratio = finite_unit(self.detached_mass_ratio);
+        self.component_count = self.component_count.clamp(1, 4);
+        self.shape_aspect_ratio = if self.shape_aspect_ratio.is_finite() {
+            self.shape_aspect_ratio.clamp(1.0, 4.0)
+        } else {
+            1.0
+        };
+        self.stretch = if self.stretch.is_finite() {
+            self.stretch.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.compression = finite_unit(self.compression);
+        self.bond_strain = finite_unit(self.bond_strain);
+        self.material_stress = finite_unit(self.material_stress);
+        self.contact_area = finite_unit(self.contact_area);
+        self.slosh_energy = finite_unit(self.slosh_energy);
+        self.internal_speed = finite_unit(self.internal_speed);
+        self.collision_impulse = finite_unit(self.collision_impulse);
+        self.contact_impulse = finite_unit(self.contact_impulse);
+        self.release_impulse = finite_unit(self.release_impulse);
+        self.detach_impulse = finite_unit(self.detach_impulse);
+        self.remerge_impulse = finite_unit(self.remerge_impulse);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VocalRequest {
     pub motif_id: u64,
@@ -768,6 +952,18 @@ pub struct VocalRequest {
     pub gesture: crate::VoiceGesture,
     #[serde(default)]
     pub priority: u8,
+    #[serde(default)]
+    pub style: VocalStyle,
+    #[serde(default)]
+    pub valence: f32,
+    #[serde(default)]
+    pub arousal: f32,
+    #[serde(default)]
+    pub fatigue: f32,
+    #[serde(default)]
+    pub confidence: f32,
+    #[serde(default)]
+    pub attachment: f32,
     /// Optional normalized inter-onset intervals for a grounded rhythm echo.
     /// Zero entries mean no authored interval; waveform ownership stays in
     /// `pet_audio` and no raw input timing history is retained.
@@ -874,6 +1070,8 @@ pub struct VocalMotif {
     pub parent_id: Option<u64>,
     pub generation: u32,
     pub seed: u64,
+    #[serde(default)]
+    pub family: VocalFamily,
     pub syllables: Vec<Syllable>,
     pub context_weights: [f32; 16],
     pub expected_reward: f32,
@@ -895,12 +1093,14 @@ pub struct Syllable {
     pub mouth_open: f32,
     pub trill_amount: f32,
     pub vibrato_amount: f32,
+    #[serde(default)]
+    pub gesture: VocalGesture,
 }
 
 #[must_use]
 pub fn generate_initial_motifs(voice: &VoiceGenome) -> Vec<VocalMotif> {
     let mut rng = ChaCha8Rng::seed_from_u64(voice.voice_seed);
-    (0..8)
+    (0..VocalFamily::ALL.len())
         .map(|index| generate_motif(&mut rng, voice, index, None, 0))
         .collect()
 }
@@ -926,12 +1126,31 @@ pub fn mutate_motif(parent: &VocalMotif, mutation_seed: u64) -> VocalMotif {
         syllable.amplitude = unit(syllable.amplitude * (1.0 + signed_random(&mut rng) * 0.05));
         syllable.noisiness = unit(syllable.noisiness + signed_random(&mut rng) * 0.05);
         syllable.trill_amount = unit(syllable.trill_amount + signed_random(&mut rng) * 0.08);
+        syllable.gesture.pressure_peak =
+            unit(syllable.gesture.pressure_peak * (1.0 + signed_random(&mut rng) * 0.055));
+        syllable.gesture.adduction =
+            unit(syllable.gesture.adduction + signed_random(&mut rng) * 0.035);
+        syllable.gesture.open_quotient =
+            (syllable.gesture.open_quotient + signed_random(&mut rng) * 0.025).clamp(0.30, 0.82);
+        syllable.gesture.closure_sharpness =
+            unit(syllable.gesture.closure_sharpness + signed_random(&mut rng) * 0.04);
+        syllable.gesture.frontness =
+            (syllable.gesture.frontness + signed_random(&mut rng) * 0.05).clamp(-1.0, 1.0);
+        syllable.gesture.constriction =
+            unit(syllable.gesture.constriction + signed_random(&mut rng) * 0.04);
+        syllable.gesture.nasality =
+            unit(syllable.gesture.nasality + signed_random(&mut rng) * 0.035);
+        syllable.gesture.instability =
+            unit(syllable.gesture.instability + signed_random(&mut rng) * 0.035);
+        syllable.gesture.body_excitation =
+            unit(syllable.gesture.body_excitation + signed_random(&mut rng) * 0.035);
         clamp_syllable(syllable);
     }
-    if random_unit(&mut rng) < 0.08 && child.syllables.len() < 6 {
+    let (minimum_count, maximum_count) = family_syllable_bounds(child.family);
+    if random_unit(&mut rng) < 0.08 && child.syllables.len() < maximum_count {
         let source = child.syllables[(rng.next_u32() as usize) % child.syllables.len()].clone();
         child.syllables.push(source);
-    } else if random_unit(&mut rng) < 0.06 && child.syllables.len() > 1 {
+    } else if random_unit(&mut rng) < 0.06 && child.syllables.len() > minimum_count {
         child.syllables.pop();
     }
     child
@@ -944,26 +1163,30 @@ fn generate_motif(
     parent_id: Option<u64>,
     generation: u32,
 ) -> VocalMotif {
-    let syllable_count = 2 + (rng.next_u32() % 4) as usize;
+    let family = VocalFamily::ALL[index % VocalFamily::ALL.len()];
+    let (minimum_count, maximum_count) = family_syllable_bounds(family);
+    let syllable_count = if minimum_count == maximum_count {
+        minimum_count
+    } else {
+        minimum_count + (rng.next_u32() as usize % (maximum_count - minimum_count + 1))
+    };
     let mut syllables = Vec::with_capacity(syllable_count);
-    let range = voice.pitch_range_octaves * 0.5;
-    for _ in 0..syllable_count {
-        let start = 2.0_f32.powf(signed_random(rng) * range);
-        let peak = start * 2.0_f32.powf(signed_random(rng) * range * 0.6);
-        let end = peak * 2.0_f32.powf(signed_random(rng) * range * 0.6);
-        syllables.push(Syllable {
-            duration_ms: (70.0 + random_unit(rng) * 190.0) / voice.phrase_speed,
-            gap_after_ms: random_unit(rng) * 110.0 / voice.phrase_speed,
-            pitch_start: start,
-            pitch_peak: peak,
-            pitch_end: end,
-            amplitude: 0.45 + random_unit(rng) * 0.45,
-            noisiness: unit(voice.breathiness + signed_random(rng) * 0.12),
-            click: unit(voice.click_amount + signed_random(rng) * 0.10),
-            mouth_open: 0.35 + random_unit(rng) * 0.60,
-            trill_amount: random_unit(rng) * 0.55,
-            vibrato_amount: random_unit(rng) * 0.75,
-        });
+    for syllable_index in 0..syllable_count {
+        let mut syllable = canonical_syllable(family, syllable_index, voice);
+        syllable.duration_ms *= 1.0 + signed_random(rng) * 0.07;
+        syllable.gap_after_ms *= 1.0 + signed_random(rng) * 0.10;
+        let identity_pitch =
+            2.0_f32.powf(signed_random(rng) * voice.pitch_range_octaves.clamp(0.3, 2.0) * 0.045);
+        syllable.pitch_start *= identity_pitch;
+        syllable.pitch_peak *= identity_pitch * (1.0 + signed_random(rng) * 0.025);
+        syllable.pitch_end *= identity_pitch * (1.0 + signed_random(rng) * 0.025);
+        syllable.gesture.frontness =
+            (syllable.gesture.frontness + signed_random(rng) * 0.06).clamp(-1.0, 1.0);
+        syllable.gesture.nasality = unit(syllable.gesture.nasality + signed_random(rng) * 0.04);
+        syllable.gesture.body_excitation =
+            unit(syllable.gesture.body_excitation + signed_random(rng) * 0.04);
+        clamp_syllable(&mut syllable);
+        syllables.push(syllable);
     }
     let id = rng.next_u64() ^ index as u64;
     VocalMotif {
@@ -971,6 +1194,7 @@ fn generate_motif(
         parent_id,
         generation,
         seed: rng.next_u64(),
+        family,
         syllables,
         context_weights: array::from_fn(|_| signed_random(rng) * 0.12),
         expected_reward: 0.0,
@@ -992,6 +1216,368 @@ fn clamp_syllable(syllable: &mut Syllable) {
     syllable.mouth_open = unit(syllable.mouth_open);
     syllable.trill_amount = unit(syllable.trill_amount);
     syllable.vibrato_amount = unit(syllable.vibrato_amount);
+    syllable.gesture.sanitize();
+}
+
+/// Repairs additive fields from legacy motifs without changing their learned IDs.
+pub fn repair_vocal_motifs(motifs: &mut [VocalMotif]) {
+    for motif in motifs {
+        let legacy_gestures = motif
+            .syllables
+            .iter()
+            .all(|syllable| syllable.gesture == VocalGesture::default());
+        if legacy_gestures {
+            motif.family =
+                VocalFamily::ALL[(splitmix64(motif.seed) as usize) % VocalFamily::ALL.len()];
+        }
+        for (index, syllable) in motif.syllables.iter_mut().enumerate() {
+            if legacy_gestures || !syllable.gesture.is_valid() {
+                syllable.gesture = legacy_gesture(motif.family, motif.seed, index, syllable);
+            }
+            clamp_syllable(syllable);
+        }
+    }
+}
+
+#[must_use]
+pub fn gesture_distance(left: VocalGesture, right: VocalGesture) -> f32 {
+    0.18 * (left.pressure_peak - right.pressure_peak).abs()
+        + 0.14 * (left.adduction - right.adduction).abs()
+        + 0.10 * (left.open_quotient - right.open_quotient).abs()
+        + 0.12 * (left.frontness - right.frontness).abs()
+        + 0.12 * (left.constriction - right.constriction).abs()
+        + 0.10 * (left.nasality - right.nasality).abs()
+        + 0.12 * (left.instability - right.instability).abs()
+        + 0.12 * (left.body_excitation - right.body_excitation).abs()
+}
+
+fn family_syllable_bounds(family: VocalFamily) -> (usize, usize) {
+    match family {
+        VocalFamily::PlayYip | VocalFamily::RhythmMimic => (2, 3),
+        VocalFamily::AttentionCall | VocalFamily::PlayfulTrill => (2, 2),
+        _ => (1, 1),
+    }
+}
+
+fn canonical_syllable(family: VocalFamily, index: usize, voice: &VoiceGenome) -> Syllable {
+    let (
+        duration_ms,
+        gap_after_ms,
+        pitch_start,
+        pitch_peak,
+        pitch_end,
+        amplitude,
+        noisiness,
+        click,
+        mouth_open,
+        trill_amount,
+        gesture,
+    ) = match family {
+        VocalFamily::SoftContact => (
+            225.0,
+            0.0,
+            0.88,
+            1.00,
+            1.07,
+            0.56,
+            0.16,
+            0.04,
+            0.58,
+            0.04,
+            VocalGesture {
+                pressure_peak: 0.46,
+                adduction: 0.46,
+                open_quotient: 0.64,
+                closure_sharpness: 0.38,
+                frontness: 0.12,
+                tongue_height: 0.06,
+                lip_rounding: 0.24,
+                constriction: 0.14,
+                nasality: 0.18,
+                instability: 0.05,
+                body_excitation: 0.42,
+            },
+        ),
+        VocalFamily::QuestionWhine => (
+            455.0,
+            0.0,
+            0.78,
+            1.24,
+            1.06,
+            0.62,
+            0.12,
+            0.02,
+            0.72,
+            0.05,
+            VocalGesture {
+                pressure_peak: 0.58,
+                adduction: 0.52,
+                open_quotient: 0.67,
+                closure_sharpness: 0.42,
+                frontness: 0.34,
+                tongue_height: 0.10,
+                lip_rounding: 0.18,
+                constriction: 0.10,
+                nasality: 0.20,
+                instability: 0.08,
+                body_excitation: 0.38,
+            },
+        ),
+        VocalFamily::PlayYip => (
+            105.0 + index as f32 * 12.0,
+            62.0,
+            0.96,
+            1.28 - index as f32 * 0.05,
+            1.08,
+            0.70 - index as f32 * 0.05,
+            0.14,
+            0.12,
+            0.68,
+            0.10,
+            VocalGesture {
+                pressure_peak: 0.72 - index as f32 * 0.07,
+                adduction: 0.62,
+                open_quotient: 0.52,
+                closure_sharpness: 0.68,
+                frontness: 0.26,
+                tongue_height: 0.05,
+                lip_rounding: 0.12,
+                constriction: 0.22,
+                nasality: 0.08,
+                instability: 0.14,
+                body_excitation: 0.56,
+            },
+        ),
+        VocalFamily::AttentionCall => (
+            if index == 0 { 245.0 } else { 190.0 },
+            if index == 0 { 92.0 } else { 0.0 },
+            if index == 0 { 0.88 } else { 0.94 },
+            if index == 0 { 1.18 } else { 1.08 },
+            if index == 0 { 0.98 } else { 1.02 },
+            if index == 0 { 0.72 } else { 0.58 },
+            0.15,
+            0.08,
+            0.66,
+            0.05,
+            VocalGesture {
+                pressure_peak: if index == 0 { 0.72 } else { 0.54 },
+                adduction: 0.58,
+                open_quotient: 0.58,
+                closure_sharpness: 0.54,
+                frontness: 0.18,
+                tongue_height: 0.04,
+                lip_rounding: 0.20,
+                constriction: 0.18,
+                nasality: 0.14,
+                instability: 0.08,
+                body_excitation: 0.48,
+            },
+        ),
+        VocalFamily::ContentMurmur => (
+            430.0,
+            0.0,
+            0.62,
+            0.67,
+            0.59,
+            0.52,
+            0.18,
+            0.01,
+            0.18,
+            0.02,
+            VocalGesture {
+                pressure_peak: 0.38,
+                adduction: 0.44,
+                open_quotient: 0.70,
+                closure_sharpness: 0.30,
+                frontness: -0.28,
+                tongue_height: -0.12,
+                lip_rounding: 0.58,
+                constriction: 0.30,
+                nasality: 0.68,
+                instability: 0.04,
+                body_excitation: 0.82,
+            },
+        ),
+        VocalFamily::Purr => (
+            500.0,
+            0.0,
+            0.54,
+            0.57,
+            0.53,
+            0.48,
+            0.20,
+            0.0,
+            0.10,
+            0.0,
+            VocalGesture {
+                pressure_peak: 0.30,
+                adduction: 0.50,
+                open_quotient: 0.72,
+                closure_sharpness: 0.34,
+                frontness: -0.36,
+                tongue_height: -0.18,
+                lip_rounding: 0.62,
+                constriction: 0.28,
+                nasality: 0.62,
+                instability: 0.10,
+                body_excitation: 0.88,
+            },
+        ),
+        VocalFamily::StartleSqueak => (
+            92.0,
+            0.0,
+            0.94,
+            1.48,
+            1.08,
+            0.66,
+            0.22,
+            0.20,
+            0.80,
+            0.04,
+            VocalGesture {
+                pressure_peak: 0.92,
+                adduction: 0.76,
+                open_quotient: 0.42,
+                closure_sharpness: 0.84,
+                frontness: 0.42,
+                tongue_height: 0.20,
+                lip_rounding: 0.06,
+                constriction: 0.30,
+                nasality: 0.04,
+                instability: 0.58,
+                body_excitation: 0.62,
+            },
+        ),
+        VocalFamily::FrustratedGrunt => (
+            175.0,
+            0.0,
+            0.72,
+            0.68,
+            0.57,
+            0.66,
+            0.34,
+            0.10,
+            0.30,
+            0.03,
+            VocalGesture {
+                pressure_peak: 0.74,
+                adduction: 0.78,
+                open_quotient: 0.40,
+                closure_sharpness: 0.72,
+                frontness: -0.22,
+                tongue_height: 0.28,
+                lip_rounding: 0.38,
+                constriction: 0.66,
+                nasality: 0.22,
+                instability: 0.36,
+                body_excitation: 0.66,
+            },
+        ),
+        VocalFamily::RhythmMimic => (
+            82.0,
+            105.0,
+            0.92,
+            1.10,
+            0.96,
+            0.60,
+            0.16,
+            0.28,
+            0.55,
+            0.04,
+            VocalGesture {
+                pressure_peak: 0.62,
+                adduction: 0.64,
+                open_quotient: 0.50,
+                closure_sharpness: 0.72,
+                frontness: 0.18,
+                tongue_height: 0.12,
+                lip_rounding: 0.16,
+                constriction: 0.32,
+                nasality: 0.10,
+                instability: 0.12,
+                body_excitation: 0.48,
+            },
+        ),
+        VocalFamily::PlayfulTrill => (
+            205.0,
+            if index == 0 { 70.0 } else { 0.0 },
+            0.90,
+            1.15,
+            1.03,
+            0.64,
+            0.16,
+            0.08,
+            0.62,
+            0.48,
+            VocalGesture {
+                pressure_peak: 0.64,
+                adduction: 0.58,
+                open_quotient: 0.56,
+                closure_sharpness: 0.56,
+                frontness: 0.24,
+                tongue_height: 0.06,
+                lip_rounding: 0.14,
+                constriction: 0.38,
+                nasality: 0.12,
+                instability: 0.24,
+                body_excitation: 0.54,
+            },
+        ),
+    };
+    Syllable {
+        duration_ms: duration_ms / voice.phrase_speed.clamp(0.5, 1.8),
+        gap_after_ms: gap_after_ms / voice.phrase_speed.clamp(0.5, 1.8),
+        pitch_start,
+        pitch_peak,
+        pitch_end,
+        amplitude,
+        noisiness: unit(noisiness + voice.breathiness * 0.20),
+        click: unit(click + voice.click_amount * 0.15),
+        mouth_open,
+        trill_amount,
+        vibrato_amount: 0.0,
+        gesture,
+    }
+}
+
+fn legacy_gesture(
+    family: VocalFamily,
+    motif_seed: u64,
+    index: usize,
+    syllable: &Syllable,
+) -> VocalGesture {
+    let mut gesture = canonical_syllable(family, index, &legacy_voice_identity()).gesture;
+    let variation = seeded_signed(motif_seed ^ index as u64 ^ 0x76ab_31d2);
+    gesture.pressure_peak = unit(0.34 + syllable.amplitude * 0.56 + variation * 0.03);
+    gesture.adduction = unit(0.40 + syllable.click * 0.22 + syllable.trill_amount * 0.08);
+    gesture.open_quotient =
+        (0.68 - syllable.click * 0.16 - syllable.noisiness * 0.08).clamp(0.30, 0.82);
+    gesture.closure_sharpness = unit(0.30 + syllable.click * 0.52);
+    gesture.frontness = (syllable.pitch_end - syllable.pitch_start).clamp(-1.0, 1.0);
+    gesture.constriction = unit(0.12 + syllable.click * 0.28 + syllable.trill_amount * 0.18);
+    gesture.nasality = unit(0.10 + (1.0 - syllable.mouth_open) * 0.48);
+    gesture.instability = unit(0.04 + syllable.trill_amount * 0.30 + syllable.noisiness * 0.16);
+    gesture.body_excitation = unit(0.26 + syllable.amplitude * 0.48);
+    gesture.sanitize();
+    gesture
+}
+
+fn legacy_voice_identity() -> VoiceGenome {
+    let mut voice = crate::Genome::from_seed(0x564f_4943_455f_5631).voice;
+    voice.phrase_speed = 1.0;
+    voice
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn seeded_signed(seed: u64) -> f32 {
+    let bits = (splitmix64(seed) >> 40) as u32;
+    bits as f32 / 0x00ff_ffff as f32 * 2.0 - 1.0
 }
 
 #[allow(clippy::too_many_arguments)]

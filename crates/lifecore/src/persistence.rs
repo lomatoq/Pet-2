@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::{
     ACTION_COUNT, ActionId, AffectState, BodyFeedback, ContextualBandit, DevelopmentState, Drives,
     Genome, MemorySystem, MicroBrain, PendingAttention, PersistentInteractionState,
-    VocalLexiconState, VocalMotif, generate_initial_motifs,
+    VocalLexiconState, VocalMotif, generate_initial_motifs, repair_vocal_motifs,
 };
 
 pub const LIFE_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
@@ -231,6 +231,33 @@ pub struct LifeSnapshot {
 }
 
 impl LifeSnapshot {
+    /// Repairs additive voice fields that did not exist in legacy snapshots.
+    /// The mapping is deterministic and changes no learned reward, memory, or
+    /// interaction state.
+    pub fn repair_additive_voice_schema(&mut self) {
+        self.state.genome.voice.repair_anatomy();
+        repair_vocal_motifs(&mut self.state.vocal_motifs);
+    }
+
+    /// Storage must recognize a legacy additive schema before `LifeCore` owns
+    /// the snapshot and can migrate it in place. Current snapshots still take
+    /// the allocation-free strict path.
+    pub fn validate_with_additive_voice_repair(&self) -> Result<(), LifeError> {
+        let needs_repair = self.state.genome.voice.anatomy.schema == 0
+            || self.state.vocal_motifs.iter().any(|motif| {
+                motif
+                    .syllables
+                    .iter()
+                    .any(|syllable| syllable.gesture == crate::VocalGesture::default())
+            });
+        if !needs_repair {
+            return self.validate();
+        }
+        let mut repaired = self.clone();
+        repaired.repair_additive_voice_schema();
+        repaired.validate()
+    }
+
     pub fn validate(&self) -> Result<(), LifeError> {
         if !matches!(self.schema_version, 1 | 2 | LIFE_SNAPSHOT_SCHEMA_VERSION) {
             return Err(LifeError::UnsupportedSchema {

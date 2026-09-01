@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "Ten Day One Hour Curriculum",
+  "preset": "seven_day_socialization",
+  "simulated_hours": 240.0,
+  "episodes_per_day": 36,
+  "total_episodes": 360,
+  "replicate_count": 1,
+  "seed": 573657340243,
+  "outcome_model": "respectful_supportive",
+  "quiet_advance": "calendar_only",
+  "include_saved_gesture_replays": false,
+  "sleep_consolidation": true,
+  "persistent_learning": true,
+  "evolution_policy": "eligible_max_one",
+  "maximum_generations": 1,
+  "checkpoint_interval_hours": 24.0,
+  "persistence": "fork"
+}

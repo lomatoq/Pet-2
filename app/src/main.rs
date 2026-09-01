@@ -44,7 +44,10 @@ use lifecore::{
     stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
-use pet_audio::{AudioCallbackLevels, AudioEngine, AudioVisualFeedback, SelectedOutputConfig};
+use pet_audio::{
+    AudioCallbackLevels, AudioEngine, AudioVisualFeedback, BodyVoiceAnalyzer, SelectedOutputConfig,
+    global_body_voice_bridge,
+};
 use pet_body::{
     BodyMaterialSnapshot, BodyRenderMode, EcologyRenderer, LiquidTuningAcknowledgement,
     LiquidTuningProfile, MaterialVariant, ProceduralBody, RenderOutcome, Renderer, VisualMindInput,
@@ -347,6 +350,7 @@ struct AudioManager {
     rejected_requests: u64,
     recent_rms: f32,
     recent_peak: f32,
+    body_voice_analyzer: BodyVoiceAnalyzer,
 }
 
 enum AudioWorkerCommand {
@@ -524,6 +528,7 @@ impl AudioManager {
             rejected_requests: 0,
             recent_rms: 0.0,
             recent_peak: 0.0,
+            body_voice_analyzer: BodyVoiceAnalyzer::default(),
         };
         if !disabled {
             manager.start_in_background();
@@ -694,6 +699,11 @@ impl AudioManager {
                 false
             }
         }
+    }
+
+    fn publish_body_voice(&mut self, raw: lifecore::BodyVoiceFrame, dt: f32) {
+        let frame = self.body_voice_analyzer.update(raw, dt);
+        global_body_voice_bridge().publish(frame);
     }
 
     fn take_unheard_rejection(&mut self) -> Option<u64> {
@@ -2078,6 +2088,8 @@ impl PetApplication {
                 &body_sensors,
                 body_dt,
             );
+            let body_voice = body_voice_frame(&runtime.body, &body_sensors);
+            runtime.audio.publish_body_voice(body_voice, body_dt);
             let bounds = runtime.topology.virtual_physical_bounds;
             let desktop_aspect = bounds.width() as f32 / bounds.height().max(1) as f32;
             runtime.ecology.fixed_update(
@@ -4563,6 +4575,58 @@ fn voice_visual_state(audio: &AudioManager) -> VoiceVisualState {
     }
 }
 
+fn body_voice_frame(body: &ProceduralBody, sensors: &SensorFrame) -> lifecore::BodyVoiceFrame {
+    let diagnostics = body.embodiment.liquid.diagnostics();
+    let physical = body.embodied_interaction_frame();
+    let total_mass = (diagnostics.main_mass + diagnostics.detached_mass).max(f32::EPSILON);
+    let normalized_strain =
+        ((diagnostics.maximum_bond_strain - 0.06) / (0.55 - 0.06)).clamp(0.0, 1.0);
+    let bond_strain = normalized_strain * normalized_strain * (3.0 - 2.0 * normalized_strain);
+    let collision_impulse = body
+        .simulation
+        .feedback
+        .collision
+        .as_ref()
+        .map_or(0.0, |collision| collision.intensity.clamp(0.0, 1.0));
+    lifecore::BodyVoiceFrame {
+        main_mass_ratio: (diagnostics.main_mass / total_mass).clamp(0.0, 1.0),
+        detached_mass_ratio: (diagnostics.detached_mass / total_mass).clamp(0.0, 1.0),
+        component_count: diagnostics.component_count.clamp(1, 4) as u8,
+        shape_aspect_ratio: diagnostics.stretch_ratio.clamp(1.0, 4.0),
+        stretch: ((diagnostics.stretch_ratio - 1.0) / 0.45).clamp(-1.0, 1.0),
+        compression: diagnostics.maximum_compression.clamp(0.0, 1.0),
+        bond_strain,
+        material_stress: diagnostics
+            .stress_magnitude
+            .max(physical.contact.effective_pressure)
+            .max(physical.material.deformation_energy)
+            .clamp(0.0, 1.0),
+        contact_area: physical.contact.area_fraction.clamp(0.0, 1.0),
+        slosh_energy: physical.material.slosh_energy.clamp(0.0, 1.0),
+        internal_speed: (physical.material.internal_relative_speed / 8.0).clamp(0.0, 1.0),
+        collision_impulse,
+        contact_impulse: 0.0,
+        release_impulse: if sensors.pointer_released {
+            (physical.material.internal_relative_speed / 5.0
+                + physical.contact.effective_pressure * 0.35)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        detach_impulse: if physical.detached_event.is_some() {
+            0.82
+        } else {
+            0.0
+        },
+        remerge_impulse: if physical.remerge_event.is_some() {
+            0.86
+        } else {
+            0.0
+        },
+    }
+    .sanitized()
+}
+
 fn perception_visual_frames(frame: DesktopVisualFrame) -> (VisualFeatureFrame, SpatialVisualFrame) {
     let summary = frame.summary;
     (
@@ -5757,6 +5821,12 @@ mod tests {
             purr: false,
             gesture: lifecore::VoiceGesture::WarmChuff,
             priority: 128,
+            style: lifecore::VocalStyle::SocialContact,
+            valence: 0.0,
+            arousal: 0.2,
+            fatigue: 0.0,
+            confidence: 0.8,
+            attachment: 0.4,
             rhythm_intervals: [0.0; 8],
         };
         assert!(manager.enqueue(&voice, &first_motif, &first_request));

@@ -34,7 +34,7 @@ impl PortablePetState {
                 expected: PORTABLE_STATE_SCHEMA_VERSION,
             });
         }
-        self.life.validate()?;
+        self.life.validate_with_additive_voice_repair()?;
         if let Some(vita) = &self.vita
             && !vita.is_valid()
         {
@@ -596,6 +596,69 @@ mod tests {
         assert_eq!(store.load_state().unwrap(), Some(state.clone()));
         store.save_state(&state).unwrap();
         assert!(store.paths.backup.exists());
+    }
+
+    #[test]
+    fn legacy_snapshot_repairs_voice_anatomy_and_gestures() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let life = LifeCore::new(Genome::from_seed(0x001E_6AC7), 0x001E_6AC7);
+        let mut legacy_life = life.snapshot();
+        let expected_pitch = legacy_life.state.genome.voice.base_pitch_hz;
+        let expected_motif_ids = legacy_life
+            .state
+            .vocal_motifs
+            .iter()
+            .map(|motif| motif.id)
+            .collect::<Vec<_>>();
+        let expected_habits = legacy_life.habits.clone();
+        let expected_memories = legacy_life.memories.clone();
+        legacy_life.state.genome.voice.anatomy = lifecore::VoiceAnatomy::default();
+        for motif in &mut legacy_life.state.vocal_motifs {
+            for syllable in &mut motif.syllables {
+                syllable.gesture = lifecore::VocalGesture::default();
+            }
+        }
+        let portable = PortablePetState {
+            schema_version: PORTABLE_STATE_SCHEMA_VERSION,
+            life: legacy_life,
+            vita: None,
+            position: PersistedPetPosition::default(),
+        };
+        fs::create_dir_all(&store.paths.root).unwrap();
+        fs::write(
+            &store.paths.state,
+            serde_json::to_vec_pretty(&portable).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store
+            .load_state()
+            .expect("legacy storage validation accepts additive voice migration")
+            .expect("legacy state exists");
+        let restored = LifeCore::restore(loaded.life).expect("legacy voice repairs in place");
+        let restored_snapshot = restored.snapshot();
+        assert_eq!(restored.state.genome.voice.anatomy.schema, 1);
+        assert_eq!(restored.state.genome.voice.base_pitch_hz, expected_pitch);
+        assert_eq!(
+            restored
+                .state
+                .vocal_motifs
+                .iter()
+                .map(|motif| motif.id)
+                .collect::<Vec<_>>(),
+            expected_motif_ids
+        );
+        assert_eq!(restored_snapshot.habits, expected_habits);
+        assert_eq!(restored_snapshot.memories, expected_memories);
+        assert!(
+            restored
+                .state
+                .vocal_motifs
+                .iter()
+                .flat_map(|motif| &motif.syllables)
+                .any(|syllable| syllable.gesture != lifecore::VocalGesture::default())
+        );
     }
 
     #[test]

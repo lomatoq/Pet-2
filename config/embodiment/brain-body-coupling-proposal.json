@@ -1,0 +1,317 @@
+{
+  "schema_version": 1,
+  "title": "PET 2 causal brain-to-body coupling proposal",
+  "status": "implementation_ready_not_yet_wired",
+  "parameter_catalog": "config/embodiment/brain-body-parameter-catalog.json",
+  "active_liquid_profile": "config/embodiment/active-liquid-profile-r11.json",
+  "diagnosis": {
+    "already_implemented": [
+      "Affect, mood and attention already enter VisualMindInput.",
+      "VisualPhysiology already changes pulse, shell_opacity, inner_density, translucency, flow_strength, flow_speed, core_glow, halo, iris_activity, eye_wetness, droplet_energy, droplet_spread and droplet_cohesion.",
+      "InteractionBodyActuation already changes bounded PBF compliance, cohesion, pulse, lean, recoil, resistance and cooperation.",
+      "ExpressionState already maps affect into pupils, brows, mouth, cheek glow and body glow."
+    ],
+    "why_the_user_sees_almost_no_change": [
+      "The active material has material.override_genome_colors=true, so Genome primary/secondary/glow colors are ignored.",
+      "The active cinematic palette is almost black and its bloom_strength is 0.05, so small glow/physiology changes have poor contrast.",
+      "Body dimensions, roundness and persistent size are read from Genome and do not change during ordinary learning.",
+      "Core PBF viscosity, density compliance and surface tension come from a fixed LiquidTuningProfile; only small interaction deltas currently reach the solver.",
+      "Current metamorphosis mutates only a limited trait subset and does not mutate body_length, body_width, body_roundness, softness, viscosity, density compliance or surface tension.",
+      "BrainGenome learning mechanics are not body-state outputs; mapping learning_rate directly to color would be causally wrong."
+    ]
+  },
+  "architecture": {
+    "owner": "LifeCore remains authoritative for persistent cognition; a new BodyPhenotypeDirector derives bounded commands without mutating cognition.",
+    "pipeline": "LifeState + VitaState + MorphDiagnostics + BodyFeedback -> EmbodimentSourceFrame -> BodyPhenotypeDirector -> FastPhenotypeActuation + DevelopmentalEvidence -> pet_body",
+    "rates_hz": {
+      "source_frame": 20,
+      "fast_target_update": 20,
+      "physics_application": 120,
+      "developmental_evidence": 0.2,
+      "persistent_mutation": "sleep consolidation / eligible metamorphosis only"
+    },
+    "authority_rules": [
+      "Renderer and shader never mutate LifeState, VitaState or Genome.",
+      "Fast phenotype is recomputed from an immutable source snapshot and is not persisted as identity.",
+      "Persistent morphology is changed only by versioned DevelopmentState mutation records.",
+      "Structural solver fields never change while components are detached, returning or merging.",
+      "Base identity remains visible under every emotional state."
+    ]
+  },
+  "normalized_inputs": {
+    "positive_valence": "clamp(max(affect.valence, vita.mood.baseline_valence), 0, 1)",
+    "negative_valence": "clamp(max(-affect.valence, -vita.mood.baseline_valence), 0, 1)",
+    "arousal": "clamp(0.70*affect.arousal + 0.30*vita.mood.baseline_arousal, 0, 1)",
+    "stress": "clamp(max(affect.stress, vita.appraisal.threat, drives.safety), 0, 1)",
+    "fatigue": "clamp(max(vita.mood.fatigue, drives.sleep), 0, 1)",
+    "confidence": "clamp(0.55*affect.confidence + 0.25*vita.mood.confidence + 0.20*vita.self_model.body_schema_confidence, 0, 1)",
+    "curiosity": "clamp(0.45*temperament.curiosity + 0.30*drives.curiosity + 0.25*vita.appraisal.novelty, 0, 1)",
+    "social_warmth": "clamp(0.45*affect.attachment + 0.30*vita.mood.social_openness + 0.25*temperament.sociability, 0, 1)",
+    "neural_approach": "clamp01(zscore(MBON_A)-zscore(MBON_V)+0.5)",
+    "neural_threat": "clamp01(0.55*zscore(LOOM)+0.25*zscore(VIB)+0.20*zscore(VALN))",
+    "neural_novelty": "clamp01(0.55*zscore(NOV)+0.25*zscore(EXP)-0.20*zscore(HAB))",
+    "neural_rest": "clamp01(zscore(REST))",
+    "normalized_ATT": "clamp01(zscore(ATT))",
+    "attention_confidence": "clamp(vita.attention.confidence, 0, 1)",
+    "attention_commitment": "clamp(vita.attention.commitment_remaining / 0.8, 0, 1)",
+    "self_uncertainty": "clamp(vita.self_model.uncertainty, 0, 1)",
+    "physical_load": "clamp(0.30*pressure + 0.22*deformation + 0.24*strain + 0.16*(1-topology_budget_remaining) + 0.40*detached_mass_fraction, 0, 1)"
+  },
+  "filtering": {
+    "formula": "y += (target-y) * (1-exp(-dt/tau)); choose tau_rise when target>y, tau_fall otherwise",
+    "default_tau_rise_seconds": 0.22,
+    "default_tau_fall_seconds": 0.85,
+    "hysteresis": "A discrete visual mode may switch only when the new score exceeds the current score by 0.12 for at least 0.25 s.",
+    "identity_mix": "final = identity_base + fast_delta; fast_delta must return to zero and never rewrite the base."
+  },
+  "fast_couplings": [
+    {
+      "id": "area_preserving_breathing_shape",
+      "targets": ["analytic.body_length_scale_runtime", "analytic.body_width_scale_runtime"],
+      "formula": "length=clamp(1 + 0.030*arousal + 0.018*curiosity - 0.040*fatigue - 0.025*stress,0.94,1.05); width=clamp(1/length,0.95,1.06)",
+      "smoothing": [0.30, 1.10],
+      "meaning": "Актывацыя выцягвае і адкрывае сілуэт, fatigue/stress яго кампактуюць; плошча амаль захоўваецца.",
+      "persistent": false
+    },
+    {
+      "id": "softness_compliance",
+      "targets": ["pbf.density_compliance_runtime_multiplier"],
+      "formula": "clamp(1 + 0.16*social_warmth + 0.12*fatigue - 0.22*stress - 0.12*neural_threat + 0.08*neural_approach,0.75,1.25)",
+      "smoothing": [0.20, 0.75],
+      "meaning": "Бяспечны кантакт робіць цела мякчэйшым; пагроза — сабраным. Множыць profile value, не перапісвае яго.",
+      "persistent": false
+    },
+    {
+      "id": "viscosity_damping",
+      "targets": ["pbf.viscosity_runtime_multiplier", "pbf.flight_damping_runtime_multiplier"],
+      "formula": "viscosity=clamp(1 + 0.22*fatigue + 0.10*stress - 0.18*arousal,0.78,1.30); damping=clamp(1 + 0.20*fatigue + 0.14*neural_rest - 0.12*arousal,0.82,1.28)",
+      "smoothing": [0.45, 1.40],
+      "meaning": "Стомленае цела павольней пераліваецца; узбуджанае даўжэй мае follow-through.",
+      "persistent": false
+    },
+    {
+      "id": "surface_tension_cohesion",
+      "targets": ["pbf.surface_tension_runtime_multiplier", "visual_physiology.droplet_cohesion"],
+      "formula": "clamp(1 + 0.18*stress + 0.14*neural_threat + 0.08*fatigue - 0.12*drives.play - 0.08*curiosity,0.80,1.25)",
+      "smoothing": [0.18, 0.90],
+      "meaning": "Пры пагрозе маса збіраецца; у гульні і даследаванні крыху распускаецца.",
+      "persistent": false
+    },
+    {
+      "id": "flight_lag_and_stretch",
+      "targets": ["pbf.flight_inertia_runtime_multiplier", "pbf.flight_stretch_runtime_multiplier", "pbf.flight_max_lag_runtime_multiplier"],
+      "formula": "inertia=clamp(0.92 + 0.20*fatigue + 0.10*(1-confidence),0.85,1.20); stretch=clamp(0.90 + 0.22*arousal + 0.12*neural_novelty - 0.10*stress,0.85,1.22); max_lag=clamp(0.90 + 0.18*arousal + 0.10*fatigue,0.90,1.18)",
+      "smoothing": [0.16, 0.65],
+      "meaning": "Палёт становіцца бачнымі anticipation, lag, stretch і settle, але profile constants застаюцца базай.",
+      "persistent": false
+    },
+    {
+      "id": "identity_preserving_color",
+      "targets": ["material.primary_hsv_runtime", "material.secondary_hsv_runtime", "material.glow_hsv_runtime"],
+      "formula": "hue_shift_turns=clamp(0.012*positive_valence - 0.010*negative_valence + 0.006*neural_novelty,-0.0222,0.0222); saturation_delta=clamp(0.06*arousal + 0.04*curiosity - 0.12*stress - 0.05*fatigue,-0.14,0.08); value_delta=clamp(0.08*positive_valence + 0.10*arousal - 0.10*fatigue - 0.06*stress,-0.12,0.12)",
+      "smoothing": [0.55, 1.80],
+      "meaning": "Base hue заўсёды бачны; max hue shift 8 degrees. Колер не адзіны носьбіт эмоцыі.",
+      "required_profile_change": "Use genome-derived base or blend the authored palette with Genome. Keeping override_genome_colors=true without a genome blend prevents developmental color from appearing.",
+      "persistent": false
+    },
+    {
+      "id": "emission_and_soul_glow",
+      "targets": ["material.emission_runtime_multiplier", "material.soul_glow_strength_runtime_multiplier", "material.soul_glow_pulse_runtime_multiplier", "visual_physiology.core_glow", "visual_physiology.halo"],
+      "formula": "emission=clamp(0.82 + 0.30*arousal + 0.22*social_warmth + 0.14*positive_valence - 0.18*fatigue,0.70,1.35); pulse=clamp(0.70 + 0.40*arousal + 0.18*neural_novelty,0.70,1.30)",
+      "smoothing": [0.20, 0.95],
+      "meaning": "Arousal у першую чаргу чытаецца праз рытм і emission, не праз замену hue.",
+      "persistent": false
+    },
+    {
+      "id": "optical_density",
+      "targets": ["material.opacity_runtime_multiplier", "material.translucency_runtime_delta", "visual_physiology.inner_density", "visual_physiology.shell_opacity"],
+      "formula": "opacity=clamp(1 + 0.08*confidence + 0.10*stress - 0.10*fatigue - 0.08*self_uncertainty,0.86,1.14); translucency_delta=clamp(0.10*fatigue + 0.06*curiosity - 0.08*stress,-0.10,0.12)",
+      "smoothing": [0.50, 1.60],
+      "meaning": "Упэўненасць робіць ядро чытэльным; fatigue/uncertainty — больш празрыстым.",
+      "persistent": false
+    },
+    {
+      "id": "internal_flow",
+      "targets": ["material.internal_flow_runtime_multiplier", "material.caustic_speed_runtime_multiplier", "visual_physiology.flow_strength", "visual_physiology.flow_speed"],
+      "formula": "strength=clamp(0.80 + 0.35*arousal + 0.25*curiosity + 0.18*neural_novelty + 0.10*stress - 0.20*fatigue,0.65,1.35); speed=clamp(0.80 + 0.35*arousal + 0.20*neural_novelty - 0.25*fatigue,0.60,1.35)",
+      "smoothing": [0.28, 1.00],
+      "meaning": "Плынь паказвае neural activity і curiosity без structural solver mutation.",
+      "persistent": false
+    },
+    {
+      "id": "attention_face",
+      "targets": ["expression.pupil_focus", "expression.pupil_size", "expression.eye_scale", "face.microsaccade_amount_runtime_multiplier", "face.microsaccade_rate_runtime_multiplier"],
+      "formula": "focus=clamp(0.35 + 0.40*attention_confidence + 0.20*normalized_ATT + 0.15*confidence,0,1); pupil=clamp(0.42 + 0.34*arousal + 0.12*neural_threat,0.32,0.92); microsaccade=clamp(1 + 0.20*curiosity - 0.35*attention_commitment,0.55,1.20)",
+      "smoothing": [0.12, 0.50],
+      "meaning": "Нейральная ўвага фіксуе позірк; microsaccades гаснуць падчас моцнай fixation.",
+      "persistent": false
+    },
+    {
+      "id": "conflict_asymmetry",
+      "targets": ["expression.brow_asymmetry", "expression.mouth_asymmetry", "interaction_body_actuation.lean"],
+      "formula": "asymmetry=clamp(morph.turn*(0.18+0.42*morph.conflict),-0.55,0.55); lean=clamp(morph.turn*(0.020+0.035*morph.confidence),-0.055,0.055)",
+      "smoothing": [0.14, 0.60],
+      "meaning": "Унутраны канфлікт бачны як bounded асіметрыя, не як выпадковы noise.",
+      "persistent": false
+    },
+    {
+      "id": "physical_load_response",
+      "targets": ["expression.effort", "expression.mouth_compression", "interaction_body_actuation.resistance", "interaction_body_actuation.recoil"],
+      "formula": "effort=physical_load; compression=clamp(0.15+0.75*physical_load,0,1); resistance=clamp(stress*physical_load,0,1); recoil=clamp(0.08*neural_threat*max(acceleration,pressure),0,0.08)",
+      "smoothing": [0.08, 0.45],
+      "meaning": "Нагрузка цела непасрэдна выклікае высілак, мяккую boundary і recoil.",
+      "persistent": false
+    },
+    {
+      "id": "apparent_size",
+      "targets": ["render.apparent_scale"],
+      "formula": "clamp(1 + 0.025*confidence + 0.018*positive_valence - 0.030*stress - 0.025*fatigue,0.95,1.04)",
+      "smoothing": [0.45, 1.60],
+      "meaning": "Толькі 5-9% expressive breathing/stance. Рэальны persistent body size змяняецца асобна праз development.",
+      "persistent": false
+    }
+  ],
+  "slow_development": {
+    "eligibility": [
+      "At least 24 simulated hours.",
+      "At least 120 completed interaction episodes.",
+      "At least 8 gesture classes observed.",
+      "At least 5 sleep consolidations.",
+      "At least 12 quiet/no-response episodes.",
+      "At least 8 safe-boundary episodes.",
+      "Mass conservation, remerge, topology and finite-state invariants pass.",
+      "Interaction turn is closed."
+    ],
+    "evidence_channels": {
+      "flight_mastery": "EMA(successful landings + cursor chases + confidence - prediction_error)",
+      "social_security": "EMA(positive voluntary response + attachment + respected boundary - frustration)",
+      "exploration_mastery": "EMA(neural_novelty + curiosity + successful object interaction)",
+      "rest_adaptation": "EMA(sleep consolidation quality + fatigue recovery)",
+      "physical_resilience": "EMA(successful stretch/remerge - emergency recovery - topology exhaustion)",
+      "communication_mastery": "EMA(vocal interaction reward + rhythm success - ignored bids)"
+    },
+    "per_generation_caps": {
+      "body_length_relative": 0.02,
+      "body_width_relative": 0.02,
+      "body_roundness_absolute": 0.03,
+      "head_ratio_absolute": 0.015,
+      "eye_size_absolute": 0.01,
+      "wing_span_relative": 0.03,
+      "tail_length_relative": 0.03,
+      "limb_length_relative": 0.025,
+      "softness_absolute": 0.04,
+      "visual_mass_absolute": 0.035,
+      "inertia_absolute": 0.04,
+      "primary_hue_degrees": 2.0,
+      "secondary_hue_degrees": 3.0,
+      "saturation_absolute": 0.03,
+      "pattern_scale_relative": 0.03,
+      "pattern_contrast_absolute": 0.025,
+      "bioluminescence_absolute": 0.04,
+      "voice_base_pitch_relative": 0.02,
+      "voice_formant_scale_relative": 0.02
+    },
+    "trait_logic": [
+      {
+        "when": "flight_mastery high for >=3 simulated days",
+        "change": "wing_span +, wing_aspect +, inertia -, flight resonance lower",
+        "reason": "Навык палёту павольна каналізуе больш лёгкі паветраны phenotype."
+      },
+      {
+        "when": "social_security high and physical_resilience high",
+        "change": "softness +, roundness +, glow value +, harsh pattern contrast -",
+        "reason": "Стабільны бяспечны кантакт дазваляе больш адкрытае мяккае цела."
+      },
+      {
+        "when": "neural_threat/stress high but boundaries succeed",
+        "change": "visual_mass +, tail_thickness +, softness slightly -, saturation slightly -",
+        "reason": "Пастаянная фізічная асцярожнасць робіць silhouette сабраным; не ўзнагароджваць distress."
+      },
+      {
+        "when": "exploration_mastery high",
+        "change": "eye_size +, ear_fin_size +, pattern_scale small shift, bioluminescence +",
+        "reason": "Даследаванне ўплывае на sensing/legibility channels."
+      },
+      {
+        "when": "rest_adaptation high and night_activity high",
+        "change": "bioluminescence +, glow hue small shift, metabolic pulse slower",
+        "reason": "Сутачны вопыт бачны без змены семантыкі."
+      },
+      {
+        "when": "communication_mastery high",
+        "change": "formant_scale small coherent change + ear_fin_size small change; do not change maximum_loudness",
+        "reason": "Голас і рэзананс павольна звязваюцца з целам."
+      }
+    ],
+    "mutation_formula": "delta = clamp(species_gain * centered_evidence * genome.developmental_plasticity * genome.mutation_rate, -per_generation_cap, +per_generation_cap)",
+    "promotion": "Create full before/after Genome record, run morphology extremes + body invariants + voice limits, then atomically promote or rollback."
+  },
+  "never_runtime_couple": [
+    "pbf.fixed_hz",
+    "pbf.particle_count",
+    "pbf.substeps",
+    "pbf.impact_substeps",
+    "pbf.density_iterations",
+    "pbf.impact_density_iterations",
+    "pbf.numerical_xsph",
+    "pbf.spacing_scale",
+    "pbf.kernel_radius_scale",
+    "pbf.component_link_radius_scale",
+    "pbf.bond_iterations",
+    "pbf.maximum_speed",
+    "interaction.maximum_detached_components",
+    "interaction.maximum_detached_mass_fraction",
+    "voice.maximum_loudness",
+    "compositor.render_scale",
+    "compositor.exposure",
+    "genome.identity_seed",
+    "genome.pattern_seed",
+    "genome.brain.learning_rate",
+    "genome.brain.maximum_plastic_delta"
+  ],
+  "implementation_files": [
+    {
+      "file": "crates/lifecore/src/phenotype.rs",
+      "work": "Add serializable EmbodimentSourceFrame, FastPhenotypeActuation and DevelopmentalEvidence contracts."
+    },
+    {
+      "file": "app/src/vita_runtime.rs",
+      "work": "Build one immutable source frame from Life/VITA/Morph diagnostics at 20 Hz."
+    },
+    {
+      "file": "app/src/expression_director.rs",
+      "work": "Own BodyPhenotypeDirector state, filtering, hysteresis and causal trace."
+    },
+    {
+      "file": "crates/pet_body/src/lib.rs",
+      "work": "Accept FastPhenotypeActuation beside VisualMindInput; do not let renderer read cognition directly."
+    },
+    {
+      "file": "crates/pet_body/src/liquid/mod.rs",
+      "work": "Apply only safe runtime multipliers after profile sanitization; clamp around authored base."
+    },
+    {
+      "file": "crates/pet_body/src/renderer.rs",
+      "work": "Blend identity palette with bounded runtime HSV/emission/opacity deltas."
+    },
+    {
+      "file": "crates/lifecore/src/development.rs",
+      "work": "Accumulate slow evidence and extend metamorphosis to bounded coherent BodyGenome traits."
+    },
+    {
+      "file": "tools/body_lab/src/main.rs",
+      "work": "Show source signal, filtered target, clamp reason and effective phenotype value live."
+    }
+  ],
+  "acceptance_tests": [
+    "Hold the same render seed and increase only arousal: flow/pulse/emission must rise; body area changes <2%.",
+    "Increase stress with arousal held constant: cohesion and compression rise; saturation falls; hue shift remains <=8 degrees.",
+    "Increase fatigue: viscosity/damping rise, flow and apparent size fall, blink slows.",
+    "Switch active material override on/off: Genome palette remains identifiable in both modes.",
+    "Run 10 simulated days with one fixed evidence trace twice: final Genome hash and phenotype trace match.",
+    "A single high-stress event never changes persistent morphology.",
+    "No fast channel changes particle_count, fixed_hz, solver iterations, topology limits or loudness cap.",
+    "Detached/returning components preserve desktop-frame inertia while the body root moves.",
+    "Every target logs source terms, raw target, filtered value, clamp and persistence class."
+  ]
+}
