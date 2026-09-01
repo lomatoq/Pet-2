@@ -77,10 +77,14 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let wave_a = sin((warped_r * 0.92 + ripple_phase) * TAU);
         let wave_b = sin((warped_r * 1.37 + ripple_phase * 0.73 + 1.73) * TAU);
         let broad_wave = 0.50 + 0.50 * (wave_a * 0.82 + wave_b * 0.18);
-        let ripple_alpha = broad_wave
+        // Keep a soft floor under the wave so the field never disappears in
+        // its broad troughs. Raising energy here changes visibility without
+        // sharpening the gradient or reintroducing contour bands.
+        let ripple_visibility = 0.22 + broad_wave * 0.78;
+        let ripple_alpha = ripple_visibility
             * field_mask
             * (0.32 + center_density * 0.68)
-            * mix(0.008, 0.021, activity);
+            * mix(0.016, 0.041, activity);
 
         // TODO: sample the renderer's existing desktop backdrop here once its bind
         // group is exposed to the ecology overlay. Keep the local one-draw-call
