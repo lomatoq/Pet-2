@@ -109,6 +109,7 @@ pub struct SpatialAttentionRuntime {
     habituation: [f32; VISUAL_GRID_CELLS],
     target: Option<VisualAttentionTarget>,
     hold_remaining: f32,
+    ambient_scan_cooldown: f32,
     shared_cue: Option<SharedAttentionCue>,
 }
 
@@ -118,6 +119,9 @@ impl Default for SpatialAttentionRuntime {
             habituation: [0.0; VISUAL_GRID_CELLS],
             target: None,
             hold_remaining: 0.0,
+            // Static desktop structure is scenery. The organism samples it only
+            // occasionally instead of staring at text edges every frame.
+            ambient_scan_cooldown: 3.5,
             shared_cue: None,
         }
     }
@@ -146,6 +150,7 @@ impl SpatialAttentionRuntime {
             0.0
         };
         self.hold_remaining = (self.hold_remaining - dt).max(0.0);
+        self.ambient_scan_cooldown = (self.ambient_scan_cooldown - dt).max(0.0);
         if let Some(cue) = &mut self.shared_cue {
             cue.remaining_seconds = (cue.remaining_seconds - dt).max(0.0);
             cue.strength = (cue.remaining_seconds / 2.0).clamp(0.0, 1.0);
@@ -165,13 +170,13 @@ impl SpatialAttentionRuntime {
             self.target = None;
             return;
         };
+        let ambient_scan = self.ambient_scan_cooldown <= 0.0;
         let mut best = None;
         for (index, cell) in frame.cells.iter().copied().enumerate() {
             let raw_salience = cell
                 .motion
                 .max(cell.sudden_change)
-                .max(cell.colorfulness)
-                .max(cell.edge_density);
+                .max(cell.colorfulness.max(cell.edge_density) * 0.08);
             self.habituation[index] = if raw_salience > 0.12 {
                 (self.habituation[index] + dt * raw_salience * 0.24).clamp(0.0, 0.88)
             } else {
@@ -180,28 +185,25 @@ impl SpatialAttentionRuntime {
             let novelty_gain = 1.0 - self.habituation[index];
             let motion_score = cell.motion * novelty_gain;
             let luminance_score = ((cell.luminance - 0.5).abs() * 2.0 - 0.35).max(0.0);
-            // A saturated or structured static region must be able to cross the
-            // attention threshold on its own. The previous weights made the
-            // mathematical maximum for color alone lower than that threshold,
-            // while edge density was sampled but never used at all.
             let color_score = ((cell.colorfulness - 0.30) / 0.70).clamp(0.0, 1.0) * novelty_gain;
             let shape_score = ((cell.edge_density - 0.16) / 0.64).clamp(0.0, 1.0) * novelty_gain;
             let sudden_score = cell.sudden_change * novelty_gain;
-            let score = (sudden_score * 0.40
-                + motion_score * 0.22
-                + luminance_score * 0.08
-                + color_score * 0.24
-                + shape_score * 0.22)
-                .clamp(0.0, 1.0);
-            let kind = if sudden_score
-                >= motion_score
-                    .max(luminance_score)
-                    .max(color_score)
-                    .max(shape_score)
-            {
-                VisualRegionKind::SuddenChange
-            } else if motion_score >= luminance_score.max(color_score).max(shape_score) {
-                VisualRegionKind::Motion
+            // Motion and abrupt change are reflexes. Color, luminance and edge
+            // structure are a coarse background model and become candidates only
+            // during a short, infrequent environmental scan.
+            let dynamic_score = sudden_score * 0.58 + motion_score * 0.34;
+            let ambient_score = if ambient_scan {
+                luminance_score * 0.06 + color_score * 0.13 + shape_score * 0.13
+            } else {
+                0.0
+            };
+            let score = dynamic_score.max(ambient_score).clamp(0.0, 1.0);
+            let kind = if dynamic_score >= ambient_score {
+                if sudden_score >= motion_score {
+                    VisualRegionKind::SuddenChange
+                } else {
+                    VisualRegionKind::Motion
+                }
             } else if shape_score >= luminance_score.max(color_score) {
                 VisualRegionKind::StructuredShape
             } else if luminance_score >= color_score {
@@ -232,6 +234,13 @@ impl SpatialAttentionRuntime {
         }
         self.target = best.filter(|target| target.score >= 0.12);
         self.hold_remaining = if self.target.is_some() { 0.65 } else { 0.0 };
+        if ambient_scan {
+            // The sequence-dependent phase keeps different installations from
+            // looking mechanically periodic without introducing randomness into
+            // tests or replay.
+            let phase = (frame.sequence.wrapping_mul(37) % 101) as f32 / 100.0;
+            self.ambient_scan_cooldown = 8.0 + phase * 6.0;
+        }
     }
 }
 
@@ -284,28 +293,35 @@ mod tests {
     }
 
     #[test]
-    fn saturated_static_color_can_claim_attention_without_motion() {
+    fn saturated_static_color_is_background_until_an_ambient_scan() {
         let mut runtime = SpatialAttentionRuntime::default();
         let mut frame = SpatialVisualFrame::default();
         frame.cells[23].colorfulness = 1.0;
 
         runtime.update(Some(&frame), 0.05);
+        assert_eq!(runtime.target(), None);
+
+        for _ in 0..70 {
+            runtime.update(Some(&frame), 0.05);
+        }
 
         let target = runtime
             .target()
-            .expect("color should be behaviorally visible");
+            .expect("color should be sampled during an environmental scan");
         assert_eq!(target.kind, VisualRegionKind::UnusualColor);
         assert_eq!(cell_index(target.position), 23);
         assert!(target.score >= 0.12);
     }
 
     #[test]
-    fn structured_monochrome_region_can_claim_attention() {
+    fn structured_monochrome_region_is_sampled_but_not_continuously() {
         let mut runtime = SpatialAttentionRuntime::default();
         let mut frame = SpatialVisualFrame::default();
         frame.cells[71].edge_density = 1.0;
 
-        runtime.update(Some(&frame), 0.05);
+        for _ in 0..71 {
+            runtime.update(Some(&frame), 0.05);
+        }
 
         let target = runtime
             .target()
@@ -313,5 +329,10 @@ mod tests {
         assert_eq!(target.kind, VisualRegionKind::StructuredShape);
         assert_eq!(cell_index(target.position), 71);
         assert!(target.score >= 0.12);
+
+        for _ in 0..20 {
+            runtime.update(Some(&frame), 0.05);
+        }
+        assert_eq!(runtime.target(), None);
     }
 }

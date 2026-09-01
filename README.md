@@ -86,8 +86,11 @@ view. `Habitat Lab.app` is the macOS equivalent of Windows `Pet2-Dev.cmd`: it
 restarts the installed Pet in bounded 5 Hz telemetry mode and keeps the Live
 Brain panel open. That panel shows realtime desktop position, movement, final
 gaze, visual-saliency target, cursor/orb context, decisions, drives, and visible
-body response. The deterministic cross-platform scenario runner remains in
-`tools/HabitatLab`.
+body response. Its attention map also renders the same privacy-safe `8x5`
+brightness/color/motion approximation consumed by the organism, plus anonymous
+window rectangles. It never exposes window titles, typed text, native window
+identifiers, screenshots, or pixel buffers. The deterministic cross-platform
+scenario runner remains in `tools/HabitatLab`.
 
 Packaging leaves only the ZIP archive in `dist`; the installed applications are
 therefore not duplicated in Spotlight or Launchpad by an unpacked build tree.

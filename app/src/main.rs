@@ -24,7 +24,9 @@ use desktop_host::{
     DesktopVisualFrame, DisplayTopology, EventLogEntry, LabControlCommand, LabControlEnvelope,
     LabDrive, MonitorId, MonitorInfo, PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition,
     PhysicalDesktopPoint, PlatformBackend, PointerState, PortablePetState, RectI, SensorNormalizer,
-    StateStore, create_platform_backend, prepare_overlay_window_attributes,
+    StateStore, VISUAL_GRID_HEIGHT as DESKTOP_VISUAL_GRID_HEIGHT,
+    VISUAL_GRID_WIDTH as DESKTOP_VISUAL_GRID_WIDTH, create_platform_backend,
+    prepare_overlay_window_attributes,
 };
 use ecology_runtime::{EcologyResolveFrame, EcologyRuntime, VisualAttentionSample};
 use glam::Vec2;
@@ -2105,6 +2107,13 @@ impl PetApplication {
                 let ecology_visual = runtime.ecology.visual_context();
                 let ecology_visual_effect = runtime.ecology.visual_effect();
                 let saliency_target = runtime.vita.visual_attention_target();
+                let coarse_scene = coarse_visual_scene_telemetry(
+                    runtime
+                        .last_visual_sample
+                        .as_ref()
+                        .filter(|_| runtime.vita.visual_age_seconds() < 2.5),
+                    &runtime.sensors,
+                );
                 let ecology_state = runtime.ecology.state();
                 let orb = ecology_state
                     .objects
@@ -2433,6 +2442,7 @@ impl PetApplication {
                         "object_physics_us": runtime.ecology.object_physics_microseconds(),
                         "episode_tick_us": runtime.ecology.episode_tick_microseconds(),
                         "visual_grid_age_ms": runtime.vita.visual_age_seconds() * 1_000.0,
+                        "coarse_scene": coarse_scene,
                     },
                     "timings_ms": {
                         "physics": [physics_timing.p50, physics_timing.p95, physics_timing.p99],
@@ -3901,6 +3911,70 @@ fn perception_visual_frames(frame: DesktopVisualFrame) -> (VisualFeatureFrame, S
             timestamp: frame.timestamp,
         },
     )
+}
+
+const LAB_VISUAL_GRID_WIDTH: usize = 8;
+const LAB_VISUAL_GRID_HEIGHT: usize = 5;
+const LAB_WINDOW_LIMIT: usize = 12;
+
+/// Emits only a tiny feature mosaic and anonymous rectangles for Habitat Lab.
+/// It cannot reconstruct text: every cell covers a large piece of the desktop,
+/// values are quantized, and no pixel buffer or native window identity crosses
+/// this boundary.
+fn coarse_visual_scene_telemetry(
+    frame: Option<&DesktopVisualFrame>,
+    sensors: &SensorFrame,
+) -> serde_json::Value {
+    let cells = frame.map_or_else(Vec::new, |frame| {
+        (0..LAB_VISUAL_GRID_HEIGHT)
+            .flat_map(|row| {
+                (0..LAB_VISUAL_GRID_WIDTH).map(move |column| {
+                    let source_x = column * DESKTOP_VISUAL_GRID_WIDTH / LAB_VISUAL_GRID_WIDTH;
+                    let source_y = row * DESKTOP_VISUAL_GRID_HEIGHT / LAB_VISUAL_GRID_HEIGHT;
+                    let cell = frame.cells[source_y * DESKTOP_VISUAL_GRID_WIDTH + source_x];
+                    [
+                        quantize_feature(cell.luminance),
+                        quantize_feature(cell.hue),
+                        quantize_feature(cell.colorfulness),
+                        quantize_feature(cell.motion.max(cell.sudden_change)),
+                        quantize_feature(cell.edge_density),
+                    ]
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let windows = sensors
+        .visible_surfaces
+        .iter()
+        .take(LAB_WINDOW_LIMIT)
+        .map(|surface| {
+            [
+                surface.rect.minimum.x.clamp(0.0, 1.0),
+                surface.rect.minimum.y.clamp(0.0, 1.0),
+                surface.rect.maximum.x.clamp(0.0, 1.0),
+                surface.rect.maximum.y.clamp(0.0, 1.0),
+            ]
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "available": frame.is_some(),
+        "width": LAB_VISUAL_GRID_WIDTH,
+        "height": LAB_VISUAL_GRID_HEIGHT,
+        // [luminance, hue, colorfulness, motion/change, edge density], all u8.
+        "cells": cells,
+        "windows": windows,
+        "visible_window_count": sensors.visible_surfaces.len(),
+        "active_window": sensors.active_window_rect.map(|rect| [
+            rect.minimum.x.clamp(0.0, 1.0),
+            rect.minimum.y.clamp(0.0, 1.0),
+            rect.maximum.x.clamp(0.0, 1.0),
+            rect.maximum.y.clamp(0.0, 1.0),
+        ]),
+    })
+}
+
+fn quantize_feature(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn morsel_profile_from_visual(
@@ -5552,5 +5626,37 @@ mod tests {
                 .unwrap(),
             applied
         );
+    }
+
+    #[test]
+    fn habitat_scene_is_tiny_quantized_and_never_exposes_window_identity() {
+        let mut visual = DesktopVisualFrame::default();
+        visual.cells[0].luminance = 0.73;
+        visual.cells[0].hue = 0.42;
+        visual.cells[0].colorfulness = 0.81;
+        visual.cells[0].motion = 0.64;
+        visual.cells[0].edge_density = 0.55;
+        let sensors = SensorFrame {
+            active_window_rect: Some(lifecore::Rect {
+                minimum: Vec2::new(0.1, 0.2),
+                maximum: Vec2::new(0.9, 0.8),
+            }),
+            visible_surfaces: vec![lifecore::SurfaceRect {
+                id: lifecore::SurfaceId("secret-native-window-id".into()),
+                rect: lifecore::Rect {
+                    minimum: Vec2::new(0.1, 0.2),
+                    maximum: Vec2::new(0.9, 0.8),
+                },
+            }],
+            ..SensorFrame::default()
+        };
+
+        let scene = coarse_visual_scene_telemetry(Some(&visual), &sensors);
+        assert_eq!(scene["width"], LAB_VISUAL_GRID_WIDTH);
+        assert_eq!(scene["height"], LAB_VISUAL_GRID_HEIGHT);
+        assert_eq!(scene["cells"].as_array().unwrap().len(), 40);
+        assert_eq!(scene["cells"][0].as_array().unwrap().len(), 5);
+        assert_eq!(scene["windows"].as_array().unwrap().len(), 1);
+        assert!(!scene.to_string().contains("secret-native-window-id"));
     }
 }

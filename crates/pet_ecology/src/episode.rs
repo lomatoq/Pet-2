@@ -608,9 +608,9 @@ fn select_episode(
     }
     if frame.visual_target.is_some()
         && frame.visual_strength >= 0.12
-        && (frame.visual_colorfulness >= 0.42
-            || frame.visual_structure >= 0.24
-            || frame.visual_surprise >= 0.18)
+        && (frame.visual_surprise >= 0.18
+            || (frame.selected_action == ActionId::ExploreScreen
+                && (frame.visual_colorfulness >= 0.42 || frame.visual_structure >= 0.24)))
     {
         let color_dominates =
             frame.visual_colorfulness >= frame.visual_structure.max(frame.visual_surprise);
@@ -841,8 +841,9 @@ fn fill_candidate_trace(
             },
             frame.visual_target.is_some()
                 && (frame.shared_attention
-                    || frame.visual_structure >= 0.24
-                    || frame.visual_surprise >= 0.18)
+                    || frame.visual_surprise >= 0.18
+                    || (frame.selected_action == ActionId::ExploreScreen
+                        && frame.visual_structure >= 0.24))
                 && !frame.focus_mode,
             if frame.shared_attention {
                 EpisodeReason::SharedAttentionCue
@@ -855,7 +856,7 @@ fn fill_candidate_trace(
             frame.visual_strength * frame.visual_colorfulness.max(0.35) * 0.90,
             frame.visual_target.is_some()
                 && (frame.selected_action == ActionId::ExploreScreen
-                    || frame.visual_colorfulness >= 0.42)
+                    || (frame.visual_surprise >= 0.18 && frame.visual_colorfulness >= 0.42))
                 && !frame.focus_mode,
             if frame.visual_colorfulness >= 0.42 {
                 EpisodeReason::VisualNovelty
@@ -1970,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn saturated_color_starts_visible_chromatic_reaction_without_action_coincidence() {
+    fn static_color_stays_background_until_screen_exploration_is_active() {
         let mut state = EcologyState::new(9_102);
         let mut director = EpisodeDirector::default();
         let mut frame = behavior_frame(ActionId::IdleHover);
@@ -1979,6 +1980,10 @@ mod tests {
         frame.visual_strength = 0.74;
         frame.visual_colorfulness = 0.92;
 
+        let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(output.debug.active_goal, None);
+
+        frame.selected_action = ActionId::ExploreScreen;
         let output = director.tick(&mut state, frame, representative_intent(), 0.05);
 
         assert_eq!(output.debug.active_goal, Some(EpisodeGoal::ChromaticEcho));
@@ -1992,10 +1997,10 @@ mod tests {
     }
 
     #[test]
-    fn structured_shape_causes_orient_then_approach() {
+    fn structured_shape_causes_orient_then_approach_during_screen_exploration() {
         let mut state = EcologyState::new(9_103);
         let mut director = EpisodeDirector::default();
-        let mut frame = behavior_frame(ActionId::IdleHover);
+        let mut frame = behavior_frame(ActionId::ExploreScreen);
         frame.visual_target = Some(Vec2::new(0.18, 0.78));
         frame.visual_strength = 0.68;
         frame.visual_structure = 0.90;

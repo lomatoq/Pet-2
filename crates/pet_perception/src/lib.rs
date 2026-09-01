@@ -83,8 +83,13 @@ pub struct PerceptionRuntime {
     click_activity: VecDeque<f64>,
     last_idle_seconds: Option<f32>,
     last_keyboard_activity: Option<f64>,
+    typing_notice_ready: bool,
+    typing_notice_cooldown: f32,
     scroll_velocity: f32,
     scroll_burst: f32,
+    scroll_notice_ready: bool,
+    scroll_notice_cooldown: f32,
+    window_glance_cooldown: f32,
     surfaces: BTreeMap<String, SurfaceHistory>,
     visual: Option<VisualFeatureFrame>,
     visual_age: f32,
@@ -102,8 +107,13 @@ impl Default for PerceptionRuntime {
             click_activity: VecDeque::with_capacity(MAX_RHYTHM_EVENTS),
             last_idle_seconds: None,
             last_keyboard_activity: None,
+            typing_notice_ready: false,
+            typing_notice_cooldown: 0.0,
             scroll_velocity: 0.0,
             scroll_burst: 0.0,
+            scroll_notice_ready: false,
+            scroll_notice_cooldown: 0.0,
+            window_glance_cooldown: 5.0,
             surfaces: BTreeMap::new(),
             visual: None,
             visual_age: f32::INFINITY,
@@ -119,6 +129,12 @@ impl PerceptionRuntime {
     /// Adds an abstract keyboard-activity timestamp. The caller must discard the key
     /// code and character before invoking this method.
     pub fn note_key_activity(&mut self, timestamp: f64) {
+        if self
+            .last_keyboard_activity
+            .is_none_or(|last| timestamp - last >= 1.15)
+        {
+            self.typing_notice_ready = true;
+        }
         push_time(&mut self.keyboard_activity, timestamp);
         self.last_keyboard_activity = Some(timestamp);
     }
@@ -130,6 +146,9 @@ impl PerceptionRuntime {
     /// Adds normalized wheel movement in `-1..=1`; no target content is retained.
     pub fn note_scroll(&mut self, normalized_delta: f32) {
         let delta = finite(normalized_delta).clamp(-1.0, 1.0);
+        if self.scroll_velocity.abs() < 0.055 {
+            self.scroll_notice_ready = true;
+        }
         self.scroll_velocity = (self.scroll_velocity + delta * 0.72).clamp(-1.0, 1.0);
         self.scroll_burst = (self.scroll_burst + delta.abs() * 0.48).clamp(0.0, 1.0);
     }
@@ -206,6 +225,9 @@ impl PerceptionRuntime {
         prune_times(&mut self.click_activity, timestamp, 8.0);
         self.scroll_velocity *= (-dt * 5.5).exp();
         self.scroll_burst *= (-dt * 2.2).exp();
+        self.typing_notice_cooldown = (self.typing_notice_cooldown - dt).max(0.0);
+        self.scroll_notice_cooldown = (self.scroll_notice_cooldown - dt).max(0.0);
+        self.window_glance_cooldown = (self.window_glance_cooldown - dt).max(0.0);
         self.visual_age += dt;
         self.spatial_attention.update(
             self.spatial_visual
@@ -222,12 +244,37 @@ impl PerceptionRuntime {
             .last_keyboard_activity
             .map_or(60.0, |last| (timestamp - last).max(0.0) as f32)
             .clamp(0.0, 3_600.0);
-        let ecology = self.update_windows(sensors, body.world_position, timestamp, dt);
+        let mut ecology = self.update_windows(sensors, body.world_position, timestamp, dt);
+        if ecology.motion < 0.04
+            && ecology.popup_salience < 0.08
+            && self.window_glance_cooldown <= 0.0
+            && let Some(rect) = sensors.active_window_rect
+        {
+            let area = rect_area(rect);
+            let center = rect_center(rect);
+            // A small panel is more object-like; a large stable app is scenery.
+            // Both may receive a rare glance, but neither becomes a continuous
+            // stimulus merely because it occupies the desktop.
+            let smallness = (1.0 - area / 0.42).clamp(0.0, 1.0);
+            ecology.events.push(
+                StimulusEvent {
+                    kind: StimulusKind::WindowEdge,
+                    position: Some(center),
+                    intensity: 0.17 + smallness * 0.24,
+                    novelty: 0.05 + smallness * 0.11,
+                    threat: 0.0,
+                    social_relevance: 0.0,
+                }
+                .bounded(),
+            );
+            let geometry_phase = (center.x * 7.0 + center.y * 11.0 + area * 13.0).fract();
+            self.window_glance_cooldown = 10.0 + area * 12.0 + geometry_phase * 7.0;
+        }
 
         let visual = self.visual.filter(|_| self.visual_age < 2.5);
         let mut events = Vec::with_capacity(16);
         push_pointer_events(&mut events, pointer, sensors.cursor_position);
-        if typing_rate_hz > 0.35 {
+        if typing_rate_hz > 0.35 && self.typing_notice_ready && self.typing_notice_cooldown <= 0.0 {
             events.push(
                 StimulusEvent {
                     kind: StimulusKind::TypingRhythm,
@@ -241,8 +288,13 @@ impl PerceptionRuntime {
                 }
                 .bounded(),
             );
+            self.typing_notice_ready = false;
+            self.typing_notice_cooldown = 6.0 + (typing_rate_hz / 8.0).clamp(0.0, 1.0) * 5.0;
         }
-        if self.scroll_velocity.abs() > 0.08 {
+        if self.scroll_velocity.abs() > 0.08
+            && self.scroll_notice_ready
+            && self.scroll_notice_cooldown <= 0.0
+        {
             events.push(
                 StimulusEvent {
                     kind: StimulusKind::ScrollFlow,
@@ -256,6 +308,8 @@ impl PerceptionRuntime {
                 }
                 .bounded(),
             );
+            self.scroll_notice_ready = false;
+            self.scroll_notice_cooldown = 3.5;
         }
         events.extend(ecology.events.iter().copied());
         if let Some(target) = self.spatial_attention.target() {
@@ -517,8 +571,10 @@ impl PerceptionRuntime {
             let mut popup = 0.0;
             if is_new && age < 0.2 {
                 let area = rect_area(surface.rect);
-                popup =
-                    ((0.32 - area).max(0.0) * 2.2 + (1.0 - distance * 2.0) * 0.35).clamp(0.0, 1.0);
+                let object_scale = ((0.38 - area) / 0.38).clamp(0.0, 1.0);
+                popup = (object_scale * 0.68
+                    + (1.0 - distance * 2.0).clamp(0.0, 1.0) * object_scale * 0.24)
+                    .clamp(0.0, 1.0);
                 ecology.popup_salience = ecology.popup_salience.max(popup);
                 if popup > 0.12 {
                     ecology.events.push(
@@ -932,6 +988,110 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| { event.kind == StimulusKind::MovingWindow && event.threat > 0.0 })
+        );
+    }
+
+    #[test]
+    fn large_static_window_is_background_with_only_a_rare_glance() {
+        let mut runtime = PerceptionRuntime::default();
+        let mut sensors = SensorFrame {
+            active_window_rect: Some(Rect {
+                minimum: Vec2::new(0.04, 0.05),
+                maximum: Vec2::new(0.96, 0.94),
+            }),
+            visible_surfaces: vec![SurfaceRect {
+                id: SurfaceId("large-background".into()),
+                rect: Rect {
+                    minimum: Vec2::new(0.04, 0.05),
+                    maximum: Vec2::new(0.96, 0.94),
+                },
+            }],
+            ..SensorFrame::default()
+        };
+        let mut glances = 0;
+        let mut popups = 0;
+        for tick in 0..500 {
+            sensors.timestamp = tick as f64 * 0.05;
+            let percept = runtime.update(&sensors, &BodyFeedback::default(), 0.05);
+            glances += percept
+                .events
+                .iter()
+                .filter(|event| event.kind == StimulusKind::WindowEdge)
+                .count();
+            popups += percept
+                .events
+                .iter()
+                .filter(|event| event.kind == StimulusKind::Popup)
+                .count();
+        }
+        assert_eq!(popups, 0);
+        assert!((1..=2).contains(&glances));
+    }
+
+    #[test]
+    fn new_small_window_is_object_like_and_noticeable() {
+        let mut runtime = PerceptionRuntime::default();
+        let sensors = SensorFrame {
+            timestamp: 1.0,
+            visible_surfaces: vec![SurfaceRect {
+                id: SurfaceId("small-panel".into()),
+                rect: Rect {
+                    minimum: Vec2::new(0.70, 0.12),
+                    maximum: Vec2::new(0.91, 0.34),
+                },
+            }],
+            ..SensorFrame::default()
+        };
+        let percept = runtime.update(&sensors, &BodyFeedback::default(), 0.05);
+        assert!(
+            percept
+                .events
+                .iter()
+                .any(|event| event.kind == StimulusKind::Popup && event.intensity > 0.4)
+        );
+    }
+
+    #[test]
+    fn typing_and_scroll_are_one_soft_notice_per_burst() {
+        let mut runtime = PerceptionRuntime::default();
+        let mut sensors = SensorFrame {
+            active_window_rect: Some(Rect {
+                minimum: Vec2::new(0.1, 0.1),
+                maximum: Vec2::new(0.9, 0.9),
+            }),
+            ..SensorFrame::default()
+        };
+        runtime.note_key_activity(1.0);
+        runtime.note_key_activity(1.1);
+        runtime.note_scroll(0.8);
+        sensors.timestamp = 1.2;
+        let first = runtime.update(&sensors, &BodyFeedback::default(), 0.05);
+        assert!(
+            first
+                .events
+                .iter()
+                .any(|event| event.kind == StimulusKind::TypingRhythm)
+        );
+        assert!(
+            first
+                .events
+                .iter()
+                .any(|event| event.kind == StimulusKind::ScrollFlow)
+        );
+
+        sensors.timestamp = 1.25;
+        let repeated = runtime.update(&sensors, &BodyFeedback::default(), 0.05);
+        assert!(
+            !repeated
+                .events
+                .iter()
+                .any(|event| event.kind == StimulusKind::TypingRhythm)
+        );
+        assert!(
+            !repeated
+                .events
+                .iter()
+                .any(|event| event.kind == StimulusKind::ScrollFlow)
         );
     }
 

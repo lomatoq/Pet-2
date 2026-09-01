@@ -1493,11 +1493,34 @@ fn attention_kind(kind: StimulusKind) -> AttentionKind {
 }
 
 fn event_salience(event: &StimulusEvent, life: &LifeState) -> f32 {
-    (event.intensity * 0.34
+    let base = event.intensity * 0.34
         + event.novelty * 0.24
         + event.threat * (0.28 + life.drives.safety * 0.30)
-        + event.social_relevance * (0.18 + life.drives.social * 0.32))
-        .clamp(0.0, 1.0)
+        + event.social_relevance * (0.18 + life.drives.social * 0.32);
+    let curiosity = life.genome.temperament.curiosity;
+    let awake = (1.0 - life.drives.sleep * 0.82).clamp(0.12, 1.0);
+    let focus = if life.focus_mode { 0.22 } else { 1.0 };
+    let passive_gain =
+        (0.34 + curiosity * 0.42 + life.affect.arousal * 0.18 + event.novelty * 0.32)
+            .clamp(0.22, 1.0)
+            * awake
+            * focus;
+    let gain = match event.kind {
+        // Sudden windows remain safety-relevant. Stable window geometry, screen
+        // texture, scrolling and typing compete through animal-like curiosity and
+        // are easy to ignore while sleepy or while the user is focused.
+        StimulusKind::Popup | StimulusKind::MovingWindow if event.threat > 0.18 => 1.0,
+        StimulusKind::TypingRhythm => {
+            passive_gain * (0.62 + life.drives.social * 0.30).clamp(0.62, 0.92)
+        }
+        StimulusKind::ScrollFlow
+        | StimulusKind::WindowEdge
+        | StimulusKind::VisualChange
+        | StimulusKind::BrightArea
+        | StimulusKind::DarkArea => passive_gain,
+        _ => 1.0,
+    };
+    (base * gain).clamp(0.0, 1.0)
 }
 
 fn dot(left: &[f32; VITA_CONTEXT_SIZE], right: &[f32; VITA_CONTEXT_SIZE]) -> f32 {
@@ -1741,5 +1764,30 @@ mod tests {
         assert_eq!(intent.expression.mouth_open, 0.47);
         assert!(intent.expression.mouth_curve > 0.9);
         assert!(intent.expression.cheek_glow > 0.9);
+    }
+
+    #[test]
+    fn passive_desktop_activity_is_easy_to_ignore_while_sleepy_or_focused() {
+        let event = StimulusEvent {
+            kind: StimulusKind::ScrollFlow,
+            position: Some(Vec2::splat(0.5)),
+            intensity: 0.62,
+            novelty: 0.22,
+            threat: 0.0,
+            social_relevance: 0.0,
+        };
+        let mut curious = LifeState::new(crate::Genome::from_seed(811));
+        curious.genome.temperament.curiosity = 0.92;
+        curious.drives.sleep = 0.02;
+        curious.affect.arousal = 0.78;
+        let curious_score = event_salience(&event, &curious);
+
+        let mut sleepy = curious.clone();
+        sleepy.drives.sleep = 1.0;
+        sleepy.focus_mode = true;
+        let sleepy_score = event_salience(&event, &sleepy);
+
+        assert!(curious_score > sleepy_score * 8.0);
+        assert!(sleepy_score < 0.02);
     }
 }

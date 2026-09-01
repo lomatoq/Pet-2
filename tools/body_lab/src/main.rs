@@ -2094,6 +2094,8 @@ fn live_attention_map(ui: &mut egui::Ui, latest: &Value) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 5.0, egui::Color32::from_rgb(20, 26, 37));
 
+    paint_coarse_visual_scene(&painter, rect, latest);
+
     let to_screen = |point: Vec2| {
         egui::pos2(
             rect.left() + point.x.clamp(0.0, 1.0) * rect.width(),
@@ -2161,9 +2163,130 @@ fn live_attention_map(ui: &mut egui::Ui, latest: &Value) {
         );
     }
     ui.small(format!(
-        "owner: {} · cyan=final gaze · purple=VITA · yellow=visual · green=orb · red=cursor",
-        text(latest, "/details/gaze/source")
+        "owner: {} · backdrop={} · windows={} · cyan=final gaze · purple=VITA · yellow=visual",
+        text(latest, "/details/gaze/source"),
+        if boolean(latest, "/details/ecology/coarse_scene/available") {
+            "coarse 8×5 vision"
+        } else {
+            "geometry only"
+        },
+        format_number(
+            latest,
+            "/details/ecology/coarse_scene/visible_window_count",
+            0
+        ),
     ));
+}
+
+fn paint_coarse_visual_scene(painter: &egui::Painter, rect: egui::Rect, latest: &Value) {
+    let scene = &latest["details"]["ecology"]["coarse_scene"];
+    let width = scene["width"].as_u64().unwrap_or(0) as usize;
+    let height = scene["height"].as_u64().unwrap_or(0) as usize;
+    if let Some(cells) = scene["cells"].as_array()
+        && width > 0
+        && height > 0
+    {
+        for (index, cell) in cells.iter().take(width * height).enumerate() {
+            let Some(features) = cell.as_array() else {
+                continue;
+            };
+            let feature = |index: usize| {
+                features.get(index).and_then(Value::as_u64).unwrap_or(0) as f32 / 255.0
+            };
+            let luminance = feature(0);
+            let hue = feature(1);
+            let colorfulness = feature(2);
+            let motion = feature(3);
+            let column = index % width;
+            let row = index / width;
+            let cell_rect = egui::Rect::from_min_max(
+                egui::pos2(
+                    rect.left() + column as f32 / width as f32 * rect.width(),
+                    rect.top() + row as f32 / height as f32 * rect.height(),
+                ),
+                egui::pos2(
+                    rect.left() + (column + 1) as f32 / width as f32 * rect.width(),
+                    rect.top() + (row + 1) as f32 / height as f32 * rect.height(),
+                ),
+            );
+            painter.rect_filled(
+                cell_rect.shrink(0.7),
+                1.5,
+                coarse_hsv_color(hue, colorfulness * 0.72, 0.08 + luminance * 0.56),
+            );
+            if motion > 0.08 {
+                painter.rect_stroke(
+                    cell_rect.shrink(1.3),
+                    1.5,
+                    egui::Stroke::new(0.7 + motion * 2.2, egui::Color32::from_rgb(255, 176, 76)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
+
+    if let Some(windows) = scene["windows"].as_array() {
+        for window in windows {
+            if let Some(window_rect) = normalized_json_rect(window, rect) {
+                painter.rect_stroke(
+                    window_rect,
+                    2.0,
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(180, 205, 230, 105),
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
+    if let Some(active) = normalized_json_rect(&scene["active_window"], rect) {
+        painter.rect_stroke(
+            active,
+            2.0,
+            egui::Stroke::new(1.8, egui::Color32::from_rgb(112, 218, 255)),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+fn normalized_json_rect(value: &Value, canvas: egui::Rect) -> Option<egui::Rect> {
+    let values = value.as_array()?;
+    let number = |index: usize| values.get(index)?.as_f64().map(|value| value as f32);
+    let left = number(0)?.clamp(0.0, 1.0);
+    let top = number(1)?.clamp(0.0, 1.0);
+    let right = number(2)?.clamp(left, 1.0);
+    let bottom = number(3)?.clamp(top, 1.0);
+    Some(egui::Rect::from_min_max(
+        egui::pos2(
+            canvas.left() + left * canvas.width(),
+            canvas.top() + top * canvas.height(),
+        ),
+        egui::pos2(
+            canvas.left() + right * canvas.width(),
+            canvas.top() + bottom * canvas.height(),
+        ),
+    ))
+}
+
+fn coarse_hsv_color(hue: f32, saturation: f32, value: f32) -> egui::Color32 {
+    let hue = hue.rem_euclid(1.0) * 6.0;
+    let chroma = value * saturation;
+    let x = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let (red, green, blue) = match hue as u8 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let offset = value - chroma;
+    egui::Color32::from_rgb(
+        ((red + offset).clamp(0.0, 1.0) * 255.0) as u8,
+        ((green + offset).clamp(0.0, 1.0) * 255.0) as u8,
+        ((blue + offset).clamp(0.0, 1.0) * 255.0) as u8,
+    )
 }
 
 fn live_perception_and_decision(ui: &mut egui::Ui, latest: &Value) {
