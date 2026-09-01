@@ -46,7 +46,7 @@ use lifecore::{
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
 use pet_audio::{
     AudioCallbackLevels, AudioEngine, AudioVisualFeedback, BodyVoiceAnalyzer, SelectedOutputConfig,
-    global_body_voice_bridge,
+    default_output_device_name, global_body_voice_bridge,
 };
 use pet_body::{
     BodyMaterialSnapshot, BodyRenderMode, EcologyRenderer, LiquidTuningAcknowledgement,
@@ -390,6 +390,9 @@ struct AudioWorkerChannels {
 const AUDIO_COMMAND_CAPACITY: usize = 32;
 const AUDIO_EVENT_CAPACITY: usize = 64;
 const AUDIO_OWNER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const AUDIO_DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const AUDIO_DEVICE_MISSING_GRACE_CHECKS: u8 = 2;
+const AUDIO_CALLBACK_STALL_GRACE_CHECKS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TimingPercentiles {
@@ -780,6 +783,10 @@ fn audio_owner_loop(commands: Receiver<AudioWorkerCommand>, events: SyncSender<A
     }
 
     let mut pending_unheard = VecDeque::with_capacity(AUDIO_COMMAND_CAPACITY);
+    let mut next_device_check = Instant::now() + AUDIO_DEVICE_CHECK_INTERVAL;
+    let mut missing_device_checks = 0_u8;
+    let mut stalled_callback_checks = 0_u8;
+    let mut callback_count = engine.callback_levels().callback_count;
     loop {
         while let Some(request_id) = engine.poll_started_request() {
             if let Some(index) = pending_unheard
@@ -809,6 +816,73 @@ fn audio_owner_loop(commands: Receiver<AudioWorkerCommand>, events: SyncSender<A
             return;
         }
 
+        if Instant::now() >= next_device_check {
+            next_device_check = Instant::now() + AUDIO_DEVICE_CHECK_INTERVAL;
+            match default_output_device_name() {
+                Ok(default_name) => {
+                    missing_device_checks = 0;
+                    if audio_output_route_changed(engine.device_name(), &default_name) {
+                        engine.clear_visual_feedback();
+                        for (request_id, _) in pending_unheard.drain(..) {
+                            let _ = events.send(AudioWorkerEvent::RequestRejected {
+                                request_id,
+                                error: "audio output changed before the request was heard".into(),
+                            });
+                        }
+                        let _ = events.send(AudioWorkerEvent::RuntimeLost {
+                            error: format!(
+                                "audio output changed from {:?} to {:?}; restarting on the new output",
+                                engine.device_name(),
+                                default_name
+                            ),
+                        });
+                        return;
+                    }
+
+                    let observed_callback_count = engine.callback_levels().callback_count;
+                    if audio_callback_is_stalled(
+                        &mut callback_count,
+                        &mut stalled_callback_checks,
+                        observed_callback_count,
+                    ) {
+                        engine.clear_visual_feedback();
+                        for (request_id, _) in pending_unheard.drain(..) {
+                            let _ = events.send(AudioWorkerEvent::RequestRejected {
+                                request_id,
+                                error: "audio callback stalled before the request was heard".into(),
+                            });
+                        }
+                        let _ = events.send(AudioWorkerEvent::RuntimeLost {
+                            error: format!(
+                                "audio callback stopped on {:?}; restarting the output stream",
+                                engine.device_name()
+                            ),
+                        });
+                        return;
+                    }
+                }
+                Err(error) => {
+                    missing_device_checks = missing_device_checks.saturating_add(1);
+                    if missing_device_checks >= AUDIO_DEVICE_MISSING_GRACE_CHECKS {
+                        engine.clear_visual_feedback();
+                        for (request_id, _) in pending_unheard.drain(..) {
+                            let _ = events.send(AudioWorkerEvent::RequestRejected {
+                                request_id,
+                                error: "audio output disappeared before the request was heard"
+                                    .into(),
+                            });
+                        }
+                        let _ = events.send(AudioWorkerEvent::RuntimeLost {
+                            error: format!(
+                                "default audio output is unavailable ({error}); waiting to reconnect"
+                            ),
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+
         match commands.recv_timeout(AUDIO_OWNER_POLL_INTERVAL) {
             Ok(AudioWorkerCommand::Enqueue {
                 voice,
@@ -832,6 +906,24 @@ fn audio_owner_loop(commands: Receiver<AudioWorkerCommand>, events: SyncSender<A
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+fn audio_output_route_changed(active_name: &str, default_name: &str) -> bool {
+    !active_name.trim().eq_ignore_ascii_case(default_name.trim())
+}
+
+fn audio_callback_is_stalled(
+    previous_count: &mut u64,
+    stalled_checks: &mut u8,
+    observed_count: u64,
+) -> bool {
+    if observed_count == *previous_count {
+        *stalled_checks = stalled_checks.saturating_add(1);
+    } else {
+        *stalled_checks = 0;
+    }
+    *previous_count = observed_count;
+    *stalled_checks >= AUDIO_CALLBACK_STALL_GRACE_CHECKS
 }
 
 fn prepare_state(
@@ -5774,6 +5866,46 @@ mod tests {
         assert!(matches!(
             result,
             AudioWorkerEvent::StartFailed { error } if error == "expected test failure"
+        ));
+    }
+
+    #[test]
+    fn audio_route_watchdog_detects_a_real_endpoint_change_only() {
+        assert!(!audio_output_route_changed(
+            " Headphones (Nothing Headphone (a)) ",
+            "headphones (nothing headphone (a))"
+        ));
+        assert!(audio_output_route_changed(
+            "Headphones (Nothing Headphone (a))",
+            "MO34WQC2 (NVIDIA High Definition Audio)"
+        ));
+    }
+
+    #[test]
+    fn audio_callback_watchdog_recovers_after_progress_and_trips_after_two_misses() {
+        let mut previous = 10;
+        let mut stalled_checks = 0;
+        assert!(!audio_callback_is_stalled(
+            &mut previous,
+            &mut stalled_checks,
+            10
+        ));
+        assert_eq!(stalled_checks, 1);
+        assert!(!audio_callback_is_stalled(
+            &mut previous,
+            &mut stalled_checks,
+            11
+        ));
+        assert_eq!(stalled_checks, 0);
+        assert!(!audio_callback_is_stalled(
+            &mut previous,
+            &mut stalled_checks,
+            11
+        ));
+        assert!(audio_callback_is_stalled(
+            &mut previous,
+            &mut stalled_checks,
+            11
         ));
     }
 
