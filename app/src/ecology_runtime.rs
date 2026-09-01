@@ -8,9 +8,10 @@ use morph_brain::{
 };
 use pet_body::EcologyVisualEffect;
 use pet_ecology::{
-    ActionSignature, ActivityEpisode, ContactSource, EcologyBehaviorFrame, EcologyDecisionTrace,
-    EcologyOutcome, EcologyOutput, EcologyState, EcologyVisualContext, EcologyVocalTrigger,
-    EmbodiedEnvironmentFrame, EpisodeDirector, EpisodeGoal, ExternalContact, MAX_OBJECT_SPEED,
+    ActionSignature, ActivityEpisode, ContactSource, ConventionOutcome, EcologyBehaviorFrame,
+    EcologyDecisionTrace, EcologyOutcome, EcologyOutput, EcologyState, EcologyVisualContext,
+    EcologyVocalTrigger, EmbodiedEnvironmentFrame, EpisodeDirector, EpisodeGoal, ExternalContact,
+    GestureConventionMatch, GestureConventionMeaning, GestureSignature, MAX_OBJECT_SPEED,
     MorselProfile, ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig,
     RhythmSignature, WindowAffordanceFrame, WorldObject, resolve_object_body_contact,
     step_object_with_windows,
@@ -492,6 +493,73 @@ impl EcologyRuntime {
         timestamp: f64,
     ) -> Result<(u64, bool), pet_ecology::EcologyError> {
         self.state.skills.observe(signature, timestamp)
+    }
+
+    #[must_use]
+    pub fn recognize_gesture_convention(
+        &self,
+        signature: &GestureSignature,
+        quality: f32,
+        safety_boundary_or_sleep: bool,
+    ) -> Option<GestureConventionMatch> {
+        self.state
+            .gesture_conventions
+            .recognize(signature, quality, safety_boundary_or_sleep)
+    }
+
+    #[must_use]
+    pub fn nearest_gesture_convention(
+        &self,
+        meaning: GestureConventionMeaning,
+        signature: &GestureSignature,
+    ) -> Option<u64> {
+        self.state
+            .gesture_conventions
+            .nearest_id(meaning, signature)
+    }
+
+    pub fn observe_gesture_convention_success(
+        &mut self,
+        meaning: GestureConventionMeaning,
+        signature: GestureSignature,
+        timestamp: f64,
+        strong_or_explicit: bool,
+        learning_openness: f32,
+    ) -> Result<Option<(u64, bool)>, pet_ecology::EcologyError> {
+        self.state
+            .gesture_conventions
+            .observe_success_with_openness(
+                meaning,
+                signature,
+                timestamp,
+                strong_or_explicit,
+                learning_openness,
+            )
+    }
+
+    pub fn record_gesture_convention_outcome(
+        &mut self,
+        id: u64,
+        outcome: ConventionOutcome,
+        timestamp: f64,
+    ) -> Result<(), pet_ecology::EcologyError> {
+        self.state
+            .gesture_conventions
+            .record_outcome(id, outcome, timestamp)
+    }
+
+    pub fn delete_gesture_convention(&mut self, id: u64) -> bool {
+        self.state.gesture_conventions.delete(id)
+    }
+
+    pub fn clear_gesture_conventions(&mut self) -> bool {
+        self.state.gesture_conventions.clear()
+    }
+
+    pub fn rollback_gesture_conventions(&mut self, version: u32) -> bool {
+        self.state
+            .gesture_conventions
+            .rollback_to_version(u64::from(version))
     }
 
     #[must_use]

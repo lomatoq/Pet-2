@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "Boundary Safety",
+  "preset": "boundary_safety",
+  "simulated_hours": 6.0,
+  "episodes_per_day": 0,
+  "total_episodes": 100,
+  "replicate_count": 1,
+  "seed": 573657340243,
+  "outcome_model": "boundary_validation",
+  "quiet_advance": "exact",
+  "include_saved_gesture_replays": false,
+  "sleep_consolidation": false,
+  "persistent_learning": false,
+  "evolution_policy": "off",
+  "maximum_generations": 0,
+  "checkpoint_interval_hours": 6.0,
+  "persistence": "dry_run"
+}

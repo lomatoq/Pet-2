@@ -89,6 +89,10 @@ pub struct StoragePaths {
     pub liquid_tuning_status: PathBuf,
     pub morph_brain: PathBuf,
     pub ecology_state: PathBuf,
+    pub body_state: PathBuf,
+    pub body_backup: PathBuf,
+    pub interaction_replays: PathBuf,
+    pub evolution_runs: PathBuf,
     pub events: PathBuf,
     pub telemetry: PathBuf,
     pub telemetry_previous: PathBuf,
@@ -114,6 +118,8 @@ pub enum StorageError {
     InvalidPosition,
     #[error("portable state contains an invalid VITA mind")]
     InvalidVitaState,
+    #[error("body state failed semantic validation")]
+    InvalidBodyState,
     #[error("telemetry record is {record_bytes} bytes, exceeding the {max_bytes}-byte log cap")]
     TelemetryRecordTooLarge { record_bytes: u64, max_bytes: u64 },
     #[error(transparent)]
@@ -147,6 +153,10 @@ impl StateStore {
                 liquid_tuning_status: root.join("liquid-tuning-applied.json"),
                 morph_brain: root.join("morph-brain.json"),
                 ecology_state: root.join("ecology-state.json"),
+                body_state: root.join("body-state.json"),
+                body_backup: root.join("backups").join("body-state.previous.json"),
+                interaction_replays: root.join("interaction-replays"),
+                evolution_runs: root.join("evolution-runs"),
                 events: root.join("events.jsonl"),
                 telemetry: root.join("telemetry.jsonl"),
                 telemetry_previous: root.join("telemetry.previous.jsonl"),
@@ -294,6 +304,44 @@ impl StateStore {
                 .join("morph-brain.previous.json"),
             state,
         )
+    }
+
+    pub fn load_body_state<T: DeserializeOwned>(&self) -> Result<Option<T>, StorageError> {
+        self.load_body_state_validated(|_| true)
+    }
+
+    pub fn load_body_state_validated<T: DeserializeOwned>(
+        &self,
+        validate: impl Fn(&T) -> bool,
+    ) -> Result<Option<T>, StorageError> {
+        let load_valid = |path: &Path| -> Result<T, StorageError> {
+            let state = read_json(path)?;
+            if validate(&state) {
+                Ok(state)
+            } else {
+                Err(StorageError::InvalidBodyState)
+            }
+        };
+        if !self.paths.body_state.exists() {
+            return if self.paths.body_backup.exists() {
+                load_valid(&self.paths.body_backup).map(Some)
+            } else {
+                Ok(None)
+            };
+        }
+        match load_valid(&self.paths.body_state) {
+            Ok(state) => Ok(Some(state)),
+            Err(primary_error) if self.paths.body_backup.exists() => {
+                load_valid(&self.paths.body_backup)
+                    .map(Some)
+                    .map_err(|_| primary_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn save_body_state<T: Serialize>(&self, state: &T) -> Result<(), StorageError> {
+        atomic_json(&self.paths.body_state, &self.paths.body_backup, state)
     }
 
     pub fn load_ecology_state(&self) -> Result<Option<EcologyState>, StorageError> {

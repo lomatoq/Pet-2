@@ -29,6 +29,16 @@ impl ExpressionRuntime {
             (&mut self.current.mouth_tension, target.mouth_tension),
             (&mut self.current.cheek_glow, target.cheek_glow),
             (&mut self.current.body_glow, target.body_glow),
+            (&mut self.current.eye_aperture, target.eye_aperture),
+            (&mut self.current.eye_scale, target.eye_scale),
+            (&mut self.current.brow_asymmetry, target.brow_asymmetry),
+            (
+                &mut self.current.mouth_compression,
+                target.mouth_compression,
+            ),
+            (&mut self.current.mouth_asymmetry, target.mouth_asymmetry),
+            (&mut self.current.effort, target.effort),
+            (&mut self.current.relief, target.relief),
         ] {
             *current = smooth(*current, target, response);
         }

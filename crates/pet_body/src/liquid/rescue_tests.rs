@@ -1,5 +1,5 @@
 use glam::Vec2;
-use lifecore::{BodyIntent, Genome, LocomotionMode, PoseIntent};
+use lifecore::{BodyIntent, Genome, InteractionBodyActuation, LocomotionMode, PoseIntent};
 
 use super::*;
 
@@ -47,8 +47,8 @@ fn migrated_runtime(seed: u64) -> (Genome, LiquidMorphRuntime) {
     profile.pbf.pinch_bounce = 1.0;
     let profile = profile
         .sanitized()
-        .expect("v15 fixture must migrate to v16");
-    assert_eq!(profile.schema_version, 16);
+        .expect("v15 fixture must migrate to the current schema");
+    assert_eq!(profile.schema_version, crate::LIQUID_TUNING_SCHEMA_VERSION);
     assert_eq!(profile.pbf.fixed_hz, 120.0);
     assert_eq!(profile.pbf.substeps, 1);
     assert_eq!(profile.pbf.density_iterations, 6);
@@ -56,7 +56,12 @@ fn migrated_runtime(seed: u64) -> (Genome, LiquidMorphRuntime) {
     assert_eq!(profile.pbf.shape_recovery, 0.0);
     assert_eq!(profile.pbf.idle_fragment_size, 0.0);
     let mut runtime = LiquidMorphRuntime::new(seed);
-    runtime.set_tuning(profile.pbf, profile.face, profile.material.variant);
+    runtime.set_tuning(
+        profile.pbf,
+        profile.interaction,
+        profile.face,
+        profile.material.variant,
+    );
     (genome, runtime)
 }
 
@@ -301,7 +306,7 @@ fn stationary_pointer_field_settles_without_jitter_or_step_spikes() {
 }
 
 #[test]
-fn slow_pointer_pull_is_local_and_not_a_rigid_body_fit() {
+fn slow_stretch_raises_strain_without_matching_flick_kinematics() {
     let (genome, mut runtime) = migrated_runtime(0x10CA1);
     settle(&mut runtime, &genome, 2.0);
     let before: Vec<Vec2> = runtime.particles[..runtime.particle_count]
@@ -309,6 +314,8 @@ fn slow_pointer_pull_is_local_and_not_a_rigid_body_fit() {
         .map(|particle| particle.position)
         .collect();
     let feedback = BodyFeedback::default();
+    let mut peak_strain = 0.0_f32;
+    let mut peak_pointer_speed = 0.0_f32;
     for tick in 0..300 {
         let t = tick as f32 / 299.0;
         let local = Vec2::new(
@@ -325,6 +332,9 @@ fn slow_pointer_pull_is_local_and_not_a_rigid_body_fit() {
                 ..DropletMotion::default()
             },
         );
+        let physical = runtime.embodied_interaction_frame();
+        peak_strain = peak_strain.max(physical.material.maximum_strain);
+        peak_pointer_speed = peak_pointer_speed.max(physical.contact.pointer_speed);
     }
     let after: Vec<Vec2> = runtime.particles[..runtime.particle_count]
         .iter()
@@ -346,14 +356,67 @@ fn slow_pointer_pull_is_local_and_not_a_rigid_body_fit() {
     let rigid = rigid_motion_explained(&before, &after);
     assert!(near >= far * 2.0, "near={near} far={far} rigid={rigid}");
     assert!(rigid < 0.85, "rigid fit explained {rigid:.3}");
+    assert!(peak_strain >= 0.10, "peak strain={peak_strain}");
+    assert!(
+        peak_pointer_speed < 1.0,
+        "slow stretch reported flick-like speed={peak_pointer_speed}"
+    );
     assert_eq!(runtime.diagnostics().failsafe_hits, 0);
     assert_eq!(runtime.diagnostics().recovery_count, 0);
 }
 
 #[test]
-fn pointer_tear_releases_and_remerges_without_a_merge_impulse() {
+fn sharp_flick_raises_release_speed_and_slosh_without_fake_hold() {
+    let (genome, mut runtime) = migrated_runtime(0xF11C);
+    settle(&mut runtime, &genome, 2.0);
+    let feedback = BodyFeedback::default();
+    let motion = DropletMotion {
+        world_to_body_scale: Vec2::ONE,
+        ..DropletMotion::default()
+    };
+    let mut peak_slosh = 0.0_f32;
+    let mut peak_speed = 0.0_f32;
+    for tick in 0..18 {
+        let phase = tick as f32 / 17.0;
+        let local = Vec2::new(0.20 + phase * 0.42, -0.01);
+        step(
+            &mut runtime,
+            &genome,
+            &pointer_sensor(local, true),
+            &feedback,
+            motion,
+        );
+        let physical = runtime.embodied_interaction_frame();
+        peak_slosh = peak_slosh.max(physical.material.slosh_energy);
+        peak_speed = peak_speed.max(physical.contact.pointer_speed);
+    }
+    step(
+        &mut runtime,
+        &genome,
+        &pointer_sensor(Vec2::new(0.62, -0.01), false),
+        &feedback,
+        motion,
+    );
+    let released = runtime.embodied_interaction_frame();
+    peak_slosh = peak_slosh.max(released.material.slosh_energy);
+    peak_speed = peak_speed.max(released.contact.pointer_speed);
+
+    assert!(!released.contact.active);
+    assert_eq!(released.contact.contact_seconds, 0.0);
+    assert!(peak_speed >= 1.0, "release speed={peak_speed}");
+    assert!(peak_slosh >= 0.015, "slosh={peak_slosh}");
+    assert_eq!(runtime.diagnostics().recovery_count, 0);
+}
+
+#[test]
+fn mass_is_conserved_before_during_and_after_remerge() {
     let (genome, mut runtime) = migrated_runtime(0x7EA4);
     settle(&mut runtime, &genome, 2.0);
+    let initial_mass_bits = runtime.particles[..runtime.particle_count]
+        .iter()
+        .map(|particle| particle.inverse_mass.max(1.0e-5).recip())
+        .sum::<f32>()
+        .to_bits();
     let feedback = BodyFeedback::default();
     let motion = DropletMotion {
         world_to_body_scale: Vec2::ONE,
@@ -373,6 +436,12 @@ fn pointer_tear_releases_and_remerges_without_a_merge_impulse() {
         );
         let detached = runtime.diagnostics().detached_mass.round() as usize;
         if (8..=16).contains(&detached) {
+            let detached_mass_bits = runtime.particles[..runtime.particle_count]
+                .iter()
+                .map(|particle| particle.inverse_mass.max(1.0e-5).recip())
+                .sum::<f32>()
+                .to_bits();
+            assert_eq!(detached_mass_bits, initial_mass_bits);
             observed_natural_tear = Some(detached);
             release_position = local;
             break;
@@ -418,6 +487,12 @@ fn pointer_tear_releases_and_remerges_without_a_merge_impulse() {
         }
     }
     let diagnostics = runtime.diagnostics();
+    let final_mass_bits = runtime.particles[..runtime.particle_count]
+        .iter()
+        .map(|particle| particle.inverse_mass.max(1.0e-5).recip())
+        .sum::<f32>()
+        .to_bits();
+    assert_eq!(final_mass_bits, initial_mass_bits);
     assert_eq!(diagnostics.component_count, 1, "{diagnostics:?}");
     assert!(
         diagnostics.main_mass >= runtime.particle_count as f32 * 0.95,
@@ -432,6 +507,144 @@ fn pointer_tear_releases_and_remerges_without_a_merge_impulse() {
     assert!(merge_delta_v < 0.08, "merge delta-v={merge_delta_v}");
     assert_eq!(diagnostics.failsafe_hits, 0, "{diagnostics:?}");
     assert_eq!(diagnostics.recovery_count, 0, "{diagnostics:?}");
+}
+
+#[test]
+fn fixed_seed_replays_identical_split_and_remerge_ticks() {
+    fn replay() -> (u32, u32) {
+        let (genome, mut runtime) = migrated_runtime(0x7EA4);
+        settle(&mut runtime, &genome, 2.0);
+        let feedback = BodyFeedback::default();
+        let motion = DropletMotion {
+            world_to_body_scale: Vec2::ONE,
+            ..DropletMotion::default()
+        };
+        let mut split_tick = None;
+        let mut release_position = Vec2::new(0.82, 0.03);
+        for tick in 0..420_u32 {
+            let phase = tick as f32 / 419.0;
+            let local = Vec2::new(0.24 + phase * 0.58, 0.03);
+            step(
+                &mut runtime,
+                &genome,
+                &pointer_sensor(local, true),
+                &feedback,
+                motion,
+            );
+            if runtime
+                .embodied_interaction_frame()
+                .detached_event
+                .is_some()
+            {
+                split_tick = Some(tick);
+                release_position = local;
+                break;
+            }
+        }
+        let split_tick = split_tick.expect("fixed seed did not split");
+        let released = pointer_sensor(release_position, false);
+        let mut merge_tick = None;
+        for tick in 0..600_u32 {
+            step(&mut runtime, &genome, &released, &feedback, motion);
+            if runtime.embodied_interaction_frame().remerge_event.is_some() {
+                merge_tick = Some(split_tick + 1 + tick);
+                break;
+            }
+        }
+        (split_tick, merge_tick.expect("fixed seed did not remerge"))
+    }
+
+    let first = replay();
+    let second = replay();
+    assert_eq!(first, second);
+    assert!(first.1 > first.0);
+}
+
+#[test]
+fn voluntary_separation_uses_real_production_particles_under_the_hard_guard() {
+    let (genome, mut runtime) = migrated_runtime(0x7EA4);
+    let mut production = runtime.tuning;
+    production.surface_tension = 2.5;
+    production.grab_stiffness = 390.0;
+    production.pointer_support_scale = 2.4;
+    production.pointer_response_hz = 35.0;
+    production.return_strength = 0.05;
+    production.character_field_radius_scale = 1.17;
+    runtime.set_tuning(
+        production,
+        runtime.interaction_tuning,
+        FaceTuning::default(),
+        MaterialVariant::CinematicJelly,
+    );
+    settle(&mut runtime, &genome, 2.0);
+    let feedback = BodyFeedback::default();
+    let motion = DropletMotion {
+        world_to_body_scale: Vec2::ONE,
+        ..DropletMotion::default()
+    };
+    let mut maximum_detached = 0.0_f32;
+    let mut maximum_strain = 0.0_f32;
+    let mut maximum_radius = 0.0_f32;
+    let mut maximum_predicted_detached = 0.0_f32;
+    let mut budget_rejections = 0_u32;
+    let mut maximum_predicted_components = 0_usize;
+    let mut minimum_predicted_fragment = usize::MAX;
+    let mut release_position = Vec2::new(0.82, 0.03);
+    for tick in 0..420 {
+        let phase = tick as f32 / 419.0;
+        let mut sensors = pointer_sensor(Vec2::new(0.24 + phase * 0.58, 0.03), true);
+        sensors.interaction_actuation = InteractionBodyActuation {
+            compliance_delta: 0.25,
+            cohesion_delta: -0.25,
+            cooperation: 1.0,
+            allow_intentional_bud: true,
+            ..InteractionBodyActuation::default()
+        };
+        step(&mut runtime, &genome, &sensors, &feedback, motion);
+        maximum_detached = maximum_detached.max(
+            runtime
+                .embodied_interaction_frame()
+                .material
+                .detached_mass_fraction,
+        );
+        maximum_strain =
+            maximum_strain.max(runtime.embodied_interaction_frame().material.maximum_strain);
+        maximum_radius = maximum_radius.max(
+            runtime.particles[..runtime.particle_count]
+                .iter()
+                .map(|particle| particle.position.distance(runtime.components.main_com))
+                .fold(0.0, f32::max),
+        );
+        maximum_predicted_detached =
+            maximum_predicted_detached.max(runtime.topology_decision.detached_mass_fraction);
+        budget_rejections += u32::from(runtime.topology_decision.budget_exhausted);
+        maximum_predicted_components =
+            maximum_predicted_components.max(runtime.topology_decision.predicted_component_count);
+        minimum_predicted_fragment =
+            minimum_predicted_fragment.min(runtime.topology_decision.minimum_fragment_particles);
+        if maximum_detached > 0.0 {
+            release_position = Vec2::new(0.24 + phase * 0.58, 0.03);
+            break;
+        }
+    }
+    assert!(
+        maximum_detached > 0.0,
+        "detached={maximum_detached} predicted={maximum_predicted_detached} components={maximum_predicted_components} min_fragment={minimum_predicted_fragment} rejects={budget_rejections} strain={maximum_strain} radius={maximum_radius} diagnostics={:?}",
+        runtime.diagnostics()
+    );
+    assert!(maximum_detached <= runtime.interaction_tuning.maximum_detached_mass_fraction + 1.0e-5);
+    let released = pointer_sensor(release_position, false);
+    let mut saw_remerge = false;
+    for _ in 0..1_320 {
+        step(&mut runtime, &genome, &released, &feedback, motion);
+        saw_remerge |= runtime.embodied_interaction_frame().remerge_event.is_some();
+        if saw_remerge && runtime.diagnostics().component_count == 1 {
+            break;
+        }
+    }
+    assert!(saw_remerge);
+    assert_eq!(runtime.diagnostics().component_count, 1);
+    assert_eq!(runtime.diagnostics().recovery_count, 0);
 }
 
 #[test]

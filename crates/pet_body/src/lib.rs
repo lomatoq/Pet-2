@@ -26,8 +26,11 @@ pub use embodiment::{EmbodiedPose, EmbodiedRuntime, GazeMode, VoiceVisualState};
 pub use expression::ExpressionRuntime;
 pub use graph::{BodyGraph, BodyNode, BodyPart};
 pub use liquid::{
+    BODY_MATERIAL_SNAPSHOT_SCHEMA_VERSION, BodyMaterialSnapshot, BodySnapshotError,
     BubbleRenderState, LiquidDiagnostics, LiquidMorphRuntime, LiquidRenderState,
-    MAX_IDLE_FRAGMENTS, MAX_PARTICLES, ParticleRenderState,
+    MAX_IDLE_FRAGMENTS, MAX_PARTICLES, ParticleRenderState, SavedComponentLifecycle,
+    SavedLiquidParticle, SavedTrackedComponent, SavedViscoelasticBond,
+    liquid_structural_tuning_hash,
 };
 pub use locomotion::BodySimulation;
 pub use mesh::{MeshError, MeshVertex, ProceduralMesh, ProjectedHitShape};
@@ -40,15 +43,16 @@ pub use renderer::{
     ReviewBackground,
 };
 pub use tuning::{
-    AnalyticTuning, BodyRenderMode, CompositorTuning, DropletTuning, FaceTuning,
+    AnalyticTuning, BodyRenderMode, CompositorTuning, DropletTuning, FaceTuning, InteractionTuning,
     LIQUID_TUNING_SCHEMA_VERSION, LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialTuning,
-    MaterialVariant, PbfTuning, TuningProfileError,
+    MaterialVariant, PbfTuning, TopologyConstraintMode, TuningProfileError,
 };
 pub use visual_traits::DerivedVisualTraits;
 
 use glam::{Vec2, Vec3};
 use lifecore::{
-    AffectState, BodyFeedback, BodyGenome, BodyIntent, Genome, PoseIntent, SensorFrame,
+    AffectState, BodyFeedback, BodyGenome, BodyIntent, EmbodiedInteractionFrame, Genome,
+    PoseIntent, SensorFrame,
 };
 use pet_ecology::EmbodiedEnvironmentFrame;
 
@@ -180,6 +184,31 @@ impl ProceduralBody {
 
     pub fn set_embodied_environment(&mut self, environment: &EmbodiedEnvironmentFrame) {
         self.embodiment.liquid.set_embodied_environment(environment);
+    }
+
+    #[must_use]
+    pub fn embodied_interaction_frame(&self) -> EmbodiedInteractionFrame {
+        self.embodiment.liquid.embodied_interaction_frame()
+    }
+
+    #[must_use]
+    pub fn body_material_snapshot(&self) -> BodyMaterialSnapshot {
+        self.embodiment.liquid.body_material_snapshot(
+            self.tuning.seed,
+            self.tuning.schema_version,
+            self.tuning.profile_revision,
+        )
+    }
+
+    pub fn restore_body_material_snapshot(
+        &mut self,
+        snapshot: &BodyMaterialSnapshot,
+    ) -> Result<(), BodySnapshotError> {
+        self.embodiment.liquid.restore_body_material_snapshot(
+            snapshot,
+            self.tuning.seed,
+            self.tuning.schema_version,
+        )
     }
 
     pub fn set_ecology_visual_effect(&mut self, effect: EcologyVisualEffect) {
@@ -316,9 +345,12 @@ impl ProceduralBody {
         self.visual_traits = traits;
         self.embodiment.droplets.set_tuning(profile.droplets);
         self.embodiment.modal_dynamics.set_tuning(profile.analytic);
-        self.embodiment
-            .liquid
-            .set_tuning(profile.pbf, profile.face, profile.material.variant);
+        self.embodiment.liquid.set_tuning(
+            profile.pbf,
+            profile.interaction,
+            profile.face,
+            profile.material.variant,
+        );
         self.tuning = profile;
         Ok(())
     }
@@ -564,7 +596,8 @@ impl ProceduralBody {
                 BODY_LAB_EYE_SIZE
             } else {
                 genome.body.eye_size
-            } * profile.face.eye_size_scale,
+            } * profile.face.eye_size_scale
+                * pose.eye_scale.clamp(0.88, 1.18),
             eye_spacing: if cinematic {
                 BODY_LAB_EYE_SPACING
             } else {

@@ -31,6 +31,16 @@ before/after genome checkpoints and their lifetime snapshots from validated
 telemetry frame's mutation count/generation so replay never leaks a future
 mutation into the past.
 
+The `Accelerated Learning` panel is a separate, explicit workflow from that
+read-only rewind. It writes a typed schema-1 config, launches `pet2` as a
+separate headless process, and reports the exact 120/60/20/5 Hz clock mode,
+episode/gesture distribution, bounded learning updates, consolidations,
+eligibility, invariant failures, performance, and state hashes. The default is
+`Dry run`; `Fork` keeps accepted state under `evolution-runs`, and promotion is
+enabled only for a parsed report whose invariants passed. Promotion first makes
+a complete recovery backup, and `Rollback` restores that backup. Synthetic
+curricula never modify the user gesture-convention library.
+
 New telemetry groups contain normalized or
 aggregate state, not pixels, typed text, raw audio, or native window IDs.
 

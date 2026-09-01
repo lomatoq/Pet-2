@@ -4,13 +4,16 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use desktop_host::{
-    LAB_CONTROL_SCHEMA_VERSION, LabControlCommand, LabControlEnvelope, LabDrive, StateStore,
+    EVOLUTION_CONFIG_SCHEMA_VERSION, EvolutionConfig, EvolutionOutcomeModel, EvolutionPersistence,
+    EvolutionPolicy, EvolutionPreset, EvolutionRunReport, LAB_CONTROL_SCHEMA_VERSION,
+    LabControlCommand, LabControlEnvelope, LabDrive, LabGesture, PortablePetState,
+    QuietAdvanceMode, StateStore,
 };
 use egui::{CollapsingHeader, Context, DragValue, Sense, Slider};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor, wgpu};
@@ -21,12 +24,15 @@ use lifecore::{
     LocomotionMode, PoseIntent, SensorFrame, VocalRequest, apply_emotion_to_expression,
     generate_initial_motifs,
 };
+use morph_brain::MorphBrainState;
 use pet_audio::AudioEngine;
 use pet_body::{
-    BodyRenderMode, DebugView, LiquidDiagnostics, LiquidTuningAcknowledgement, LiquidTuningProfile,
-    MaterialVariant, ProceduralBody, RenderOutcome, Renderer, ReviewBackground, VisualMindInput,
+    BodyMaterialSnapshot, BodyRenderMode, DebugView, LiquidDiagnostics,
+    LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant, ProceduralBody,
+    RenderOutcome, Renderer, ReviewBackground, TopologyConstraintMode, VisualMindInput,
     VoiceVisualState,
 };
+use pet_ecology::EcologyState;
 use serde_json::Value;
 use winit::{
     application::ApplicationHandler,
@@ -171,11 +177,58 @@ struct LivePetMonitor {
     control_status: String,
     evolution_scrub: EvolutionScrubState,
     canonical_evolution: CanonicalEvolutionCache,
+    accelerated_learning: AcceleratedLearningState,
     last_state_poll: Instant,
     state_file_signature: Option<(SystemTime, u64)>,
     status: String,
     last_poll: Instant,
     last_received: Option<Instant>,
+}
+
+struct AcceleratedLearningState {
+    preset: EvolutionPreset,
+    simulated_hours: f64,
+    episodes_per_day: u32,
+    replicate_count: u32,
+    seed: u64,
+    outcome_model: EvolutionOutcomeModel,
+    include_saved_replays: bool,
+    sleep_consolidation: bool,
+    evolution_policy: EvolutionPolicy,
+    maximum_generations: u32,
+    checkpoint_interval_hours: f64,
+    persistence: EvolutionPersistence,
+    child: Option<Child>,
+    started_at: Option<Instant>,
+    report_path: Option<PathBuf>,
+    report: Option<EvolutionRunReport>,
+    last_promotion_backup: Option<PathBuf>,
+    status: String,
+}
+
+impl Default for AcceleratedLearningState {
+    fn default() -> Self {
+        Self {
+            preset: EvolutionPreset::OneDayDiagnostic,
+            simulated_hours: 24.0,
+            episodes_per_day: 48,
+            replicate_count: 4,
+            seed: 573_657_340_241,
+            outcome_model: EvolutionOutcomeModel::MixedRealistic,
+            include_saved_replays: false,
+            sleep_consolidation: true,
+            evolution_policy: EvolutionPolicy::Off,
+            maximum_generations: 0,
+            checkpoint_interval_hours: 24.0,
+            persistence: EvolutionPersistence::DryRun,
+            child: None,
+            started_at: None,
+            report_path: None,
+            report: None,
+            last_promotion_backup: None,
+            status: "No accelerated run started from this Body Lab session.".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1218,6 +1271,7 @@ impl LivePetMonitor {
             control_status: "No intervention sent from this Body Lab session.".into(),
             evolution_scrub: EvolutionScrubState::default(),
             canonical_evolution: CanonicalEvolutionCache::default(),
+            accelerated_learning: AcceleratedLearningState::default(),
             last_state_poll: Instant::now() - Duration::from_secs(2),
             state_file_signature: None,
             status: format!("Waiting for {}", store.paths.telemetry.display()),
@@ -1230,6 +1284,7 @@ impl LivePetMonitor {
         self.advance_playback();
         self.expire_pending_control();
         self.poll_canonical_evolution();
+        self.accelerated_learning.poll();
         if self.last_poll.elapsed() < Duration::from_millis(80) {
             return;
         }
@@ -1571,6 +1626,415 @@ impl LivePetMonitor {
     }
 }
 
+impl AcceleratedLearningState {
+    fn apply_preset(&mut self, preset: EvolutionPreset) {
+        self.preset = preset;
+        match preset {
+            EvolutionPreset::OneDayDiagnostic => {
+                self.simulated_hours = 24.0;
+                self.episodes_per_day = 48;
+                self.replicate_count = 4;
+                self.outcome_model = EvolutionOutcomeModel::MixedRealistic;
+                self.sleep_consolidation = true;
+                self.evolution_policy = EvolutionPolicy::Off;
+                self.maximum_generations = 0;
+                self.checkpoint_interval_hours = 24.0;
+                self.persistence = EvolutionPersistence::DryRun;
+            }
+            EvolutionPreset::SevenDaySocialization => {
+                self.simulated_hours = 168.0;
+                self.episodes_per_day = 36;
+                self.replicate_count = 4;
+                self.outcome_model = EvolutionOutcomeModel::RespectfulSupportive;
+                self.sleep_consolidation = true;
+                self.evolution_policy = EvolutionPolicy::EligibleMaxOne;
+                self.maximum_generations = 1;
+                self.checkpoint_interval_hours = 24.0;
+                self.persistence = EvolutionPersistence::Fork;
+            }
+            EvolutionPreset::BoundarySafety => {
+                self.simulated_hours = 6.0;
+                self.episodes_per_day = 0;
+                self.replicate_count = 1;
+                self.outcome_model = EvolutionOutcomeModel::BoundaryValidation;
+                self.sleep_consolidation = false;
+                self.evolution_policy = EvolutionPolicy::Off;
+                self.maximum_generations = 0;
+                self.checkpoint_interval_hours = 6.0;
+                self.persistence = EvolutionPersistence::DryRun;
+            }
+            EvolutionPreset::ThirtyDayPersonality => {
+                self.simulated_hours = 720.0;
+                self.episodes_per_day = 30;
+                self.replicate_count = 8;
+                self.outcome_model = EvolutionOutcomeModel::MixedRealistic;
+                self.sleep_consolidation = true;
+                // Standard Body Lab automation remains max-one. A second
+                // generation requires a newly validated run and explicit
+                // promotion instead of chained mutations.
+                self.evolution_policy = EvolutionPolicy::EligibleMaxOne;
+                self.maximum_generations = 1;
+                self.checkpoint_interval_hours = 24.0;
+                self.persistence = EvolutionPersistence::Fork;
+            }
+            EvolutionPreset::Custom => {}
+        }
+    }
+
+    fn config(&self) -> EvolutionConfig {
+        EvolutionConfig {
+            schema_version: EVOLUTION_CONFIG_SCHEMA_VERSION,
+            name: evolution_preset_label(self.preset).to_owned(),
+            preset: self.preset,
+            simulated_hours: self.simulated_hours,
+            episodes_per_day: self.episodes_per_day,
+            total_episodes: (self.preset == EvolutionPreset::BoundarySafety).then_some(100),
+            replicate_count: self.replicate_count,
+            seed: self.seed,
+            outcome_model: self.outcome_model,
+            quiet_advance: QuietAdvanceMode::Exact,
+            include_saved_gesture_replays: self.include_saved_replays,
+            sleep_consolidation: self.sleep_consolidation,
+            persistent_learning: self.preset != EvolutionPreset::BoundarySafety,
+            evolution_policy: self.evolution_policy,
+            maximum_generations: self.maximum_generations,
+            checkpoint_interval_hours: self.checkpoint_interval_hours,
+            persistence: self.persistence,
+        }
+    }
+
+    fn start(&mut self, store: &StateStore) {
+        if self.child.is_some() {
+            self.status = "An accelerated runner process is already active.".to_owned();
+            return;
+        }
+        let config = self.config();
+        if let Err(error) = config.validate() {
+            self.status = format!("Evolution config rejected: {error}");
+            return;
+        }
+        let run_id = format!("body-lab-{}-{}", unix_time_ms(), config.seed);
+        let run_directory = store.paths.evolution_runs.join(run_id);
+        let config_path = run_directory.join("config.json");
+        let report_path = run_directory.join("report.json");
+        let log_path = run_directory.join("runner.log");
+        if let Err(error) = fs::create_dir_all(&run_directory) {
+            self.status = format!("Cannot create evolution run directory: {error}");
+            return;
+        }
+        if let Err(error) = write_pretty_json(&config_path, &config) {
+            self.status = error;
+            return;
+        }
+        let current_exe = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Cannot locate Body Lab executable: {error}");
+                return;
+            }
+        };
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let executable = match resolve_pet_executable(&current_exe, &workspace_root) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let log = match File::create(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.status = format!("Cannot create runner log: {error}");
+                return;
+            }
+        };
+        let stderr = match log.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                self.status = format!("Cannot duplicate runner log handle: {error}");
+                return;
+            }
+        };
+        let mut command = Command::new(&executable);
+        command
+            .arg("--headless")
+            .arg("--evolution-config")
+            .arg(&config_path)
+            .arg("--evolution-report")
+            .arg(&report_path)
+            .arg("--evolution-persist")
+            .arg(evolution_persistence_cli(config.persistence))
+            .arg("--evolution-max-generations")
+            .arg(config.maximum_generations.to_string())
+            .arg("--no-audio")
+            .arg("--data-dir")
+            .arg(&store.paths.root)
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr));
+        if let Some(parent) = executable.parent() {
+            command.current_dir(parent);
+        }
+        match command.spawn() {
+            Ok(child) => {
+                self.child = Some(child);
+                self.started_at = Some(Instant::now());
+                self.report_path = Some(report_path.clone());
+                self.report = None;
+                self.status = format!(
+                    "Runner started as a separate process · report {}",
+                    report_path.display()
+                );
+            }
+            Err(error) => self.status = format!("Cannot start evolution runner: {error}"),
+        }
+    }
+
+    fn poll(&mut self) {
+        let exit = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(exit) => exit,
+                Err(error) => {
+                    self.status = format!("Runner status check failed: {error}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let Some(exit) = exit else {
+            return;
+        };
+        self.child = None;
+        let elapsed = self
+            .started_at
+            .take()
+            .map_or(0.0, |at| at.elapsed().as_secs_f32());
+        let report = self
+            .report_path
+            .as_deref()
+            .and_then(|path| File::open(path).ok())
+            .and_then(|file| serde_json::from_reader::<_, EvolutionRunReport>(file).ok());
+        self.report = report;
+        self.status = match &self.report {
+            Some(report) => format!(
+                "Runner exited {} after {:.1} s · {} · {} episode(s)",
+                exit, elapsed, report.status, report.completed_episodes
+            ),
+            None => format!(
+                "Runner exited {} after {:.1} s without a readable report; inspect runner.log.",
+                exit, elapsed
+            ),
+        };
+    }
+
+    fn cancel(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            self.status = "No active accelerated runner to cancel.".to_owned();
+            return;
+        };
+        match child.kill().and_then(|_| child.wait()) {
+            Ok(exit) => self.status = format!("Runner cancelled; process exited {exit}."),
+            Err(error) => self.status = format!("Could not cancel runner: {error}"),
+        }
+        self.started_at = None;
+    }
+
+    fn open_report(&mut self) {
+        let Some(path) = self.report_path.as_ref().filter(|path| path.is_file()) else {
+            self.status = "No evolution report is available to open.".to_owned();
+            return;
+        };
+        match Command::new("explorer.exe").arg(path).spawn() {
+            Ok(_) => self.status = format!("Opened {}", path.display()),
+            Err(error) => self.status = format!("Could not open report: {error}"),
+        }
+    }
+
+    fn promote(&mut self, store: &StateStore) {
+        let Some(report) = self.report.as_ref() else {
+            self.status = "Promotion blocked: no parsed report.".to_owned();
+            return;
+        };
+        if !report.invariants.passed || !report.status.starts_with("completed") {
+            self.status =
+                "Promotion blocked: report did not pass acceptance invariants.".to_owned();
+            return;
+        }
+        let Some(path) = report.persisted_state.as_deref().map(PathBuf::from) else {
+            self.status = "Promotion blocked: this run did not create a fork.".to_owned();
+            return;
+        };
+        match promote_validated_fork(store, &path, report.final_life_state_hash) {
+            Ok(backup) => {
+                self.last_promotion_backup = Some(backup.clone());
+                self.status = format!(
+                    "Validated fork promoted. Recovery backup: {}",
+                    backup.display()
+                );
+            }
+            Err(error) => self.status = format!("Promotion failed without accepting fork: {error}"),
+        }
+    }
+
+    fn rollback(&mut self, store: &StateStore) {
+        let Some(backup) = self.last_promotion_backup.clone() else {
+            self.status = "No promotion backup from this Body Lab session.".to_owned();
+            return;
+        };
+        match restore_bundle(store, &StateStore::at(&backup), true) {
+            Ok(()) => self.status = format!("Rolled back from {}", backup.display()),
+            Err(error) => self.status = format!("Rollback failed: {error}"),
+        }
+    }
+}
+
+fn evolution_preset_label(preset: EvolutionPreset) -> &'static str {
+    match preset {
+        EvolutionPreset::OneDayDiagnostic => "One Day Diagnostic",
+        EvolutionPreset::SevenDaySocialization => "Seven Day Socialization",
+        EvolutionPreset::ThirtyDayPersonality => "Thirty Day Personality",
+        EvolutionPreset::BoundarySafety => "Boundary Safety",
+        EvolutionPreset::Custom => "Custom",
+    }
+}
+
+fn evolution_outcome_label(model: EvolutionOutcomeModel) -> &'static str {
+    match model {
+        EvolutionOutcomeModel::RespectfulSupportive => "Respectful supportive",
+        EvolutionOutcomeModel::MixedRealistic => "Mixed realistic",
+        EvolutionOutcomeModel::QuietUser => "Quiet user",
+        EvolutionOutcomeModel::BoundaryValidation => "Boundary validation",
+    }
+}
+
+fn evolution_persistence_cli(persistence: EvolutionPersistence) -> &'static str {
+    match persistence {
+        EvolutionPersistence::DryRun => "dry-run",
+        EvolutionPersistence::Fork => "fork",
+        EvolutionPersistence::SaveFinal => "save-final",
+    }
+}
+
+fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let mut file =
+        File::create(path).map_err(|error| format!("Cannot create {}: {error}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, value)
+        .map_err(|error| format!("Cannot serialize {}: {error}", path.display()))?;
+    file.write_all(b"\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("Cannot finish {}: {error}", path.display()))
+}
+
+struct PromotionBundle {
+    portable: PortablePetState,
+    tuning: LiquidTuningProfile,
+    morph: MorphBrainState,
+    ecology: EcologyState,
+    body: BodyMaterialSnapshot,
+}
+
+fn load_promotion_bundle(store: &StateStore) -> Result<PromotionBundle, String> {
+    let portable = store
+        .load_state()
+        .map_err(|error| error.to_string())?
+        .ok_or("fork state.json is missing")?;
+    let morph = store
+        .load_morph_brain::<MorphBrainState>()
+        .map_err(|error| error.to_string())?
+        .filter(MorphBrainState::is_valid)
+        .ok_or("fork morph-brain.json is missing or invalid")?;
+    let ecology = store
+        .load_ecology_state()
+        .map_err(|error| error.to_string())?
+        .ok_or("fork ecology-state.json is missing")?;
+    let tuning = store
+        .load_liquid_tuning::<LiquidTuningProfile>()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| LiquidTuningProfile::for_seed(portable.life.state.genome.identity_seed))
+        .sanitized()
+        .map_err(|error| error.to_string())?;
+    let body = store
+        .load_body_state_validated(|snapshot: &BodyMaterialSnapshot| {
+            snapshot
+                .validate(
+                    portable.life.state.genome.identity_seed,
+                    tuning.schema_version,
+                    tuning.pbf,
+                )
+                .is_ok()
+        })
+        .map_err(|error| error.to_string())?
+        .ok_or("fork body-state.json is missing or invalid")?;
+    Ok(PromotionBundle {
+        portable,
+        tuning,
+        morph,
+        ecology,
+        body,
+    })
+}
+
+fn save_promotion_bundle(store: &StateStore, bundle: &PromotionBundle) -> Result<(), String> {
+    store
+        .save_state(&bundle.portable)
+        .and_then(|_| store.save_liquid_tuning(&bundle.tuning))
+        .and_then(|_| store.save_morph_brain(&bundle.morph))
+        .and_then(|_| store.save_ecology_state(&bundle.ecology))
+        .and_then(|_| store.save_body_state(&bundle.body))
+        .map_err(|error| error.to_string())
+}
+
+fn restore_bundle(
+    destination: &StateStore,
+    source: &StateStore,
+    require_complete: bool,
+) -> Result<(), String> {
+    let bundle = load_promotion_bundle(source)?;
+    if require_complete {
+        bundle
+            .portable
+            .validate()
+            .map_err(|error| error.to_string())?;
+    }
+    save_promotion_bundle(destination, &bundle)
+}
+
+fn promote_validated_fork(
+    live: &StateStore,
+    fork_path: &Path,
+    report_hash: u64,
+) -> Result<PathBuf, String> {
+    let runs_root = fs::canonicalize(&live.paths.evolution_runs)
+        .map_err(|error| format!("cannot resolve evolution-runs root: {error}"))?;
+    let fork_path =
+        fs::canonicalize(fork_path).map_err(|error| format!("cannot resolve fork: {error}"))?;
+    if !fork_path.starts_with(&runs_root) {
+        return Err("fork is outside this Pet's bounded evolution-runs directory".to_owned());
+    }
+    let fork = StateStore::at(&fork_path);
+    let incoming = load_promotion_bundle(&fork)?;
+    let incoming_hash = lifecore::stable_hash_bytes(
+        &serde_json::to_vec(&incoming.portable.life).map_err(|error| error.to_string())?,
+    );
+    if incoming_hash != report_hash {
+        return Err("fork Life snapshot hash does not match the validated report".to_owned());
+    }
+    let current = load_promotion_bundle(live)?;
+    let backup_path = live
+        .paths
+        .evolution_runs
+        .join("promotion-backups")
+        .join(format!("{}-{report_hash:016x}", unix_time_ms()));
+    let backup = StateStore::at(&backup_path);
+    save_promotion_bundle(&backup, &current)?;
+    if let Err(error) = save_promotion_bundle(live, &incoming) {
+        let _ = save_promotion_bundle(live, &current);
+        return Err(format!(
+            "commit failed and recovery backup was restored: {error}"
+        ));
+    }
+    Ok(backup_path)
+}
+
 fn telemetry_read_is_live(stream_was_bootstrapped: bool, received: usize) -> bool {
     stream_was_bootstrapped && received > 0
 }
@@ -1605,7 +2069,15 @@ fn build_lab_control_envelope(
         } => ((*duration_seconds * 1_000.0).ceil() as u32).saturating_add(2_000),
         LabControlCommand::Reward { .. }
         | LabControlCommand::FocusMode { .. }
-        | LabControlCommand::ClearDrivePulses => 5_000,
+        | LabControlCommand::ClearDrivePulses
+        | LabControlCommand::DeleteGestureConvention { .. }
+        | LabControlCommand::RollbackGestureConventions { .. }
+        | LabControlCommand::ClearGestureConventions => 5_000,
+        LabControlCommand::StimulatePointerGesture {
+            duration_seconds, ..
+        } => ((*duration_seconds * 1_000.0) as u32)
+            .saturating_add(2_000)
+            .clamp(2_100, 30_000),
     }
     .clamp(1_000, 30_000);
     LabControlEnvelope {
@@ -1630,6 +2102,18 @@ fn lab_control_description(command: &LabControlCommand) -> String {
             format!("focus mode {}", if *enabled { "on" } else { "off" })
         }
         LabControlCommand::ClearDrivePulses => "clear temporary drive pulses".into(),
+        LabControlCommand::StimulatePointerGesture {
+            gesture,
+            intensity,
+            duration_seconds,
+        } => format!("fixture {gesture:?}, intensity {intensity:.2}, {duration_seconds:.2} s"),
+        LabControlCommand::DeleteGestureConvention { convention_id } => {
+            format!("delete gesture convention {convention_id}")
+        }
+        LabControlCommand::RollbackGestureConventions { version } => {
+            format!("rollback gesture conventions to version {version}")
+        }
+        LabControlCommand::ClearGestureConventions => "clear gesture conventions".into(),
     }
 }
 
@@ -1737,6 +2221,8 @@ fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
             ui.separator();
             live_controlled_intervention(ui, monitor);
             ui.separator();
+            accelerated_learning_panel(ui, monitor);
+            ui.separator();
 
             let stale_seconds = monitor.stale_seconds();
             let selected_frame = monitor.selected;
@@ -1799,6 +2285,228 @@ fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
                     live_learning_memory_social(ui, latest);
                     live_raw_json(ui, latest);
                 });
+        });
+}
+
+fn accelerated_learning_panel(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
+    let store = monitor.control_store.clone();
+    let state = &mut monitor.accelerated_learning;
+    CollapsingHeader::new("Accelerated Learning")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.small(
+                "Deterministic multi-rate curriculum · runner is a separate process · synthetic experience never writes user conventions.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Preset:");
+                for preset in [
+                    EvolutionPreset::OneDayDiagnostic,
+                    EvolutionPreset::SevenDaySocialization,
+                    EvolutionPreset::BoundarySafety,
+                    EvolutionPreset::ThirtyDayPersonality,
+                    EvolutionPreset::Custom,
+                ] {
+                    if ui
+                        .selectable_label(state.preset == preset, evolution_preset_label(preset))
+                        .clicked()
+                    {
+                        state.apply_preset(preset);
+                    }
+                }
+            });
+            egui::Grid::new("accelerated_learning_fields")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Simulated hours / days");
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(DragValue::new(&mut state.simulated_hours).range(0.01..=720.0))
+                            .changed()
+                        {
+                            state.preset = EvolutionPreset::Custom;
+                        }
+                        ui.small(format!("{:.2} d", state.simulated_hours / 24.0));
+                    });
+                    ui.end_row();
+                    ui.label("Episodes per day");
+                    if ui
+                        .add(DragValue::new(&mut state.episodes_per_day).range(0..=100))
+                        .changed()
+                    {
+                        state.preset = EvolutionPreset::Custom;
+                    }
+                    ui.end_row();
+                    ui.label("Seed count / replicates");
+                    ui.add(DragValue::new(&mut state.replicate_count).range(1..=8));
+                    ui.end_row();
+                    ui.label("Base seed");
+                    ui.add(DragValue::new(&mut state.seed).speed(1.0));
+                    ui.end_row();
+                    ui.label("Outcome model");
+                    egui::ComboBox::from_id_salt("evolution_outcome_model")
+                        .selected_text(evolution_outcome_label(state.outcome_model))
+                        .show_ui(ui, |ui| {
+                            for model in [
+                                EvolutionOutcomeModel::RespectfulSupportive,
+                                EvolutionOutcomeModel::MixedRealistic,
+                                EvolutionOutcomeModel::QuietUser,
+                                EvolutionOutcomeModel::BoundaryValidation,
+                            ] {
+                                ui.selectable_value(
+                                    &mut state.outcome_model,
+                                    model,
+                                    evolution_outcome_label(model),
+                                );
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Saved gesture replays");
+                    ui.checkbox(&mut state.include_saved_replays, "Include explicit captures");
+                    ui.end_row();
+                    ui.label("Sleep consolidation");
+                    ui.checkbox(&mut state.sleep_consolidation, "Enabled");
+                    ui.end_row();
+                    ui.label("Evolution policy");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut state.evolution_policy, EvolutionPolicy::Off, "Off");
+                        ui.selectable_value(
+                            &mut state.evolution_policy,
+                            EvolutionPolicy::EligibleMaxOne,
+                            "Eligible, max 1",
+                        );
+                    });
+                    ui.end_row();
+                    ui.label("Max generations");
+                    ui.add(DragValue::new(&mut state.maximum_generations).range(0..=1));
+                    ui.end_row();
+                    ui.label("Checkpoint interval (h)");
+                    ui.add(
+                        DragValue::new(&mut state.checkpoint_interval_hours).range(1.0..=168.0),
+                    );
+                    ui.end_row();
+                    ui.label("Persistence");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut state.persistence,
+                            EvolutionPersistence::DryRun,
+                            "Dry run",
+                        );
+                        ui.selectable_value(
+                            &mut state.persistence,
+                            EvolutionPersistence::Fork,
+                            "Fork",
+                        );
+                        ui.selectable_value(
+                            &mut state.persistence,
+                            EvolutionPersistence::SaveFinal,
+                            "Save final",
+                        );
+                    });
+                    ui.end_row();
+                });
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(state.child.is_none(), egui::Button::new("Start"))
+                    .clicked()
+                {
+                    state.start(&store);
+                }
+                if ui
+                    .add_enabled(state.child.is_some(), egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    state.cancel();
+                }
+                if ui
+                    .add_enabled(
+                        state.report_path.as_ref().is_some_and(|path| path.is_file()),
+                        egui::Button::new("Open report"),
+                    )
+                    .clicked()
+                {
+                    state.open_report();
+                }
+                let promotable = state.report.as_ref().is_some_and(|report| {
+                    report.invariants.passed
+                        && report.status.starts_with("completed")
+                        && report.persisted_state.is_some()
+                });
+                if ui
+                    .add_enabled(promotable, egui::Button::new("Promote validated fork"))
+                    .clicked()
+                {
+                    state.promote(&store);
+                }
+                if ui
+                    .add_enabled(
+                        state.last_promotion_backup.is_some(),
+                        egui::Button::new("Rollback"),
+                    )
+                    .clicked()
+                {
+                    state.rollback(&store);
+                }
+            });
+            if let Some(started) = state.started_at {
+                ui.label(format!(
+                    "RUNNING · {:.1} s wall time · target {:.2} simulated h · report is committed only after completion",
+                    started.elapsed().as_secs_f32(),
+                    state.simulated_hours
+                ));
+            }
+            ui.small(&state.status);
+            if let Some(report) = &state.report {
+                let invariant_color = if report.invariants.passed {
+                    egui::Color32::from_rgb(105, 232, 172)
+                } else {
+                    egui::Color32::from_rgb(255, 105, 96)
+                };
+                ui.colored_label(
+                    invariant_color,
+                    format!(
+                        "{} · clock {:?}{} · {:.2} h · {}/{} episodes · generation {} → {}",
+                        report.status,
+                        report.clock_mode,
+                        if report.approximate_calendar_advance {
+                            " (approximate)"
+                        } else {
+                            " (exact)"
+                        },
+                        report.simulated_seconds / 3_600.0,
+                        report.completed_episodes,
+                        report.config.scheduled_episode_count(),
+                        report.initial_generation,
+                        report.final_generation,
+                    ),
+                );
+                ui.small(format!(
+                    "learning updates {} · convention updates {} · consolidations {} · eligible {} · state {:016x} · genome {:016x}",
+                    report.interaction_variant_updates,
+                    report.convention_updates,
+                    report.sleep_consolidations,
+                    report.eligibility.eligible,
+                    report.final_life_state_hash,
+                    report.final_genome_hash,
+                ));
+                ui.small(format!(
+                    "body p50/p95/max {:.1}/{:.1}/{:.1} µs · {:.2} episodes/s · invariant failures: {}",
+                    report.performance.body_step_p50_microseconds,
+                    report.performance.body_step_p95_microseconds,
+                    report.performance.body_step_max_microseconds,
+                    report.performance.episodes_per_wall_second,
+                    report.invariants.failures.len(),
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Gestures:");
+                    for (gesture, count) in &report.gesture_distribution {
+                        ui.monospace(format!("{gesture}={count}"));
+                    }
+                });
+                for failure in &report.invariants.failures {
+                    ui.colored_label(egui::Color32::from_rgb(255, 140, 110), failure);
+                }
+            }
         });
 }
 
@@ -2007,6 +2715,104 @@ fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor)
                 }
             });
 
+            ui.separator();
+            ui.strong("Body Communication fixtures");
+            ui.small(
+                "Each button runs a predefined fixed-seed pointer fixture through real body physics; no classifier label is injected.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                for (gesture, duration) in [
+                    (LabGesture::SoftTouch, 0.7),
+                    (LabGesture::SlowStretch, 1.5),
+                    (LabGesture::Tickle, 1.2),
+                    (LabGesture::ThreeBeatRhythm, 1.8),
+                    (LabGesture::CircularTwist, 1.5),
+                    (LabGesture::SharpFlick, 0.45),
+                    (LabGesture::Hold, 1.4),
+                    (LabGesture::PullRelease, 1.2),
+                    (LabGesture::RealSplitRemerge, 3.6),
+                    (LabGesture::FragmentHelp, 3.6),
+                    (LabGesture::OverstrainBoundary, 1.2),
+                    (LabGesture::SleepQuietInteraction, 0.8),
+                ] {
+                    if ui
+                        .add_enabled(enabled, egui::Button::new(lab_gesture_label(gesture)))
+                        .clicked()
+                    {
+                        pending_command = Some(LabControlCommand::StimulatePointerGesture {
+                            gesture,
+                            intensity: 0.72,
+                            duration_seconds: duration,
+                        });
+                    }
+                }
+            });
+
+            if let Some(conventions) = monitor
+                .selected_frame()
+                .and_then(|frame| frame.pointer("/details/body_interaction/learned_conventions"))
+            {
+                ui.separator();
+                ui.strong("Learned gesture conventions");
+                if let Some(items) = conventions.get("items").and_then(Value::as_array) {
+                    for item in items {
+                        let id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
+                        let meaning = item
+                            .get("meaning")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        let confidence = item
+                            .get("confidence")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0);
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("#{id} {meaning} · {confidence:.2}"));
+                            if ui
+                                .add_enabled(
+                                    enabled && id > 0,
+                                    egui::Button::new("Delete by ID"),
+                                )
+                                .clicked()
+                            {
+                                pending_command = Some(
+                                    LabControlCommand::DeleteGestureConvention {
+                                        convention_id: id,
+                                    },
+                                );
+                            }
+                        });
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(versions) = conventions
+                        .get("rollback_versions")
+                        .and_then(Value::as_array)
+                    {
+                        for version in versions.iter().filter_map(Value::as_u64).rev().take(8) {
+                            if ui
+                                .add_enabled(
+                                    enabled && version <= u64::from(u32::MAX),
+                                    egui::Button::new(format!("Rollback v{version}")),
+                                )
+                                .clicked()
+                            {
+                                pending_command = Some(
+                                    LabControlCommand::RollbackGestureConventions {
+                                        version: version as u32,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Clear all conventions"))
+                        .clicked()
+                    {
+                        pending_command = Some(LabControlCommand::ClearGestureConventions);
+                    }
+                });
+            }
+
             if let Some(command) = pending_command {
                 monitor.send_control(command);
             }
@@ -2019,6 +2825,23 @@ fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor)
                 scalar_table(ui, "live_lab_intervention_status", status, 32);
             }
         });
+}
+
+const fn lab_gesture_label(gesture: LabGesture) -> &'static str {
+    match gesture {
+        LabGesture::SoftTouch => "Soft touch",
+        LabGesture::SlowStretch => "Slow stretch",
+        LabGesture::Tickle => "Tickle",
+        LabGesture::ThreeBeatRhythm => "Three-beat rhythm",
+        LabGesture::CircularTwist => "Circular twist",
+        LabGesture::SharpFlick => "Sharp flick",
+        LabGesture::Hold => "Hold",
+        LabGesture::PullRelease => "Pull/release",
+        LabGesture::RealSplitRemerge => "Real split/remerge",
+        LabGesture::FragmentHelp => "Fragment help",
+        LabGesture::OverstrainBoundary => "Overstrain boundary",
+        LabGesture::SleepQuietInteraction => "Sleep/quiet interaction",
+    }
 }
 
 fn live_blockers(latest: &Value, stale_seconds: Option<f32>) -> Vec<(u8, String)> {
@@ -3699,6 +4522,7 @@ impl LabUi {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         self.preset_controls(ui);
+                        self.body_communication_controls(ui);
                         self.physics_controls(ui);
                         self.material_controls(ui);
                         self.face_controls(ui);
@@ -3948,7 +4772,7 @@ impl LabUi {
                     .to_owned()
             }
             PresetSelection::MoonlitGlass => {
-                "Cool translucent glass, warm inner light, softer low-viscosity motion, and the same stable v16 solver lane."
+                "Cool translucent glass, warm inner light, softer low-viscosity motion, and the same stable v17 solver lane."
                     .to_owned()
             }
             PresetSelection::User(id) => self
@@ -4093,6 +4917,194 @@ impl LabUi {
             }
             Err(error) => self.status = format!("Preset delete failed: {error}"),
         }
+    }
+
+    fn body_communication_controls(&mut self, ui: &mut egui::Ui) {
+        CollapsingHeader::new("Body Communication")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("Eight semantic controls map to bounded physical sensing, topology, response, turn-taking, recovery, and confidence updates.");
+                let mut touch_sensitivity =
+                    ((1.60 - self.profile.interaction.pressure_reference) / 1.15)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(Slider::new(&mut touch_sensitivity, 0.0..=1.0).text("Touch sensitivity"))
+                    .changed()
+                {
+                    self.profile.interaction.pressure_reference =
+                        1.60 - touch_sensitivity * 1.15;
+                    self.profile.interaction.contact_weight_floor =
+                        0.02 + touch_sensitivity * 0.10;
+                    self.profile.interaction.soft_touch_pressure_max =
+                        0.16 + touch_sensitivity * 0.19;
+                    self.profile.interaction.signal_smoothing_hz =
+                        8.0 + touch_sensitivity * 16.0;
+                }
+
+                let mut stretch_compliance = ((self.profile.interaction.stretch_strain_max - 0.42)
+                    / 0.43)
+                    .clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut stretch_compliance, 0.0..=1.0)
+                            .text("Stretch compliance"),
+                    )
+                    .changed()
+                {
+                    self.profile.interaction.stretch_strain_min =
+                        0.08 + stretch_compliance * 0.16;
+                    self.profile.interaction.stretch_strain_max =
+                        0.42 + stretch_compliance * 0.43;
+                    self.profile.interaction.boundary_strain =
+                        0.52 + stretch_compliance * 0.43;
+                    self.profile.pbf.density_compliance =
+                        1.0e-7 * (1_500.0_f32).powf(stretch_compliance);
+                }
+
+                let mut playful_separation =
+                    ((self.profile.interaction.maximum_detached_mass_fraction - 0.05) / 0.20)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut playful_separation, 0.0..=1.0)
+                            .text("Playful separation"),
+                    )
+                    .changed()
+                {
+                    self.profile.interaction.maximum_detached_components =
+                        (1.0 + playful_separation * 2.0).round() as u8;
+                    self.profile.interaction.maximum_detached_mass_fraction =
+                        0.05 + playful_separation * 0.20;
+                    self.profile.interaction.minimum_fragment_particles =
+                        (12.0 - playful_separation * 9.0).round() as u8;
+                    self.profile.interaction.split_hold_seconds =
+                        0.30 - playful_separation * 0.25;
+                }
+
+                let mut cohesion_under_stress =
+                    ((self.profile.pbf.surface_tension - 0.60) / 1.60).clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut cohesion_under_stress, 0.0..=1.0)
+                            .text("Cohesion under stress"),
+                    )
+                    .changed()
+                {
+                    self.profile.pbf.surface_tension = 0.60 + cohesion_under_stress * 1.60;
+                    self.profile.pbf.bond_yield_strain =
+                        0.15 + cohesion_under_stress * 0.45;
+                    self.profile.pbf.bond_break_strain =
+                        0.38 + cohesion_under_stress * 0.82;
+                    self.profile.interaction.boundary_hold_seconds =
+                        0.15 + cohesion_under_stress * 0.90;
+                }
+
+                let mut reaction_amplitude =
+                    ((self.profile.interaction.response_amplitude - 0.25) / 1.0)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut reaction_amplitude, 0.0..=1.0)
+                            .text("Reaction amplitude"),
+                    )
+                    .changed()
+                {
+                    self.profile.interaction.response_amplitude =
+                        0.25 + reaction_amplitude;
+                }
+
+                let mut turn_patience =
+                    ((self.profile.interaction.turn_wait_seconds - 0.45) / 2.05)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(Slider::new(&mut turn_patience, 0.0..=1.0).text("Turn patience"))
+                    .changed()
+                {
+                    self.profile.interaction.turn_wait_seconds = 0.45 + turn_patience * 2.05;
+                    self.profile.interaction.turn_cooldown_seconds =
+                        0.40 + turn_patience * 2.10;
+                    self.profile.interaction.gesture_window_seconds =
+                        1.0 + turn_patience * 2.0;
+                }
+
+                let mut recovery_speed =
+                    ((self.profile.interaction.recovery_field_boost - 1.0) / 1.0)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(Slider::new(&mut recovery_speed, 0.0..=1.0).text("Recovery speed"))
+                    .changed()
+                {
+                    self.profile.interaction.fragment_lifetime_seconds =
+                        15.0 - recovery_speed * 12.0;
+                    self.profile.interaction.offscreen_recovery_delay_seconds =
+                        5.0 - recovery_speed * 4.75;
+                    self.profile.interaction.recovery_field_boost = 1.0 + recovery_speed;
+                    self.profile.pbf.return_strength = 0.45 + recovery_speed * 0.55;
+                }
+
+                let mut learning_openness =
+                    ((self.profile.interaction.learning_openness - 0.50) / 0.75)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut learning_openness, 0.0..=1.0)
+                            .text("Learning openness"),
+                    )
+                    .changed()
+                {
+                    self.profile.interaction.learning_openness =
+                        0.50 + learning_openness * 0.75;
+                }
+
+                CollapsingHeader::new("Advanced interaction fields").show(ui, |ui| {
+                    let tuning = &mut self.profile.interaction;
+                    ui.checkbox(&mut tuning.enabled, "Interaction enabled");
+                    egui::ComboBox::from_label("Topology constraint")
+                        .selected_text(format!("{:?}", tuning.topology_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut tuning.topology_mode,
+                                TopologyConstraintMode::ObserveOnly,
+                                "Observe only",
+                            );
+                            ui.selectable_value(
+                                &mut tuning.topology_mode,
+                                TopologyConstraintMode::GuardedNecks,
+                                "Guarded necks",
+                            );
+                            ui.selectable_value(
+                                &mut tuning.topology_mode,
+                                TopologyConstraintMode::Viscoelastic,
+                                "Viscoelastic",
+                            );
+                        });
+                    ui.add(Slider::new(&mut tuning.contact_weight_floor, 0.0..=0.25).text("Contact weight floor"));
+                    ui.add(Slider::new(&mut tuning.pressure_reference, 0.05..=8.0).logarithmic(true).text("Pressure reference"));
+                    ui.add(Slider::new(&mut tuning.signal_smoothing_hz, 1.0..=60.0).text("Signal smoothing Hz"));
+                    ui.add(Slider::new(&mut tuning.gesture_window_seconds, 0.5..=4.0).text("Gesture window"));
+                    ui.add(Slider::new(&mut tuning.gesture_commit_confidence, 0.50..=0.85).text("Commit confidence"));
+                    ui.add(Slider::new(&mut tuning.gesture_ambiguity_margin, 0.05..=0.35).text("Ambiguity margin"));
+                    ui.add(Slider::new(&mut tuning.soft_touch_pressure_max, 0.05..=0.50).text("Soft-touch pressure max"));
+                    ui.add(Slider::new(&mut tuning.stretch_strain_min, 0.05..=0.45).text("Stretch strain min"));
+                    ui.add(Slider::new(&mut tuning.stretch_strain_max, 0.10..=1.20).text("Stretch strain max"));
+                    ui.add(Slider::new(&mut tuning.flick_speed_min, 0.5..=8.0).text("Flick speed min"));
+                    ui.add(Slider::new(&mut tuning.rhythm_interval_cv_max, 0.05..=0.50).text("Rhythm CV max"));
+                    ui.add(Slider::new(&mut tuning.rhythm_min_impulses, 3..=8).text("Rhythm impulses"));
+                    ui.add(Slider::new(&mut tuning.maximum_detached_components, 1..=3).text("Detached component max"));
+                    ui.add(Slider::new(&mut tuning.maximum_detached_mass_fraction, 0.05..=0.25).text("Detached mass max"));
+                    ui.add(Slider::new(&mut tuning.minimum_fragment_particles, 3..=12).text("Fragment particle min"));
+                    ui.add(Slider::new(&mut tuning.split_hold_seconds, 0.025..=0.50).text("Split hold"));
+                    ui.add(Slider::new(&mut tuning.boundary_strain, 0.45..=1.20).text("Boundary strain"));
+                    ui.add(Slider::new(&mut tuning.boundary_hold_seconds, 0.10..=2.0).text("Boundary hold"));
+                    ui.add(Slider::new(&mut tuning.fragment_lifetime_seconds, 3.0..=15.0).text("Fragment lifetime"));
+                    ui.add(Slider::new(&mut tuning.offscreen_recovery_delay_seconds, 0.25..=5.0).text("Offscreen recovery delay"));
+                    ui.add(Slider::new(&mut tuning.recovery_field_boost, 1.0..=2.0).text("Recovery field boost"));
+                    ui.add(Slider::new(&mut tuning.turn_wait_seconds, 0.45..=2.50).text("Turn wait"));
+                    ui.add(Slider::new(&mut tuning.turn_cooldown_seconds, 0.25..=5.0).text("Turn cooldown"));
+                    ui.add(Slider::new(&mut tuning.response_amplitude, 0.25..=1.25).text("Response amplitude"));
+                    ui.add(Slider::new(&mut tuning.learning_openness, 0.50..=1.25).text("Confidence update multiplier"));
+                });
+            });
     }
 
     fn physics_controls(&mut self, ui: &mut egui::Ui) {
@@ -5160,6 +6172,88 @@ fn preview_seeded_unit(mut value: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lifecore::LifeCore;
+
+    fn write_test_promotion_bundle(root: &Path, seed: u64) -> (StateStore, u64) {
+        let store = StateStore::at(root);
+        let genome = Genome::from_seed(seed);
+        let life = LifeCore::new(genome.clone(), seed ^ 0xA11F_EC0A);
+        let portable = PortablePetState {
+            schema_version: desktop_host::PORTABLE_STATE_SCHEMA_VERSION,
+            life: life.snapshot(),
+            vita: None,
+            position: desktop_host::PersistedPetPosition::default(),
+        };
+        let tuning = LiquidTuningProfile::for_seed(genome.identity_seed)
+            .sanitized()
+            .unwrap();
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.apply_tuning_profile(tuning.clone()).unwrap();
+        let morph = morph_brain::MorphBrain::new(genome.identity_seed, None).unwrap();
+        store.save_state(&portable).unwrap();
+        store.save_liquid_tuning(&tuning).unwrap();
+        store.save_morph_brain(&morph.snapshot()).unwrap();
+        store
+            .save_ecology_state(&EcologyState::new(genome.identity_seed))
+            .unwrap();
+        store
+            .save_body_state(&body.body_material_snapshot())
+            .unwrap();
+        let hash = lifecore::stable_hash_bytes(&serde_json::to_vec(&portable.life).unwrap());
+        (store, hash)
+    }
+
+    #[test]
+    fn validated_fork_can_be_promoted_atomically() {
+        let temporary = tempfile::tempdir().unwrap();
+        let live_root = temporary.path().join("live");
+        let (live, _) = write_test_promotion_bundle(&live_root, 101);
+        let fork_root = live.paths.evolution_runs.join("accepted-fork");
+        let (_, fork_hash) = write_test_promotion_bundle(&fork_root, 202);
+
+        let backup = promote_validated_fork(&live, &fork_root, fork_hash).unwrap();
+        assert_eq!(
+            live.load_state()
+                .unwrap()
+                .unwrap()
+                .life
+                .state
+                .genome
+                .identity_seed,
+            Genome::from_seed(202).identity_seed
+        );
+        restore_bundle(&live, &StateStore::at(&backup), true).unwrap();
+        assert_eq!(
+            live.load_state()
+                .unwrap()
+                .unwrap()
+                .life
+                .state
+                .genome
+                .identity_seed,
+            Genome::from_seed(101).identity_seed
+        );
+    }
+
+    #[test]
+    fn failed_run_never_promotes_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let live_root = temporary.path().join("live");
+        let (live, _) = write_test_promotion_bundle(&live_root, 303);
+        let fork_root = live.paths.evolution_runs.join("rejected-fork");
+        let (_, fork_hash) = write_test_promotion_bundle(&fork_root, 404);
+        assert!(promote_validated_fork(&live, &fork_root, fork_hash ^ 1).is_err());
+        assert_eq!(
+            live.load_state()
+                .unwrap()
+                .unwrap()
+                .life
+                .state
+                .genome
+                .identity_seed,
+            Genome::from_seed(303).identity_seed
+        );
+    }
 
     #[test]
     fn built_in_presets_are_visually_and_dynamically_distinct_but_solver_safe() {
@@ -5466,7 +6560,7 @@ mod tests {
     }
 
     #[test]
-    fn physics_panel_exposes_only_the_schema_sixteen_authoring_controls() {
+    fn physics_panel_exposes_only_the_schema_seventeen_authoring_controls() {
         let source = include_str!("main.rs");
         let panel = source
             .split_once("fn physics_controls")

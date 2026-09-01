@@ -148,6 +148,14 @@ not the running organism. The live view follows attention, decisions, drives,
 affect, body and object motion, Morph/VITA/Fusion state, learning, identity, and
 exact bounded mutation checkpoints.
 
+Live Brain also contains `Accelerated Learning`. It launches the deterministic
+curriculum runner in a separate process with 120 Hz body/pointer, 60 Hz
+perception, 20 Hz LifeCore/VITA/Morph, and 5 Hz summaries. Dry runs never replace
+the living Pet; accepted forks can be promoted only after report validation and
+with a complete rollback backup. The legacy `--simulate-hours` option is now an
+explicit approximate calendar-only compatibility path and cannot generate
+synthetic interaction learning.
+
 Telemetry is written to an 8 MiB `telemetry.jsonl` plus one rotated previous
 file. The older semantic `events.jsonl` is not truncated or rotated and no
 longer receives high-rate debug frames; ordinary semantic events still append

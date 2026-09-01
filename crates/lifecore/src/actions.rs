@@ -5,7 +5,9 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::{AffectState, DriveVector, VoiceGenome};
+use crate::{
+    AffectState, DriveVector, EmbodiedInteractionFrame, InteractionBodyActuation, VoiceGenome,
+};
 
 pub const ACTION_COUNT: usize = 24;
 pub const EXPRESSION_READOUT_COUNT: usize = 12;
@@ -541,6 +543,10 @@ pub struct SensorFrame {
     pub local_luminance: Option<f32>,
     pub user_presence: Option<f32>,
     pub user_availability: Option<f32>,
+    #[serde(default)]
+    pub embodied_interaction: EmbodiedInteractionFrame,
+    #[serde(default)]
+    pub interaction_actuation: InteractionBodyActuation,
 }
 
 impl Default for SensorFrame {
@@ -573,6 +579,8 @@ impl Default for SensorFrame {
             local_luminance: None,
             user_presence: None,
             user_availability: None,
+            embodied_interaction: EmbodiedInteractionFrame::default(),
+            interaction_actuation: InteractionBodyActuation::default(),
         }
     }
 }
@@ -666,6 +674,20 @@ pub struct ExpressionState {
     pub mouth_tension: f32,
     pub cheek_glow: f32,
     pub body_glow: f32,
+    #[serde(default = "default_eye_aperture")]
+    pub eye_aperture: f32,
+    #[serde(default = "default_eye_scale")]
+    pub eye_scale: f32,
+    #[serde(default)]
+    pub brow_asymmetry: f32,
+    #[serde(default)]
+    pub mouth_compression: f32,
+    #[serde(default)]
+    pub mouth_asymmetry: f32,
+    #[serde(default)]
+    pub effort: f32,
+    #[serde(default)]
+    pub relief: f32,
 }
 
 impl Default for ExpressionState {
@@ -683,6 +705,13 @@ impl Default for ExpressionState {
             mouth_tension: 0.0,
             cheek_glow: 0.0,
             body_glow: 0.2,
+            eye_aperture: 1.0,
+            eye_scale: 1.0,
+            brow_asymmetry: 0.0,
+            mouth_compression: 0.0,
+            mouth_asymmetry: 0.0,
+            effort: 0.0,
+            relief: 0.0,
         }
     }
 }
@@ -704,6 +733,7 @@ impl ExpressionState {
             mouth_tension: positive_readout(readouts[9], 0.20),
             cheek_glow: unit(readouts[10] * 0.35 + affect.attachment * 0.65),
             body_glow: unit(0.15 + readouts[11] * 0.25 + affect.arousal * 0.35),
+            ..Self::default()
         }
     }
 }
@@ -763,6 +793,13 @@ pub enum VocalTrigger {
     SkillMastered,
     RhythmEcho,
     VisualNotice,
+    SoftTouch,
+    PhysicalStartle,
+    PlayfulRelease,
+    CalmBoundary,
+    ComponentDetached,
+    ComponentRemerged,
+    FragmentHelped,
 }
 
 impl VocalTrigger {
@@ -781,7 +818,14 @@ impl VocalTrigger {
             | Self::HomeReturn
             | Self::SkillMastered
             | Self::RhythmEcho
-            | Self::VisualNotice => true,
+            | Self::VisualNotice
+            | Self::SoftTouch
+            | Self::PhysicalStartle
+            | Self::PlayfulRelease
+            | Self::CalmBoundary
+            | Self::ComponentDetached
+            | Self::ComponentRemerged
+            | Self::FragmentHelped => true,
         }
     }
 
@@ -792,6 +836,14 @@ impl VocalTrigger {
             Self::Action(ActionId::Chirp | ActionId::MimicClickRhythm) | Self::ToyOffer
         )
     }
+}
+
+const fn default_eye_aperture() -> f32 {
+    1.0
+}
+
+const fn default_eye_scale() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

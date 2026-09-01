@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "Seven Day Socialization",
+  "preset": "seven_day_socialization",
+  "simulated_hours": 168.0,
+  "episodes_per_day": 36,
+  "replicate_count": 4,
+  "seed": 573657340242,
+  "outcome_model": "respectful_supportive",
+  "quiet_advance": "exact",
+  "include_saved_gesture_replays": false,
+  "sleep_consolidation": true,
+  "persistent_learning": true,
+  "evolution_policy": "eligible_max_one",
+  "maximum_generations": 1,
+  "checkpoint_interval_hours": 24.0,
+  "persistence": "fork"
+}

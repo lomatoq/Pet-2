@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 16;
+pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 17;
 const OLDEST_MIGRATABLE_LIQUID_TUNING_SCHEMA_VERSION: u32 = 6;
 
 /// Approved Body Lab seed-42 palette. Cinematic intentionally uses this authored
@@ -39,10 +39,52 @@ pub struct LiquidTuningProfile {
     pub render_mode: BodyRenderMode,
     pub analytic: AnalyticTuning,
     pub pbf: PbfTuning,
+    pub interaction: InteractionTuning,
     pub droplets: DropletTuning,
     pub material: MaterialTuning,
     pub face: FaceTuning,
     pub compositor: CompositorTuning,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyConstraintMode {
+    ObserveOnly,
+    #[default]
+    GuardedNecks,
+    Viscoelastic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InteractionTuning {
+    pub enabled: bool,
+    pub topology_mode: TopologyConstraintMode,
+    pub contact_weight_floor: f32,
+    pub pressure_reference: f32,
+    pub signal_smoothing_hz: f32,
+    pub gesture_window_seconds: f32,
+    pub gesture_commit_confidence: f32,
+    pub gesture_ambiguity_margin: f32,
+    pub soft_touch_pressure_max: f32,
+    pub stretch_strain_min: f32,
+    pub stretch_strain_max: f32,
+    pub flick_speed_min: f32,
+    pub rhythm_interval_cv_max: f32,
+    pub rhythm_min_impulses: u8,
+    pub maximum_detached_components: u8,
+    pub maximum_detached_mass_fraction: f32,
+    pub minimum_fragment_particles: u8,
+    pub split_hold_seconds: f32,
+    pub boundary_strain: f32,
+    pub boundary_hold_seconds: f32,
+    pub fragment_lifetime_seconds: f32,
+    pub offscreen_recovery_delay_seconds: f32,
+    pub recovery_field_boost: f32,
+    pub turn_wait_seconds: f32,
+    pub turn_cooldown_seconds: f32,
+    pub response_amplitude: f32,
+    pub learning_openness: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +343,7 @@ impl LiquidTuningProfile {
             render_mode: BodyRenderMode::AnalyticJelly,
             analytic: AnalyticTuning::default(),
             pbf: PbfTuning::default(),
+            interaction: InteractionTuning::default(),
             droplets: DropletTuning::default(),
             material: MaterialTuning::default(),
             face: FaceTuning::default(),
@@ -319,7 +362,7 @@ impl LiquidTuningProfile {
             // so loading a file cannot silently change its look.
             self.material.variant = MaterialVariant::CurrentSafe;
             self.schema_version = LIQUID_TUNING_SCHEMA_VERSION;
-        } else if (9..=15).contains(&self.schema_version) {
+        } else if (9..=16).contains(&self.schema_version) {
             // Cinematic profiles already opted into their material. Schemas 10
             // through 15 preserve the selected material lane. Schema 16 replaces
             // the unstable mode-switched solver settings below without touching
@@ -346,11 +389,83 @@ impl LiquidTuningProfile {
         }
         self.analytic.sanitize();
         self.pbf.sanitize();
+        self.interaction.sanitize();
         self.droplets.sanitize();
         self.material.sanitize();
         self.face.sanitize();
         self.compositor.sanitize();
         Ok(self)
+    }
+}
+
+impl Default for InteractionTuning {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            topology_mode: TopologyConstraintMode::GuardedNecks,
+            contact_weight_floor: 0.04,
+            pressure_reference: 1.0,
+            signal_smoothing_hz: 14.0,
+            gesture_window_seconds: 2.0,
+            gesture_commit_confidence: 0.62,
+            gesture_ambiguity_margin: 0.12,
+            soft_touch_pressure_max: 0.24,
+            stretch_strain_min: 0.14,
+            stretch_strain_max: 0.58,
+            flick_speed_min: 2.40,
+            rhythm_interval_cv_max: 0.20,
+            rhythm_min_impulses: 3,
+            maximum_detached_components: 3,
+            maximum_detached_mass_fraction: 0.18,
+            minimum_fragment_particles: 4,
+            split_hold_seconds: 0.075,
+            boundary_strain: 0.72,
+            boundary_hold_seconds: 0.45,
+            fragment_lifetime_seconds: 10.0,
+            offscreen_recovery_delay_seconds: 1.25,
+            recovery_field_boost: 1.60,
+            turn_wait_seconds: 1.15,
+            turn_cooldown_seconds: 1.25,
+            response_amplitude: 1.0,
+            learning_openness: 1.0,
+        }
+    }
+}
+
+impl InteractionTuning {
+    fn sanitize(&mut self) {
+        self.contact_weight_floor = bounded(self.contact_weight_floor, 0.0, 0.25, 0.04);
+        self.pressure_reference = bounded(self.pressure_reference, 0.05, 8.0, 1.0);
+        self.signal_smoothing_hz = bounded(self.signal_smoothing_hz, 1.0, 60.0, 14.0);
+        self.gesture_window_seconds = bounded(self.gesture_window_seconds, 0.5, 4.0, 2.0);
+        self.gesture_commit_confidence = bounded(self.gesture_commit_confidence, 0.50, 0.85, 0.62);
+        self.gesture_ambiguity_margin = bounded(self.gesture_ambiguity_margin, 0.05, 0.35, 0.12);
+        self.soft_touch_pressure_max = bounded(self.soft_touch_pressure_max, 0.05, 0.50, 0.24);
+        self.stretch_strain_min = bounded(self.stretch_strain_min, 0.05, 0.45, 0.14);
+        self.stretch_strain_max = bounded(
+            self.stretch_strain_max,
+            self.stretch_strain_min + 0.05,
+            1.20,
+            0.58,
+        );
+        self.flick_speed_min = bounded(self.flick_speed_min, 0.5, 8.0, 2.40);
+        self.rhythm_interval_cv_max = bounded(self.rhythm_interval_cv_max, 0.05, 0.50, 0.20);
+        self.rhythm_min_impulses = self.rhythm_min_impulses.clamp(3, 8);
+        self.maximum_detached_components = self.maximum_detached_components.clamp(1, 3);
+        self.maximum_detached_mass_fraction =
+            bounded(self.maximum_detached_mass_fraction, 0.05, 0.25, 0.18);
+        self.minimum_fragment_particles = self.minimum_fragment_particles.clamp(3, 12);
+        self.split_hold_seconds = bounded(self.split_hold_seconds, 0.025, 0.50, 0.075);
+        self.boundary_strain = bounded(self.boundary_strain, 0.45, 1.20, 0.72);
+        self.boundary_hold_seconds = bounded(self.boundary_hold_seconds, 0.10, 2.0, 0.45);
+        self.fragment_lifetime_seconds = bounded(self.fragment_lifetime_seconds, 3.0, 15.0, 10.0);
+        self.offscreen_recovery_delay_seconds =
+            bounded(self.offscreen_recovery_delay_seconds, 0.25, 5.0, 1.25);
+        self.recovery_field_boost = bounded(self.recovery_field_boost, 1.0, 2.0, 1.60);
+        self.turn_wait_seconds = bounded(self.turn_wait_seconds, 0.45, 2.50, 1.15);
+        self.turn_cooldown_seconds = bounded(self.turn_cooldown_seconds, 0.25, 5.0, 1.25);
+        self.response_amplitude = bounded(self.response_amplitude, 0.25, 1.25, 1.0);
+        self.learning_openness = bounded(self.learning_openness, 0.50, 1.25, 1.0);
     }
 }
 
@@ -852,7 +967,7 @@ mod tests {
     #[test]
     fn schema_sixteen_defaults_select_the_single_stable_solver_lane() {
         let pbf = PbfTuning::default();
-        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 16);
+        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 17);
         assert_eq!(pbf.substeps, 1);
         assert_eq!(pbf.impact_substeps, 1);
         assert_eq!(pbf.density_iterations, 6);
@@ -866,6 +981,23 @@ mod tests {
         assert_eq!(pbf.idle_fragment_size, 0.0);
         assert_eq!(pbf.idle_bud_pull_strength, 0.0);
         assert_eq!(pbf.pinch_bounce, 0.0);
+    }
+
+    #[test]
+    fn schema_sixteen_gains_safe_interaction_defaults() {
+        let profile = LiquidTuningProfile::for_seed(42);
+        let mut value = serde_json::to_value(&profile).unwrap();
+        value["schema_version"] = serde_json::json!(16);
+        value.as_object_mut().unwrap().remove("interaction");
+        let migrated: LiquidTuningProfile = serde_json::from_value(value).unwrap();
+        let migrated = migrated.sanitized().unwrap();
+        assert_eq!(migrated.schema_version, LIQUID_TUNING_SCHEMA_VERSION);
+        assert_eq!(
+            migrated.interaction.topology_mode,
+            TopologyConstraintMode::GuardedNecks
+        );
+        assert_eq!(migrated.interaction.maximum_detached_components, 3);
+        assert_eq!(migrated.interaction.maximum_detached_mass_fraction, 0.18);
     }
 
     #[test]
@@ -1201,7 +1333,7 @@ mod tests {
 
         let legacy: LiquidTuningProfile = serde_json::from_value(value).unwrap();
         let migrated = legacy.sanitized().unwrap();
-        assert_eq!(migrated.schema_version, 16);
+        assert_eq!(migrated.schema_version, LIQUID_TUNING_SCHEMA_VERSION);
         assert_eq!(migrated.profile_revision, 91);
         assert_eq!(migrated.render_mode, BodyRenderMode::ParticlePbf);
         assert_eq!(migrated.material.variant, MaterialVariant::CinematicJelly);

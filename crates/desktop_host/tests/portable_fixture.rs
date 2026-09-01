@@ -18,7 +18,9 @@ fn portable_fixture_restores_without_native_handles_or_identity_drift() {
 
     let restored = LifeCore::restore(state.life.clone()).expect("LifeCore restores");
     let restored_snapshot = restored.snapshot();
-    assert_eq!(restored_snapshot, state.life);
+    let mut migrated_snapshot = state.life.clone();
+    migrated_snapshot.schema_version = lifecore::LIFE_SNAPSHOT_SCHEMA_VERSION;
+    assert_eq!(restored_snapshot, migrated_snapshot);
     assert_eq!(
         stable_hash_bytes(
             &serde_json::to_vec(&restored_snapshot.state.vocal_motifs)

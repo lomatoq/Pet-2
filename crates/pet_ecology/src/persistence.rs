@@ -30,6 +30,8 @@ pub enum EcologyError {
     InvalidTaste,
     #[error("ecology skill library contains invalid data")]
     InvalidSkills,
+    #[error("ecology gesture convention library contains invalid data")]
+    InvalidGestureConventions,
     #[error("ecology contains too many object memories")]
     TooManyObjectMemories,
     #[error("ecology object memory contains invalid data")]

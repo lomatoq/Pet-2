@@ -14,11 +14,18 @@ pub struct MaterialGrab {
     target_center: Vec2,
     filtered_center: Vec2,
     filtered_velocity: Vec2,
+    previous_filtered_velocity: Vec2,
+    filtered_acceleration: Vec2,
     amplitude: f32,
     field_axis: Vec2,
     differential_forces: [Vec2; MAX_LIQUID_PARTICLES],
     cursor_distance: f32,
     field_coverage: f32,
+    effective_area_fraction: f32,
+    effective_pressure: f32,
+    weighted_contact_center: Vec2,
+    weighted_material_velocity: Vec2,
+    pressure_impulse: f32,
 }
 
 impl Default for MaterialGrab {
@@ -29,13 +36,34 @@ impl Default for MaterialGrab {
             target_center: Vec2::ZERO,
             filtered_center: Vec2::ZERO,
             filtered_velocity: Vec2::ZERO,
+            previous_filtered_velocity: Vec2::ZERO,
+            filtered_acceleration: Vec2::ZERO,
             amplitude: 0.0,
             field_axis: Vec2::ZERO,
             differential_forces: [Vec2::ZERO; MAX_LIQUID_PARTICLES],
             cursor_distance: 0.0,
             field_coverage: 0.0,
+            effective_area_fraction: 0.0,
+            effective_pressure: 0.0,
+            weighted_contact_center: Vec2::ZERO,
+            weighted_material_velocity: Vec2::ZERO,
+            pressure_impulse: 0.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct MaterialGrabReadback {
+    pub active: bool,
+    pub held: bool,
+    pub filtered_velocity: Vec2,
+    pub filtered_acceleration: Vec2,
+    pub contact_center: Vec2,
+    pub material_velocity: Vec2,
+    pub normal: Vec2,
+    pub area_fraction: f32,
+    pub effective_pressure: f32,
+    pub pressure_impulse: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -185,6 +213,9 @@ impl MaterialGrab {
             if !self.initialized || (!self.held && self.amplitude <= 1.0e-4) {
                 self.filtered_center = target_center;
                 self.filtered_velocity = Vec2::ZERO;
+                self.previous_filtered_velocity = Vec2::ZERO;
+                self.filtered_acceleration = Vec2::ZERO;
+                self.pressure_impulse = 0.0;
                 self.initialized = true;
             }
             self.target_center = target_center;
@@ -192,6 +223,7 @@ impl MaterialGrab {
         self.held = held;
 
         if self.initialized && dt > 0.0 {
+            self.previous_filtered_velocity = self.filtered_velocity;
             let support = parameters.support_radius.max(1.0e-4);
             let max_speed = support * parameters.max_speed_radii_per_second.max(0.0);
             let max_acceleration = support
@@ -209,6 +241,8 @@ impl MaterialGrab {
             );
             self.filtered_center = position;
             self.filtered_velocity = velocity;
+            self.filtered_acceleration =
+                (self.filtered_velocity - self.previous_filtered_velocity) / dt;
         }
 
         let target_amplitude = if held { 1.0 } else { 0.0 };
@@ -219,9 +253,14 @@ impl MaterialGrab {
         };
         self.amplitude =
             exponential_transition(self.amplitude, target_amplitude, transition_seconds, dt);
+        if held {
+            self.pressure_impulse =
+                (self.pressure_impulse + self.effective_pressure * dt).min(60.0);
+        }
         if !held && self.amplitude < 1.0e-5 {
             self.amplitude = 0.0;
             self.filtered_velocity = Vec2::ZERO;
+            self.filtered_acceleration = Vec2::ZERO;
         }
 
         let axis = self.filtered_center - body_origin;
@@ -238,6 +277,10 @@ impl MaterialGrab {
     ) {
         self.differential_forces.fill(Vec2::ZERO);
         self.field_coverage = 0.0;
+        self.effective_area_fraction = 0.0;
+        self.effective_pressure = 0.0;
+        self.weighted_contact_center = fallback_center;
+        self.weighted_material_velocity = Vec2::ZERO;
         if self.amplitude <= 0.0 || count == 0 {
             return;
         }
@@ -245,8 +288,15 @@ impl MaterialGrab {
         let support = parameters.support_radius.max(1.0e-4);
         let peak_acceleration = parameters.peak_acceleration.max(0.0);
         let mut weighted_center = Vec2::ZERO;
+        let mut weighted_material_velocity = Vec2::ZERO;
         let mut weight_sum = 0.0;
+        let mut support_weight_sum = 0.0;
+        let mut support_weight_squared_sum = 0.0;
         for (index, particle) in particles[..count].iter_mut().enumerate() {
+            let distance = self.filtered_center.distance(particle.position);
+            let support_weight = (1.0 - distance / support).clamp(0.0, 1.0).powi(2);
+            support_weight_sum += support_weight;
+            support_weight_squared_sum += support_weight * support_weight;
             let force = pointer_gradient(
                 self.filtered_center - particle.position,
                 support,
@@ -256,14 +306,23 @@ impl MaterialGrab {
             particle.force += force;
             let weight = force.length();
             weighted_center += particle.position * weight;
+            weighted_material_velocity += particle.velocity * weight;
             weight_sum += weight;
         }
         self.field_coverage = weight_sum / (count as f32 * peak_acceleration.max(1.0e-5));
+        let effective_particle_count =
+            support_weight_sum * support_weight_sum / support_weight_squared_sum.max(1.0e-5);
+        self.effective_area_fraction =
+            (effective_particle_count / count.max(1) as f32).clamp(0.0, 1.0);
+        let force_density = weight_sum / effective_particle_count.max(1.0);
+        self.effective_pressure = (force_density / peak_acceleration.max(1.0e-5)).clamp(0.0, 1.0);
         if weight_sum <= 1.0e-5 {
             self.field_axis = (self.filtered_center - fallback_center).normalize_or_zero();
         } else {
+            self.weighted_contact_center = weighted_center / weight_sum;
+            self.weighted_material_velocity = weighted_material_velocity / weight_sum;
             self.field_axis =
-                (self.filtered_center - weighted_center / weight_sum).normalize_or_zero();
+                (self.filtered_center - self.weighted_contact_center).normalize_or_zero();
         }
     }
 
@@ -315,6 +374,22 @@ impl MaterialGrab {
             self.field_axis
         } else {
             Vec2::ZERO
+        }
+    }
+
+    #[must_use]
+    pub(super) fn readback(&self) -> MaterialGrabReadback {
+        MaterialGrabReadback {
+            active: self.is_active() && self.effective_area_fraction > 0.0,
+            held: self.held,
+            filtered_velocity: self.filtered_velocity,
+            filtered_acceleration: self.filtered_acceleration,
+            contact_center: self.weighted_contact_center,
+            material_velocity: self.weighted_material_velocity,
+            normal: self.field_axis,
+            area_fraction: self.effective_area_fraction,
+            effective_pressure: self.effective_pressure,
+            pressure_impulse: self.pressure_impulse,
         }
     }
 }

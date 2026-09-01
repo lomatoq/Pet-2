@@ -60,12 +60,18 @@ pub struct EmbodiedPose {
     pub blink_left: f32,
     pub blink_right: f32,
     pub squint: f32,
+    pub eye_aperture: f32,
+    pub eye_scale: f32,
     pub brow_raise: f32,
     pub brow_tension: f32,
     pub brow_asymmetry: f32,
     pub mouth_open: f32,
     pub mouth_curve: f32,
     pub mouth_tension: f32,
+    pub mouth_compression: f32,
+    pub mouth_asymmetry: f32,
+    pub effort: f32,
+    pub relief: f32,
     pub cheek_glow: f32,
     pub squash: Vec2,
     pub tilt: f32,
@@ -145,6 +151,8 @@ impl EmbodiedRuntime {
         Self {
             pose: EmbodiedPose {
                 pupil_size: 0.52,
+                eye_aperture: 1.0,
+                eye_scale: 1.0,
                 squash: Vec2::ONE,
                 breath: 0.5,
                 ..EmbodiedPose::default()
@@ -311,6 +319,21 @@ impl EmbodiedRuntime {
         );
         self.update_attention_face_pose(mode, mind, feedback);
         self.update_blink(mode, intent, affect, expression, dt);
+        self.pose.eye_aperture = smooth(
+            self.pose.eye_aperture,
+            expression.eye_aperture.clamp(0.0, 1.0),
+            16.0,
+            dt,
+        );
+        self.pose.eye_scale = smooth(
+            self.pose.eye_scale,
+            expression.eye_scale.clamp(0.88, 1.18),
+            12.0,
+            dt,
+        );
+        let aperture_closure = 1.0 - self.pose.eye_aperture;
+        self.pose.blink_left = self.pose.blink_left.max(aperture_closure);
+        self.pose.blink_right = self.pose.blink_right.max(aperture_closure);
         self.update_pupil(mode, intent, sensors, mind, expression, face_tuning, dt);
         self.update_soft_body(genome, intent, feedback, affect, dt);
 
@@ -325,13 +348,21 @@ impl EmbodiedRuntime {
         self.pose.mouth_open = smooth(self.pose.mouth_open, mouth_target, 22.0, dt);
         self.pose.mouth_curve = smooth(
             self.pose.mouth_curve,
-            (expression.mouth_curve + affect.valence * 0.34).clamp(-1.0, 1.0),
+            (expression.mouth_curve
+                + expression.relief * 0.18
+                + expression.mouth_asymmetry * 0.12
+                + affect.valence * 0.34)
+                .clamp(-1.0, 1.0),
             11.0,
             dt,
         );
         self.pose.mouth_tension = smooth(
             self.pose.mouth_tension,
-            (expression.mouth_tension + affect.frustration * 0.35).clamp(0.0, 1.0),
+            (expression.mouth_tension
+                + expression.mouth_compression * 0.62
+                + expression.effort * 0.28
+                + affect.frustration * 0.35)
+                .clamp(0.0, 1.0),
             13.0,
             dt,
         );
@@ -347,13 +378,35 @@ impl EmbodiedRuntime {
             14.0,
             dt,
         );
-        let asymmetry = (self.elapsed * 0.41 + self.seed_phase).sin() * 0.12
+        let procedural_asymmetry = (self.elapsed * 0.41 + self.seed_phase).sin() * 0.12
             + if intent.pose == PoseIntent::Curious {
                 0.18
             } else {
                 0.0
             };
+        let interaction_weight = expression
+            .effort
+            .max(expression.relief)
+            .max(expression.brow_asymmetry.abs())
+            .max(expression.mouth_compression)
+            .clamp(0.0, 1.0);
+        let asymmetry = procedural_asymmetry * (1.0 - interaction_weight)
+            + expression.brow_asymmetry * interaction_weight;
         self.pose.brow_asymmetry = smooth(self.pose.brow_asymmetry, asymmetry, 7.0, dt);
+        self.pose.mouth_compression = smooth(
+            self.pose.mouth_compression,
+            expression.mouth_compression,
+            13.0,
+            dt,
+        );
+        self.pose.mouth_asymmetry = smooth(
+            self.pose.mouth_asymmetry,
+            expression.mouth_asymmetry,
+            10.0,
+            dt,
+        );
+        self.pose.effort = smooth(self.pose.effort, expression.effort, 10.0, dt);
+        self.pose.relief = smooth(self.pose.relief, expression.relief, 8.0, dt);
         self.pose.squint = smooth(
             self.pose.squint,
             (expression.squint + affect.stress * 0.28).clamp(0.0, 1.0),

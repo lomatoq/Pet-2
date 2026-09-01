@@ -19,6 +19,19 @@ fn ecology_json_roundtrip_preserves_den_slots_and_has_no_active_episode() {
 }
 
 #[test]
+fn schema_one_migrates_without_synthesizing_conventions() {
+    let state = EcologyState::new(58);
+    let mut json = serde_json::to_value(&state).unwrap();
+    json["schema_version"] = serde_json::json!(1);
+    json.as_object_mut().unwrap().remove("gesture_conventions");
+    let legacy: EcologyState = serde_json::from_value(json).unwrap();
+    let restored = EcologyState::restore(legacy).unwrap();
+    assert_eq!(restored.schema_version, 2);
+    assert!(restored.gesture_conventions.conventions.is_empty());
+    assert!(restored.skills.skills.is_empty());
+}
+
+#[test]
 fn restore_rejects_corrupt_skill_library() {
     let mut state = EcologyState::new(55);
     state.skills.next_skill_id = 0;

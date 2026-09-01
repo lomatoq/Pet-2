@@ -5,10 +5,11 @@ use thiserror::Error;
 
 use crate::{
     ACTION_COUNT, ActionId, AffectState, BodyFeedback, ContextualBandit, DevelopmentState, Drives,
-    Genome, MemorySystem, MicroBrain, PendingAttention, VocalMotif, generate_initial_motifs,
+    Genome, MemorySystem, MicroBrain, PendingAttention, PersistentInteractionState, VocalMotif,
+    generate_initial_motifs,
 };
 
-pub const LIFE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const LIFE_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentVocalization {
@@ -115,6 +116,8 @@ pub struct LifeState {
     pub pending_vocal_credit: Option<PendingVocalCredit>,
     #[serde(default)]
     pub pending_vocal_delivery: Option<PendingVocalDelivery>,
+    #[serde(default)]
+    pub interactions: PersistentInteractionState,
     pub development: DevelopmentState,
     pub last_body_feedback: BodyFeedback,
     pub tick_count: u64,
@@ -145,6 +148,7 @@ impl LifeState {
             recent_vocalizations: VecDeque::new(),
             pending_vocal_credit: None,
             pending_vocal_delivery: None,
+            interactions: PersistentInteractionState::default(),
             development: DevelopmentState::default(),
             last_body_feedback: BodyFeedback::default(),
             tick_count: 0,
@@ -190,6 +194,7 @@ impl LifeState {
                         .iter()
                         .any(|motif| motif.id == delivery.motif_id)
             })
+            && self.interactions.is_valid()
             && self.last_body_feedback.world_position.is_finite()
             && self.last_body_feedback.velocity.is_finite()
             && self.last_body_feedback.acceleration.is_finite()
@@ -215,7 +220,7 @@ pub struct LifeSnapshot {
 
 impl LifeSnapshot {
     pub fn validate(&self) -> Result<(), LifeError> {
-        if self.schema_version != LIFE_SNAPSHOT_SCHEMA_VERSION {
+        if self.schema_version != 1 && self.schema_version != LIFE_SNAPSHOT_SCHEMA_VERSION {
             return Err(LifeError::UnsupportedSchema {
                 found: self.schema_version,
                 expected: LIFE_SNAPSHOT_SCHEMA_VERSION,

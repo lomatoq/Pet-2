@@ -16,7 +16,9 @@ pet_body = { path = "../crates/pet_body" }
 pet_ecology = { path = "../crates/pet_ecology" }
 pet_perception = { path = "../crates/pet_perception" }
 pollster.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]

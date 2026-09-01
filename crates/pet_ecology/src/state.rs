@@ -2,12 +2,12 @@ use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DenState, EcologyError, MAX_ACTIVE_MORSELS, MAX_OBJECTS, MetabolicState, MimesisLibrary,
-    MorselProfile, ObjectId, ObjectKind, ObjectLifecycle, TasteProfile, WorldObject,
-    canonical_orb_id,
+    DenState, EcologyError, GestureConventionLibrary, MAX_ACTIVE_MORSELS, MAX_OBJECTS,
+    MetabolicState, MimesisLibrary, MorselProfile, ObjectId, ObjectKind, ObjectLifecycle,
+    TasteProfile, WorldObject, canonical_orb_id,
 };
 
-pub const ECOLOGY_STATE_SCHEMA_VERSION: u32 = 1;
+pub const ECOLOGY_STATE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_OBJECT_MEMORIES: usize = 32;
 pub const EPISODE_GOAL_COUNT: usize = 27;
 
@@ -107,6 +107,8 @@ pub struct EcologyState {
     pub metabolism: MetabolicState,
     pub taste: TasteProfile,
     pub skills: MimesisLibrary,
+    #[serde(default)]
+    pub gesture_conventions: GestureConventionLibrary,
     pub object_memories: Vec<ObjectMemory>,
     pub episode_stats: EpisodeStats,
     pub rng: SavedEcologyRng,
@@ -140,6 +142,7 @@ impl EcologyState {
                 skills: Vec::new(),
                 next_skill_id: 1,
             },
+            gesture_conventions: GestureConventionLibrary::default(),
             object_memories: Vec::new(),
             episode_stats: EpisodeStats::default(),
             rng: SavedEcologyRng::for_seed(identity_seed ^ 0xEC01_06A1_5EED_0001),
@@ -153,6 +156,12 @@ impl EcologyState {
 
     pub fn restore(mut snapshot: Self) -> Result<Self, EcologyError> {
         snapshot.validate()?;
+        if snapshot.schema_version == 1 {
+            // Legacy mimesis skills were motor memories, not user-language
+            // evidence. Never invent conventions during migration.
+            snapshot.gesture_conventions = GestureConventionLibrary::default();
+            snapshot.schema_version = ECOLOGY_STATE_SCHEMA_VERSION;
+        }
         snapshot.objects.retain(|object| {
             object.kind == ObjectKind::Orb || object.lifecycle != ObjectLifecycle::Consumed
         });
@@ -171,7 +180,7 @@ impl EcologyState {
     }
 
     pub fn validate(&self) -> Result<(), EcologyError> {
-        if self.schema_version != ECOLOGY_STATE_SCHEMA_VERSION {
+        if !matches!(self.schema_version, 1 | ECOLOGY_STATE_SCHEMA_VERSION) {
             return Err(EcologyError::UnsupportedSchema {
                 found: self.schema_version,
                 expected: ECOLOGY_STATE_SCHEMA_VERSION,
@@ -239,6 +248,7 @@ impl EcologyState {
         self.metabolism.validate()?;
         self.taste.validate()?;
         self.skills.validate()?;
+        self.gesture_conventions.validate()?;
         if self.object_memories.len() > MAX_OBJECT_MEMORIES {
             return Err(EcologyError::TooManyObjectMemories);
         }
