@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Wire-format version for the bounded Body Lab -> Pet command slot.
-pub const LAB_CONTROL_SCHEMA_VERSION: u32 = 2;
+pub const LAB_CONTROL_SCHEMA_VERSION: u32 = 3;
 pub const LAB_CONTROL_MIN_EXPIRY_MS: u32 = 100;
 pub const LAB_CONTROL_MAX_EXPIRY_MS: u32 = 30_000;
 
@@ -86,6 +86,8 @@ pub enum LabControlCommand {
         version: u32,
     },
     ClearGestureConventions,
+    /// Graceful persistence barrier used only by validated state promotion.
+    ShutdownForPromotion,
 }
 
 impl LabControlCommand {
@@ -154,7 +156,8 @@ impl LabControlCommand {
             | Self::ClearDrivePulses
             | Self::DeleteGestureConvention { .. }
             | Self::RollbackGestureConventions { .. }
-            | Self::ClearGestureConventions => Ok(()),
+            | Self::ClearGestureConventions
+            | Self::ShutdownForPromotion => Ok(()),
         }
     }
 }

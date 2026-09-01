@@ -28,8 +28,9 @@ use desktop_host::{
     DesktopVisualFrame, DisplayTopology, EventLogEntry, EvolutionPersistence, LabControlCommand,
     LabControlEnvelope, LabDrive, LabGesture, MonitorId, MonitorInfo,
     PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition, PhysicalDesktopPoint, PlatformBackend,
-    PointerState, PortablePetState, RectI, SensorNormalizer, StateStore, create_platform_backend,
-    prepare_overlay_window_attributes,
+    PointerState, PortablePetState, RUNTIME_LOAD_ACK_SCHEMA_VERSION, RectI,
+    RuntimeLoadAcknowledgement, RuntimeLoadStatus, SensorNormalizer, StateStore,
+    create_platform_backend, prepare_overlay_window_attributes,
 };
 use ecology_runtime::{EcologyResolveFrame, EcologyRuntime, VisualAttentionSample};
 use glam::Vec2;
@@ -208,6 +209,7 @@ struct Arguments {
     pointer_replay: Option<PathBuf>,
     evolution_config: Option<PathBuf>,
     evolution_report: Option<PathBuf>,
+    evolution_progress: Option<PathBuf>,
     evolution_persist: Option<EvolutionPersistence>,
     evolution_max_generations: Option<u32>,
     export_state: Option<PathBuf>,
@@ -256,6 +258,12 @@ impl Arguments {
                     parsed.evolution_report =
                         Some(PathBuf::from(value("--evolution-report", &mut arguments)?));
                 }
+                "--evolution-progress" => {
+                    parsed.evolution_progress = Some(PathBuf::from(value(
+                        "--evolution-progress",
+                        &mut arguments,
+                    )?));
+                }
                 "--evolution-persist" => {
                     parsed.evolution_persist =
                         Some(value("--evolution-persist", &mut arguments)?.parse()?);
@@ -283,7 +291,7 @@ impl Arguments {
                             .into(),
                     );
                 }
-                "--no-audio" => parsed.no_audio = true,
+                "--no-audio" | "--no-audio-output" => parsed.no_audio = true,
                 "--focus-mode" => parsed.focus_mode = true,
                 "--brain-mode" => {
                     parsed.brain_mode = value("--brain-mode", &mut arguments)?.parse()?;
@@ -1572,6 +1580,10 @@ struct PetRuntime {
     pending_gesture_convention: Option<PendingGestureConvention>,
     lab_pointer_fixture: Option<LabPointerFixture>,
     last_convention_update_episode: u64,
+    shutdown_for_promotion: bool,
+    runtime_ack_accumulator: f32,
+    loaded_life_state_hash: u64,
+    loaded_genome_hash: u64,
 }
 
 #[derive(Clone)]
@@ -1781,6 +1793,7 @@ impl PetApplication {
         runtime.save_accumulator += elapsed;
         runtime.tuning_poll_accumulator += elapsed;
         runtime.lab_control_poll_accumulator += elapsed;
+        runtime.runtime_ack_accumulator += elapsed;
         runtime.debug_accumulator += elapsed;
         runtime.fps_accumulator += elapsed;
         runtime.max_frame_gap_ms = runtime.max_frame_gap_ms.max(elapsed * 1_000.0);
@@ -1789,6 +1802,20 @@ impl PetApplication {
         if runtime.lab_control_poll_accumulator >= LAB_CONTROL_POLL_INTERVAL_SECONDS {
             runtime.lab_control_poll_accumulator %= LAB_CONTROL_POLL_INTERVAL_SECONDS;
             poll_lab_control(&self.store, runtime, SystemTime::now(), now);
+        }
+        if runtime.shutdown_for_promotion {
+            runtime.platform.shutdown();
+            runtime.ecology.prepare_shutdown();
+            if let Some(runtime) = self.runtime.as_ref() {
+                self.persist(runtime);
+                write_runtime_ack(&self.store, runtime, RuntimeLoadStatus::Stopped);
+            }
+            event_loop.exit();
+            return;
+        }
+        if runtime.runtime_ack_accumulator >= 1.0 {
+            runtime.runtime_ack_accumulator %= 1.0;
+            write_runtime_ack(&self.store, runtime, RuntimeLoadStatus::Running);
         }
         runtime.lab_interventions.expire_pulses(now);
 
@@ -2874,6 +2901,10 @@ impl ApplicationHandler for PetApplication {
         let runtime_started = Instant::now();
         let runtime_started_unix_ms = unix_time_millis(SystemTime::now());
         let last_morph = prepared.morph.last_output();
+        let loaded_life_state_hash = serde_json::to_vec(&prepared.life.snapshot())
+            .map(|bytes| stable_hash_bytes(&bytes))
+            .unwrap_or(0);
+        let loaded_genome_hash = prepared.life.state.genome.stable_hash();
         self.runtime = Some(PetRuntime {
             window,
             renderer,
@@ -2959,7 +2990,14 @@ impl ApplicationHandler for PetApplication {
             pending_gesture_convention: None,
             lab_pointer_fixture: None,
             last_convention_update_episode: 0,
+            shutdown_for_promotion: false,
+            runtime_ack_accumulator: 1.0,
+            loaded_life_state_hash,
+            loaded_genome_hash,
         });
+        if let Some(runtime) = self.runtime.as_ref() {
+            write_runtime_ack(&self.store, runtime, RuntimeLoadStatus::Running);
+        }
         startup_probe(self.arguments.debug_log, "native runtime installed");
     }
 
@@ -3274,7 +3312,23 @@ impl ApplicationHandler for PetApplication {
         }
         if let Some(runtime) = self.runtime.as_ref() {
             self.persist(runtime);
+            write_runtime_ack(&self.store, runtime, RuntimeLoadStatus::Stopped);
         }
+    }
+}
+
+fn write_runtime_ack(store: &StateStore, runtime: &PetRuntime, status: RuntimeLoadStatus) {
+    let acknowledgement = RuntimeLoadAcknowledgement {
+        schema_version: RUNTIME_LOAD_ACK_SCHEMA_VERSION,
+        status,
+        pid: std::process::id(),
+        executable_version: env!("CARGO_PKG_VERSION").to_owned(),
+        loaded_life_state_hash: runtime.loaded_life_state_hash,
+        loaded_genome_hash: runtime.loaded_genome_hash,
+        updated_unix_ms: unix_time_millis(SystemTime::now()),
+    };
+    if let Err(error) = store.save_runtime_ack(&acknowledgement) {
+        eprintln!("could not write runtime load acknowledgement: {error}");
     }
 }
 
@@ -3607,6 +3661,10 @@ fn poll_lab_control(
             }
             changed
         }
+        LabControlCommand::ShutdownForPromotion => {
+            runtime.shutdown_for_promotion = true;
+            true
+        }
     };
     runtime.lab_interventions.note_applied(changed);
 }
@@ -3628,6 +3686,7 @@ const fn lab_command_name(command: &LabControlCommand) -> &'static str {
         LabControlCommand::DeleteGestureConvention { .. } => "delete_gesture_convention",
         LabControlCommand::RollbackGestureConventions { .. } => "rollback_gesture_conventions",
         LabControlCommand::ClearGestureConventions => "clear_gesture_conventions",
+        LabControlCommand::ShutdownForPromotion => "shutdown_for_promotion",
     }
 }
 
@@ -5306,7 +5365,8 @@ fn print_help() {
          \n  --headless-smoke SECONDS Run a bounded headless smoke test\n\
          \n  --simulate-hours HOURS   Compatibility alias for approximate calendar-only evolution\n\
          \n  --evolution-config PATH  Run a typed deterministic multi-rate curriculum\n\
-         \n  --evolution-report PATH  Write the atomic schema-1 evolution report\n\
+         \n  --evolution-report PATH  Write the atomic schema-2 evolution report\n\
+         \n  --evolution-progress PATH Atomically update bounded live progress\n\
          \n  --evolution-persist MODE dry-run, fork, or save-final\n\
          \n  --evolution-max-generations N  Override the bounded generation cap\n\
          \n  --pointer-replay PATH     Replay a bounded body-local physical interaction\n\
@@ -5319,7 +5379,7 @@ fn print_help() {
          \n  --brain-mode MODE        classic, morphic, fusion, morph-shadow, or morph-fusion\n\
          \n  --debug-log              Write 1 Hz frame and embodiment diagnostics\n\
          \n  --dev-mode               Start bounded 5 Hz causal telemetry\n\
-         \n  --no-audio               Disable the audio device\n\
+         \n  --no-audio-output        Disable device playback, not offline synthesis\n\
          \n\nHOTKEY: Win+Alt+D toggles bounded causal telemetry at runtime\n"
     );
 }

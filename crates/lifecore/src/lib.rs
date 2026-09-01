@@ -687,6 +687,22 @@ impl LifeCore {
         true
     }
 
+    /// Confirm that a headless/offline host really synthesized this request.
+    /// This clears the process-owned delivery slot, but intentionally does not
+    /// create recency, social credit, or a claim that anybody heard the sound.
+    pub fn confirm_vocal_request_rendered_offline(&mut self, request_id: u64) -> bool {
+        if self
+            .state
+            .pending_vocal_delivery
+            .as_ref()
+            .is_none_or(|pending| pending.request_id != request_id)
+        {
+            return false;
+        }
+        self.state.pending_vocal_delivery = None;
+        true
+    }
+
     /// Cancel a queued performance that never reached the callback. Since no
     /// learning state is committed before `confirm_vocal_request_heard`, this is
     /// a lossless discard rather than a fragile rollback.
@@ -2663,6 +2679,35 @@ mod tests {
         snapshot.state.development.mutation_history[0].child_genome_hash = Some(0);
 
         assert!(LifeCore::restore(snapshot).is_err());
+    }
+
+    #[test]
+    fn offline_render_receipt_never_claims_a_heard_social_event() {
+        let mut core = LifeCore::new(Genome::from_seed(0x000F_F11E), 91);
+        let sensors = SensorFrame::default();
+        let uses_before = core
+            .state
+            .vocal_motifs
+            .iter()
+            .map(|motif| motif.use_count)
+            .collect::<Vec<_>>();
+        let recent_before = core.state.recent_vocalizations.clone();
+        let request = core
+            .request_vocalization(VocalTrigger::SoftTouch, &sensors)
+            .unwrap();
+
+        assert!(core.confirm_vocal_request_rendered_offline(request.performance_seed));
+        assert!(core.state.pending_vocal_delivery.is_none());
+        assert!(core.state.pending_vocal_credit.is_none());
+        assert_eq!(core.state.recent_vocalizations, recent_before);
+        assert_eq!(
+            core.state
+                .vocal_motifs
+                .iter()
+                .map(|motif| motif.use_count)
+                .collect::<Vec<_>>(),
+            uses_before
+        );
     }
 
     #[test]

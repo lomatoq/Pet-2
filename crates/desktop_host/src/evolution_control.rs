@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const EVOLUTION_CONFIG_SCHEMA_VERSION: u32 = 1;
-pub const EVOLUTION_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const EVOLUTION_REPORT_SCHEMA_VERSION: u32 = 2;
+pub const EVOLUTION_PROGRESS_SCHEMA_VERSION: u32 = 1;
 pub const MAX_EVOLUTION_REPLICATES: u32 = 8;
 pub const MAX_EVOLUTION_GENERATIONS: u32 = 2;
 
@@ -48,6 +49,82 @@ pub enum EvolutionPersistence {
     DryRun,
     Fork,
     SaveFinal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvolutionProgressStage {
+    Starting,
+    Replicate,
+    Episode,
+    Finalizing,
+    Completed,
+    Failed,
+}
+
+/// Atomically replaced while a headless run is alive. This is deliberately a
+/// small operational receipt rather than a second copy of the final report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvolutionProgress {
+    pub schema_version: u32,
+    pub stage: EvolutionProgressStage,
+    pub replicate_index: u32,
+    pub replicate_count: u32,
+    pub episode_index: u32,
+    pub episode_count: u32,
+    pub simulated_seconds: f64,
+    pub audio_render_count: u32,
+    pub learning_update_count: u32,
+    pub elapsed_wall_seconds: f64,
+    pub eta_seconds: Option<f64>,
+    pub last_error: Option<String>,
+}
+
+impl EvolutionProgress {
+    #[must_use]
+    pub fn fraction(&self) -> f32 {
+        let total = u64::from(self.replicate_count.max(1))
+            .saturating_mul(u64::from(self.episode_count.max(1)));
+        let complete = u64::from(self.replicate_index)
+            .saturating_mul(u64::from(self.episode_count.max(1)))
+            .saturating_add(u64::from(self.episode_index));
+        (complete as f64 / total as f64).clamp(0.0, 1.0) as f32
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EvolutionAudioSummary {
+    pub rendered_count: u32,
+    pub exported_wav_count: u32,
+    pub total_rendered_seconds: f64,
+    pub rms_min: f32,
+    pub rms_max: f32,
+    pub peak_max: f32,
+    pub zero_crossing_rate_mean: f32,
+    pub wav_artifacts: Vec<String>,
+}
+
+pub const RUNTIME_LOAD_ACK_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLoadStatus {
+    Running,
+    Stopping,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLoadAcknowledgement {
+    pub schema_version: u32,
+    pub status: RuntimeLoadStatus,
+    pub pid: u32,
+    pub executable_version: String,
+    pub loaded_life_state_hash: u64,
+    pub loaded_genome_hash: u64,
+    pub updated_unix_ms: u64,
 }
 
 impl FromStr for EvolutionPersistence {
@@ -190,6 +267,7 @@ pub struct EvolutionReplicateSummary {
     pub final_genome_hash: u64,
     pub final_life_state_hash: u64,
     pub interaction_variant_updates: u32,
+    pub audio: EvolutionAudioSummary,
     pub telemetry_samples: u64,
     pub gesture_distribution: BTreeMap<String, u32>,
     pub eligibility: EvolutionEligibility,
@@ -226,6 +304,7 @@ pub struct EvolutionRunReport {
     pub gesture_distribution: BTreeMap<String, u32>,
     pub interaction_variant_updates: u32,
     pub convention_updates: u32,
+    pub audio: EvolutionAudioSummary,
     pub telemetry_samples: u64,
     pub eligibility: EvolutionEligibility,
     pub invariants: EvolutionInvariantSummary,

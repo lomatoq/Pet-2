@@ -11,9 +11,9 @@ use std::{
 
 use desktop_host::{
     EVOLUTION_CONFIG_SCHEMA_VERSION, EvolutionConfig, EvolutionOutcomeModel, EvolutionPersistence,
-    EvolutionPolicy, EvolutionPreset, EvolutionRunReport, LAB_CONTROL_SCHEMA_VERSION,
-    LabControlCommand, LabControlEnvelope, LabDrive, LabGesture, PortablePetState,
-    QuietAdvanceMode, StateStore,
+    EvolutionPolicy, EvolutionPreset, EvolutionProgress, EvolutionRunReport,
+    LAB_CONTROL_SCHEMA_VERSION, LabControlCommand, LabControlEnvelope, LabDrive, LabGesture,
+    PortablePetState, QuietAdvanceMode, RuntimeLoadAcknowledgement, RuntimeLoadStatus, StateStore,
 };
 use egui::{CollapsingHeader, Context, DragValue, Sense, Slider};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor, wgpu};
@@ -201,7 +201,14 @@ struct AcceleratedLearningState {
     child: Option<Child>,
     started_at: Option<Instant>,
     report_path: Option<PathBuf>,
+    progress_path: Option<PathBuf>,
+    log_path: Option<PathBuf>,
     report: Option<EvolutionRunReport>,
+    progress: Option<EvolutionProgress>,
+    executable: Option<PathBuf>,
+    executable_sha256: Option<String>,
+    child_pid: Option<u32>,
+    error_tail: String,
     last_promotion_backup: Option<PathBuf>,
     status: String,
 }
@@ -224,7 +231,14 @@ impl Default for AcceleratedLearningState {
             child: None,
             started_at: None,
             report_path: None,
+            progress_path: None,
+            log_path: None,
             report: None,
+            progress: None,
+            executable: None,
+            executable_sha256: None,
+            child_pid: None,
+            error_tail: String::new(),
             last_promotion_backup: None,
             status: "No accelerated run started from this Body Lab session.".to_owned(),
         }
@@ -1717,6 +1731,7 @@ impl AcceleratedLearningState {
         let run_directory = store.paths.evolution_runs.join(run_id);
         let config_path = run_directory.join("config.json");
         let report_path = run_directory.join("report.json");
+        let progress_path = run_directory.join("progress.json");
         let log_path = run_directory.join("runner.log");
         if let Err(error) = fs::create_dir_all(&run_directory) {
             self.status = format!("Cannot create evolution run directory: {error}");
@@ -1762,11 +1777,13 @@ impl AcceleratedLearningState {
             .arg(&config_path)
             .arg("--evolution-report")
             .arg(&report_path)
+            .arg("--evolution-progress")
+            .arg(&progress_path)
             .arg("--evolution-persist")
             .arg(evolution_persistence_cli(config.persistence))
             .arg("--evolution-max-generations")
             .arg(config.maximum_generations.to_string())
-            .arg("--no-audio")
+            .arg("--no-audio-output")
             .arg("--data-dir")
             .arg(&store.paths.root)
             .stdout(Stdio::from(log))
@@ -1776,13 +1793,23 @@ impl AcceleratedLearningState {
         }
         match command.spawn() {
             Ok(child) => {
+                let pid = child.id();
                 self.child = Some(child);
                 self.started_at = Some(Instant::now());
                 self.report_path = Some(report_path.clone());
+                self.progress_path = Some(progress_path);
+                self.log_path = Some(log_path);
                 self.report = None;
+                self.progress = None;
+                self.executable_sha256 = executable_sha256(&executable).ok();
+                self.executable = Some(executable.clone());
+                self.child_pid = Some(pid);
+                self.error_tail.clear();
                 self.status = format!(
-                    "Runner started as a separate process · report {}",
-                    report_path.display()
+                    "Runner started · Pet 2 v{} · PID {} · report {}",
+                    env!("CARGO_PKG_VERSION"),
+                    pid,
+                    report_path.display(),
                 );
             }
             Err(error) => self.status = format!("Cannot start evolution runner: {error}"),
@@ -1790,6 +1817,12 @@ impl AcceleratedLearningState {
     }
 
     fn poll(&mut self) {
+        if let Some(path) = &self.progress_path
+            && let Ok(file) = File::open(path)
+            && let Ok(progress) = serde_json::from_reader::<_, EvolutionProgress>(file)
+        {
+            self.progress = Some(progress);
+        }
         let exit = match self.child.as_mut() {
             Some(child) => match child.try_wait() {
                 Ok(exit) => exit,
@@ -1804,6 +1837,7 @@ impl AcceleratedLearningState {
             return;
         };
         self.child = None;
+        self.child_pid = None;
         let elapsed = self
             .started_at
             .take()
@@ -1814,14 +1848,19 @@ impl AcceleratedLearningState {
             .and_then(|path| File::open(path).ok())
             .and_then(|file| serde_json::from_reader::<_, EvolutionRunReport>(file).ok());
         self.report = report;
+        self.error_tail = self
+            .log_path
+            .as_deref()
+            .and_then(|path| read_log_tail(path, 24).ok())
+            .unwrap_or_default();
         self.status = match &self.report {
             Some(report) => format!(
                 "Runner exited {} after {:.1} s · {} · {} episode(s)",
                 exit, elapsed, report.status, report.completed_episodes
             ),
             None => format!(
-                "Runner exited {} after {:.1} s without a readable report; inspect runner.log.",
-                exit, elapsed
+                "Runner exited {} after {:.1} s without a readable report. The error tail is shown below.",
+                exit, elapsed,
             ),
         };
     }
@@ -1835,6 +1874,7 @@ impl AcceleratedLearningState {
             Ok(exit) => self.status = format!("Runner cancelled; process exited {exit}."),
             Err(error) => self.status = format!("Could not cancel runner: {error}"),
         }
+        self.child_pid = None;
         self.started_at = None;
     }
 
@@ -1863,13 +1903,36 @@ impl AcceleratedLearningState {
             self.status = "Promotion blocked: this run did not create a fork.".to_owned();
             return;
         };
+        let expected_hash = report.final_life_state_hash;
+        let old_pid = match stop_live_runtime_for_promotion(store) {
+            Ok(pid) => pid,
+            Err(error) => {
+                self.status = format!("Promotion blocked before writing live state: {error}");
+                return;
+            }
+        };
         match promote_validated_fork(store, &path, report.final_life_state_hash) {
             Ok(backup) => {
-                self.last_promotion_backup = Some(backup.clone());
-                self.status = format!(
-                    "Validated fork promoted. Recovery backup: {}",
-                    backup.display()
-                );
+                match launch_desktop_pet_at(store).and_then(|(executable, pid)| {
+                    wait_for_loaded_hash(store, expected_hash, old_pid, Duration::from_secs(12))?;
+                    Ok((executable, pid))
+                }) {
+                    Ok((executable, pid)) => {
+                        self.last_promotion_backup = Some(backup.clone());
+                        self.status = format!(
+                            "Validated fork promoted and acknowledged live · state {expected_hash:016x} · PID {pid} · {} · recovery {}",
+                            executable.display(),
+                            backup.display(),
+                        );
+                    }
+                    Err(error) => {
+                        let rollback = restore_bundle(store, &StateStore::at(&backup), true);
+                        let _ = launch_desktop_pet_at(store);
+                        self.status = format!(
+                            "Promotion acknowledgement failed and was rolled back: {error}; rollback={rollback:?}"
+                        );
+                    }
+                }
             }
             Err(error) => self.status = format!("Promotion failed without accepting fork: {error}"),
         }
@@ -2073,6 +2136,7 @@ fn build_lab_control_envelope(
         | LabControlCommand::DeleteGestureConvention { .. }
         | LabControlCommand::RollbackGestureConventions { .. }
         | LabControlCommand::ClearGestureConventions => 5_000,
+        LabControlCommand::ShutdownForPromotion => 15_000,
         LabControlCommand::StimulatePointerGesture {
             duration_seconds, ..
         } => ((*duration_seconds * 1_000.0) as u32)
@@ -2114,6 +2178,7 @@ fn lab_control_description(command: &LabControlCommand) -> String {
             format!("rollback gesture conventions to version {version}")
         }
         LabControlCommand::ClearGestureConventions => "clear gesture conventions".into(),
+        LabControlCommand::ShutdownForPromotion => "graceful shutdown for promotion".into(),
     }
 }
 
@@ -2297,6 +2362,12 @@ fn accelerated_learning_panel(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
             ui.small(
                 "Deterministic multi-rate curriculum · runner is a separate process · synthetic experience never writes user conventions.",
             );
+            if state.persistence == EvolutionPersistence::DryRun {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 196, 92),
+                    "DRY RUN · results are measured and reported, but learned state will not be saved or promoted",
+                );
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Preset:");
                 for preset in [
@@ -2450,12 +2521,57 @@ fn accelerated_learning_panel(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
             });
             if let Some(started) = state.started_at {
                 ui.label(format!(
-                    "RUNNING · {:.1} s wall time · target {:.2} simulated h · report is committed only after completion",
+                    "RUNNING · {:.1} s wall time · target {:.2} simulated h · live progress is committed after every episode",
                     started.elapsed().as_secs_f32(),
                     state.simulated_hours
                 ));
             }
+            if let Some(executable) = &state.executable {
+                ui.monospace(format!(
+                    "exe {} · version {} · SHA-256 {} · PID {}",
+                    executable.display(),
+                    env!("CARGO_PKG_VERSION"),
+                    state.executable_sha256.as_deref().unwrap_or("unavailable"),
+                    state
+                        .child_pid
+                        .map_or_else(|| "exited".to_owned(), |pid| pid.to_string()),
+                ));
+            }
+            if let Some(progress) = &state.progress {
+                ui.add(
+                    egui::ProgressBar::new(progress.fraction())
+                        .show_percentage()
+                        .text(format!(
+                            "{:?} · replicate {}/{} · episode {}/{}",
+                            progress.stage,
+                            progress.replicate_index.saturating_add(1).min(progress.replicate_count),
+                            progress.replicate_count,
+                            progress.episode_index,
+                            progress.episode_count,
+                        )),
+                );
+                ui.small(format!(
+                    "sim {:.2} h · PCM renders {} · learning updates {} · wall {:.1} s · ETA {}",
+                    progress.simulated_seconds / 3_600.0,
+                    progress.audio_render_count,
+                    progress.learning_update_count,
+                    progress.elapsed_wall_seconds,
+                    progress
+                        .eta_seconds
+                        .map_or_else(|| "—".to_owned(), |eta| format!("{eta:.1} s")),
+                ));
+                if let Some(error) = &progress.last_error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 105, 96), error);
+                }
+            }
             ui.small(&state.status);
+            if !state.error_tail.is_empty() && state.report.is_none() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 105, 96),
+                    "Runner error tail:",
+                );
+                ui.monospace(&state.error_tail);
+            }
             if let Some(report) = &state.report {
                 let invariant_color = if report.invariants.passed {
                     egui::Color32::from_rgb(105, 232, 172)
@@ -2481,8 +2597,10 @@ fn accelerated_learning_panel(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
                     ),
                 );
                 ui.small(format!(
-                    "learning updates {} · convention updates {} · consolidations {} · eligible {} · state {:016x} · genome {:016x}",
+                    "learning updates {} · PCM renders {} ({} WAV) · convention updates {} · consolidations {} · eligible {} · state {:016x} · genome {:016x}",
                     report.interaction_variant_updates,
+                    report.audio.rendered_count,
+                    report.audio.exported_wav_count,
                     report.convention_updates,
                     report.sleep_consolidations,
                     report.eligibility.eligible,
@@ -5950,14 +6068,22 @@ fn delete_user_preset(directory: &Path, id: &str) -> Result<(), String> {
 }
 
 fn canonical_pet_executable_name() -> &'static str {
-    if cfg!(windows) { "Pet 2.exe" } else { "Pet 2" }
+    if cfg!(windows) { "Pet2.exe" } else { "Pet2" }
 }
 
 fn development_pet_executable_name() -> &'static str {
     if cfg!(windows) { "pet2.exe" } else { "pet2" }
 }
 
-fn pet_executable_candidates(current_exe: &Path, workspace_root: &Path) -> Vec<PathBuf> {
+fn legacy_pet_executable_name() -> &'static str {
+    if cfg!(windows) { "Pet 2.exe" } else { "Pet 2" }
+}
+
+fn pet_executable_candidates(
+    current_exe: &Path,
+    workspace_root: &Path,
+    include_builds_current_fallback: bool,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut push_unique = |candidate: PathBuf| {
         if !candidates.contains(&candidate) {
@@ -5966,33 +6092,51 @@ fn pet_executable_candidates(current_exe: &Path, workspace_root: &Path) -> Vec<P
     };
     if let Some(parent) = current_exe.parent() {
         push_unique(parent.join(canonical_pet_executable_name()));
+        push_unique(parent.join(development_pet_executable_name()));
+        push_unique(parent.join(legacy_pet_executable_name()));
     }
-    push_unique(
-        workspace_root
-            .join("builds")
-            .join("current")
-            .join(canonical_pet_executable_name()),
-    );
     push_unique(
         workspace_root
             .join("target")
             .join("release")
             .join(development_pet_executable_name()),
     );
-    if let Some(parent) = current_exe.parent() {
-        push_unique(parent.join(development_pet_executable_name()));
-    }
     push_unique(
         workspace_root
             .join("target")
             .join("debug")
             .join(development_pet_executable_name()),
     );
+    if include_builds_current_fallback {
+        push_unique(
+            workspace_root
+                .join("builds")
+                .join("current")
+                .join(canonical_pet_executable_name()),
+        );
+        push_unique(
+            workspace_root
+                .join("builds")
+                .join("current")
+                .join(legacy_pet_executable_name()),
+        );
+    }
     candidates
 }
 
 fn resolve_pet_executable(current_exe: &Path, workspace_root: &Path) -> Result<PathBuf, String> {
-    let candidates = pet_executable_candidates(current_exe, workspace_root);
+    let launched_from_builds_current = current_exe
+        .components()
+        .any(|part| part.as_os_str() == "builds")
+        && current_exe
+            .components()
+            .any(|part| part.as_os_str() == "current");
+    let explicit_fallback = env::var("PET2_BUILDS_CURRENT_FALLBACK").as_deref() == Ok("1");
+    let candidates = pet_executable_candidates(
+        current_exe,
+        workspace_root,
+        launched_from_builds_current || explicit_fallback,
+    );
     candidates
         .iter()
         .find(|candidate| candidate.is_file())
@@ -6005,8 +6149,43 @@ fn resolve_pet_executable(current_exe: &Path, workspace_root: &Path) -> Result<P
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+                    + "; set PET2_BUILDS_CURRENT_FALLBACK=1 only to opt into builds/current"
             )
         })
+}
+
+fn executable_sha256(path: &Path) -> Result<String, String> {
+    let output = if cfg!(windows) {
+        Command::new("certutil.exe")
+            .arg("-hashfile")
+            .arg(path)
+            .arg("SHA256")
+            .output()
+    } else {
+        Command::new("sha256sum").arg(path).output()
+    }
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|word| word.trim().to_ascii_lowercase())
+        .find(|word| word.len() == 64 && word.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "SHA-256 utility returned no 64-digit digest".to_owned())
+}
+
+fn read_log_tail(path: &Path, line_count: usize) -> Result<String, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut lines = VecDeque::with_capacity(line_count);
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        if lines.len() == line_count {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+    Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
 }
 
 fn launch_desktop_pet() -> Result<PathBuf, String> {
@@ -6019,6 +6198,84 @@ fn launch_desktop_pet() -> Result<PathBuf, String> {
     }
     command.spawn().map_err(|error| error.to_string())?;
     Ok(executable)
+}
+
+fn launch_desktop_pet_at(store: &StateStore) -> Result<(PathBuf, u32), String> {
+    let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let executable = resolve_pet_executable(&current_exe, &workspace_root)?;
+    let mut command = Command::new(&executable);
+    command.arg("--data-dir").arg(&store.paths.root);
+    if let Some(parent) = executable.parent() {
+        command.current_dir(parent);
+    }
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    Ok((executable, child.id()))
+}
+
+fn stop_live_runtime_for_promotion(store: &StateStore) -> Result<Option<u32>, String> {
+    let now = unix_time_ms();
+    let acknowledgement = store
+        .load_runtime_ack::<RuntimeLoadAcknowledgement>()
+        .map_err(|error| error.to_string())?;
+    let Some(running) = acknowledgement.filter(|ack| {
+        ack.status == RuntimeLoadStatus::Running && now.saturating_sub(ack.updated_unix_ms) <= 3_000
+    }) else {
+        return Ok(None);
+    };
+    let command = LabControlEnvelope {
+        schema_version: LAB_CONTROL_SCHEMA_VERSION,
+        command_id: now.max(1),
+        issued_unix_ms: now,
+        expires_after_ms: 15_000,
+        command: LabControlCommand::ShutdownForPromotion,
+    };
+    store
+        .save_lab_control(&command)
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(ack) = store
+            .load_runtime_ack::<RuntimeLoadAcknowledgement>()
+            .map_err(|error| error.to_string())?
+            && ack.pid == running.pid
+            && ack.status == RuntimeLoadStatus::Stopped
+        {
+            return Ok(Some(running.pid));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "live Pet PID {} did not acknowledge a graceful stop within 10 s",
+        running.pid
+    ))
+}
+
+fn wait_for_loaded_hash(
+    store: &StateStore,
+    expected_hash: u64,
+    old_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<RuntimeLoadAcknowledgement, String> {
+    let started_unix_ms = unix_time_ms();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(ack) = store
+            .load_runtime_ack::<RuntimeLoadAcknowledgement>()
+            .map_err(|error| error.to_string())?
+            && ack.status == RuntimeLoadStatus::Running
+            && ack.loaded_life_state_hash == expected_hash
+            && old_pid != Some(ack.pid)
+            && ack.updated_unix_ms >= started_unix_ms
+        {
+            return Ok(ack);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "new live Pet did not acknowledge loaded state {expected_hash:016x} within {:.1} s",
+        timeout.as_secs_f32()
+    ))
 }
 
 fn save_profile_file(path: &Path, profile: &LiquidTuningProfile) -> Result<(), String> {
@@ -6342,7 +6599,7 @@ mod tests {
     }
 
     #[test]
-    fn pet_executable_resolution_prefers_canonical_then_release_then_debug() {
+    fn pet_executable_resolution_prefers_packaged_sibling_then_matching_targets() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path();
         let current_directory = workspace.join("builds").join("current");
@@ -6382,6 +6639,31 @@ mod tests {
             resolve_pet_executable(&current_exe, workspace).unwrap(),
             debug
         );
+    }
+
+    #[test]
+    fn stale_builds_current_cannot_override_the_body_lab_sibling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path();
+        let target = workspace.join("target").join("debug");
+        let stale_directory = workspace.join("builds").join("current");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&stale_directory).unwrap();
+        let body_lab = target.join(if cfg!(windows) {
+            "BodyLab.exe"
+        } else {
+            "BodyLab"
+        });
+        let matching_pet = target.join(canonical_pet_executable_name());
+        let stale_pet = stale_directory.join(canonical_pet_executable_name());
+        File::create(&matching_pet).unwrap();
+        File::create(&stale_pet).unwrap();
+
+        assert_eq!(
+            resolve_pet_executable(&body_lab, workspace).unwrap(),
+            matching_pet
+        );
+        assert!(!pet_executable_candidates(&body_lab, workspace, false).contains(&stale_pet));
     }
 
     #[test]

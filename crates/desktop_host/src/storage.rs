@@ -98,6 +98,8 @@ pub struct StoragePaths {
     pub telemetry_previous: PathBuf,
     pub lab_control: PathBuf,
     pub lab_control_backup: PathBuf,
+    pub runtime_load_ack: PathBuf,
+    pub runtime_load_ack_backup: PathBuf,
     pub backup: PathBuf,
     pub ecology_backup: PathBuf,
 }
@@ -162,6 +164,10 @@ impl StateStore {
                 telemetry_previous: root.join("telemetry.previous.jsonl"),
                 lab_control: root.join("lab-control.json"),
                 lab_control_backup: root.join("backups").join("lab-control.previous.json"),
+                runtime_load_ack: root.join("runtime-load-ack.json"),
+                runtime_load_ack_backup: root
+                    .join("backups")
+                    .join("runtime-load-ack.previous.json"),
                 backup: root.join("backups").join("state.previous.json"),
                 ecology_backup: root.join("backups").join("ecology-state.previous.json"),
                 root,
@@ -394,6 +400,21 @@ impl StateStore {
             &self.paths.lab_control,
             &self.paths.lab_control_backup,
             control,
+        )
+    }
+
+    pub fn load_runtime_ack<T: DeserializeOwned>(&self) -> Result<Option<T>, StorageError> {
+        if !self.paths.runtime_load_ack.exists() {
+            return Ok(None);
+        }
+        read_json(&self.paths.runtime_load_ack).map(Some)
+    }
+
+    pub fn save_runtime_ack<T: Serialize>(&self, acknowledgement: &T) -> Result<(), StorageError> {
+        atomic_json(
+            &self.paths.runtime_load_ack,
+            &self.paths.runtime_load_ack_backup,
+            acknowledgement,
         )
     }
 

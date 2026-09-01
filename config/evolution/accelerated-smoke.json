@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "name": "Accelerated Learning Pipeline Smoke",
+  "preset": "custom",
+  "simulated_hours": 0.01,
+  "episodes_per_day": 0,
+  "total_episodes": 2,
+  "replicate_count": 1,
+  "seed": 573657340241,
+  "outcome_model": "mixed_realistic",
+  "quiet_advance": "exact",
+  "include_saved_gesture_replays": false,
+  "sleep_consolidation": false,
+  "persistent_learning": true,
+  "evolution_policy": "off",
+  "maximum_generations": 0,
+  "checkpoint_interval_hours": 1.0,
+  "persistence": "dry_run"
+}

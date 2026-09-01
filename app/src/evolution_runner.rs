@@ -8,11 +8,12 @@ use std::{
 };
 
 use desktop_host::{
-    EVOLUTION_CONFIG_SCHEMA_VERSION, EVOLUTION_REPORT_SCHEMA_VERSION, EvolutionCheckpoint,
-    EvolutionConfig, EvolutionEligibility, EvolutionInvariantSummary, EvolutionOutcomeModel,
+    EVOLUTION_CONFIG_SCHEMA_VERSION, EVOLUTION_PROGRESS_SCHEMA_VERSION,
+    EVOLUTION_REPORT_SCHEMA_VERSION, EvolutionAudioSummary, EvolutionCheckpoint, EvolutionConfig,
+    EvolutionEligibility, EvolutionInvariantSummary, EvolutionOutcomeModel,
     EvolutionPerformanceSummary, EvolutionPersistence, EvolutionPolicy, EvolutionPreset,
-    EvolutionReplicateSummary, EvolutionRunReport, PORTABLE_STATE_SCHEMA_VERSION, PortablePetState,
-    QuietAdvanceMode, StateStore,
+    EvolutionProgress, EvolutionProgressStage, EvolutionReplicateSummary, EvolutionRunReport,
+    PORTABLE_STATE_SCHEMA_VERSION, PortablePetState, QuietAdvanceMode, StateStore,
 };
 use glam::Vec2;
 use lifecore::{
@@ -21,6 +22,7 @@ use lifecore::{
     PoseIntent, SensorFrame, VitaState, stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphWorldInput};
+use pet_audio::{OfflinePcm, OfflineSampleFormat, export_debug_wav, render_motif};
 use pet_body::{
     BodyMaterialSnapshot, LiquidTuningProfile, ProceduralBody, VisualMindInput, VoiceVisualState,
 };
@@ -60,6 +62,176 @@ struct ReplicateResult {
     sleep_consolidations: u32,
     body_timings_us: Vec<f64>,
     base_ticks: u64,
+}
+
+const MAX_EXPORTED_WAVS_PER_REPLICATE: u32 = 24;
+
+struct OfflineAudioRecorder {
+    directory: PathBuf,
+    replicate_index: u32,
+    summary: EvolutionAudioSummary,
+    rms_sum: f64,
+}
+
+impl OfflineAudioRecorder {
+    fn new(directory: PathBuf, replicate_index: u32) -> Self {
+        Self {
+            directory,
+            replicate_index,
+            summary: EvolutionAudioSummary {
+                rms_min: f32::MAX,
+                ..EvolutionAudioSummary::default()
+            },
+            rms_sum: 0.0,
+        }
+    }
+
+    fn render(&mut self, life: &mut LifeCore, request: lifecore::VocalRequest) {
+        let Some(motif) = life
+            .state
+            .vocal_motifs
+            .iter()
+            .find(|motif| motif.id == request.motif_id)
+            .cloned()
+        else {
+            life.cancel_vocal_request(request.performance_seed);
+            return;
+        };
+        let OfflinePcm::F32(samples) = render_motif(
+            &life.state.genome.voice,
+            &motif,
+            &request,
+            48_000,
+            1,
+            OfflineSampleFormat::F32,
+        ) else {
+            unreachable!("offline runner requests f32 PCM")
+        };
+        let count = samples.len().max(1) as f32;
+        let rms = (samples
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>()
+            / f64::from(count))
+        .sqrt() as f32;
+        let peak = samples
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        let zero_crossings = samples
+            .windows(2)
+            .filter(|pair| pair[0].is_sign_positive() != pair[1].is_sign_positive())
+            .count() as f32;
+        let zcr = zero_crossings / count;
+        self.summary.rendered_count = self.summary.rendered_count.saturating_add(1);
+        self.summary.total_rendered_seconds += samples.len() as f64 / 48_000.0;
+        self.summary.rms_min = self.summary.rms_min.min(rms);
+        self.summary.rms_max = self.summary.rms_max.max(rms);
+        self.summary.peak_max = self.summary.peak_max.max(peak);
+        self.rms_sum += f64::from(zcr);
+        if self.summary.exported_wav_count < MAX_EXPORTED_WAVS_PER_REPLICATE
+            && fs::create_dir_all(&self.directory).is_ok()
+        {
+            let path = self.directory.join(format!(
+                "replicate-{:02}-voice-{:04}-{:016x}.wav",
+                self.replicate_index, self.summary.rendered_count, request.performance_seed
+            ));
+            if export_debug_wav(&path, &samples, 48_000, 1).is_ok() {
+                self.summary.exported_wav_count = self.summary.exported_wav_count.saturating_add(1);
+                self.summary.wav_artifacts.push(path.display().to_string());
+            }
+        }
+        let _ = life.confirm_vocal_request_rendered_offline(request.performance_seed);
+    }
+
+    fn finish(mut self) -> EvolutionAudioSummary {
+        if self.summary.rendered_count == 0 {
+            self.summary.rms_min = 0.0;
+        } else {
+            self.summary.zero_crossing_rate_mean =
+                (self.rms_sum / f64::from(self.summary.rendered_count)) as f32;
+        }
+        self.summary
+    }
+}
+
+struct ProgressWriter {
+    path: Option<PathBuf>,
+    started: Instant,
+    progress: EvolutionProgress,
+    finished: bool,
+}
+
+impl ProgressWriter {
+    fn new(path: Option<PathBuf>, replicate_count: u32, episode_count: u32) -> Self {
+        Self {
+            path,
+            started: Instant::now(),
+            progress: EvolutionProgress {
+                schema_version: EVOLUTION_PROGRESS_SCHEMA_VERSION,
+                stage: EvolutionProgressStage::Starting,
+                replicate_index: 0,
+                replicate_count,
+                episode_index: 0,
+                episode_count,
+                simulated_seconds: 0.0,
+                audio_render_count: 0,
+                learning_update_count: 0,
+                elapsed_wall_seconds: 0.0,
+                eta_seconds: None,
+                last_error: None,
+            },
+            finished: false,
+        }
+    }
+
+    fn write(&mut self) {
+        self.progress.elapsed_wall_seconds = self.started.elapsed().as_secs_f64();
+        let fraction = f64::from(self.progress.fraction());
+        self.progress.eta_seconds = (fraction > 0.0 && fraction < 1.0)
+            .then(|| self.progress.elapsed_wall_seconds * (1.0 - fraction) / fraction);
+        if let Some(path) = &self.path
+            && let Err(error) = atomic_json(path, &self.progress, false)
+        {
+            eprintln!("failed to update evolution progress: {error}");
+        }
+        println!(
+            "progress stage={:?} replicate={}/{} episode={}/{} sim_time={:.2}s audio_render_count={} learning_update_count={} eta={:?} last_error={:?}",
+            self.progress.stage,
+            self.progress
+                .replicate_index
+                .saturating_add(1)
+                .min(self.progress.replicate_count),
+            self.progress.replicate_count,
+            self.progress.episode_index,
+            self.progress.episode_count,
+            self.progress.simulated_seconds,
+            self.progress.audio_render_count,
+            self.progress.learning_update_count,
+            self.progress.eta_seconds,
+            self.progress.last_error,
+        );
+    }
+
+    fn complete(&mut self) {
+        self.progress.stage = EvolutionProgressStage::Completed;
+        self.progress.replicate_index = self.progress.replicate_count;
+        self.progress.episode_index = self.progress.episode_count;
+        self.finished = true;
+        self.write();
+    }
+}
+
+impl Drop for ProgressWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.progress.stage = EvolutionProgressStage::Failed;
+            self.progress.last_error =
+                Some("runner exited before completion; inspect runner.log".into());
+            self.write();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +391,20 @@ pub(crate) fn run(
         config.maximum_generations = maximum;
     }
     config.validate()?;
+    let report_path = arguments
+        .evolution_report
+        .clone()
+        .unwrap_or_else(|| store.paths.evolution_runs.join("latest-report.json"));
+    let audio_directory = report_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("audio");
+    let mut progress = ProgressWriter::new(
+        arguments.evolution_progress.clone(),
+        config.replicate_count,
+        config.scheduled_episode_count(),
+    );
+    progress.write();
 
     if arguments.simulate_hours.is_some() {
         eprintln!(
@@ -258,8 +444,20 @@ pub(crate) fn run(
     let started = Instant::now();
     let mut results = Vec::with_capacity(config.replicate_count as usize);
     for replicate in 0..config.replicate_count {
-        results.push(run_replicate(&config, &initial, replicate)?);
+        progress.progress.stage = EvolutionProgressStage::Replicate;
+        progress.progress.replicate_index = replicate;
+        progress.progress.episode_index = 0;
+        progress.write();
+        results.push(run_replicate(
+            &config,
+            &initial,
+            replicate,
+            &audio_directory,
+            &mut progress,
+        )?);
     }
+    progress.progress.stage = EvolutionProgressStage::Finalizing;
+    progress.write();
     let wall_seconds = started.elapsed().as_secs_f64();
     let all_invariants_passed = results
         .iter()
@@ -270,11 +468,6 @@ pub(crate) fn run(
     let primary = results
         .first()
         .ok_or("evolution runner produced no deterministic replicate")?;
-    let report_path = arguments
-        .evolution_report
-        .clone()
-        .unwrap_or_else(|| store.paths.evolution_runs.join("latest-report.json"));
-
     let persisted_state = if all_invariants_passed {
         persist_accepted_state(&config, store, &initial, primary)?
     } else {
@@ -324,6 +517,7 @@ pub(crate) fn run(
         gesture_distribution: primary.summary.gesture_distribution.clone(),
         interaction_variant_updates: primary.summary.interaction_variant_updates,
         convention_updates: 0,
+        audio: primary.summary.audio.clone(),
         telemetry_samples: primary.summary.telemetry_samples,
         eligibility: primary.summary.eligibility.clone(),
         invariants: primary.summary.invariants.clone(),
@@ -341,6 +535,7 @@ pub(crate) fn run(
         persisted_state,
     };
     atomic_report(&report_path, &report)?;
+    progress.complete();
     println!("{}", serde_json::to_string_pretty(&report)?);
     if !all_invariants_passed {
         return Err(format!(
@@ -383,6 +578,8 @@ fn run_replicate(
     config: &EvolutionConfig,
     initial: &InitialState,
     replicate_index: u32,
+    audio_directory: &Path,
+    progress: &mut ProgressWriter,
 ) -> Result<ReplicateResult, Box<dyn Error>> {
     let seed = config
         .seed
@@ -417,6 +614,9 @@ fn run_replicate(
     let mut completed_episodes = 0_u32;
     let initial_recovery_count = body.embodiment.liquid.diagnostics().recovery_count;
     let initial_variant_updates = variant_updates(&life);
+    let audio_before = progress.progress.audio_render_count;
+    let learning_before = progress.progress.learning_update_count;
+    let mut audio = OfflineAudioRecorder::new(audio_directory.to_owned(), replicate_index);
 
     for episode in 0..episode_count {
         let scheduled =
@@ -433,6 +633,7 @@ fn run_replicate(
             &mut morph,
             &mut intent,
             &mut telemetry_samples,
+            &mut audio,
         );
         capture_checkpoints(
             &life,
@@ -470,8 +671,18 @@ fn run_replicate(
             &mut telemetry_samples,
             &mut quiet_or_no_response_episodes,
             &mut safe_boundary_episodes,
+            &mut audio,
         );
         completed_episodes = completed_episodes.saturating_add(1);
+        progress.progress.stage = EvolutionProgressStage::Episode;
+        progress.progress.replicate_index = replicate_index;
+        progress.progress.episode_index = completed_episodes;
+        progress.progress.simulated_seconds = base_tick as f64 / BASE_HZ as f64;
+        progress.progress.audio_render_count =
+            audio_before.saturating_add(audio.summary.rendered_count);
+        progress.progress.learning_update_count = learning_before
+            .saturating_add(variant_updates(&life).saturating_sub(initial_variant_updates));
+        progress.write();
         capture_checkpoints(
             &life,
             base_tick,
@@ -491,6 +702,7 @@ fn run_replicate(
         &mut morph,
         &mut intent,
         &mut telemetry_samples,
+        &mut audio,
     );
     capture_checkpoints(
         &life,
@@ -567,6 +779,10 @@ fn run_replicate(
         vita.note_metamorphosis();
     }
     let final_life_state_hash = life_hash(&life)?;
+    let audio = audio.finish();
+    progress.progress.audio_render_count = audio_before.saturating_add(audio.rendered_count);
+    progress.progress.learning_update_count =
+        learning_before.saturating_add(interaction_variant_updates);
     let summary = EvolutionReplicateSummary {
         replicate_index,
         seed,
@@ -575,6 +791,7 @@ fn run_replicate(
         final_genome_hash: life.state.genome.stable_hash(),
         final_life_state_hash,
         interaction_variant_updates,
+        audio,
         telemetry_samples,
         gesture_distribution,
         eligibility,
@@ -607,6 +824,7 @@ fn advance_quiet(
     morph: &mut MorphBrain,
     intent: &mut BodyIntent,
     telemetry_samples: &mut u64,
+    audio: &mut OfflineAudioRecorder,
 ) {
     if target_tick <= *base_tick {
         return;
@@ -633,7 +851,7 @@ fn advance_quiet(
             let morph_output = morph.tick(sensors, &feedback, &life.state, LIFE_DT);
             let mut output = life.tick(sensors, &feedback, LIFE_DT);
             if let Some(request) = output.vocal_request.take() {
-                life.cancel_vocal_request(request.performance_seed);
+                audio.render(life, request);
             }
             (*intent, _) = vita.resolve_intent_with_morph(
                 BrainMode::MorphFusion,
@@ -674,6 +892,7 @@ fn run_episode(
     telemetry_samples: &mut u64,
     quiet_or_no_response_episodes: &mut u32,
     safe_boundary_episodes: &mut u32,
+    audio: &mut OfflineAudioRecorder,
 ) {
     let mut fixture = FixtureRuntime::new(kind, seed, episode_index);
     let anticipation = 0.25_f32;
@@ -769,7 +988,7 @@ fn run_episode(
                 }
             }
             if let Some(request) = output.vocal_request.take() {
-                life.cancel_vocal_request(request.performance_seed);
+                audio.render(life, request);
             }
             (*intent, _) = vita.resolve_intent_with_morph(
                 BrainMode::MorphFusion,
@@ -1147,6 +1366,14 @@ fn persist_accepted_state(
 }
 
 fn atomic_report(path: &Path, report: &EvolutionRunReport) -> Result<(), Box<dyn Error>> {
+    atomic_json(path, report, true)
+}
+
+fn atomic_json<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    keep_previous: bool,
+) -> Result<(), Box<dyn Error>> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
@@ -1162,19 +1389,29 @@ fn atomic_report(path: &Path, report: &EvolutionRunReport) -> Result<(), Box<dyn
         .write(true)
         .open(&temporary)?;
     let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, report)?;
+    serde_json::to_writer_pretty(&mut writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
     if path.exists() {
-        let backup = path.with_extension("previous.json");
+        let backup = if keep_previous {
+            path.with_extension("previous.json")
+        } else {
+            path.with_extension("replaced.json")
+        };
         if backup.exists() {
             fs::remove_file(&backup)?;
         }
         fs::rename(path, backup)?;
     }
     fs::rename(&temporary, path)?;
+    if !keep_previous {
+        let backup = path.with_extension("replaced.json");
+        if backup.exists() {
+            fs::remove_file(backup)?;
+        }
+    }
     Ok(())
 }
 
@@ -1243,6 +1480,8 @@ mod tests {
         let mut intent = stable_body_intent();
         let mut base_tick = 1;
         let mut telemetry_samples = 0;
+        let directory = tempfile::tempdir().unwrap();
+        let mut audio = OfflineAudioRecorder::new(directory.path().to_owned(), 0);
 
         advance_quiet(
             QuietAdvanceMode::Exact,
@@ -1255,6 +1494,7 @@ mod tests {
             &mut morph,
             &mut intent,
             &mut telemetry_samples,
+            &mut audio,
         );
 
         assert_eq!(base_tick, 25);
@@ -1360,7 +1600,11 @@ mod tests {
             persistence: EvolutionPersistence::Fork,
         };
         config.validate().unwrap();
-        let result = run_replicate(&config, &initial, 0).unwrap();
+        let audio_directory = tempfile::tempdir().unwrap();
+        let mut progress = ProgressWriter::new(None, 1, 0);
+        let result =
+            run_replicate(&config, &initial, 0, audio_directory.path(), &mut progress).unwrap();
+        progress.finished = true;
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
         let persisted = persist_accepted_state(&config, &store, &initial, &result)
