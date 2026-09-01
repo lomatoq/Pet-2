@@ -14,7 +14,7 @@ use pet_ecology::{
     GestureConventionMatch, GestureConventionMeaning, GestureSignature, MAX_OBJECT_SPEED,
     MorselProfile, ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig,
     RhythmSignature, WindowAffordanceFrame, WorldObject, resolve_object_body_contact,
-    step_den_attraction, step_object_with_windows, stored_orb_hover_offset,
+    step_den_attraction, step_object_with_windows,
 };
 
 /// Application integration boundary for the portable habitat. Native input,
@@ -858,18 +858,6 @@ impl EcologyRuntime {
                 self.grab_active = true;
                 if let Some(object_id) = self.grabbed_object {
                     self.clear_den_slot_references(object_id);
-                    if let Some(object) = self
-                        .state
-                        .objects
-                        .iter_mut()
-                        .find(|object| object.id == object_id)
-                        && object.lifecycle == ObjectLifecycle::StoredInDen
-                    {
-                        let hover_offset =
-                            stored_orb_hover_offset(object.id, timestamp as f32, aspect);
-                        object.position =
-                            (object.position + hover_offset).clamp(Vec2::ZERO, Vec2::ONE);
-                    }
                 }
             }
         }
@@ -1227,7 +1215,7 @@ mod tests {
 
         assert!(runtime.hit_test(anchor, aspect, desktop_height, 0.0));
         assert!(runtime.observe_pointer(Some(anchor), true, true, aspect, desktop_height, 1.0,));
-        let visible_at_drag_start = anchor + stored_orb_hover_offset(orb_id, 1.03, aspect);
+        let visible_at_drag_start = anchor;
         runtime.observe_pointer(
             Some(Vec2::new(0.50, 0.42)),
             true,

@@ -4,6 +4,9 @@ use pet_ecology::{EcologyState, ObjectKind, ObjectLifecycle, stored_orb_hover_of
 use wgpu::util::DeviceExt;
 
 const MAX_ECOLOGY_INSTANCES: usize = 9;
+const STORED_ORB_HOVER_FREQUENCY: f32 = 1.15;
+const STORED_ORB_HOVER_MAX_SPEED_PX: f32 = 0.85;
+const STORED_ORB_HOVER_MAX_ACCELERATION_PX: f32 = 1.20;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -19,6 +22,8 @@ pub struct EcologyRenderer {
     den_activity: f32,
     den_activity_integral_seconds: f32,
     last_time_seconds: Option<f32>,
+    stored_orb_hover_offset_px: Vec2,
+    stored_orb_hover_velocity_px: Vec2,
 }
 
 impl EcologyRenderer {
@@ -93,6 +98,8 @@ impl EcologyRenderer {
             den_activity: 0.0,
             den_activity_integral_seconds: 0.0,
             last_time_seconds: None,
+            stored_orb_hover_offset_px: Vec2::ZERO,
+            stored_orb_hover_velocity_px: Vec2::ZERO,
         }
     }
 
@@ -145,6 +152,27 @@ impl EcologyRenderer {
         self.den_activity = self.den_activity.clamp(0.0, 1.0);
         self.den_activity_integral_seconds += self.den_activity * dt;
 
+        let stored_hover_target = state
+            .objects
+            .iter()
+            .find(|object| {
+                object.kind == ObjectKind::Orb && object.lifecycle == ObjectLifecycle::StoredInDen
+            })
+            .map_or(Vec2::ZERO, |orb| {
+                let offset = stored_orb_hover_offset(orb.id, time_seconds, aspect);
+                Vec2::new(offset.x * aspect, offset.y) * pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX
+            });
+        advance_stored_orb_hover(
+            &mut self.stored_orb_hover_offset_px,
+            &mut self.stored_orb_hover_velocity_px,
+            stored_hover_target,
+            dt,
+        );
+        let stored_hover_offset = Vec2::new(
+            self.stored_orb_hover_offset_px.x / (pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * aspect),
+            self.stored_orb_hover_offset_px.y / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX,
+        );
+
         let mut instances = [EcologyInstance::default(); MAX_ECOLOGY_INSTANCES];
         let mut count = 0_usize;
 
@@ -187,8 +215,8 @@ impl EcologyRenderer {
                 * 2.0
                 * den_scale;
             let rgb = hsv_to_rgb(object.hue, object.saturation, object.value);
-            let hover_offset = if stored_in_den {
-                stored_orb_hover_offset(object.id, time_seconds, aspect)
+            let hover_offset = if object.kind == ObjectKind::Orb {
+                stored_hover_offset
             } else {
                 Vec2::ZERO
             };
@@ -242,6 +270,32 @@ impl EcologyRenderer {
     }
 }
 
+fn advance_stored_orb_hover(
+    offset_px: &mut Vec2,
+    velocity_px: &mut Vec2,
+    target_px: Vec2,
+    dt: f32,
+) {
+    let dt = if dt.is_finite() {
+        dt.clamp(0.0, 0.05)
+    } else {
+        0.0
+    };
+    if dt <= 0.0 {
+        return;
+    }
+    let acceleration = ((target_px - *offset_px) * STORED_ORB_HOVER_FREQUENCY.powi(2)
+        - *velocity_px * (2.0 * STORED_ORB_HOVER_FREQUENCY))
+        .clamp_length_max(STORED_ORB_HOVER_MAX_ACCELERATION_PX);
+    *velocity_px =
+        (*velocity_px + acceleration * dt).clamp_length_max(STORED_ORB_HOVER_MAX_SPEED_PX);
+    *offset_px += *velocity_px * dt;
+    if target_px == Vec2::ZERO && offset_px.length() < 0.001 && velocity_px.length() < 0.001 {
+        *offset_px = Vec2::ZERO;
+        *velocity_px = Vec2::ZERO;
+    }
+}
+
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -264,7 +318,13 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> Vec3 {
 
 #[cfg(test)]
 mod tests {
+    use glam::Vec2;
     use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+    use super::{
+        STORED_ORB_HOVER_MAX_ACCELERATION_PX, STORED_ORB_HOVER_MAX_SPEED_PX,
+        advance_stored_orb_hover,
+    };
 
     #[test]
     fn ecology_shader_parses_and_validates() {
@@ -272,5 +332,31 @@ mod tests {
         Validator::new(ValidationFlags::all(), Capabilities::all())
             .validate(&module)
             .unwrap();
+    }
+
+    #[test]
+    fn stored_orb_hover_enters_and_leaves_without_a_position_step() {
+        let dt = 1.0 / 60.0;
+        let mut offset = Vec2::ZERO;
+        let mut velocity = Vec2::ZERO;
+        let target = Vec2::new(2.4, -1.5);
+
+        advance_stored_orb_hover(&mut offset, &mut velocity, target, dt);
+        assert!(offset.length() <= STORED_ORB_HOVER_MAX_ACCELERATION_PX * dt * dt);
+
+        for _ in 0..600 {
+            let previous = offset;
+            advance_stored_orb_hover(&mut offset, &mut velocity, target, dt);
+            assert!((offset - previous).length() <= STORED_ORB_HOVER_MAX_SPEED_PX * dt + 1.0e-6);
+        }
+
+        let before_release = offset;
+        advance_stored_orb_hover(&mut offset, &mut velocity, Vec2::ZERO, dt);
+        assert!((offset - before_release).length() <= STORED_ORB_HOVER_MAX_SPEED_PX * dt + 1.0e-6);
+        for _ in 0..1_200 {
+            advance_stored_orb_hover(&mut offset, &mut velocity, Vec2::ZERO, dt);
+        }
+        assert!(offset.length() < 0.01);
+        assert!(velocity.length() < 0.01);
     }
 }

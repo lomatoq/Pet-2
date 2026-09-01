@@ -2,17 +2,19 @@ use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EcologyError, MAX_OBJECT_SPEED, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig,
-    WorldObject,
+    EcologyError, MAX_OBJECT_SPEED, ORB_SCREEN_GRAVITY, ObjectId, ObjectKind, ObjectLifecycle,
+    ObjectPhysicsConfig, WorldObject,
 };
 
 pub const DEN_SLOT_COUNT: usize = 3;
 pub const DEN_ATTRACTION_RADIUS_PX: f32 = 190.0;
-pub const DEN_CAPTURE_RADIUS_PX: f32 = 7.0;
+pub const DEN_CAPTURE_RADIUS_PX: f32 = 1.25;
 const DEN_ATTRACTION_FULL_STRENGTH_RADIUS_PX: f32 = 50.0;
 const DEN_ATTRACTION_MAX_SPEED: f32 = 0.58;
-const STORED_ORB_HOVER_X_PX: f32 = 6.0;
-const STORED_ORB_HOVER_Y_PX: f32 = 4.0;
+const STORED_ORB_HOVER_X_PX: f32 = 2.4;
+const STORED_ORB_HOVER_Y_PX: f32 = 1.5;
+const STORED_ORB_HOVER_X_PERIOD_SECONDS: f32 = 17.0;
+const STORED_ORB_HOVER_Y_PERIOD_SECONDS: f32 = 23.0;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -161,6 +163,10 @@ pub fn step_den_attraction(
     let desired_velocity = direction * desired_speed;
     let response = 4.0 + proximity * 9.0;
     let alpha = (1.0 - (-response * dt).exp()) * proximity;
+    // `step_object` applies screen gravity immediately before this field. Fade
+    // in an equal feed-forward term so the orb cannot settle below the den and
+    // require a visible capture snap to cross the final few pixels.
+    object.velocity.y -= ORB_SCREEN_GRAVITY * dt * proximity;
     object.velocity = object
         .velocity
         .lerp(desired_velocity, alpha)
@@ -187,9 +193,9 @@ pub fn step_den_attraction(
     false
 }
 
-/// World-space offset used by both rendering and pointer extraction. Sharing
-/// the exact curve prevents a stored orb from snapping when hover authority is
-/// handed from the den presentation to the user's drag controller.
+/// Very slow world-space hover target for a stored orb. The renderer follows
+/// this target through a bounded damped controller so lifecycle changes never
+/// introduce a positional step.
 #[must_use]
 pub fn stored_orb_hover_offset(
     object_id: ObjectId,
@@ -207,9 +213,13 @@ pub fn stored_orb_hover_offset(
         16.0 / 9.0
     };
     let seed_phase = (object_id as u32) as f32 * 0.000_13 * std::f32::consts::TAU;
-    let hover_x =
-        (time_seconds * std::f32::consts::TAU / 3.83 + seed_phase).sin() * STORED_ORB_HOVER_X_PX;
-    let hover_y = (time_seconds * std::f32::consts::TAU / 5.17 + seed_phase * 1.7).sin()
+    let hover_x = (time_seconds * std::f32::consts::TAU / STORED_ORB_HOVER_X_PERIOD_SECONDS
+        + seed_phase)
+        .sin()
+        * STORED_ORB_HOVER_X_PX;
+    let hover_y = (time_seconds * std::f32::consts::TAU / STORED_ORB_HOVER_Y_PERIOD_SECONDS
+        + seed_phase * 1.7)
+        .sin()
         * STORED_ORB_HOVER_Y_PX;
     Vec2::new(
         hover_x / (crate::REFERENCE_DESKTOP_HEIGHT_PX * aspect),
@@ -247,7 +257,19 @@ mod tests {
             assert!(orb.velocity.length() <= MAX_OBJECT_SPEED + 1.0e-5);
         }
 
-        assert!(captured);
+        let remaining_distance_px = Vec2::new(
+            (orb.position.x - den.anchor.x) * aspect,
+            orb.position.y - den.anchor.y,
+        )
+        .length()
+            * config.reference_height_px;
+        assert!(
+            captured,
+            "orb settled {remaining_distance_px:.3} px from the den center: edge={:?}, delta={:?}, velocity={:?}",
+            den.edge,
+            orb.position - den.anchor,
+            orb.velocity,
+        );
         assert_eq!(orb.position, den.anchor);
         assert_eq!(orb.velocity, Vec2::ZERO);
     }
@@ -274,6 +296,21 @@ mod tests {
                 1.0 / 120.0,
             ));
             assert_eq!(orb, before);
+        }
+    }
+
+    #[test]
+    fn stored_hover_target_moves_less_than_one_pixel_per_second() {
+        let aspect = 16.0 / 9.0;
+        let dt = 1.0 / 60.0;
+        let mut previous = stored_orb_hover_offset(91, 0.0, aspect);
+        for frame in 1..=(60 * 30) {
+            let current = stored_orb_hover_offset(91, frame as f32 * dt, aspect);
+            let step_px = Vec2::new((current.x - previous.x) * aspect, current.y - previous.y)
+                .length()
+                * crate::REFERENCE_DESKTOP_HEIGHT_PX;
+            assert!(step_px <= 1.0 * dt + 1.0e-5);
+            previous = current;
         }
     }
 }
