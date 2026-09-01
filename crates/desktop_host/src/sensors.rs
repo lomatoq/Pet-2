@@ -262,6 +262,7 @@ impl SensorNormalizer {
             user_availability: snapshot
                 .idle_seconds
                 .map(|idle| (1.0 - idle / 120.0).clamp(0.0, 1.0)),
+            desktop_focus_pressure: 0.0,
         }
     }
 }

@@ -17,6 +17,8 @@ pub use contract::*;
 pub use coordinates::*;
 pub use lab_control::*;
 pub use overlay::*;
-pub use platform::{create_platform_backend, prepare_overlay_window_attributes};
+pub use platform::{
+    create_platform_backend, fallback_display_topology, prepare_overlay_window_attributes,
+};
 pub use sensors::*;
 pub use storage::*;

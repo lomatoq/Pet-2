@@ -490,6 +490,15 @@ impl LifeCore {
             if self.state.focus_mode && !action.is_focus_allowed() {
                 return -100.0;
             }
+            if sensors.desktop_focus_pressure > 0.62 && !action.is_desktop_work_allowed() {
+                return -100.0;
+            }
+            if action == ActionId::FrustratedRetreat
+                && self.state.affect.frustration < 0.22
+                && self.state.drives.safety < 0.35
+            {
+                return -100.0;
+            }
             if !conditions_met(definition.required_conditions, &self.state, sensors, body) {
                 return -100.0;
             }
@@ -1683,6 +1692,23 @@ mod tests {
         for action in run_ticks(&mut core, 2_000, &SensorFrame::default()) {
             assert!(action.is_focus_allowed(), "focus mode selected {action:?}");
         }
+    }
+
+    #[test]
+    fn detected_desktop_work_keeps_only_quiet_actions_without_mutating_focus_mode() {
+        let mut core = LifeCore::new(Genome::from_seed(0xF0C5), 19);
+        let sensors = SensorFrame {
+            desktop_focus_pressure: 0.91,
+            user_availability: Some(0.45),
+            ..SensorFrame::default()
+        };
+        for action in run_ticks(&mut core, 2_000, &sensors) {
+            assert!(
+                action.is_desktop_work_allowed(),
+                "detected work selected {action:?}"
+            );
+        }
+        assert!(!core.state.focus_mode);
     }
 
     #[test]

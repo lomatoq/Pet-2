@@ -18,8 +18,9 @@ use objc2_core_foundation::{
     CFArray, CFDictionary, CFNumber, CFString, CFType, CGPoint, CGRect, CGSize,
 };
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGEvent, CGEventSource, CGEventSourceStateID,
-    CGEventType, CGImageAlphaInfo, CGImageByteOrderInfo, CGMouseButton,
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGDisplayBounds, CGDisplayPixelsHigh,
+    CGDisplayPixelsWide, CGEvent, CGEventSource, CGEventSourceStateID, CGEventType,
+    CGImageAlphaInfo, CGImageByteOrderInfo, CGMainDisplayID, CGMouseButton,
     CGRectMakeWithDictionaryRepresentation, CGWindowImageOption, CGWindowListCopyWindowInfo,
     CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber,
     kCGWindowOwnerPID,
@@ -31,8 +32,51 @@ use super::visual_sampling::{CAPTURE_HEIGHT, CAPTURE_WIDTH, frame_from_bgra};
 
 use crate::{
     ApplicationInfo, DesktopSnapshot, DesktopSurface, DesktopVisualFrame, DisplayTopology,
-    HostError, PhysicalDesktopPoint, PlatformBackend, PlatformCapabilities, PlatformKind, RectI,
+    HostError, MonitorId, MonitorInfo, PhysicalDesktopPoint, PlatformBackend, PlatformCapabilities,
+    PlatformKind, RectI,
 };
+
+pub(super) fn fallback_display_topology(revision: u64) -> Option<DisplayTopology> {
+    let display = CGMainDisplayID();
+    let pixel_width = CGDisplayPixelsWide(display);
+    let pixel_height = CGDisplayPixelsHigh(display);
+    let quartz_bounds = CGDisplayBounds(display);
+    let point_width = quartz_bounds.size.width.max(1.0);
+    let point_height = quartz_bounds.size.height.max(1.0);
+    let physical_width = pixel_width.max(quartz_bounds.size.width.round().max(0.0) as usize);
+    let physical_height = pixel_height.max(quartz_bounds.size.height.round().max(0.0) as usize);
+    if physical_width == 0 || physical_height == 0 {
+        return None;
+    }
+    let scale = (physical_width as f64 / point_width)
+        .max(physical_height as f64 / point_height)
+        .max(1.0);
+    let minimum = PhysicalDesktopPoint {
+        x: (quartz_bounds.origin.x * scale).round() as i32,
+        y: (quartz_bounds.origin.y * scale).round() as i32,
+    };
+    let bounds = RectI {
+        minimum,
+        maximum: PhysicalDesktopPoint {
+            x: minimum
+                .x
+                .saturating_add(physical_width.min(i32::MAX as usize) as i32),
+            y: minimum
+                .y
+                .saturating_add(physical_height.min(i32::MAX as usize) as i32),
+        },
+    };
+    Some(DisplayTopology::new(
+        vec![MonitorInfo {
+            id: MonitorId(format!("coregraphics-main-{display}")),
+            physical_bounds: bounds,
+            working_area: bounds,
+            scale_factor: scale,
+            primary: true,
+        }],
+        revision,
+    ))
+}
 
 pub struct MacOsBackend {
     started: Instant,

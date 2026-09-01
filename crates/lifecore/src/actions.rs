@@ -353,6 +353,22 @@ impl ActionId {
         )
     }
 
+    /// Actions that remain semantically honest during automatically detected
+    /// work. Unlike explicit Focus Mode this still permits quiet self-directed
+    /// activity, but never turns a work cue into a social bid.
+    #[must_use]
+    pub const fn is_desktop_work_allowed(self) -> bool {
+        matches!(
+            self,
+            Self::Sleep
+                | Self::WakeUp
+                | Self::IdleHover
+                | Self::ObserveCursor
+                | Self::ObserveUserActivity
+                | Self::RetreatFromCursor
+        )
+    }
+
     #[must_use]
     pub const fn is_vocal(self) -> bool {
         matches!(self, Self::Chirp | Self::Purr | Self::MimicClickRhythm)
@@ -541,6 +557,9 @@ pub struct SensorFrame {
     pub local_luminance: Option<f32>,
     pub user_presence: Option<f32>,
     pub user_availability: Option<f32>,
+    /// Aggregate protection pressure inferred from typing/scroll rhythm. This
+    /// contains no content and is transient rather than a saved user setting.
+    pub desktop_focus_pressure: f32,
 }
 
 impl Default for SensorFrame {
@@ -573,6 +592,7 @@ impl Default for SensorFrame {
             local_luminance: None,
             user_presence: None,
             user_availability: None,
+            desktop_focus_pressure: 0.0,
         }
     }
 }

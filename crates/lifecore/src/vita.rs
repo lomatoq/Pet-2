@@ -162,6 +162,138 @@ impl VitaPerceptFrame {
     }
 }
 
+/// Privacy-safe interpretation of the shared desktop rhythm. This never stores
+/// text, window titles, application names, or pixels: only slow scalar traces
+/// that help the organism distinguish work from an opening for interaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopContextKind {
+    Away,
+    #[default]
+    Settled,
+    Working,
+    AmbientMotion,
+    Pause,
+    Interactive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DesktopRhythmState {
+    pub context: DesktopContextKind,
+    pub focused_work_seconds: f32,
+    pub quiet_seconds: f32,
+    pub work_memory: f32,
+    pub stimulation: f32,
+    pub social_opening: f32,
+    pub interruption_risk: f32,
+}
+
+impl Default for DesktopRhythmState {
+    fn default() -> Self {
+        Self {
+            context: DesktopContextKind::Settled,
+            focused_work_seconds: 0.0,
+            quiet_seconds: 0.0,
+            work_memory: 0.0,
+            stimulation: 0.0,
+            social_opening: 0.25,
+            interruption_risk: 0.20,
+        }
+    }
+}
+
+impl DesktopRhythmState {
+    fn update(&mut self, percept: &VitaPerceptFrame, life: &LifeState, dt: f32) {
+        let typing = (percept.typing_rate_hz / 6.0).clamp(0.0, 1.0);
+        let scroll = percept.scroll_velocity.abs().clamp(0.0, 1.0);
+        let visual = percept
+            .visual_motion
+            .unwrap_or(0.0)
+            .max(percept.visual_change.unwrap_or(0.0))
+            .max(percept.window_motion)
+            .clamp(0.0, 1.0);
+        let explicit_play = percept
+            .pointer
+            .petting
+            .max(percept.pointer.chase_invitation)
+            .max(percept.pointer.circle * 0.72)
+            .max(percept.pointer.poke * 0.45);
+        let work_signal = (typing * 0.72 + scroll * 0.16 + visual * 0.12).clamp(0.0, 1.0);
+        let stimulation_target = work_signal.max(visual * 0.68);
+        self.stimulation = smooth(self.stimulation, stimulation_target, 2.2, dt);
+        self.work_memory = smooth(self.work_memory, work_signal, 0.16, dt);
+
+        if typing > 0.06 || (work_signal > 0.16 && percept.typing_pause_seconds < 1.0) {
+            self.focused_work_seconds = (self.focused_work_seconds + dt).min(3_600.0);
+        } else {
+            self.focused_work_seconds = (self.focused_work_seconds - dt * 0.42).max(0.0);
+        }
+        if stimulation_target < 0.08 {
+            self.quiet_seconds = (self.quiet_seconds + dt).min(3_600.0);
+        } else {
+            self.quiet_seconds = 0.0;
+        }
+
+        let remembered_work = self.focused_work_seconds > 2.5 || self.work_memory > 0.10;
+        let brief_pause = remembered_work
+            && work_signal < 0.10
+            && (0.8..=18.0).contains(&percept.typing_pause_seconds);
+        self.context = if explicit_play > 0.18 {
+            DesktopContextKind::Interactive
+        } else if percept.user_available < 0.10 && work_signal < 0.05 {
+            DesktopContextKind::Away
+        } else if typing > 0.06 || (work_signal > 0.14 && percept.typing_pause_seconds < 1.0) {
+            DesktopContextKind::Working
+        } else if brief_pause {
+            DesktopContextKind::Pause
+        } else if visual > 0.10 || scroll > 0.08 {
+            DesktopContextKind::AmbientMotion
+        } else {
+            DesktopContextKind::Settled
+        };
+
+        let ignored = (life.ignored_attempts as f32 / 5.0).clamp(0.0, 1.0);
+        let opening_target = match self.context {
+            DesktopContextKind::Away => 0.0,
+            DesktopContextKind::Working => 0.035,
+            DesktopContextKind::AmbientMotion => 0.12,
+            DesktopContextKind::Settled => 0.30,
+            DesktopContextKind::Pause => 0.62,
+            DesktopContextKind::Interactive => 1.0,
+        } * percept.user_available
+            * (1.0 - ignored * 0.72);
+        let risk_target = match self.context {
+            DesktopContextKind::Away => 0.90,
+            DesktopContextKind::Working => 0.92,
+            DesktopContextKind::AmbientMotion => 0.58,
+            DesktopContextKind::Settled => 0.30,
+            DesktopContextKind::Pause => 0.16,
+            DesktopContextKind::Interactive => 0.02,
+        } + ignored * 0.20;
+        self.social_opening = smooth(self.social_opening, opening_target.clamp(0.0, 1.0), 1.8, dt);
+        self.interruption_risk =
+            smooth(self.interruption_risk, risk_target.clamp(0.0, 1.0), 2.2, dt);
+    }
+
+    #[must_use]
+    pub fn protects_focused_work(&self) -> bool {
+        self.context == DesktopContextKind::Working && self.focused_work_seconds >= 10.0
+    }
+
+    fn is_valid(&self) -> bool {
+        [
+            self.focused_work_seconds,
+            self.quiet_seconds,
+            self.work_memory,
+            self.stimulation,
+            self.social_opening,
+            self.interruption_risk,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionKind {
@@ -614,7 +746,7 @@ impl InfluencePolicy {
             let expired = self.pending.take().expect("pending influence exists");
             self.learn(expired.strategy, &expired.context, -0.22);
             self.consecutive_ignored = self.consecutive_ignored.saturating_add(1);
-            self.cooldown_seconds = 8.0 + self.consecutive_ignored.min(6) as f32 * 5.0;
+            self.cooldown_seconds = 15.0 + self.consecutive_ignored.min(6) as f32 * 8.0;
         }
     }
 
@@ -628,10 +760,10 @@ impl InfluencePolicy {
             let index = pending.strategy.index();
             self.successes[index] = self.successes[index].saturating_add(1);
             self.consecutive_ignored = self.consecutive_ignored.saturating_sub(1);
-            self.cooldown_seconds = 3.0;
+            self.cooldown_seconds = 8.0;
         } else if reward < 0.0 {
             self.consecutive_ignored = self.consecutive_ignored.saturating_add(1);
-            self.cooldown_seconds = 10.0 + self.consecutive_ignored.min(6) as f32 * 6.0;
+            self.cooldown_seconds = 20.0 + self.consecutive_ignored.min(6) as f32 * 10.0;
         }
     }
 
@@ -654,29 +786,48 @@ impl InfluencePolicy {
         &mut self,
         life: &LifeState,
         percept: &VitaPerceptFrame,
+        desktop: &DesktopRhythmState,
     ) -> Option<InfluenceDecision> {
+        let explicit_invitation = percept
+            .pointer
+            .petting
+            .max(percept.pointer.chase_invitation)
+            .max(percept.pointer.circle * 0.70);
         if self.mode == InfluenceMode::Off
             || life.focus_mode
             || self.cooldown_seconds > 0.0
             || self.pending.is_some()
-            || percept.user_available < 0.18
+            || (percept.user_available < 0.18 && explicit_invitation < 0.18)
+            || (matches!(
+                desktop.context,
+                DesktopContextKind::Working | DesktopContextKind::Away
+            ) && explicit_invitation < 0.18)
+            || (desktop.social_opening < 0.16 && explicit_invitation < 0.18)
             || life.attention_budget.current < 0.08
         {
             return None;
         }
-        let motivation = life.drives.social.max(life.drives.play * 0.78);
-        if motivation < 0.40 {
+        let motivation = life.drives.social.max(life.drives.play * 0.78)
+            * (0.72 + desktop.social_opening * 0.28);
+        if motivation < 0.38 && explicit_invitation < 0.18 {
             return None;
         }
         let context = influence_context(life, percept, self.consecutive_ignored);
-        let annoyance_risk = (percept.typing_rate_hz / 8.0
+        let annoyance_risk = (percept.typing_rate_hz / 8.0 * 0.62
             + self.consecutive_ignored as f32 * 0.13
-            + (1.0 - percept.user_available) * 0.55)
+            + (1.0 - percept.user_available) * 0.38)
+            .max(desktop.interruption_risk)
             .clamp(0.0, 1.0);
         let mut best = InfluenceStrategy::DirectEyeContact;
         let mut best_score = f32::NEG_INFINITY;
         for strategy in InfluenceStrategy::ALL {
             if !strategy_allowed(self.mode, strategy) {
+                continue;
+            }
+            if desktop.context == DesktopContextKind::Pause
+                && explicit_invitation < 0.18
+                && strategy_intrusiveness(strategy) > 0.12
+            {
                 continue;
             }
             let learned = dot(&self.weights[strategy.index()], &context);
@@ -688,7 +839,8 @@ impl InfluencePolicy {
                 best_score = score;
             }
         }
-        let intensity = (motivation * (1.0 - annoyance_risk * 0.55)).clamp(0.12, 0.92);
+        let intensity = (motivation * (1.0 - annoyance_risk * 0.62) + explicit_invitation * 0.30)
+            .clamp(0.10, 0.90);
         self.attempts[best.index()] = self.attempts[best.index()].saturating_add(1);
         self.pending = Some(PendingInfluence {
             strategy: best,
@@ -696,7 +848,7 @@ impl InfluencePolicy {
             elapsed: 0.0,
             response_window: 4.5 + life.genome.temperament.persistence * 5.5,
         });
-        self.cooldown_seconds = 2.5;
+        self.cooldown_seconds = 4.0;
         Some(InfluenceDecision {
             strategy: best,
             intensity,
@@ -733,6 +885,8 @@ pub struct VitaState {
     pub emotions: Vec<EmotionEpisode>,
     pub self_model: SelfModel,
     pub influence: InfluencePolicy,
+    #[serde(default)]
+    pub desktop_rhythm: DesktopRhythmState,
     pub favorite_places: Vec<FavoritePlace>,
     pub elapsed_seconds: f64,
     pub attention_switches: u64,
@@ -748,6 +902,7 @@ impl Default for VitaState {
             emotions: Vec::new(),
             self_model: SelfModel::default(),
             influence: InfluencePolicy::default(),
+            desktop_rhythm: DesktopRhythmState::default(),
             favorite_places: Vec::new(),
             elapsed_seconds: 0.0,
             attention_switches: 0,
@@ -813,6 +968,7 @@ impl VitaState {
                 .flatten()
                 .all(|weight| weight.is_finite() && weight.abs() <= 1.501)
             && self.influence.cooldown_seconds.is_finite()
+            && self.desktop_rhythm.is_valid()
             && self.favorite_places.len() <= MAX_FAVORITE_PLACES
             && self.favorite_places.iter().all(|place| {
                 place.relative_position.is_finite()
@@ -921,13 +1077,17 @@ impl VitaMind {
         let dt = finite(dt, 0.0).clamp(0.0, 0.25);
         self.state.elapsed_seconds += f64::from(dt);
         self.state.influence.tick_pending(dt);
+        self.state.desktop_rhythm.update(percept, life, dt);
         self.state.self_model.update(life.current_action, body, dt);
         self.update_appraisal(percept, life, body, dt);
         self.update_attention(percept, sensors, life, dt);
         self.update_emotions(percept, life, dt);
         self.update_mood(life, dt);
         self.learn_place(percept, sensors, life, body, dt);
-        let influence = self.state.influence.select(life, percept);
+        let influence = self
+            .state
+            .influence
+            .select(life, percept, &self.state.desktop_rhythm);
         self.compose_output(percept, base_intent, influence)
     }
 
@@ -1041,11 +1201,26 @@ impl VitaMind {
                 + percept.pointer.approach * 0.32,
         );
         for event in &percept.events {
-            let candidate = attention_candidate(
-                attention_kind(event.kind),
-                event.position,
-                event_salience(event, life),
-            );
+            let mut confidence = event_salience(event, life);
+            let contextual_gain = match (self.state.desktop_rhythm.context, event.kind) {
+                (_, StimulusKind::PointerGesture) => 1.15,
+                (_, StimulusKind::Popup | StimulusKind::MovingWindow) if event.threat > 0.18 => 1.0,
+                (DesktopContextKind::Working, StimulusKind::TypingRhythm) => 0.78,
+                (
+                    DesktopContextKind::Working,
+                    StimulusKind::ScrollFlow
+                    | StimulusKind::WindowEdge
+                    | StimulusKind::VisualChange
+                    | StimulusKind::BrightArea
+                    | StimulusKind::DarkArea,
+                ) => 0.48,
+                (DesktopContextKind::Pause, _) => 1.10,
+                (DesktopContextKind::Away, _) => 0.35,
+                _ => 1.0,
+            };
+            confidence *= contextual_gain;
+            let candidate =
+                attention_candidate(attention_kind(event.kind), event.position, confidence);
             if candidate.confidence > best.confidence {
                 best = candidate;
             }
@@ -1053,6 +1228,7 @@ impl VitaMind {
         let viewer_score = (percept.user_available
             * (life.drives.social * 0.55 + life.affect.attachment * 0.35)
             * (1.0 - life.affect.stress * 0.45)
+            * (0.12 + self.state.desktop_rhythm.social_opening * 0.88)
             + deterministic_jitter(self.identity_seed ^ life.tick_count, 0) * 0.012)
             .clamp(0.0, 1.0);
         if viewer_score > best.confidence {
@@ -1117,7 +1293,7 @@ impl VitaMind {
         }
     }
 
-    fn update_emotions(&mut self, percept: &VitaPerceptFrame, life: &LifeState, dt: f32) {
+    fn update_emotions(&mut self, _percept: &VitaPerceptFrame, life: &LifeState, dt: f32) {
         for episode in &mut self.state.emotions {
             episode.remaining_seconds = (episode.remaining_seconds - dt).max(0.0);
             episode.intensity = (episode.intensity - dt * 0.035).max(0.0);
@@ -1152,11 +1328,29 @@ impl VitaMind {
                 appraisal.goal_congruence,
                 StimulusKind::PointerGesture,
             ))
+        } else if life.recent_reward > 0.42 && self.state.self_model.agency > 0.42 {
+            Some((
+                EmotionKind::Pride,
+                life.recent_reward,
+                StimulusKind::SelfBody,
+            ))
         } else if life.affect.frustration > 0.50 {
             Some((
                 EmotionKind::Frustration,
                 life.affect.frustration,
                 StimulusKind::User,
+            ))
+        } else if life.ignored_attempts >= 2 && life.drives.social > 0.34 {
+            Some((
+                EmotionKind::Shyness,
+                (life.drives.social * 0.58 + life.affect.stress * 0.42).clamp(0.0, 1.0),
+                StimulusKind::User,
+            ))
+        } else if appraisal.novelty > 0.26 && life.drives.curiosity > 0.20 {
+            Some((
+                EmotionKind::Curiosity,
+                (appraisal.novelty * 0.62 + life.drives.curiosity * 0.38).clamp(0.0, 1.0),
+                StimulusKind::VisualChange,
             ))
         } else if self.state.self_model.calibration_urge > 0.58 {
             Some((
@@ -1164,7 +1358,19 @@ impl VitaMind {
                 self.state.self_model.calibration_urge,
                 StimulusKind::SelfBody,
             ))
-        } else if percept.typing_rate_hz < 0.1 && life.drives.novelty > 0.68 {
+        } else if matches!(
+            self.state.desktop_rhythm.context,
+            DesktopContextKind::Settled | DesktopContextKind::Working
+        ) && self.state.desktop_rhythm.quiet_seconds > 6.0
+            && life.drives.homeostatic_cost() < 0.62
+            && life.affect.valence > 0.04
+        {
+            Some((
+                EmotionKind::Contentment,
+                (0.30 + life.affect.valence.max(0.0) * 0.45).clamp(0.0, 0.72),
+                StimulusKind::User,
+            ))
+        } else if self.state.desktop_rhythm.quiet_seconds > 18.0 && life.drives.novelty > 0.58 {
             Some((
                 EmotionKind::Boredom,
                 life.drives.novelty,
@@ -1309,6 +1515,28 @@ impl VitaMind {
                 }
                 EmotionKind::Contentment | EmotionKind::Boredom => {}
             }
+        }
+        // Work-generated motion may turn the eyes and subtly change posture,
+        // but it is not permission to cross the desktop or demand a response.
+        if influence.is_none()
+            && matches!(
+                self.state.desktop_rhythm.context,
+                DesktopContextKind::Working | DesktopContextKind::AmbientMotion
+            )
+            && matches!(
+                self.state.attention.kind,
+                AttentionKind::Typing
+                    | AttentionKind::Scroll
+                    | AttentionKind::Window
+                    | AttentionKind::Visual
+            )
+            && self.state.attention.confidence > 0.10
+            && self.state.appraisal.threat < 0.30
+        {
+            output.pose_override = Some(PoseIntent::Curious);
+            output.locomotion_override = None;
+            output.target_override = None;
+            output.interaction_override = None;
         }
         if let Some(decision) = influence {
             apply_influence(&mut output, decision.strategy, decision.intensity, percept);
@@ -1618,6 +1846,48 @@ mod tests {
     }
 
     #[test]
+    fn sustained_work_blocks_bids_but_a_real_pause_creates_an_opening() {
+        let mut life = LifeState::new(Genome::from_seed(0xD35C_7001));
+        life.drives.social = 0.92;
+        life.drives.play = 0.72;
+        life.affect.attachment = 0.64;
+        let working = VitaPerceptFrame {
+            typing_rate_hz: 4.8,
+            typing_pause_seconds: 0.1,
+            user_available: 0.78,
+            ..VitaPerceptFrame::default()
+        };
+        let mut desktop = DesktopRhythmState::default();
+        for _ in 0..240 {
+            desktop.update(&working, &life, 0.05);
+        }
+        assert_eq!(desktop.context, DesktopContextKind::Working);
+        assert!(desktop.protects_focused_work());
+        assert!(desktop.social_opening < 0.08);
+        assert!(
+            InfluencePolicy::default()
+                .select(&life, &working, &desktop)
+                .is_none()
+        );
+
+        let paused = VitaPerceptFrame {
+            typing_pause_seconds: 3.0,
+            user_available: 0.86,
+            ..VitaPerceptFrame::default()
+        };
+        for _ in 0..40 {
+            desktop.update(&paused, &life, 0.05);
+        }
+        assert_eq!(desktop.context, DesktopContextKind::Pause);
+        assert!(desktop.social_opening > 0.35);
+        assert!(
+            InfluencePolicy::default()
+                .select(&life, &paused, &desktop)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn committed_cursor_attention_follows_the_live_cursor_instead_of_freezing_coordinates() {
         let core = LifeCore::new(Genome::from_seed(0x000C_0A5E), 7);
         let mut life = core.state.clone();
@@ -1703,6 +1973,15 @@ mod tests {
         let bytes = serde_json::to_vec(&mind.snapshot()).unwrap();
         let decoded: VitaState = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, mind.snapshot());
+    }
+
+    #[test]
+    fn previous_vita_state_gains_a_default_desktop_rhythm_without_resetting_learning() {
+        let mut value = serde_json::to_value(VitaState::default()).unwrap();
+        value.as_object_mut().unwrap().remove("desktop_rhythm");
+        let decoded: VitaState = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.desktop_rhythm, DesktopRhythmState::default());
+        assert!(decoded.is_valid());
     }
 
     #[test]

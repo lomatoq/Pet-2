@@ -1765,14 +1765,18 @@ fn show_live_panel(context: &Context, monitor: &mut LivePetMonitor, panel: DevPa
                         ui.separator();
                         ui.columns(2, |columns| {
                             live_perception_and_decision(&mut columns[0], &latest);
-                            live_drives(&mut columns[1], &latest);
+                            live_desktop_rhythm(&mut columns[1], &latest);
                         });
+                        ui.separator();
+                        live_drives(ui, &latest);
                     }
                     DevPanel::Behavior => {
                         ui.columns(2, |columns| {
                             live_drives(&mut columns[0], &latest);
                             live_perception_and_decision(&mut columns[1], &latest);
                         });
+                        ui.separator();
+                        live_desktop_rhythm(ui, &latest);
                         ui.separator();
                         live_candidates(ui, &latest);
                         ui.separator();
@@ -1846,6 +1850,7 @@ fn live_now_summary(ui: &mut egui::Ui, latest: &Value) {
     let goal = text(latest, "/details/ecology/active_goal");
     let attention = text(latest, "/details/gaze/attention_kind");
     let gaze_owner = text(latest, "/details/gaze/source");
+    let desktop_context = text(latest, "/details/vita/desktop_rhythm/context");
     let gaze_target = format_vector(latest, "/details/gaze/intent_world_target");
     let explanation = interest_explanation(latest);
     egui::Frame::default()
@@ -1864,15 +1869,22 @@ fn live_now_summary(ui: &mut egui::Ui, latest: &Value) {
                 });
                 columns[2].small("LOOKING");
                 columns[2].strong(gaze_target);
-                columns[3].small("GAZE OWNER");
-                columns[3].strong(if gaze_owner.is_empty() {
-                    "—"
+                columns[3].small("CONTEXT");
+                columns[3].strong(if desktop_context.is_empty() {
+                    if gaze_owner.is_empty() {
+                        "—"
+                    } else {
+                        &gaze_owner
+                    }
                 } else {
-                    &gaze_owner
+                    &desktop_context
                 });
             });
             ui.add_space(6.0);
             ui.label(explanation);
+            if !gaze_owner.is_empty() && !desktop_context.is_empty() {
+                ui.small(format!("Gaze owner: {gaze_owner}"));
+            }
         });
     ui.add_space(8.0);
 }
@@ -1886,6 +1898,8 @@ fn interest_explanation(latest: &Value) -> String {
     let scroll = number(latest, "/details/scroll_velocity")
         .unwrap_or(0.0)
         .abs();
+    let desktop_context = text(latest, "/details/vita/desktop_rhythm/context");
+    let opening = number(latest, "/details/vita/desktop_rhythm/social_opening").unwrap_or(0.0);
     if goal == "SleepInDen" {
         return "Rest owns behavior; passive window motion and typing are deliberately suppressed."
             .into();
@@ -1897,7 +1911,8 @@ fn interest_explanation(latest: &Value) -> String {
     }
     if attention == "Typing" || typing > 0.35 {
         return format!(
-            "A typing burst was noticed at {typing:.1} Hz, but it remains a soft cue rather than a movement command."
+            "A typing burst was noticed at {typing:.1} Hz. Context is {desktop_context}; social opening is {opening:.0}%, so this remains a glance rather than a movement command.",
+            opening = opening * 100.0,
         );
     }
     if attention == "Scroll" || scroll > 0.08 {
@@ -1918,6 +1933,72 @@ fn interest_explanation(latest: &Value) -> String {
     } else {
         format!("{goal} currently owns behavior because of {reason}.")
     }
+}
+
+fn live_desktop_rhythm(ui: &mut egui::Ui, latest: &Value) {
+    ui.heading("Shared desktop rhythm");
+    let context = text(latest, "/details/vita/desktop_rhythm/context");
+    let focused =
+        number(latest, "/details/vita/desktop_rhythm/focused_work_seconds").unwrap_or(0.0);
+    let quiet = number(latest, "/details/vita/desktop_rhythm/quiet_seconds").unwrap_or(0.0);
+    let stimulation = number(latest, "/details/vita/desktop_rhythm/stimulation").unwrap_or(0.0);
+    let opening = number(latest, "/details/vita/desktop_rhythm/social_opening").unwrap_or(0.0);
+    let risk = number(latest, "/details/vita/desktop_rhythm/interruption_risk").unwrap_or(0.0);
+    let protection = number(latest, "/details/perception/desktop_focus_pressure").unwrap_or(0.0);
+    let cooldown = number(latest, "/details/vita/influence/cooldown_seconds").unwrap_or(0.0);
+    let social_need = number(latest, "/details/drives/social").unwrap_or(0.0);
+    let play_need = number(latest, "/details/drives/play").unwrap_or(0.0);
+    let initiative = if protection > 0.62 {
+        "protected by work".to_owned()
+    } else if cooldown > 0.05 {
+        format!("cooldown {cooldown:.1} s")
+    } else if opening < 0.16 {
+        "no social opening".to_owned()
+    } else if social_need.max(play_need) < 0.38 {
+        "no internal need".to_owned()
+    } else {
+        "quiet bid may compete".to_owned()
+    };
+    egui::Grid::new("desktop_rhythm_grid")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            live_metric(
+                ui,
+                "Context",
+                if context.is_empty() {
+                    "—".into()
+                } else {
+                    context.clone()
+                },
+            );
+            live_metric(ui, "Focused work", format!("{focused:.1} s"));
+            live_metric(ui, "Quiet", format!("{quiet:.1} s"));
+            live_metric(ui, "Stimulation", format!("{:.0}%", stimulation * 100.0));
+            live_metric(ui, "Social opening", format!("{:.0}%", opening * 100.0));
+            live_metric(ui, "Interruption risk", format!("{:.0}%", risk * 100.0));
+            live_metric(
+                ui,
+                "Action protection",
+                format!("{:.0}%", protection * 100.0),
+            );
+            live_metric(ui, "Initiative", initiative);
+        });
+    let explanation = match context.as_str() {
+        "working" => {
+            "Work is protected: motion may move the eyes, but cannot start a social or toy approach."
+        }
+        "pause" => "A brief work pause creates a small, learned opportunity for a quiet check-in.",
+        "interactive" => {
+            "The pointer gesture is an explicit invitation, so reciprocal play may start."
+        }
+        "ambient_motion" => {
+            "The screen is changing in the background; it competes for occasional glances and habituates."
+        }
+        "away" => "The user appears away; autonomous rest and self-play own behavior.",
+        _ => "The desktop is settled. Internal needs may surface without demanding attention.",
+    };
+    ui.small(explanation);
 }
 
 fn live_behavior_controls(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
@@ -2222,6 +2303,17 @@ fn live_blockers(latest: &Value, stale_seconds: Option<f32>) -> Vec<(u8, String)
         ));
     }
     let visual_age = number(latest, "/details/ecology/visual_grid_age_ms");
+    if latest
+        .pointer("/details/capabilities/screen_capture")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        blockers.push((
+            2,
+            "SCREEN RECORDING OFF — enable Pet2 in macOS Privacy & Security, then restart Pet2"
+                .into(),
+        ));
+    }
     if visual_age.is_none_or(|age| age > 250.0) {
         blockers.push((2, "VISUAL OFFLINE — reduced desktop grid is stale".into()));
     }
@@ -2594,7 +2686,8 @@ fn live_motor_and_body(ui: &mut egui::Ui, latest: &Value) {
 }
 
 fn live_drives(ui: &mut egui::Ui, latest: &Value) {
-    ui.heading("Internal drives");
+    ui.heading("Internal needs (pressure)");
+    ui.small("Higher means less satisfied. Actions relieve only the matching need; neutral hovering no longer clears the whole mind.");
     let overlay_active = boolean(latest, "/details/lab_interventions/overlay_active");
     if overlay_active {
         ui.colored_label(
@@ -2602,15 +2695,15 @@ fn live_drives(ui: &mut egui::Ui, latest: &Value) {
             "Temporary overlay: natural → effective reaches Morph and VITA/Ecology; LifeCore homeostasis and resolved action remain natural.",
         );
     }
-    for drive in [
-        "safety",
-        "play",
-        "curiosity",
-        "autonomy",
-        "sleep",
-        "social",
-        "comfort",
-        "novelty",
+    for (drive, meaning) in [
+        ("safety", "pressure to create distance from threat"),
+        ("play", "need for active, voluntary play"),
+        ("curiosity", "need to inspect something uncertain"),
+        ("autonomy", "need to choose a self-directed activity"),
+        ("sleep", "accumulated fatigue and circadian pressure"),
+        ("social", "need for a small reciprocal contact"),
+        ("comfort", "need to settle, land, purr, or rest"),
+        ("novelty", "need for environmental variation"),
     ] {
         let natural_path = if overlay_active {
             format!("/details/lab_interventions/natural_drives/{drive}")
@@ -2627,7 +2720,7 @@ fn live_drives(ui: &mut egui::Ui, latest: &Value) {
             natural
         };
         ui.horizontal(|ui| {
-            ui.label(format!("{drive:>9}"));
+            ui.label(format!("{drive:>9}")).on_hover_text(meaning);
             ui.add(
                 egui::ProgressBar::new(effective.clamp(0.0, 1.0))
                     .desired_width(145.0)
@@ -5938,7 +6031,7 @@ mod tests {
                 "ecology": {}
             }
         });
-        assert!(interest_explanation(&typing).contains("soft cue"));
+        assert!(interest_explanation(&typing).contains("glance rather than a movement command"));
 
         let window = serde_json::json!({
             "details": {

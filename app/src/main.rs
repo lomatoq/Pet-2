@@ -938,6 +938,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             vita.note_scroll((time * 0.7).sin());
         }
         vita.observe(&sensors, &feedback, dt);
+        sensors.desktop_focus_pressure = vita.desktop_focus_pressure();
         let morph_started = Instant::now();
         let morph_world = ecology.morph_world_input(feedback.world_position, life.state.drives);
         let morph_output =
@@ -984,7 +985,8 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
                 drives: life.state.drives,
                 sensors: &sensors,
                 body: &feedback,
-                focus_mode: life.state.focus_mode,
+                focus_mode: life.state.focus_mode
+                    || vita.state().desktop_rhythm.protects_focused_work(),
                 dt,
             },
         );
@@ -1128,6 +1130,10 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         "genome_hash": life.state.genome.stable_hash(),
         "mesh_hash": body.mesh.stable_hash(),
         "current_action": format!("{:?}", life.state.current_action),
+        "final_drives": life.state.drives,
+        "desktop_rhythm": vita.state().desktop_rhythm,
+        "influence_cooldown_seconds": vita.state().influence.cooldown_seconds,
+        "influence_ignored": vita.state().influence.consecutive_ignored,
         "action_counts": action_counts,
         "distance_traveled": distance_traveled,
         "moving_fraction": moving_ticks as f64 / tick_count.max(1) as f64,
@@ -1767,6 +1773,8 @@ impl PetApplication {
                 );
             }
             if let Some(sample) = runtime.last_visual_sample {
+                runtime.background_capture_sequence = sample.sequence;
+                runtime.background_capture_timestamp = runtime.normalizer.monotonic_seconds();
                 runtime.sensors.mean_luminance = Some(sample.summary.mean_luminance);
                 runtime.sensors.local_luminance = Some(sample.summary.local_luminance);
                 runtime.background_luminance = sample.summary.mean_luminance;
@@ -1782,6 +1790,7 @@ impl PetApplication {
                 &runtime.body.simulation.feedback,
                 observation_dt,
             );
+            runtime.sensors.desktop_focus_pressure = runtime.vita.desktop_focus_pressure();
             let click_rhythm = runtime.vita.recent_click_rhythm();
             runtime.sensors.recent_click_rhythm =
                 click_rhythm.map_or([0.0; 8], |rhythm| rhythm.intervals);
@@ -1989,7 +1998,8 @@ impl PetApplication {
                     drives: runtime.life.state.drives,
                     sensors: &runtime.sensors,
                     body: &runtime.body.simulation.feedback,
-                    focus_mode: runtime.life.state.focus_mode,
+                    focus_mode: runtime.life.state.focus_mode
+                        || runtime.vita.state().desktop_rhythm.protects_focused_work(),
                     dt: LIFE_DT,
                 },
             );
@@ -2300,6 +2310,7 @@ impl PetApplication {
                         "user_activity_rate": runtime.sensors.user_activity_rate,
                         "user_presence": runtime.sensors.user_presence,
                         "user_availability": runtime.sensors.user_availability,
+                        "desktop_focus_pressure": runtime.sensors.desktop_focus_pressure,
                         "active_app_category": runtime.sensors.active_app_category,
                         "audio_rms": runtime.sensors.audio_rms,
                         "voice_activity": runtime.sensors.voice_activity,
@@ -2502,6 +2513,7 @@ impl PetApplication {
                         "window_identifiers": false,
                         "screen_capture_pixels": false,
                     },
+                    "capabilities": runtime.platform.capabilities(),
                 });
                 if let Some(fusion) = runtime.vita.fusion_diagnostics()
                     && let Some(details) = debug_details.as_object_mut()
@@ -3704,6 +3716,7 @@ fn vita_telemetry_json(runtime: &VitaRuntime, output: Option<&VitaOutput>) -> se
         "appraisal": state.appraisal,
         "mood": state.mood,
         "emotions": state.emotions,
+        "desktop_rhythm": state.desktop_rhythm,
         "self_model": {
             "last_action": action_wire_name(state.self_model.last_action),
             "prediction_error": state.self_model.prediction_error,
@@ -4250,7 +4263,7 @@ fn neutral_intent() -> BodyIntent {
 
 fn topology_from_event_loop(event_loop: &ActiveEventLoop, revision: u64) -> DisplayTopology {
     let primary = event_loop.primary_monitor();
-    DisplayTopology::new(
+    let topology = DisplayTopology::new(
         event_loop
             .available_monitors()
             .enumerate()
@@ -4287,7 +4300,12 @@ fn topology_from_event_loop(event_loop: &ActiveEventLoop, revision: u64) -> Disp
             })
             .collect(),
         revision,
-    )
+    );
+    if topology.virtual_physical_bounds.is_valid() {
+        topology
+    } else {
+        desktop_host::fallback_display_topology(revision).unwrap_or(topology)
+    }
 }
 
 fn update_desktop_presentation(

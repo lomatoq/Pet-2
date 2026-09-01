@@ -450,6 +450,26 @@ impl VitaRuntime {
         &self.percept
     }
 
+    /// Immediate, content-free protection signal for LifeCore's action policy.
+    /// The slow desktop rhythm owns sustained work; a fresh typing burst can
+    /// protect the very first tick before that rhythm has converged.
+    #[must_use]
+    pub fn desktop_focus_pressure(&self) -> f32 {
+        let immediate_typing = (self.percept.typing_rate_hz / 2.5).clamp(0.0, 1.0) * 0.88;
+        let immediate_scroll = self.percept.scroll_velocity.abs().clamp(0.0, 1.0) * 0.42;
+        let sustained = match self.mind.state.desktop_rhythm.context {
+            lifecore::DesktopContextKind::Working => {
+                self.mind.state.desktop_rhythm.interruption_risk
+            }
+            // A short pause is an opening for a glance or quiet check-in, not
+            // an immediate invitation for LifeCore's toy/vocal repertoire.
+            lifecore::DesktopContextKind::Pause => 0.68,
+            lifecore::DesktopContextKind::AmbientMotion => 0.42,
+            _ => 0.0,
+        };
+        immediate_typing.max(immediate_scroll).max(sustained)
+    }
+
     #[must_use]
     pub const fn fusion_diagnostics(&self) -> Option<FusionDiagnostics> {
         self.last_fusion
