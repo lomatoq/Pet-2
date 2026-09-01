@@ -137,8 +137,8 @@
   "material": {
     "variant": "cinematic_jelly",
     "override_genome_colors": false,
-    "color_source_mode": "genome_authored_blend",
-    "genome_color_blend": 0.48,
+    "color_source_mode": "genome",
+    "genome_color_blend": 1.0,
     "mood_color_blend": 0.72,
     "primary_hsv": [0.2, 0.0, 0.0],
     "secondary_hsv": [0.0, 0.39, 0.0],

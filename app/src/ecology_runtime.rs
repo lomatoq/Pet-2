@@ -14,7 +14,7 @@ use pet_ecology::{
     GestureConventionMatch, GestureConventionMeaning, GestureSignature, MAX_OBJECT_SPEED,
     MorselProfile, ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig,
     RhythmSignature, WindowAffordanceFrame, WorldObject, resolve_object_body_contact,
-    step_den_attraction, step_object_with_windows,
+    step_object_with_windows,
 };
 
 /// Application integration boundary for the portable habitat. Native input,
@@ -340,28 +340,6 @@ impl EcologyRuntime {
             });
         }
         let mut orb_has_opposing_contacts = false;
-        let den_anchor = self.state.den.anchor;
-        let orb_slot = self
-            .state
-            .objects
-            .iter()
-            .find(|object| object.kind == ObjectKind::Orb)
-            .and_then(|orb| {
-                orb.home_slot
-                    .filter(|slot| {
-                        self.state.den.slots[usize::from(*slot)].is_none()
-                            || self.state.den.slots[usize::from(*slot)] == Some(orb.id)
-                    })
-                    .or_else(|| {
-                        self.state
-                            .den
-                            .slots
-                            .iter()
-                            .position(Option::is_none)
-                            .map(|slot| slot as u8)
-                    })
-            });
-        let mut captured_orb = None;
         for object in &mut self.state.objects {
             let contacts_before = self.environment.contact_count;
             step_object_with_windows(object, config, windows, dt, &mut self.environment);
@@ -396,25 +374,12 @@ impl EcologyRuntime {
                 config,
                 &mut self.environment,
             );
-            if step_den_attraction(object, den_anchor, config, dt)
-                && let Some(slot) = orb_slot
-            {
-                object.lifecycle = ObjectLifecycle::StoredInDen;
-                object.home_slot = Some(slot);
-                captured_orb = Some((object.id, slot));
-            }
             if object.kind == ObjectKind::Orb {
                 self.environment.orb_position = Some(object.position);
                 if object.lifecycle == ObjectLifecycle::StoredInDen {
                     self.environment.orb_grounded = false;
                 }
             }
-        }
-        if let Some((object_id, slot)) = captured_orb {
-            self.clear_den_slot_references(object_id);
-            self.state.den.slots[usize::from(slot)] = Some(object_id);
-            self.state.den.visits = self.state.den.visits.saturating_add(1);
-            self.state.den.familiarity = (self.state.den.familiarity + 0.004).clamp(0.0, 1.0);
         }
         // Being inside a window bounding box is not a trap. Large/maximized
         // windows routinely cover the orb, and lower z-order edges may be fully
@@ -730,15 +695,27 @@ impl EcologyRuntime {
                     else {
                         continue;
                     };
+                    let object = &self.state.objects[object_index];
+                    let den_delta = Vec2::new(
+                        (object.position.x - self.state.den.anchor.x) * self.desktop_aspect,
+                        object.position.y - self.state.den.anchor.y,
+                    );
+                    let den_distance_px =
+                        den_delta.length() * ObjectPhysicsConfig::default().reference_height_px;
+                    if object.lifecycle != ObjectLifecycle::CarriedByPet || den_distance_px > 8.0 {
+                        continue;
+                    }
                     self.clear_den_slot_references(object_id);
                     self.state.den.slots[usize::from(slot)] = Some(object_id);
                     let object = &mut self.state.objects[object_index];
                     object.lifecycle = ObjectLifecycle::StoredInDen;
                     object.home_slot = Some(slot);
-                    object.position = self.state.den.anchor;
                     object.velocity = Vec2::ZERO;
                 }
-                ObjectCommand::Retrieve { object_id, target } => {
+                ObjectCommand::Retrieve {
+                    object_id,
+                    target: _,
+                } => {
                     self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
@@ -746,8 +723,11 @@ impl EcologyRuntime {
                         .iter_mut()
                         .find(|object| object.id == object_id)
                     {
-                        object.lifecycle = ObjectLifecycle::Free;
-                        object.position = target.clamp(Vec2::ZERO, Vec2::ONE);
+                        // Backward-compatible command semantics: take the
+                        // object into the pet's carry state at its current
+                        // position. Movement is subsequently explicit.
+                        object.lifecycle = ObjectLifecycle::CarriedByPet;
+                        object.home_slot = None;
                         object.velocity = Vec2::ZERO;
                     }
                 }
@@ -1153,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_episode_clears_den_slot_without_losing_orb() {
+    fn retrieve_episode_begins_a_physical_carry_without_losing_orb() {
         use lifecore::{ExpressionState, LocomotionMode, PoseIntent};
 
         let directory = tempfile::tempdir().unwrap();
@@ -1163,6 +1143,7 @@ mod tests {
         runtime.state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
         runtime.state.objects[0].position = runtime.state.den.anchor;
         runtime.state.den.slots[0] = Some(orb_id);
+        let stored_position = runtime.state.objects[0].position;
         let sensors = SensorFrame {
             cursor_position: Vec2::new(0.5, 0.4),
             ..SensorFrame::default()
@@ -1195,7 +1176,11 @@ mod tests {
         );
         assert_eq!(runtime.state.den.slots, [None; 3]);
         assert_eq!(runtime.state.objects.len(), 1);
-        assert_eq!(runtime.state.objects[0].lifecycle, ObjectLifecycle::Free);
+        assert_eq!(runtime.state.objects[0].position, stored_position);
+        assert_eq!(
+            runtime.state.objects[0].lifecycle,
+            ObjectLifecycle::CarriedByPet
+        );
         runtime.state.validate().unwrap();
     }
 
@@ -1249,12 +1234,11 @@ mod tests {
     }
 
     #[test]
-    fn released_orb_inside_the_field_glides_into_a_real_den_slot() {
+    fn released_orb_near_den_remains_physical_and_is_not_magically_stored() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
         let mut runtime = EcologyRuntime::load_or_create(&store, 80, true).unwrap();
         let aspect = 16.0 / 9.0;
-        let orb_id = runtime.state.objects[0].id;
         let anchor = runtime.state.den.anchor;
         runtime.state.objects[0].position = anchor + Vec2::new(0.0, -0.10);
         runtime.state.objects[0].velocity = Vec2::ZERO;
@@ -1268,18 +1252,13 @@ mod tests {
 
         for _ in 0..1_200 {
             runtime.fixed_update(aspect, &windows, &body, 1.0 / 120.0);
-            if runtime.state.objects[0].lifecycle == ObjectLifecycle::StoredInDen {
-                break;
-            }
         }
 
-        assert_eq!(
+        assert_ne!(
             runtime.state.objects[0].lifecycle,
-            ObjectLifecycle::StoredInDen,
+            ObjectLifecycle::StoredInDen
         );
-        assert_eq!(runtime.state.objects[0].position, anchor);
-        assert_eq!(runtime.state.objects[0].velocity, Vec2::ZERO);
-        assert_eq!(runtime.state.den.slots[0], Some(orb_id));
+        assert_eq!(runtime.state.den.slots, [None; 3]);
         runtime.state.validate().unwrap();
     }
 
@@ -1351,6 +1330,9 @@ mod tests {
         runtime.state.validate().unwrap();
 
         restore_stored(&mut runtime);
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
+        let physical_handoff_position = runtime.state.den.anchor + Vec2::new(0.001, 0.0);
+        runtime.state.objects[0].position = physical_handoff_position;
         apply(
             &mut runtime,
             ObjectCommand::Store {
@@ -1359,6 +1341,7 @@ mod tests {
             },
         );
         assert_eq!(runtime.state.den.slots, [None, None, Some(orb_id)]);
+        assert_eq!(runtime.state.objects[0].position, physical_handoff_position);
         runtime.state.validate().unwrap();
     }
 

@@ -455,22 +455,35 @@ impl Lab {
                     }
                 }
                 ObjectCommand::Store { object_id, slot } if usize::from(slot) < 3 => {
+                    let Some(object_index) = self
+                        .state
+                        .objects
+                        .iter()
+                        .position(|object| object.id == object_id)
+                    else {
+                        continue;
+                    };
+                    let object = &self.state.objects[object_index];
+                    let den_delta = Vec2::new(
+                        (object.position.x - self.state.den.anchor.x) * LAB_DESKTOP_ASPECT,
+                        object.position.y - self.state.den.anchor.y,
+                    );
+                    let den_distance_px =
+                        den_delta.length() * ObjectPhysicsConfig::default().reference_height_px;
+                    if object.lifecycle != ObjectLifecycle::CarriedByPet || den_distance_px > 8.0 {
+                        continue;
+                    }
                     self.clear_den_slot_references(object_id);
                     self.state.den.slots[usize::from(slot)] = Some(object_id);
-                    let anchor = self.state.den.anchor;
-                    if let Some(object) = self
-                        .state
-                        .objects
-                        .iter_mut()
-                        .find(|object| object.id == object_id)
-                    {
-                        object.lifecycle = ObjectLifecycle::StoredInDen;
-                        object.home_slot = Some(slot);
-                        object.position = anchor;
-                        object.velocity = Vec2::ZERO;
-                    }
+                    let object = &mut self.state.objects[object_index];
+                    object.lifecycle = ObjectLifecycle::StoredInDen;
+                    object.home_slot = Some(slot);
+                    object.velocity = Vec2::ZERO;
                 }
-                ObjectCommand::Retrieve { object_id, target } => {
+                ObjectCommand::Retrieve {
+                    object_id,
+                    target: _,
+                } => {
                     self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
@@ -478,8 +491,8 @@ impl Lab {
                         .iter_mut()
                         .find(|object| object.id == object_id)
                     {
-                        object.lifecycle = ObjectLifecycle::Free;
-                        object.position = target.clamp(Vec2::ZERO, Vec2::ONE);
+                        object.lifecycle = ObjectLifecycle::CarriedByPet;
+                        object.home_slot = None;
                         object.velocity = Vec2::ZERO;
                     }
                 }

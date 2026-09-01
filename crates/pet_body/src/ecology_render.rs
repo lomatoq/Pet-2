@@ -345,7 +345,10 @@ mod tests {
 
     #[test]
     fn ecology_shader_parses_and_validates() {
-        let module = naga::front::wgsl::parse_str(include_str!("ecology_objects.wgsl")).unwrap();
+        let source = include_str!("ecology_objects.wgsl");
+        assert!(source.contains("fn den_concentric_ripple"));
+        assert!(source.contains("fn den_converging_energy_noise"));
+        let module = naga::front::wgsl::parse_str(source).unwrap();
         Validator::new(ValidationFlags::all(), Capabilities::all())
             .validate(&module)
             .unwrap();

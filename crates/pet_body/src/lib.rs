@@ -93,23 +93,19 @@ fn blend_hsv_identity(genome: Vec3, authored: Vec3, genome_weight: f32) -> Vec3 
     )
 }
 
-fn apply_hsv_runtime(
+fn apply_glow_runtime(
     base: Vec3,
     runtime: MaterialRuntimeActuation,
     mood_color_blend: f32,
-    glow: bool,
 ) -> Vec3 {
     let mood_color_blend = unit(mood_color_blend);
-    // R12 keeps the causal material values deliberately small. Convert them to
-    // a richer presentation target, then expose a strict identity↔mood blend.
-    // Value receives less gain than hue so emotion is readable without washing
-    // the jelly toward white.
+    // Mood belongs to the emitted soul/rim light, not the body pigment. This
+    // keeps the inherited genome palette recognizable while preserving a
+    // continuous, readable affect channel in the glow.
     let target = Vec3::new(
-        (base.x + runtime.hue_shift_turns.clamp(-0.0222, 0.0222) * if glow { 3.2 } else { 4.0 })
-            .rem_euclid(1.0),
+        (base.x + runtime.hue_shift_turns.clamp(-0.0222, 0.0222) * 3.2).rem_euclid(1.0),
         (base.y + runtime.saturation_delta.clamp(-0.14, 0.08) * 1.25).clamp(0.0, 1.0),
-        (base.z + runtime.value_delta.clamp(-0.12, 0.12) * if glow { 0.38 } else { 0.55 })
-            .clamp(if glow { 0.12 } else { 0.0 }, 1.0),
+        (base.z + runtime.value_delta.clamp(-0.12, 0.12) * 0.38).clamp(0.12, 1.0),
     );
     let hue_delta = (target.x - base.x + 0.5).rem_euclid(1.0) - 0.5;
     Vec3::new(
@@ -810,27 +806,16 @@ impl ProceduralBody {
                 material.genome_color_blend,
             ),
         };
+        // Identity pigments stay fixed. Ecology and nervous-system affect are
+        // expressed through the soul/rim emission below.
         let primary_hsv = palette(genome.body.primary_color_hsv, material.primary_hsv);
         let secondary_hsv = palette(genome.body.secondary_color_hsv, material.secondary_hsv);
         let glow_hsv = palette(genome.body.glow_color_hsv, material.glow_hsv);
         let effect = self.ecology_visual_effect;
-        let primary_hsv = apply_hsv_runtime(
-            blend_hsv_hue(primary_hsv, effect.hue, effect.color_blend),
-            fast.material,
-            material.mood_color_blend,
-            false,
-        );
-        let secondary_hsv = apply_hsv_runtime(
-            blend_hsv_hue(secondary_hsv, effect.hue, effect.color_blend * 0.78),
-            fast.material,
-            material.mood_color_blend,
-            false,
-        );
-        let mut glow_hsv = apply_hsv_runtime(
+        let mut glow_hsv = apply_glow_runtime(
             blend_hsv_hue(glow_hsv, effect.hue, effect.color_blend),
             fast.material,
             material.mood_color_blend,
-            true,
         );
         glow_hsv.z = glow_hsv.z.max(0.12);
         RenderParameters {
@@ -1394,7 +1379,9 @@ mod tests {
 
         assert!(effective.body_length > baseline.body_length);
         assert!(effective.material_emission > baseline.material_emission);
-        assert_ne!(effective.primary_hsv, baseline.primary_hsv);
+        assert_eq!(effective.primary_hsv, baseline.primary_hsv);
+        assert_eq!(effective.secondary_hsv, baseline.secondary_hsv);
+        assert_ne!(effective.glow_hsv, baseline.glow_hsv);
         assert!(effective.pulse > baseline.pulse);
         assert_eq!(body.embodiment.physiology.pose.droplet_energy, 0.85);
         assert_eq!(
@@ -1410,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn mood_color_blend_preserves_identity_at_zero_and_is_legible_at_one() {
+    fn mood_color_blend_changes_glow_without_touching_identity_pigment() {
         let base = Vec3::new(0.74, 0.62, 0.46);
         let runtime = MaterialRuntimeActuation {
             hue_shift_turns: 0.02,
@@ -1418,15 +1405,15 @@ mod tests {
             value_delta: 0.12,
             ..MaterialRuntimeActuation::default()
         };
-        let identity = apply_hsv_runtime(base, runtime, 0.0, false);
-        let mood = apply_hsv_runtime(base, runtime, 1.0, false);
+        let identity = apply_glow_runtime(base, runtime, 0.0);
+        let mood = apply_glow_runtime(base, runtime, 1.0);
         let hue_distance = (mood.x - base.x + 0.5).rem_euclid(1.0) - 0.5;
 
         assert_eq!(identity, base);
-        assert!(hue_distance.abs() >= 0.075);
+        assert!(hue_distance.abs() >= 0.06);
         assert!(
             mood.z - base.z < 0.07,
-            "mood color washed the body toward white"
+            "mood color washed the soul glow toward white"
         );
     }
 
@@ -1572,7 +1559,7 @@ mod tests {
         let genome = Genome::from_seed(45);
         let original_hsv = genome.body.primary_color_hsv;
         let mut body = ProceduralBody::generate(&genome).unwrap();
-        let baseline = body.render_parameters(&genome, 0.4).primary_hsv;
+        let baseline = body.render_parameters(&genome, 0.4);
         body.set_ecology_visual_effect(EcologyVisualEffect {
             hue: 0.82,
             color_blend: 9.0,
@@ -1583,13 +1570,17 @@ mod tests {
             contrast_reduction: 0.9,
         });
         let affected = body.render_parameters(&genome, 0.4);
-        assert_ne!(affected.primary_hsv.x, baseline.x);
+        assert_eq!(affected.primary_hsv, baseline.primary_hsv);
+        assert_eq!(affected.secondary_hsv, baseline.secondary_hsv);
+        assert_ne!(affected.glow_hsv.x, baseline.glow_hsv.x);
         assert!(affected.pattern_contrast >= 0.18);
         assert!(affected.translucency <= 1.0);
         assert_eq!(genome.body.primary_color_hsv, original_hsv);
 
         body.set_ecology_visual_effect(EcologyVisualEffect::default());
         let restored = body.render_parameters(&genome, 0.4);
-        assert_eq!(restored.primary_hsv, baseline);
+        assert_eq!(restored.primary_hsv, baseline.primary_hsv);
+        assert_eq!(restored.secondary_hsv, baseline.secondary_hsv);
+        assert_eq!(restored.glow_hsv, baseline.glow_hsv);
     }
 }

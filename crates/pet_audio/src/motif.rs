@@ -23,6 +23,8 @@ const INTER_SYLLABLE_RELEASE_MS: f32 = 64.0;
 const PHONATION_RELEASE_BASE_MS: f32 = 260.0;
 const PHONATION_RELEASE_FATIGUE_MS: f32 = 75.0;
 const ROOM_TAIL_MS: f32 = 240.0;
+const FINAL_TAIL_FADE_MS: f32 = 48.0;
+const SYLLABLE_ATTACK_MS: f32 = 12.0;
 const MINIMUM_F0_HZ: f32 = 85.0;
 const MAXIMUM_F0_HZ: f32 = 1_600.0;
 const CONTROL_RATE_HZ: f32 = 400.0;
@@ -478,8 +480,15 @@ impl SynthVoice {
     pub fn next_stereo_frame(&mut self) -> [f32; 2] {
         if self.current.is_none() {
             if self.tail_frames_remaining > 0 {
+                let fade_frames = milliseconds_to_frames(FINAL_TAIL_FADE_MS, self.sample_rate);
+                let fade_position =
+                    self.tail_frames_remaining.saturating_sub(1) as f32 / fade_frames.max(1) as f32;
+                let fade_position = fade_position.clamp(0.0, 1.0);
+                let tail_gain = fade_position * fade_position * (3.0 - 2.0 * fade_position);
                 self.tail_frames_remaining -= 1;
-                let frame = self.render_unvoiced_tail(self.last_pan, 0.76);
+                let mut frame = self.render_unvoiced_tail(self.last_pan, 0.76);
+                frame[0] *= tail_gain;
+                frame[1] *= tail_gain;
                 if self.tail_frames_remaining == 0 {
                     self.feedback.clear();
                 }
@@ -602,8 +611,21 @@ impl SynthVoice {
             self.body_current,
             self.slosh_noise.colored(0.38),
         );
-        let raw =
-            (tract.output + body.signal) * command.gain * syllable.amplitude.clamp(0.0, 1.0) * 6.4;
+        // A fresh glottal/tract state can begin at any waveform phase. Fade the
+        // acoustic source in over a few milliseconds so every syllable joins
+        // the surviving room tail without a discontinuity or audible click.
+        let attack_frames = milliseconds_to_frames(
+            SYLLABLE_ATTACK_MS * command.attack_multiplier,
+            self.sample_rate,
+        );
+        let attack_position =
+            (self.frame_in_syllable as f32 / attack_frames.max(1) as f32).clamp(0.0, 1.0);
+        let attack_gain = attack_position * attack_position * (3.0 - 2.0 * attack_position);
+        let raw = (tract.output + body.signal)
+            * command.gain
+            * syllable.amplitude.clamp(0.0, 1.0)
+            * 6.4
+            * attack_gain;
         self.frame_in_syllable += 1;
         let mono = self.post_process_mono(raw, command.maximum_loudness);
         self.emitted_energy += (mono.abs() - self.emitted_energy) * 0.035;
@@ -772,7 +794,10 @@ impl SynthVoice {
         self.control_countdown = self.control_countdown.saturating_sub(1);
 
         let breath = self.breath.process(
-            0.76 + release_progress * 0.24,
+            // Continue from the exact authored syllable endpoint. Jumping the
+            // phase back to 0.76 briefly re-pressurized the glottis and was the
+            // remaining click at the syllable/release boundary.
+            1.0,
             gesture,
             command.anatomy,
             (0.76 + command.gain * 0.42).clamp(0.72, 1.05),
@@ -1201,6 +1226,70 @@ mod tests {
         );
         assert!(snapshot.envelope > 0.02);
         assert_eq!(snapshot.syllable_index, 0);
+    }
+
+    #[test]
+    fn every_semantic_audio_boundary_is_click_free() {
+        let voice = lifecore::Genome::from_seed(61).voice;
+        let motif = lifecore::generate_initial_motifs(&voice)[0].clone();
+        let mut vocal_request = request(motif.id, VocalStyle::RhythmMimic);
+        vocal_request.rhythm_intervals = [0.55, 0.72, 0.61, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let command = VoiceCommand::prepare(&voice, &motif, &vocal_request);
+        assert_eq!(command.syllable_count, 4);
+        let commands = Arc::new(SpscRing::new());
+        commands.push(command).unwrap();
+        commands.push(command).unwrap();
+        let mut synth = SynthVoice::new(commands, 48_000);
+        let command_frames = command.total_frames(48_000);
+        let mono = (0..command_frames * 2)
+            .map(|_| {
+                let frame = synth.next_stereo_frame();
+                (frame[0] + frame[1]) * 0.5
+            })
+            .collect::<Vec<_>>();
+
+        let mut cursor = 0;
+        for (index, syllable) in command.syllables[..usize::from(command.syllable_count)]
+            .iter()
+            .enumerate()
+        {
+            cursor += milliseconds_to_frames(syllable.duration_ms / command.tempo_scale, 48_000.0);
+            assert_boundary_is_click_free(&mono, cursor, "syllable -> release");
+            cursor += command.phonation_release_frames(index, 48_000.0);
+            assert_boundary_is_click_free(&mono, cursor, "release -> gap");
+            cursor += milliseconds_to_frames_allow_zero(
+                syllable.gap_after_ms / command.tempo_scale,
+                48_000.0,
+            );
+            assert_boundary_is_click_free(&mono, cursor, "gap -> next syllable");
+        }
+        assert_boundary_is_click_free(&mono, command_frames, "room tail -> next command");
+        assert!(mono[command_frames - 1].abs() < 1.0e-6);
+    }
+
+    fn assert_boundary_is_click_free(samples: &[f32], boundary: usize, label: &str) {
+        let boundary_step = samples
+            .get(boundary)
+            .zip(samples.get(boundary.saturating_sub(1)))
+            .map_or(0.0, |(after, before)| (after - before).abs());
+        let maximum_step = local_maximum_step(samples, boundary);
+        assert!(
+            boundary_step < 0.03,
+            "{label} contains a discontinuity: boundary step={boundary_step}, local maximum={maximum_step}"
+        );
+        assert!(
+            maximum_step < 0.04,
+            "{label} contains an impulsive transient: local maximum sample step={maximum_step}"
+        );
+    }
+
+    fn local_maximum_step(samples: &[f32], boundary: usize) -> f32 {
+        let start = boundary.saturating_sub(16).max(1);
+        let end = (boundary + 16).min(samples.len());
+        samples[start..end]
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0, f32::max)
     }
 
     fn rms(samples: &[f32]) -> f32 {
