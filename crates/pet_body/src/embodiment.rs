@@ -337,11 +337,7 @@ impl EmbodiedRuntime {
         self.update_pupil(mode, intent, sensors, mind, expression, face_tuning, dt);
         self.update_soft_body(genome, intent, feedback, affect, dt);
 
-        let voice_mouth = if voice.active {
-            voice.mouth_open.clamp(0.0, 1.0) * voice.envelope.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let voice_mouth = audible_mouth_target(voice);
         // An audible callback is the sole authority for a visibly open cavity.
         // Emotion still controls curve/tension below, but cannot mime failed audio.
         let mouth_target = voice_mouth;
@@ -1025,6 +1021,26 @@ fn voice_breath_boost(envelope: f32) -> f32 {
     envelope.clamp(0.0, 1.0) * 2.2
 }
 
+fn audible_mouth_target(voice: VoiceVisualState) -> f32 {
+    if !voice.active {
+        return 0.0;
+    }
+    let aperture = voice.mouth_open.clamp(0.0, 1.0);
+    // `envelope` is measured acoustic energy and is intentionally tiny for a
+    // quiet but audible motif. Multiplying aperture by it a second time made
+    // the mouth visually closed. Keep articulation authoritative, use energy
+    // only to modulate its range, and retain a small purr opening.
+    let audible_energy = smoothstep(0.000_2, 0.035, voice.envelope.clamp(0.0, 1.0));
+    let articulated = aperture * mix_f32(0.42, 1.0, audible_energy);
+    articulated
+        .max(audible_energy * 0.14 + voice.purr.clamp(0.0, 1.0) * 0.08)
+        .clamp(0.0, 1.0)
+}
+
+fn mix_f32(start: f32, end: f32, amount: f32) -> f32 {
+    start + (end - start) * amount.clamp(0.0, 1.0)
+}
+
 fn spring_vec2(current: &mut Vec2, velocity: &mut Vec2, target: Vec2, frequency: f32, dt: f32) {
     let acceleration = (target - *current) * frequency * frequency - *velocity * (2.0 * frequency);
     *velocity += acceleration * dt;
@@ -1135,6 +1151,34 @@ mod tests {
             assert!(runtime.pose.squash.min_element() > 0.55);
             assert!(runtime.pose.squash.max_element() < 1.65);
         }
+    }
+
+    #[test]
+    fn quiet_audible_voice_still_has_a_visible_mouth_aperture() {
+        let quiet = audible_mouth_target(VoiceVisualState {
+            active: true,
+            envelope: 0.001,
+            mouth_open: 0.68,
+            ..VoiceVisualState::default()
+        });
+        assert!(quiet > 0.28, "quiet mouth target={quiet}");
+
+        let purr = audible_mouth_target(VoiceVisualState {
+            active: true,
+            envelope: 0.01,
+            purr: 0.65,
+            ..VoiceVisualState::default()
+        });
+        assert!(purr > 0.05, "purr mouth target={purr}");
+        assert_eq!(
+            audible_mouth_target(VoiceVisualState {
+                active: false,
+                envelope: 1.0,
+                mouth_open: 1.0,
+                ..VoiceVisualState::default()
+            }),
+            0.0
+        );
     }
 
     #[test]

@@ -49,9 +49,9 @@ use pet_audio::{
     default_output_device_name, global_body_voice_bridge,
 };
 use pet_body::{
-    BodyMaterialSnapshot, BodyRenderMode, EcologyRenderer, LiquidTuningAcknowledgement,
-    LiquidTuningProfile, MaterialVariant, ProceduralBody, RenderOutcome, Renderer, VisualMindInput,
-    VoiceVisualState,
+    BodyMaterialSnapshot, BodyRenderMode, EcologyPassResources, EcologyRenderer,
+    LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant, ProceduralBody,
+    RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
 #[cfg(not(feature = "legacy-expression-fallback"))]
 use pet_ecology::ObjectLifecycle;
@@ -1675,6 +1675,7 @@ struct PetRuntime {
     background_capture_microseconds: f64,
     background_capture_timestamp: f64,
     background_capture_sequence: u64,
+    background_capture_rect: Option<RectI>,
     background_luminance: f32,
     background_contrast: f32,
     expression_director: ExpressionDirector,
@@ -2250,18 +2251,41 @@ impl PetApplication {
         runtime
             .camera_timings
             .observe(runtime.overlay_move_microseconds as f32 / 1_000.0);
-        // The checker is evaluated analytically in the material shader. Its UVs
-        // still use global desktop coordinates, so moving either the Pet or its
-        // camera cannot make the pattern slide across the liquid.
+        // Capture runs on the platform worker at 24 Hz and arrives here without
+        // blocking presentation. The half-resolution backdrop feeds only the
+        // den's local heat haze; the creature material remains unchanged.
         let background_started = Instant::now();
         let size = runtime.window.inner_size();
-        let (scale, offset) = background_uv_transform(
-            runtime.acknowledged_window_origin,
-            size,
-            runtime.topology.virtual_physical_bounds,
-        );
+        let capture_now = runtime.normalizer.monotonic_seconds();
+        if let Some(frame) = runtime.platform.capture_overlay_background(&runtime.window)
+            && runtime.renderer.update_overlay_background(
+                frame.width,
+                frame.height,
+                frame.bytes_per_row,
+                &frame.bgra8,
+            )
+        {
+            runtime.background_capture_timestamp = capture_now;
+            runtime.background_capture_sequence = frame.sequence;
+            runtime.background_capture_rect = Some(frame.physical_rect);
+            runtime.background_luminance = frame.mean_luminance;
+            runtime.background_contrast = frame.contrast;
+        }
+        let captured_rect = runtime
+            .background_capture_rect
+            .unwrap_or(runtime.topology.virtual_physical_bounds);
+        let (scale, offset) =
+            background_uv_transform(runtime.acknowledged_window_origin, size, captured_rect);
         runtime.renderer.set_background_uv_transform(scale, offset);
-        runtime.renderer.set_background_freshness(0.0);
+        let capture_age = (capture_now - runtime.background_capture_timestamp).max(0.0);
+        let freshness = if runtime.background_capture_sequence == 0 {
+            0.0
+        } else if capture_age <= 0.12 {
+            1.0
+        } else {
+            (-(capture_age - 0.12) / 0.18).exp() as f32
+        };
+        runtime.renderer.set_background_freshness(freshness);
         runtime.background_capture_microseconds =
             background_started.elapsed().as_secs_f64() * 1_000_000.0;
         runtime
@@ -3084,6 +3108,7 @@ impl ApplicationHandler for PetApplication {
             background_capture_microseconds: 0.0,
             background_capture_timestamp: 0.0,
             background_capture_sequence: 0,
+            background_capture_rect: None,
             background_luminance: 0.5,
             background_contrast: 0.0,
             expression_director: ExpressionDirector::default(),
@@ -3346,11 +3371,15 @@ impl ApplicationHandler for PetApplication {
                 let ecology_time = runtime.normalizer.monotonic_seconds() as f32;
                 let render_outcome = runtime.renderer.render_with_overlay(
                     parameters,
-                    |_device, queue, encoder, view| {
+                    |device, queue, encoder, view, backdrop| {
                         ecology_renderer.render(
+                            EcologyPassResources {
+                                device,
+                                target: view,
+                                backdrop,
+                            },
                             queue,
                             encoder,
-                            view,
                             ecology_state,
                             desktop_aspect,
                             ecology_time,

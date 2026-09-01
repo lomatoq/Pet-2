@@ -1220,7 +1220,7 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     parameters.debug_view = runtime.ui.debug_view;
     let renderer = &mut runtime.renderer;
     let egui_renderer = &mut runtime.egui_renderer;
-    let outcome = renderer.render_with_overlay(parameters, |device, queue, encoder, view| {
+    let outcome = renderer.render_with_overlay(parameters, |device, queue, encoder, view, _| {
         let callbacks = egui_renderer.update_buffers(device, queue, encoder, &paint_jobs, &screen);
         debug_assert!(callbacks.is_empty());
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

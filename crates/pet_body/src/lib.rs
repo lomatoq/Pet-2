@@ -21,7 +21,7 @@ pub use animation::{AnimationRuntime, JointState};
 pub use droplets::{
     DropletLifecycle, DropletMotion, DropletRenderState, DropletRuntime, DropletState, MAX_DROPLETS,
 };
-pub use ecology_render::EcologyRenderer;
+pub use ecology_render::{EcologyPassResources, EcologyRenderer};
 pub use embodiment::{EmbodiedPose, EmbodiedRuntime, GazeMode, VoiceVisualState};
 pub use expression::ExpressionRuntime;
 pub use graph::{BodyGraph, BodyNode, BodyPart};
@@ -39,8 +39,8 @@ pub use physiology::{
     EyeAutonomicModifiers, VisualMindInput, VisualPhysiologyPose, VisualPhysiologyRuntime,
 };
 pub use renderer::{
-    CapturedFrame, DebugView, OcclusionMode, RenderOutcome, RenderParameters, Renderer,
-    RendererCaptureError, RendererError, ReviewBackground,
+    CapturedFrame, DebugView, OcclusionMode, OverlayBackdrop, RenderOutcome, RenderParameters,
+    Renderer, RendererCaptureError, RendererError, ReviewBackground,
 };
 pub use tuning::{
     AnalyticTuning, BodyRenderMode, CompositorTuning, DropletTuning, FaceTuning, InteractionTuning,

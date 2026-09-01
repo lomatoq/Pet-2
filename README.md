@@ -116,6 +116,9 @@ an L-shaped desktop cannot leave the pet pursuing an unreachable point in a gap.
 Windows visual sensing performs one reduced `64x36` desktop capture and derives a
 privacy-safe `16x9` grid with `4x4` color/edge samples per cell. The pet's own body
 footprint is masked before temporal saliency, preventing self-attention lock.
+The den renderer also receives a transient half-resolution crop at `24 Hz` for its
+local heat-haze refraction; those pixels never enter ecology, learning, telemetry,
+or persistence, and the effect fades out if the asynchronous crop becomes stale.
 Static saturated colors and structured monochrome shapes can claim attention on
 their own, causing gaze/travel plus bounded hue, glow, flow, and cohesion changes.
 A smaller visual reflex remains visible while safety motion owns locomotion.

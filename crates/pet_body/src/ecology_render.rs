@@ -3,6 +3,8 @@ use glam::{Vec2, Vec3, Vec4};
 use pet_ecology::{EcologyState, ObjectKind, ObjectLifecycle, stored_orb_hover_offset};
 use wgpu::util::DeviceExt;
 
+use crate::OverlayBackdrop;
+
 const MAX_ECOLOGY_INSTANCES: usize = 9;
 const STORED_ORB_HOVER_FREQUENCY: f32 = 1.15;
 const STORED_ORB_HOVER_MAX_SPEED_PX: f32 = 0.85;
@@ -16,8 +18,25 @@ struct EcologyInstance {
     material: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct EcologyGlobals {
+    viewport: [f32; 4],
+    capture_transform: [f32; 4],
+}
+
+pub struct EcologyPassResources<'a> {
+    pub device: &'a wgpu::Device,
+    pub target: &'a wgpu::TextureView,
+    pub backdrop: OverlayBackdrop<'a>,
+}
+
 pub struct EcologyRenderer {
     pipeline: wgpu::RenderPipeline,
+    backdrop_layout: wgpu::BindGroupLayout,
+    backdrop_bind_group: Option<wgpu::BindGroup>,
+    backdrop_revision: Option<u64>,
+    globals_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
     den_activity: f32,
     den_activity_integral_seconds: f32,
@@ -33,9 +52,40 @@ impl EcologyRenderer {
             label: Some("living desktop ecology object shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("ecology_objects.wgsl").into()),
         });
+        let backdrop_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("living desktop ecology backdrop layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("living desktop ecology object pipeline layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&backdrop_layout],
             push_constant_ranges: &[],
         });
         let premultiplied = wgpu::BlendState {
@@ -92,8 +142,17 @@ impl EcologyRenderer {
             contents: bytemuck::cast_slice(&[EcologyInstance::default(); MAX_ECOLOGY_INSTANCES]),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+        let globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("living desktop ecology backdrop globals"),
+            contents: bytemuck::bytes_of(&EcologyGlobals::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         Self {
             pipeline,
+            backdrop_layout,
+            backdrop_bind_group: None,
+            backdrop_revision: None,
+            globals_buffer,
             instance_buffer,
             den_activity: 0.0,
             den_activity_integral_seconds: 0.0,
@@ -105,13 +164,18 @@ impl EcologyRenderer {
 
     pub fn render(
         &mut self,
+        resources: EcologyPassResources<'_>,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
         state: &EcologyState,
         desktop_aspect: f32,
         time_seconds: f32,
     ) {
+        let EcologyPassResources {
+            device,
+            target,
+            backdrop,
+        } = resources;
         let aspect = if desktop_aspect.is_finite() {
             desktop_aspect.clamp(0.25, 8.0)
         } else {
@@ -245,6 +309,40 @@ impl EcologyRenderer {
             return;
         }
         queue.write_buffer(
+            &self.globals_buffer,
+            0,
+            bytemuck::bytes_of(&EcologyGlobals {
+                viewport: [
+                    1.0 / backdrop.viewport_size[0].max(1) as f32,
+                    1.0 / backdrop.viewport_size[1].max(1) as f32,
+                    backdrop.freshness.clamp(0.0, 1.0),
+                    0.0,
+                ],
+                capture_transform: backdrop.uv_transform,
+            }),
+        );
+        if self.backdrop_revision != Some(backdrop.revision) {
+            self.backdrop_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("living desktop ecology backdrop"),
+                layout: &self.backdrop_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.globals_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(backdrop.texture),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(backdrop.sampler),
+                    },
+                ],
+            }));
+            self.backdrop_revision = Some(backdrop.revision);
+        }
+        queue.write_buffer(
             &self.instance_buffer,
             0,
             bytemuck::cast_slice(&instances[..count]),
@@ -265,6 +363,13 @@ impl EcologyRenderer {
             occlusion_query_set: None,
         });
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(
+            0,
+            self.backdrop_bind_group
+                .as_ref()
+                .expect("the ecology backdrop is initialized before drawing"),
+            &[],
+        );
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         pass.draw(0..6, 0..count as u32);
     }

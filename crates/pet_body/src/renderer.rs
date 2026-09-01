@@ -133,6 +133,21 @@ pub enum ReviewBackground {
     Cold,
 }
 
+/// Read-only desktop backdrop resources exposed to late overlay passes.
+///
+/// The texture is refreshed asynchronously by the host. `uv_transform` maps
+/// normalized overlay coordinates into that captured rectangle; `freshness`
+/// deliberately fades sampling out when capture stalls instead of freezing a
+/// visibly stale desktop behind a moving effect.
+pub struct OverlayBackdrop<'a> {
+    pub texture: &'a wgpu::TextureView,
+    pub sampler: &'a wgpu::Sampler,
+    pub uv_transform: [f32; 4],
+    pub freshness: f32,
+    pub viewport_size: [u32; 2],
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DebugView {
     #[default]
@@ -493,6 +508,7 @@ pub struct Renderer {
     background_texture: wgpu::Texture,
     background_size: (u32, u32),
     background_sampler: wgpu::Sampler,
+    background_revision: u64,
     offscreen_texture: wgpu::Texture,
     offscreen_view: wgpu::TextureView,
     offscreen_sampler: wgpu::Sampler,
@@ -517,6 +533,7 @@ pub struct Renderer {
     studio_sampler: wgpu::Sampler,
     particle_instance_buffer: wgpu::Buffer,
     background_valid: bool,
+    overlay_background_valid: bool,
     background_uv_transform: [f32; 4],
     background_freshness: f32,
     studio_material_backdrop: bool,
@@ -1507,6 +1524,7 @@ impl Renderer {
             background_texture,
             background_size,
             background_sampler,
+            background_revision: 1,
             offscreen_texture,
             offscreen_view,
             offscreen_sampler,
@@ -1531,6 +1549,7 @@ impl Renderer {
             studio_sampler,
             particle_instance_buffer,
             background_valid: false,
+            overlay_background_valid: false,
             background_uv_transform: [1.0, 1.0, 0.0, 0.0],
             background_freshness: 0.0,
             studio_material_backdrop: false,
@@ -1584,6 +1603,7 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
         self.background_texture = create_background_texture(&self.device, 1, 1);
         self.background_size = (1, 1);
+        self.background_revision = self.background_revision.wrapping_add(1);
         self.globals_bind_group = create_globals_bind_group(
             &self.device,
             &self.bind_group_layout,
@@ -1593,6 +1613,7 @@ impl Renderer {
         );
         self.recreate_intermediate_targets();
         self.background_valid = false;
+        self.overlay_background_valid = false;
         self.previous_liquid_scissor = None;
     }
 
@@ -1843,6 +1864,7 @@ impl Renderer {
         if self.background_size != (width, height) {
             self.background_texture = create_background_texture(&self.device, width, height);
             self.background_size = (width, height);
+            self.background_revision = self.background_revision.wrapping_add(1);
             self.globals_bind_group = create_globals_bind_group(
                 &self.device,
                 &self.bind_group_layout,
@@ -1884,11 +1906,27 @@ impl Renderer {
             },
         );
         self.background_valid = true;
+        self.overlay_background_valid = true;
         true
     }
 
+    /// Uploads the asynchronously captured desktop for late visual overlays
+    /// without changing the established production material of the creature.
+    pub fn update_overlay_background(
+        &mut self,
+        width: u32,
+        height: u32,
+        bytes_per_row: u32,
+        bgra8: &[u8],
+    ) -> bool {
+        let material_background_was_valid = self.background_valid;
+        let uploaded = self.update_background(width, height, bytes_per_row, bgra8);
+        self.background_valid = material_background_was_valid;
+        uploaded
+    }
+
     pub fn render(&mut self, parameters: RenderParameters) -> RenderOutcome {
-        self.render_with_overlay(parameters, |_, _, _, _| {})
+        self.render_with_overlay(parameters, |_, _, _, _, _| {})
     }
 
     /// Renders through the exact production GPU pipelines and synchronously
@@ -1898,7 +1936,7 @@ impl Renderer {
         &mut self,
         parameters: RenderParameters,
     ) -> Result<CapturedFrame, RendererCaptureError> {
-        self.render_capture_with_overlay(parameters, |_, _, _, _| {})
+        self.render_capture_with_overlay(parameters, |_, _, _, _, _| {})
     }
 
     pub fn render_capture_with_overlay<F>(
@@ -1907,7 +1945,13 @@ impl Renderer {
         overlay: F,
     ) -> Result<CapturedFrame, RendererCaptureError>
     where
-        F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+        F: FnOnce(
+            &wgpu::Device,
+            &wgpu::Queue,
+            &mut wgpu::CommandEncoder,
+            &wgpu::TextureView,
+            OverlayBackdrop<'_>,
+        ),
     {
         if !self.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
             return Err(RendererCaptureError::UnsupportedSurface);
@@ -1928,7 +1972,13 @@ impl Renderer {
         overlay: F,
     ) -> RenderOutcome
     where
-        F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+        F: FnOnce(
+            &wgpu::Device,
+            &wgpu::Queue,
+            &mut wgpu::CommandEncoder,
+            &wgpu::TextureView,
+            OverlayBackdrop<'_>,
+        ),
     {
         self.render_internal(parameters, overlay, false).0
     }
@@ -1943,7 +1993,13 @@ impl Renderer {
         Option<Result<CapturedFrame, RendererCaptureError>>,
     )
     where
-        F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+        F: FnOnce(
+            &wgpu::Device,
+            &wgpu::Queue,
+            &mut wgpu::CommandEncoder,
+            &wgpu::TextureView,
+            OverlayBackdrop<'_>,
+        ),
     {
         let requested_render_scale = parameters.render_scale.clamp(1, SUPERSAMPLE_SCALE);
         let render_scale = supported_render_scale(
@@ -2341,7 +2397,27 @@ impl Renderer {
             );
             pass.draw(0..3, 0..1);
         }
-        overlay(&self.device, &self.queue, &mut encoder, &view);
+        let background_view = self
+            .background_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        overlay(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &view,
+            OverlayBackdrop {
+                texture: &background_view,
+                sampler: &self.background_sampler,
+                uv_transform: self.background_uv_transform,
+                freshness: if self.overlay_background_valid {
+                    self.background_freshness
+                } else {
+                    0.0
+                },
+                viewport_size: [self.config.width, self.config.height],
+                revision: self.background_revision,
+            },
+        );
         let capture_format = capture.then_some(match self.config.format {
             wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Ok(false),
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => Ok(true),
