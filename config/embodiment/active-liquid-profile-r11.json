@@ -1,5 +1,5 @@
 {
-  "schema_version": 18,
+  "schema_version": 19,
   "profile_revision": 12,
   "name": "Black copy",
   "seed": 42,
@@ -138,7 +138,8 @@
     "variant": "cinematic_jelly",
     "override_genome_colors": false,
     "color_source_mode": "genome_authored_blend",
-    "genome_color_blend": 0.65,
+    "genome_color_blend": 0.48,
+    "mood_color_blend": 0.72,
     "primary_hsv": [0.2, 0.0, 0.0],
     "secondary_hsv": [0.0, 0.39, 0.0],
     "glow_hsv": [0.0, 0.0, 0.06],

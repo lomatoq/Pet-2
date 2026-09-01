@@ -93,11 +93,29 @@ fn blend_hsv_identity(genome: Vec3, authored: Vec3, genome_weight: f32) -> Vec3 
     )
 }
 
-fn apply_hsv_runtime(base: Vec3, runtime: MaterialRuntimeActuation, glow: bool) -> Vec3 {
+fn apply_hsv_runtime(
+    base: Vec3,
+    runtime: MaterialRuntimeActuation,
+    mood_color_blend: f32,
+    glow: bool,
+) -> Vec3 {
+    let mood_color_blend = unit(mood_color_blend);
+    // R12 keeps the causal material values deliberately small. Convert them to
+    // a richer presentation target, then expose a strict identity↔mood blend.
+    // Value receives less gain than hue so emotion is readable without washing
+    // the jelly toward white.
+    let target = Vec3::new(
+        (base.x + runtime.hue_shift_turns.clamp(-0.0222, 0.0222) * if glow { 3.2 } else { 4.0 })
+            .rem_euclid(1.0),
+        (base.y + runtime.saturation_delta.clamp(-0.14, 0.08) * 1.25).clamp(0.0, 1.0),
+        (base.z + runtime.value_delta.clamp(-0.12, 0.12) * if glow { 0.38 } else { 0.55 })
+            .clamp(if glow { 0.12 } else { 0.0 }, 1.0),
+    );
+    let hue_delta = (target.x - base.x + 0.5).rem_euclid(1.0) - 0.5;
     Vec3::new(
-        (base.x + runtime.hue_shift_turns.clamp(-0.0222, 0.0222)).rem_euclid(1.0),
-        (base.y + runtime.saturation_delta.clamp(-0.14, 0.08)).clamp(0.0, 1.0),
-        (base.z + runtime.value_delta.clamp(-0.12, 0.12)).clamp(if glow { 0.12 } else { 0.0 }, 1.0),
+        (base.x + hue_delta * mood_color_blend).rem_euclid(1.0),
+        base.y + (target.y - base.y) * mood_color_blend,
+        base.z + (target.z - base.z) * mood_color_blend,
     )
 }
 
@@ -799,16 +817,19 @@ impl ProceduralBody {
         let primary_hsv = apply_hsv_runtime(
             blend_hsv_hue(primary_hsv, effect.hue, effect.color_blend),
             fast.material,
+            material.mood_color_blend,
             false,
         );
         let secondary_hsv = apply_hsv_runtime(
             blend_hsv_hue(secondary_hsv, effect.hue, effect.color_blend * 0.78),
             fast.material,
+            material.mood_color_blend,
             false,
         );
         let mut glow_hsv = apply_hsv_runtime(
             blend_hsv_hue(glow_hsv, effect.hue, effect.color_blend),
             fast.material,
+            material.mood_color_blend,
             true,
         );
         glow_hsv.z = glow_hsv.z.max(0.12);
@@ -1014,9 +1035,9 @@ impl ProceduralBody {
                 * fast.material.soul_glow_pulse_multiplier)
                 .clamp(0.0, 4.0),
             material_soul_glow_feather: material.soul_glow_feather,
-            material_bloom_strength: (material.bloom_strength.max(0.10)
+            material_bloom_strength: (material.bloom_strength.max(0.05)
                 * fast.material.bloom_multiplier)
-                .clamp(0.0, 0.24),
+                .clamp(0.0, 0.18),
             liquid_iso_threshold: profile.pbf.iso_threshold,
             face_visible: profile.face.visible,
             face_eye_highlight_scale: profile.face.eye_highlight_scale,
@@ -1385,6 +1406,27 @@ mod tests {
                 body.tuning.pbf.maximum_speed,
             ),
             structural
+        );
+    }
+
+    #[test]
+    fn mood_color_blend_preserves_identity_at_zero_and_is_legible_at_one() {
+        let base = Vec3::new(0.74, 0.62, 0.46);
+        let runtime = MaterialRuntimeActuation {
+            hue_shift_turns: 0.02,
+            saturation_delta: 0.06,
+            value_delta: 0.12,
+            ..MaterialRuntimeActuation::default()
+        };
+        let identity = apply_hsv_runtime(base, runtime, 0.0, false);
+        let mood = apply_hsv_runtime(base, runtime, 1.0, false);
+        let hue_distance = (mood.x - base.x + 0.5).rem_euclid(1.0) - 0.5;
+
+        assert_eq!(identity, base);
+        assert!(hue_distance.abs() >= 0.075);
+        assert!(
+            mood.z - base.z < 0.07,
+            "mood color washed the body toward white"
         );
     }
 

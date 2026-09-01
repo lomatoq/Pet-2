@@ -47,70 +47,137 @@ fn soft_edge(distance_from_center: f32, inner: f32, outer: f32) -> f32 {
     return 1.0 - smoothstep(inner, outer, distance_from_center);
 }
 
+fn noise21(point: vec2<f32>) -> f32 {
+    let cell = floor(point);
+    let fraction = fract(point);
+    let curve = fraction * fraction * (3.0 - 2.0 * fraction);
+    let a = hash21(cell);
+    let b = hash21(cell + vec2<f32>(1.0, 0.0));
+    let c = hash21(cell + vec2<f32>(0.0, 1.0));
+    let d = hash21(cell + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, curve.x), mix(c, d, curve.x), curve.y);
+}
+
+fn den_converging_energy_noise(point: vec2<f32>, phase: f32) -> f32 {
+    let radius = length(point);
+    let direction = normalize(point + vec2<f32>(0.0001, 0.0));
+    // Adding phase to radial distance makes the coherent noise field travel
+    // inward. There is deliberately no opposing/outward layer.
+    let inward_coordinate = direction * (radius * 2.20 + phase * 0.34)
+        + vec2<f32>(-phase * 0.016, phase * 0.019)
+        + vec2<f32>(7.13, 3.71);
+    let inward_primary = noise21(inward_coordinate * 0.92) * 2.0 - 1.0;
+    let inward_detail = noise21(inward_coordinate * 1.72 + vec2<f32>(2.41, 8.17)) * 2.0 - 1.0;
+    return inward_primary * 0.84 + inward_detail * 0.16;
+}
+
+fn den_surface_height(point: vec2<f32>, phase: f32, energy_amount: f32) -> f32 {
+    let broad = sin(dot(point, vec2<f32>(0.82, 0.43)) * TAU + phase * 0.58);
+    let cross = sin(dot(point, vec2<f32>(-0.38, 1.02)) * TAU - phase * 0.41 + 1.31);
+    let eddy = sin(
+        (point.x * point.y * 1.35 + point.x * 0.24 - point.y * 0.17) * TAU
+            + phase * 0.27,
+    );
+    let traveling_energy = den_converging_energy_noise(point, phase);
+    return broad * 0.43
+        + cross * 0.25
+        + eddy * 0.12
+        + traveling_energy * energy_amount;
+}
+
+fn den_virtual_backdrop(point: vec2<f32>, phase: f32) -> vec3<f32> {
+    let broad = 0.5 + 0.5 * sin(dot(point, vec2<f32>(0.72, -0.46)) * TAU + phase * 0.11);
+    let soft = 0.5 + 0.5 * sin(dot(point, vec2<f32>(-0.34, 0.78)) * TAU - phase * 0.07 + 2.1);
+    let luminance = saturate(0.22 + broad * 0.46 + soft * 0.20);
+    return mix(vec3<f32>(0.18, 0.25, 0.38), vec3<f32>(0.57, 0.68, 0.79), luminance);
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let kind = input.material.x;
     let radial_distance = length(input.local);
     if kind > 0.5 && kind < 1.5 {
         let activity = saturate(input.material.y);
+        let familiarity = saturate(input.material.z);
         let time = input.material.w;
         let activity_integral = input.color.a;
 
         let local = input.local;
         let r = radial_distance;
-        let field_mask = 1.0 - smoothstep(0.76, 1.03, r);
-        let center_density = pow(saturate(1.0 - r), 1.40);
+        // A low-frequency two-dimensional height field replaces the old radial
+        // sine rings. Its finite-difference gradient is also the shared source
+        // for silhouette displacement, fake refraction and RGB dispersion.
+        let surface_phase = time * mix(0.12, 0.23, activity) + activity_integral * 0.28;
+        let energy_amount = mix(0.24, 0.44, activity);
+        let height = den_surface_height(local, surface_phase, energy_amount);
+        let epsilon = 0.026;
+        let gradient = vec2<f32>(
+            den_surface_height(local + vec2<f32>(epsilon, 0.0), surface_phase, energy_amount)
+                - den_surface_height(local - vec2<f32>(epsilon, 0.0), surface_phase, energy_amount),
+            den_surface_height(local + vec2<f32>(0.0, epsilon), surface_phase, energy_amount)
+                - den_surface_height(local - vec2<f32>(0.0, epsilon), surface_phase, energy_amount),
+        ) / (epsilon * 2.0);
+        let displacement_strength = mix(0.072, 0.128, activity);
+        let displaced_local = local + gradient * displacement_strength * (1.0 - smoothstep(0.72, 1.12, r));
+        let edge_displacement = height * mix(0.046, 0.086, activity);
+        let displaced_r = length(displaced_local);
+        let field_mask = 1.0 - smoothstep(0.78 + edge_displacement, 1.055 + edge_displacement, r);
+        let center_density = pow(saturate(1.0 - displaced_r), 1.32);
+        let normal = normalize(gradient + normalize(local + vec2<f32>(0.0001, 0.0)) * 0.28);
 
-        let irregularity =
-            sin(local.x * 4.1 + time * 0.21) * 0.010
-            + sin(local.y * 3.4 - time * 0.17) * 0.007
-            + sin((local.x + local.y) * 5.2 + time * 0.11) * 0.004;
-        let warped_r = r + irregularity * field_mask;
+        // There is no desktop capture bound to this pass, so the lens samples a
+        // quiet synthetic backdrop. Offsetting each channel along the same
+        // surface normal creates a restrained fake dispersion instead of grey
+        // contour lines, while remaining a single transparent draw call.
+        let optical_shift = normal * height * mix(0.038, 0.086, activity) * field_mask;
+        let chroma_split = normal * mix(0.032, 0.072, activity) * (0.35 + abs(height) * 0.65);
+        let refracted_red = den_virtual_backdrop(displaced_local + optical_shift + chroma_split, surface_phase).r;
+        let refracted_green = den_virtual_backdrop(displaced_local + optical_shift, surface_phase).g;
+        let refracted_blue = den_virtual_backdrop(displaced_local + optical_shift - chroma_split, surface_phase).b;
+        let refracted = vec3<f32>(refracted_red, refracted_green, refracted_blue);
+        let fresnel = pow(saturate((displaced_r - 0.40) / 0.66), 1.65);
+        let refract_alpha = field_mask
+            * (0.40 + center_density * 0.60)
+            * mix(0.050, 0.105, activity);
 
-        // Integrating activity on the CPU keeps both motion clocks continuous when
-        // proximity changes. The shader reconstructs the requested idle/active rates.
-        let ripple_phase = time * 0.20 + activity_integral * 0.35;
-        let particle_time = time + activity_integral * 0.35;
-        // Keep fewer than two very broad cycles across the whole field. A
-        // continuous sinusoidal modulation avoids the hard threshold that used
-        // to turn the ripple into visible concentric contour bands.
-        let wave_a = sin((warped_r * 0.92 + ripple_phase) * TAU);
-        let wave_b = sin((warped_r * 1.37 + ripple_phase * 0.73 + 1.73) * TAU);
-        let broad_wave = 0.50 + 0.50 * (wave_a * 0.82 + wave_b * 0.18);
-        // Keep a soft floor under the wave so the field never disappears in
-        // its broad troughs. Raising energy here changes visibility without
-        // sharpening the gradient or reintroducing contour bands.
-        let ripple_visibility = 0.22 + broad_wave * 0.78;
-        let ripple_alpha = ripple_visibility
-            * field_mask
-            * (0.32 + center_density * 0.68)
-            * mix(0.038, 0.088, activity);
-
-        // TODO: sample the renderer's existing desktop backdrop here once its bind
-        // group is exposed to the ecology overlay. Keep the local one-draw-call
-        // fallback instead of duplicating the capture texture or render pipeline.
-        let refracted = vec3<f32>(0.0);
-        let refract_alpha = 0.0;
-
-        let tint = vec3<f32>(0.88, 0.95, 1.00);
-        // A luminous near-white tint vanishes against bright windows. Keep the
-        // soft white field underneath, but give the ripple itself enough violet
-        // absorption contrast to remain legible on both white and dark content.
-        let ripple_tint = mix(
-            vec3<f32>(0.58, 0.38, 0.96),
-            vec3<f32>(0.42, 0.18, 0.84),
-            activity,
+        let tint = mix(
+            vec3<f32>(0.38, 0.66, 0.88),
+            vec3<f32>(0.64, 0.45, 0.86),
+            saturate(familiarity * 0.34 + activity * 0.18),
         );
+        let caustic = pow(saturate(0.58 + height * 0.42), 2.1)
+            * (0.35 + saturate(length(gradient) * 0.18) * 0.65);
+        let caustic_tint = mix(
+            vec3<f32>(0.30, 0.70, 0.94),
+            vec3<f32>(0.86, 0.38, 0.96),
+            saturate(0.5 + normal.x * 0.5),
+        );
+        let caustic_alpha = caustic
+            * field_mask
+            * (0.30 + center_density * 0.70)
+            * mix(0.009, 0.024, activity);
+        let spectrum_side = 0.5 + 0.5 * sin((normal.x - normal.y) * 3.2 + height * 4.0);
+        let dispersion_tint = mix(
+            vec3<f32>(1.00, 0.30, 0.16),
+            vec3<f32>(0.18, 0.48, 1.00),
+            spectrum_side,
+        );
+        let dispersion_alpha = field_mask
+            * (0.28 + fresnel * 0.72)
+            * saturate(0.24 + length(gradient) * 0.34)
+            * mix(0.014, 0.042, activity);
         let tint_alpha = field_mask
             * (0.20 + center_density * 0.80)
-            * mix(0.018, 0.043, activity);
+            * mix(0.012, 0.033, activity);
 
         // Stable screen-space sub-LSB dither breaks 8-bit gradient quantization
         // without temporal shimmer. Apply it to premultiplied energy and alpha
         // together so blending remains correct on light and dark backdrops.
         let dither = (hash21(floor(input.position.xy)) - 0.5) / 255.0 * field_mask;
         let dithered_tint_alpha = max(tint_alpha + dither * 0.72, 0.0);
-        let dithered_ripple_alpha = max(ripple_alpha + dither * 0.28, 0.0);
+        let dithered_caustic_alpha = max(caustic_alpha + dither * 0.28, 0.0);
+
+        let particle_time = time + activity_integral * 0.35;
 
         var particle_rgb = vec3<f32>(0.0);
         var particle_alpha = 0.0;
@@ -137,7 +204,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
             let base_size = mix(0.009, 0.016, hash11(fi + 47.2));
             let particle_size = max(base_size * scale, 0.0002);
-            let particle_distance = length(local - particle_position);
+            let particle_distance = length(displaced_local - particle_position);
             let core = (1.0 - smoothstep(
                 particle_size * 0.18,
                 particle_size,
@@ -149,19 +216,21 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 2.25,
             ) * 0.016 * field_mask;
             let particle_energy = core + halo;
-            particle_rgb += tint * particle_energy;
+            particle_rgb += mix(tint, caustic_tint, seed_a * 0.36) * particle_energy;
             particle_alpha += particle_energy;
         }
 
-        let center_glow = pow(saturate(1.0 - r / 0.34), 2.4)
-            * mix(0.004, 0.018, activity);
+        let center_glow = pow(saturate(1.0 - displaced_r / 0.38), 2.4)
+            * mix(0.002, 0.010, activity);
         let light_alpha = dithered_tint_alpha
-            + dithered_ripple_alpha
+            + dithered_caustic_alpha
+            + dispersion_alpha
             + particle_alpha
             + center_glow;
         let alpha = saturate(refract_alpha + light_alpha * (1.0 - refract_alpha));
         let light_rgb = tint * (dithered_tint_alpha + center_glow)
-            + ripple_tint * dithered_ripple_alpha
+            + caustic_tint * dithered_caustic_alpha
+            + dispersion_tint * dispersion_alpha
             + particle_rgb;
         let rgb = refracted * refract_alpha + light_rgb * (1.0 - refract_alpha);
         return vec4<f32>(rgb, alpha);

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 18;
+pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 19;
 const OLDEST_MIGRATABLE_LIQUID_TUNING_SCHEMA_VERSION: u32 = 6;
 
 /// Approved Body Lab seed-42 palette. Cinematic intentionally uses this authored
@@ -232,6 +232,9 @@ pub struct MaterialTuning {
     pub color_source_mode: ColorSourceMode,
     /// Weight of inherited Genome color in the circular-HSV identity blend.
     pub genome_color_blend: f32,
+    /// Presentation-only weight of the bounded R12 mood/material readout.
+    /// Zero preserves the identity palette; one shows the full mood target.
+    pub mood_color_blend: f32,
     pub primary_hsv: [f32; 3],
     pub secondary_hsv: [f32; 3],
     pub glow_hsv: [f32; 3],
@@ -374,7 +377,7 @@ impl LiquidTuningProfile {
             // so loading a file cannot silently change its look.
             self.material.variant = MaterialVariant::CurrentSafe;
             self.schema_version = LIQUID_TUNING_SCHEMA_VERSION;
-        } else if (9..=17).contains(&self.schema_version) {
+        } else if (9..=18).contains(&self.schema_version) {
             // Cinematic profiles already opted into their material. Schemas 10
             // through 15 preserve the selected material lane. Schema 16 replaces
             // the unstable mode-switched solver settings below without touching
@@ -399,6 +402,9 @@ impl LiquidTuningProfile {
                 ColorSourceMode::Genome
             };
             self.material.genome_color_blend = 0.65;
+        }
+        if source_schema <= 18 {
+            self.material.mood_color_blend = 0.72;
         }
         if source_schema < 17 {
             self.pbf.apply_v16_solver_defaults();
@@ -744,6 +750,7 @@ impl Default for MaterialTuning {
             override_genome_colors: true,
             color_source_mode: ColorSourceMode::GenomeAuthoredBlend,
             genome_color_blend: 0.65,
+            mood_color_blend: 0.72,
             primary_hsv: BODY_LAB_PRIMARY_HSV,
             secondary_hsv: BODY_LAB_SECONDARY_HSV,
             glow_hsv: BODY_LAB_GLOW_HSV,
@@ -807,6 +814,7 @@ impl Default for MaterialTuning {
 impl MaterialTuning {
     fn sanitize(&mut self) {
         self.genome_color_blend = bounded(self.genome_color_blend, 0.0, 1.0, 0.65);
+        self.mood_color_blend = bounded(self.mood_color_blend, 0.0, 1.0, 0.72);
         sanitize_hsv(&mut self.primary_hsv);
         sanitize_hsv(&mut self.secondary_hsv);
         sanitize_hsv(&mut self.glow_hsv);
@@ -988,9 +996,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_eighteen_defaults_keep_the_single_stable_solver_lane() {
+    fn schema_nineteen_defaults_keep_the_single_stable_solver_lane() {
         let pbf = PbfTuning::default();
-        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 18);
+        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 19);
         assert_eq!(pbf.substeps, 1);
         assert_eq!(pbf.impact_substeps, 1);
         assert_eq!(pbf.density_iterations, 6);
@@ -1014,12 +1022,23 @@ mod tests {
         profile.material.color_source_mode = ColorSourceMode::Authored;
         profile.material.genome_color_blend = 0.0;
         let migrated = profile.sanitized().expect("schema 17 migration");
-        assert_eq!(migrated.schema_version, 18);
+        assert_eq!(migrated.schema_version, 19);
         assert_eq!(
             migrated.material.color_source_mode,
             ColorSourceMode::GenomeAuthoredBlend
         );
         assert_eq!(migrated.material.genome_color_blend, 0.65);
+        assert_eq!(migrated.material.mood_color_blend, 0.72);
+    }
+
+    #[test]
+    fn schema_eighteen_gains_the_bounded_mood_color_blend() {
+        let mut profile = LiquidTuningProfile::for_seed(42);
+        profile.schema_version = 18;
+        profile.material.mood_color_blend = 0.0;
+        let migrated = profile.sanitized().expect("schema 18 migration");
+        assert_eq!(migrated.schema_version, 19);
+        assert_eq!(migrated.material.mood_color_blend, 0.72);
     }
 
     #[test]

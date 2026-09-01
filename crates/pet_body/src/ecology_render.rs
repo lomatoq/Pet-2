@@ -177,13 +177,15 @@ impl EcologyRenderer {
         let mut count = 0_usize;
 
         let den_radius_y = 105.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * 2.0;
+        let den_scale = state.den.size_scale
+            * continuous_den_scale(time_seconds, self.den_activity, state.den.familiarity);
         let den_color = Vec4::new(0.88, 0.95, 1.0, self.den_activity_integral_seconds);
         instances[count] = EcologyInstance {
             center_radius: [
                 state.den.anchor.x * 2.0 - 1.0,
                 1.0 - state.den.anchor.y * 2.0,
-                den_radius_y / aspect * state.den.size_scale,
-                den_radius_y * state.den.size_scale,
+                den_radius_y / aspect * den_scale,
+                den_radius_y * den_scale,
             ],
             color: den_color.to_array(),
             material: [1.0, self.den_activity, state.den.familiarity, time_seconds],
@@ -301,6 +303,21 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+fn continuous_den_scale(time_seconds: f32, activity: f32, familiarity: f32) -> f32 {
+    let time = if time_seconds.is_finite() {
+        time_seconds
+    } else {
+        0.0
+    };
+    let activity = activity.clamp(0.0, 1.0);
+    let familiarity = familiarity.clamp(0.0, 1.0);
+    // Two incommensurate oscillators keep the den breathing continuously
+    // without a visible spawn point, reset edge, or metronomic loop.
+    let breath = (time * 0.73).sin() * 0.72 + (time * 0.271 + 1.37).sin() * 0.28;
+    let amplitude = 0.035 + activity * 0.020 + familiarity * 0.006;
+    (1.0 + breath * amplitude).clamp(0.94, 1.07)
+}
+
 fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> Vec3 {
     let hue = hue.rem_euclid(1.0) * 6.0;
     let chroma = value * saturation;
@@ -323,7 +340,7 @@ mod tests {
 
     use super::{
         STORED_ORB_HOVER_MAX_ACCELERATION_PX, STORED_ORB_HOVER_MAX_SPEED_PX,
-        advance_stored_orb_hover,
+        advance_stored_orb_hover, continuous_den_scale,
     };
 
     #[test]
@@ -358,5 +375,21 @@ mod tests {
         }
         assert!(offset.length() < 0.01);
         assert!(velocity.length() < 0.01);
+    }
+
+    #[test]
+    fn den_scale_breathes_continuously_without_spawn_or_reset_edges() {
+        let mut minimum = f32::INFINITY;
+        let mut maximum = f32::NEG_INFINITY;
+        let mut previous = continuous_den_scale(0.0, 0.6, 0.8);
+        for frame in 1..=60 * 120 {
+            let value = continuous_den_scale(frame as f32 / 120.0, 0.6, 0.8);
+            minimum = minimum.min(value);
+            maximum = maximum.max(value);
+            assert!((value - previous).abs() < 0.001);
+            previous = value;
+        }
+        assert!(minimum < 0.97);
+        assert!(maximum > 1.03);
     }
 }

@@ -19,7 +19,10 @@ use crate::{
 
 pub const MAX_SYLLABLES: usize = 6;
 pub const COMMAND_CAPACITY: usize = 32;
-const ROOM_TAIL_MS: f32 = 72.0;
+const INTER_SYLLABLE_RELEASE_MS: f32 = 64.0;
+const PHONATION_RELEASE_BASE_MS: f32 = 260.0;
+const PHONATION_RELEASE_FATIGUE_MS: f32 = 75.0;
+const ROOM_TAIL_MS: f32 = 240.0;
 const MINIMUM_F0_HZ: f32 = 85.0;
 const MAXIMUM_F0_HZ: f32 = 1_600.0;
 const CONTROL_RATE_HZ: f32 = 400.0;
@@ -280,15 +283,35 @@ impl VoiceCommand {
     pub fn total_frames(&self, sample_rate: u32) -> usize {
         self.syllables[..usize::from(self.syllable_count)]
             .iter()
-            .map(|syllable| {
+            .enumerate()
+            .map(|(index, syllable)| {
                 milliseconds_to_frames(syllable.duration_ms / self.tempo_scale, sample_rate as f32)
                     + milliseconds_to_frames_allow_zero(
                         syllable.gap_after_ms / self.tempo_scale,
                         sample_rate as f32,
                     )
+                    + self.phonation_release_frames(index, sample_rate.max(1) as f32)
             })
             .sum::<usize>()
             + milliseconds_to_frames(ROOM_TAIL_MS, sample_rate.max(1) as f32)
+    }
+
+    fn phonation_release_frames(&self, syllable_index: usize, sample_rate: f32) -> usize {
+        if self.syllable_count == 0 {
+            return 0;
+        }
+        let final_syllable = syllable_index + 1 >= usize::from(self.syllable_count);
+        let duration_ms = if final_syllable {
+            ((PHONATION_RELEASE_BASE_MS * self.release_multiplier
+                + PHONATION_RELEASE_FATIGUE_MS * self.fatigue)
+                / self.tempo_scale.clamp(0.50, 1.80))
+            .clamp(180.0, 420.0)
+        } else {
+            (INTER_SYLLABLE_RELEASE_MS * self.release_multiplier
+                / self.tempo_scale.clamp(0.50, 1.80))
+            .clamp(42.0, 110.0)
+        };
+        milliseconds_to_frames(duration_ms, sample_rate)
     }
 }
 
@@ -330,6 +353,8 @@ pub struct SynthVoice {
     syllable_index: usize,
     frame_in_syllable: usize,
     gap_frames_remaining: usize,
+    release_frames_remaining: usize,
+    release_frames_total: usize,
     tail_frames_remaining: usize,
     breath: BreathPressureController,
     glottis: HybridLfGlottis,
@@ -405,6 +430,8 @@ impl SynthVoice {
             syllable_index: 0,
             frame_in_syllable: 0,
             gap_frames_remaining: 0,
+            release_frames_remaining: 0,
+            release_frames_total: 1,
             tail_frames_remaining: 0,
             breath: BreathPressureController::default(),
             glottis: HybridLfGlottis::new(sample_rate),
@@ -471,6 +498,9 @@ impl SynthVoice {
             return self.render_unvoiced_tail(command.pan, command.maximum_loudness);
         }
         let command = self.current.expect("command is active");
+        if self.release_frames_remaining > 0 {
+            return self.render_phonation_release(command);
+        }
         if self.syllable_index >= usize::from(command.syllable_count) {
             self.current = None;
             self.tail_frames_remaining = milliseconds_to_frames(ROOM_TAIL_MS, self.sample_rate);
@@ -482,17 +512,9 @@ impl SynthVoice {
             self.sample_rate,
         );
         if self.frame_in_syllable >= total_frames {
-            self.gap_frames_remaining = milliseconds_to_frames_allow_zero(
-                syllable.gap_after_ms / command.tempo_scale.max(0.1),
-                self.sample_rate,
-            );
-            self.syllable_index += 1;
-            self.frame_in_syllable = 0;
-            if self.syllable_index < usize::from(command.syllable_count) {
-                self.breath.begin_syllable();
-                self.control_countdown = 0;
-            }
-            self.publish_feedback(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0);
+            self.release_frames_total =
+                command.phonation_release_frames(self.syllable_index, self.sample_rate);
+            self.release_frames_remaining = self.release_frames_total;
             return self.next_stereo_frame();
         }
         let progress = self.frame_in_syllable as f32 / total_frames.saturating_sub(1).max(1) as f32;
@@ -581,7 +603,7 @@ impl SynthVoice {
             self.slosh_noise.colored(0.38),
         );
         let raw =
-            (tract.output + body.signal) * command.gain * syllable.amplitude.clamp(0.0, 1.0) * 4.0;
+            (tract.output + body.signal) * command.gain * syllable.amplitude.clamp(0.0, 1.0) * 6.4;
         self.frame_in_syllable += 1;
         let mono = self.post_process_mono(raw, command.maximum_loudness);
         self.emitted_energy += (mono.abs() - self.emitted_energy) * 0.035;
@@ -612,6 +634,8 @@ impl SynthVoice {
         self.syllable_index = 0;
         self.frame_in_syllable = 0;
         self.gap_frames_remaining = 0;
+        self.release_frames_remaining = 0;
+        self.release_frames_total = 1;
         self.tail_frames_remaining = 0;
         self.last_pan = command.pan;
         self.breath.reset();
@@ -719,6 +743,127 @@ impl SynthVoice {
         pan(mono, pan_value)
     }
 
+    fn render_phonation_release(&mut self, command: VoiceCommand) -> [f32; 2] {
+        let syllable_index = self.syllable_index.min(MAX_SYLLABLES - 1);
+        let syllable = command.syllables[syllable_index];
+        let remaining = self.release_frames_remaining.max(1) as f32;
+        let total = self.release_frames_total.max(1) as f32;
+        let remaining_normalized = (remaining / total).clamp(0.0, 1.0);
+        let release_progress = 1.0 - remaining_normalized;
+        // Smoothstep has zero slope at both endpoints: the first release sample
+        // is continuous with the syllable and the final source sample reaches
+        // silence without a click.
+        let release_gain =
+            remaining_normalized * remaining_normalized * (3.0 - 2.0 * remaining_normalized);
+
+        self.body_current = smooth_body_frame(self.body_current, self.body_target, 0.0025);
+        let mut gesture = syllable.gesture;
+        gesture.pressure_peak *= remaining_normalized;
+        gesture.adduction = (gesture.adduction * (1.0 - release_progress * 0.72)).clamp(0.0, 1.0);
+        gesture.open_quotient = (gesture.open_quotient + release_progress * 0.14).clamp(0.30, 0.88);
+        let mouth_target = syllable.mouth_open * remaining_normalized.sqrt();
+        if self.control_countdown == 0 {
+            self.tract
+                .set_targets(gesture, mouth_target, self.body_current);
+            self.body_resonance.set_targets(self.body_current, gesture);
+            self.control_countdown = self.control_interval;
+            self.diagnostics.observe_control();
+        }
+        self.control_countdown = self.control_countdown.saturating_sub(1);
+
+        let breath = self.breath.process(
+            0.76 + release_progress * 0.24,
+            gesture,
+            command.anatomy,
+            (0.76 + command.gain * 0.42).clamp(0.72, 1.05),
+            command.arousal,
+            command.fatigue,
+            command.attack_multiplier,
+            command.release_multiplier,
+            command.breath_phase_lock,
+            0.0,
+            self.last_glottal_openness,
+            self.tract_back_pressure,
+            1.0 / self.sample_rate,
+        );
+        self.diagnostics.observe_pressure(breath.pressure);
+        let target_f0 = (command.base_pitch_hz * command.pitch_scale * syllable.pitch_ratio(1.0))
+            .clamp(command.minimum_f0_hz, command.maximum_f0_hz);
+        let instability = (gesture.instability
+            + command.stress * 0.22
+            + command.roughness * 0.12
+            + command.anatomy.instability_susceptibility * 0.12)
+            .clamp(0.0, 1.0);
+        let glottal = self.glottis.process(
+            target_f0,
+            breath.pressure,
+            breath.capture,
+            gesture,
+            instability,
+            self.tract_back_pressure,
+            &mut self.cycle_noise,
+        );
+        if glottal.cycle_boundary {
+            self.diagnostics
+                .observe_cycle(glottal.f0_hz, glottal.regime);
+        }
+        self.last_glottal_openness = glottal.openness;
+        let aspiration = self.aspiration_noise.colored(command.brightness)
+            * (breath.aspiration * glottal.aspiration_gate
+                + syllable.noisiness * breath.airflow * 0.08);
+        let turbulence = self.constriction_noise.colored(command.brightness)
+            * breath.airflow
+            * (0.30 + gesture.constriction * 0.70);
+        let tract = self
+            .tract
+            .process(glottal.excitation, aspiration, turbulence);
+        self.tract_back_pressure = tract.back_pressure;
+        let body = self.body_resonance.process(
+            tract.output,
+            self.body_current,
+            self.slosh_noise.colored(0.32) * release_gain,
+        );
+        let raw = (tract.output + body.signal)
+            * command.gain
+            * syllable.amplitude.clamp(0.0, 1.0)
+            * 6.4
+            * release_gain;
+        let mono = self.post_process_mono(raw, command.maximum_loudness);
+        self.emitted_energy += (mono.abs() - self.emitted_energy) * 0.035;
+        self.diagnostics.observe_signal(
+            mono,
+            tract.oral_output,
+            tract.nasal_output,
+            body.energy,
+            tract.coefficient_delta,
+        );
+        self.publish_feedback(
+            self.emitted_energy * release_gain,
+            breath.pressure,
+            glottal.openness,
+            tract.mouth_aperture,
+            glottal.f0_hz / command.base_pitch_hz.max(1.0),
+            breath.aspiration,
+            body.energy,
+            0.0,
+            glottal.regime as u8,
+        );
+        self.release_frames_remaining = self.release_frames_remaining.saturating_sub(1);
+        if self.release_frames_remaining == 0 {
+            self.gap_frames_remaining = milliseconds_to_frames_allow_zero(
+                syllable.gap_after_ms / command.tempo_scale.max(0.1),
+                self.sample_rate,
+            );
+            self.syllable_index += 1;
+            self.frame_in_syllable = 0;
+            if self.syllable_index < usize::from(command.syllable_count) {
+                self.breath.begin_syllable();
+                self.control_countdown = 0;
+            }
+        }
+        pan(mono, command.pan)
+    }
+
     fn post_process_mono(&mut self, mono: f32, maximum_loudness: f32) -> f32 {
         let tilted = self.spectral_tilt.process(mono);
         let high_passed = tilted - self.voice_low_cut.process(tilted);
@@ -751,8 +896,13 @@ impl SynthVoice {
             self.feedback.clear();
             return;
         };
+        let acoustic_activity = (emitted_energy * 24.0).clamp(0.0, 1.0);
+        let pneumatic_activity =
+            (breath_pressure * 0.82 + aspiration * 0.24 + body_resonance_energy * 0.12)
+                .clamp(0.0, 1.0);
+        let visual_envelope = acoustic_activity.max(pneumatic_activity);
         self.feedback.publish(AudioVisualFeedback {
-            active: emitted_energy > 0.000_1 || breath_pressure > 0.02,
+            active: visual_envelope > 0.015,
             request_id: command.request_id,
             motif_id: command.motif_id,
             syllable_index: self.syllable_index.min(u8::MAX as usize) as u8,
@@ -765,7 +915,10 @@ impl SynthVoice {
             body_resonance_energy: body_resonance_energy.clamp(0.0, 1.0),
             purr_event_energy: purr_event_energy.clamp(0.0, 1.0),
             phonation_regime,
-            envelope: emitted_energy.clamp(0.0, 1.0),
+            // Raw PCM energy is intentionally quiet and therefore unsuitable
+            // as a direct 0..1 animation weight. This normalized physical
+            // envelope keeps the mouth coupled to audible energy and airflow.
+            envelope: visual_envelope,
             mouth_open: mouth_aperture.clamp(0.0, 1.0),
             noisiness: aspiration.clamp(0.0, 1.0),
             purr: purr_event_energy.clamp(0.0, 1.0),
@@ -958,5 +1111,100 @@ mod tests {
         let diagnostics = synth.diagnostics();
         assert!(diagnostics.purr_event_count > 2);
         assert!(diagnostics.purr_interval_cv > 0.005);
+    }
+
+    #[test]
+    fn final_syllable_drains_through_phonation_release_without_a_hard_cut() {
+        let voice = lifecore::Genome::from_seed(47).voice;
+        let mut motif = lifecore::generate_initial_motifs(&voice)[0].clone();
+        motif.syllables.truncate(1);
+        motif.syllables[0].gap_after_ms = 0.0;
+        let command = VoiceCommand::prepare(
+            &voice,
+            &motif,
+            &request(motif.id, VocalStyle::SocialContact),
+        );
+        let phrase_frames = command.syllables[..usize::from(command.syllable_count)]
+            .iter()
+            .map(|syllable| {
+                milliseconds_to_frames(syllable.duration_ms / command.tempo_scale, 48_000.0)
+                    + milliseconds_to_frames_allow_zero(
+                        syllable.gap_after_ms / command.tempo_scale,
+                        48_000.0,
+                    )
+            })
+            .sum::<usize>();
+        let release_frames = command.phonation_release_frames(0, 48_000.0);
+        let commands = Arc::new(SpscRing::new());
+        commands.push(command).unwrap();
+        let mut synth = SynthVoice::new(commands, 48_000);
+        let mono = (0..command.total_frames(48_000))
+            .map(|_| {
+                let frame = synth.next_stereo_frame();
+                (frame[0] + frame[1]) * 0.5
+            })
+            .collect::<Vec<_>>();
+
+        let transition_jump = (mono[phrase_frames] - mono[phrase_frames - 1]).abs();
+        assert!(
+            transition_jump < command.maximum_loudness * 0.25,
+            "final syllable still cuts at release boundary: jump={transition_jump}"
+        );
+        let release = &mono[phrase_frames..phrase_frames + release_frames];
+        let quarter = (release.len() / 4).max(1);
+        let early_rms = rms(&release[..quarter]);
+        let late_rms = rms(&release[release.len() - quarter..]);
+        assert!(
+            early_rms > 0.000_01,
+            "release carries no physical voice energy"
+        );
+        assert!(
+            late_rms < early_rms * 0.40,
+            "release does not decay: early={early_rms}, late={late_rms}"
+        );
+        assert!(
+            mono[mono.len() - 64..]
+                .iter()
+                .all(|sample| sample.abs() < 0.002),
+            "room tail must settle before the stream returns digital silence"
+        );
+    }
+
+    #[test]
+    fn every_syllable_enters_a_physical_release_before_silence() {
+        let voice = lifecore::Genome::from_seed(53).voice;
+        let mut motif = lifecore::generate_initial_motifs(&voice)[0].clone();
+        motif.syllables.truncate(2);
+        for syllable in &mut motif.syllables {
+            syllable.gap_after_ms = 24.0;
+        }
+        let command = VoiceCommand::prepare(
+            &voice,
+            &motif,
+            &request(motif.id, VocalStyle::SocialContact),
+        );
+        let commands = Arc::new(SpscRing::new());
+        commands.push(command).unwrap();
+        let feedback = Arc::new(AudioVisualBridge::default());
+        let mut synth = SynthVoice::with_feedback(commands, 48_000, Arc::clone(&feedback));
+        let first_duration = milliseconds_to_frames(
+            command.syllables[0].duration_ms / command.tempo_scale,
+            48_000.0,
+        );
+        for _ in 0..=first_duration {
+            let _ = synth.next_stereo_frame();
+        }
+        let snapshot = feedback.snapshot();
+        assert!(
+            snapshot.active,
+            "inter-syllable release was replaced by digital silence"
+        );
+        assert!(snapshot.envelope > 0.02);
+        assert_eq!(snapshot.syllable_index, 0);
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len().max(1) as f32)
+            .sqrt()
     }
 }

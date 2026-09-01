@@ -58,7 +58,11 @@ impl BreathPressureController {
         } else {
             let release =
                 ((progress - release_start) / (1.0 - release_start).max(0.01)).clamp(0.0, 1.0);
-            1.0 - release * release * 0.92
+            // The authored syllable endpoint is a real end of expiration.
+            // Reaching exactly zero lets the subsequent release phase drain
+            // stored lung/glottal energy instead of stepping from 8% drive to
+            // digital silence in one sample.
+            1.0 - release * release
         };
         let sustainable = (1.0 - fatigue * 0.52).clamp(0.34, 1.0);
         let p_target = (gesture.pressure_peak

@@ -357,11 +357,7 @@ impl EmbodiedRuntime {
         self.update_pupil(mode, intent, sensors, mind, expression, face_tuning, dt);
         self.update_soft_body(genome, intent, feedback, affect, dt);
 
-        let voice_mouth = if voice.active {
-            voice.mouth_open.clamp(0.0, 1.0) * voice.envelope.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let voice_mouth = voice_mouth_target(voice);
         // An audible callback is the sole authority for a visibly open cavity.
         // Emotion still controls curve/tension below, but cannot mime failed audio.
         let mouth_target = voice_mouth;
@@ -969,6 +965,20 @@ impl EmbodiedRuntime {
         self.modal_dynamics.update(softness, feedback, dt);
         self.pose.morph = self.modal_dynamics.deformation;
     }
+}
+
+fn voice_mouth_target(voice: VoiceVisualState) -> f32 {
+    if !voice.active {
+        return 0.0;
+    }
+    let activity = voice.envelope.clamp(0.0, 1.0).sqrt();
+    let non_purr = 1.0 - voice.purr.clamp(0.0, 1.0) * 0.62;
+    let audible_aperture_floor = (0.16 + voice.noisiness.clamp(0.0, 1.0) * 0.16) * non_purr;
+    let articulated_aperture = voice.mouth_open.clamp(0.0, 1.0).max(audible_aperture_floor);
+    // `voice.envelope` is a normalized physical activity signal. Keep quiet
+    // phonation visibly articulated instead of multiplying the tract aperture
+    // by raw near-zero PCM energy.
+    articulated_aperture * (0.30 + activity * 0.70)
 }
 
 fn gaze_mode(intent: &BodyIntent, affect: AffectState) -> GazeMode {
@@ -1687,5 +1697,29 @@ mod tests {
                 assert!((0.0..=1.0).contains(&value));
             }
         }
+    }
+
+    #[test]
+    fn normalized_voice_activity_keeps_spoken_mouth_visibly_open() {
+        let speaking = voice_mouth_target(VoiceVisualState {
+            active: true,
+            envelope: 0.52,
+            mouth_open: 0.46,
+            noisiness: 0.18,
+            ..VoiceVisualState::default()
+        });
+        let quiet_purr = voice_mouth_target(VoiceVisualState {
+            active: true,
+            envelope: 0.28,
+            mouth_open: 0.08,
+            purr: 1.0,
+            ..VoiceVisualState::default()
+        });
+        assert!(
+            speaking > 0.34,
+            "spoken aperture was visually closed: {speaking}"
+        );
+        assert!(quiet_purr < speaking);
+        assert_eq!(voice_mouth_target(VoiceVisualState::default()), 0.0);
     }
 }
