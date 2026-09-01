@@ -19,7 +19,7 @@ use crate::{
 
 pub const MAX_SYLLABLES: usize = 6;
 pub const COMMAND_CAPACITY: usize = 32;
-const ROOM_TAIL_MS: f32 = 72.0;
+const ROOM_TAIL_MS: f32 = 96.0;
 const MINIMUM_F0_HZ: f32 = 85.0;
 const MAXIMUM_F0_HZ: f32 = 1_600.0;
 const CONTROL_RATE_HZ: f32 = 400.0;
@@ -287,6 +287,17 @@ const fn identity_register(style: VocalStyle, gesture: VoiceGesture) -> Identity
     }
 }
 
+#[derive(Clone, Copy)]
+struct SpectralRelease {
+    command: VoiceCommand,
+    syllable: PreparedSyllable,
+    f0_hz: f32,
+    pressure: f32,
+    capture: f32,
+    aspiration_level: f32,
+    turbulence_level: f32,
+}
+
 pub struct SynthVoice {
     commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
     feedback: Arc<AudioVisualBridge>,
@@ -327,6 +338,10 @@ pub struct SynthVoice {
     purr_group_exhale: bool,
     diagnostics: VoiceDiagnostics,
     last_pan: f32,
+    callback_feedback: AudioVisualFeedback,
+    callback_feedback_seen: bool,
+    spectral_release: Option<SpectralRelease>,
+    release_age_frames: usize,
 }
 
 impl SynthVoice {
@@ -402,11 +417,25 @@ impl SynthVoice {
             purr_group_exhale: true,
             diagnostics: VoiceDiagnostics::default(),
             last_pan: 0.0,
+            callback_feedback: AudioVisualFeedback::default(),
+            callback_feedback_seen: false,
+            spectral_release: None,
+            release_age_frames: 0,
         }
     }
 
     pub fn begin_callback(&mut self) {
         self.body_target = self.body_bridge.snapshot_or(self.body_target);
+        self.callback_feedback = AudioVisualFeedback::default();
+        self.callback_feedback_seen = false;
+    }
+
+    pub(crate) fn end_callback(&mut self) {
+        if self.callback_feedback_seen {
+            self.feedback.publish(self.callback_feedback);
+        } else {
+            self.feedback.clear();
+        }
     }
 
     #[must_use]
@@ -418,14 +447,10 @@ impl SynthVoice {
         if self.current.is_none() {
             if self.tail_frames_remaining > 0 {
                 self.tail_frames_remaining -= 1;
-                let frame = self.render_unvoiced_tail(self.last_pan, 0.76);
-                if self.tail_frames_remaining == 0 {
-                    self.feedback.clear();
-                }
+                let frame = self.render_spectral_release_tail(self.last_pan, 0.76);
                 return frame;
             }
             let Some(command) = self.commands.pop() else {
-                self.feedback.clear();
                 return [0.0; 2];
             };
             self.start_command(command);
@@ -434,7 +459,7 @@ impl SynthVoice {
             self.gap_frames_remaining -= 1;
             self.publish_feedback(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0);
             let command = self.current.expect("gap belongs to active command");
-            return self.render_unvoiced_tail(command.pan, command.maximum_loudness);
+            return self.render_spectral_release_tail(command.pan, command.maximum_loudness);
         }
         let command = self.current.expect("command is active");
         if self.syllable_index >= usize::from(command.syllable_count) {
@@ -527,24 +552,37 @@ impl SynthVoice {
                 .observe_cycle(glottal.f0_hz, glottal.regime);
         }
         self.last_glottal_openness = glottal.openness;
-        let aspiration = self.aspiration_noise.colored(command.brightness)
-            * (breath.aspiration * glottal.aspiration_gate
-                + purr_aspiration
-                + syllable.noisiness * breath.airflow * 0.08);
-        let turbulence = self.constriction_noise.colored(command.brightness)
-            * breath.airflow
-            * (0.30 + gesture.constriction * 0.70);
+        let aspiration_level = breath.aspiration * glottal.aspiration_gate
+            + purr_aspiration
+            + syllable.noisiness * breath.airflow * 0.08;
+        let aspiration = self.aspiration_noise.colored(command.brightness) * aspiration_level;
+        let turbulence_level = breath.airflow * (0.30 + gesture.constriction * 0.70);
+        let turbulence = self.constriction_noise.colored(command.brightness) * turbulence_level;
         let tract = self
             .tract
             .process(glottal.excitation, aspiration, turbulence);
         self.tract_back_pressure = tract.back_pressure;
         let body = self.body_resonance.process(
-            tract.output + purr_body * 0.045,
+            tract.output,
+            // Purr is an internal body impulse, not tract sound. Feeding it
+            // into the resonator's internal excitation path keeps the audible
+            // pulse causal while avoiding final-bus amplitude modulation.
+            purr_body,
             self.body_current,
             self.slosh_noise.colored(0.38),
         );
         let raw =
             (tract.output + body.signal) * command.gain * syllable.amplitude.clamp(0.0, 1.0) * 4.0;
+        self.spectral_release = Some(SpectralRelease {
+            command,
+            syllable,
+            f0_hz: glottal.f0_hz,
+            pressure: breath.pressure,
+            capture: breath.capture,
+            aspiration_level,
+            turbulence_level,
+        });
+        self.release_age_frames = 0;
         self.frame_in_syllable += 1;
         let mono = self.post_process_mono(raw, command.maximum_loudness);
         self.emitted_energy += (mono.abs() - self.emitted_energy) * 0.035;
@@ -615,6 +653,8 @@ impl SynthVoice {
         self.purr_aspiration_remaining = 0;
         self.purr_group_remaining = 0;
         self.purr_group_exhale = true;
+        self.spectral_release = None;
+        self.release_age_frames = 0;
         self.publish_feedback(0.0, 0.0, 0.0, 0.0, 1.0, command.breathiness, 0.0, 0.0, 0);
     }
 
@@ -664,14 +704,70 @@ impl SynthVoice {
         )
     }
 
-    fn render_unvoiced_tail(&mut self, pan_value: f32, maximum_loudness: f32) -> [f32; 2] {
-        let tract = self.tract.process(0.0, 0.0, 0.0);
+    fn render_spectral_release_tail(&mut self, pan_value: f32, maximum_loudness: f32) -> [f32; 2] {
+        let Some(release) = self.spectral_release else {
+            let tract = self.tract.process(0.0, 0.0, 0.0);
+            let body = self.body_resonance.process(
+                tract.output,
+                0.0,
+                self.body_current,
+                self.slosh_noise.colored(0.28) * 0.05,
+            );
+            let mono = self.post_process_mono(tract.output + body.signal, maximum_loudness);
+            return pan(mono, pan_value);
+        };
+        let release_seconds = self.release_age_frames as f32 / self.sample_rate;
+        self.release_age_frames = self.release_age_frames.saturating_add(1);
+        let release_tau = if release.command.purr { 0.055 } else { 0.042 };
+        let decay = (-release_seconds / release_tau).exp();
+        // The source fades out before the phrase buffer ends, leaving the last
+        // 12 ms to the tract/body modes and room taps. This is a physical
+        // spectral release, not a repeated-sample or final-bus crossfade.
+        let terminal_source = if self.current.is_none() {
+            let remaining_seconds = self.tail_frames_remaining as f32 / self.sample_rate;
+            ((remaining_seconds - 0.012) / 0.022).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let source_decay = decay * terminal_source;
+        let gesture = release.syllable.gesture;
+        let instability = (gesture.instability
+            + release.command.stress * 0.22
+            + release.command.roughness * 0.12
+            + release.command.anatomy.instability_susceptibility * 0.12)
+            .clamp(0.0, 1.0);
+        let glottal = self.glottis.process(
+            release.f0_hz,
+            release.pressure * source_decay,
+            release.capture,
+            gesture,
+            instability,
+            self.tract_back_pressure,
+            &mut self.cycle_noise,
+        );
+        self.last_glottal_openness = glottal.openness;
+        let aspiration = self.aspiration_noise.colored(release.command.brightness)
+            * release.aspiration_level
+            * source_decay;
+        let turbulence = self.constriction_noise.colored(release.command.brightness)
+            * release.turbulence_level
+            * source_decay;
+        let tract = self
+            .tract
+            .process(glottal.excitation, aspiration, turbulence);
+        self.tract_back_pressure = tract.back_pressure;
         let body = self.body_resonance.process(
             tract.output,
+            0.0,
             self.body_current,
             self.slosh_noise.colored(0.28) * 0.05,
         );
-        let mono = self.post_process_mono(tract.output + body.signal, maximum_loudness);
+        let raw = (tract.output + body.signal)
+            * release.command.gain
+            * release.syllable.amplitude.clamp(0.0, 1.0)
+            * 4.0;
+        let mono = self.post_process_mono(raw, maximum_loudness);
+        self.emitted_energy += (mono.abs() - self.emitted_energy) * 0.035;
         self.diagnostics.observe_signal(
             mono,
             tract.oral_output,
@@ -679,6 +775,19 @@ impl SynthVoice {
             body.energy,
             tract.coefficient_delta,
         );
+        if self.current.is_some() {
+            self.publish_feedback(
+                self.emitted_energy,
+                release.pressure * source_decay,
+                glottal.openness,
+                release.syllable.mouth_open * source_decay.sqrt(),
+                glottal.f0_hz / release.command.base_pitch_hz.max(1.0),
+                release.aspiration_level * source_decay,
+                body.energy,
+                0.0,
+                glottal.regime as u8,
+            );
+        }
         pan(mono, pan_value)
     }
 
@@ -699,7 +808,7 @@ impl SynthVoice {
 
     #[allow(clippy::too_many_arguments)]
     fn publish_feedback(
-        &self,
+        &mut self,
         emitted_energy: f32,
         breath_pressure: f32,
         glottal_openness: f32,
@@ -711,10 +820,9 @@ impl SynthVoice {
         phonation_regime: u8,
     ) {
         let Some(command) = self.current else {
-            self.feedback.clear();
             return;
         };
-        self.feedback.publish(AudioVisualFeedback {
+        let feedback = AudioVisualFeedback {
             active: emitted_energy > 0.000_1 || breath_pressure > 0.02,
             request_id: command.request_id,
             motif_id: command.motif_id,
@@ -732,7 +840,50 @@ impl SynthVoice {
             mouth_open: mouth_aperture.clamp(0.0, 1.0),
             noisiness: aspiration.clamp(0.0, 1.0),
             purr: purr_event_energy.clamp(0.0, 1.0),
-        });
+        };
+        let score = feedback.envelope + feedback.breath_pressure * 0.12;
+        let current_score =
+            self.callback_feedback.envelope + self.callback_feedback.breath_pressure * 0.12;
+        if !self.callback_feedback_seen || score >= current_score {
+            self.callback_feedback.request_id = feedback.request_id;
+            self.callback_feedback.motif_id = feedback.motif_id;
+            self.callback_feedback.syllable_index = feedback.syllable_index;
+            self.callback_feedback.pitch_normalized = feedback.pitch_normalized;
+            self.callback_feedback.phonation_regime = feedback.phonation_regime;
+        }
+        self.callback_feedback.active |= feedback.active;
+        self.callback_feedback.emitted_energy = self
+            .callback_feedback
+            .emitted_energy
+            .max(feedback.emitted_energy);
+        self.callback_feedback.breath_pressure = self
+            .callback_feedback
+            .breath_pressure
+            .max(feedback.breath_pressure);
+        self.callback_feedback.glottal_openness = self
+            .callback_feedback
+            .glottal_openness
+            .max(feedback.glottal_openness);
+        self.callback_feedback.mouth_aperture = self
+            .callback_feedback
+            .mouth_aperture
+            .max(feedback.mouth_aperture);
+        self.callback_feedback.envelope = self.callback_feedback.envelope.max(feedback.envelope);
+        self.callback_feedback.mouth_open =
+            self.callback_feedback.mouth_open.max(feedback.mouth_open);
+        self.callback_feedback.aspiration =
+            self.callback_feedback.aspiration.max(feedback.aspiration);
+        self.callback_feedback.body_resonance_energy = self
+            .callback_feedback
+            .body_resonance_energy
+            .max(feedback.body_resonance_energy);
+        self.callback_feedback.purr_event_energy = self
+            .callback_feedback
+            .purr_event_energy
+            .max(feedback.purr_event_energy);
+        self.callback_feedback.noisiness = self.callback_feedback.noisiness.max(feedback.noisiness);
+        self.callback_feedback.purr = self.callback_feedback.purr.max(feedback.purr);
+        self.callback_feedback_seen = true;
     }
 }
 

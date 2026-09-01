@@ -44,6 +44,7 @@ pub struct AudioVisualFeedback {
 pub struct AudioCallbackLevels {
     pub rms: f32,
     pub peak: f32,
+    pub callback_count: u64,
 }
 
 #[derive(Default)]
@@ -66,6 +67,7 @@ pub struct AudioVisualBridge {
     purr: AtomicU32,
     rms: AtomicU32,
     peak: AtomicU32,
+    callback_count: AtomicU64,
     started_requests: SpscRing<u64, COMMAND_CAPACITY>,
 }
 
@@ -101,6 +103,7 @@ impl AudioVisualBridge {
         AudioCallbackLevels {
             rms: load_f32(&self.rms),
             peak: load_f32(&self.peak),
+            callback_count: self.callback_count.load(Ordering::Acquire),
         }
     }
 
@@ -118,6 +121,7 @@ impl AudioVisualBridge {
     pub(crate) fn publish_levels(&self, rms: f32, peak: f32) {
         store_f32(&self.rms, rms.clamp(0.0, 1.0));
         store_f32(&self.peak, peak.clamp(0.0, 1.0));
+        self.callback_count.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn publish(&self, feedback: AudioVisualFeedback) {
@@ -249,5 +253,18 @@ mod tests {
         bridge.clear();
         assert_eq!(bridge.pop_started_request(), Some(41));
         assert_eq!(bridge.pop_started_request(), None);
+    }
+
+    #[test]
+    fn callback_levels_expose_a_monotonic_heartbeat_even_during_silence() {
+        let bridge = AudioVisualBridge::default();
+        assert_eq!(bridge.levels().callback_count, 0);
+        bridge.publish_levels(0.0, 0.0);
+        assert_eq!(bridge.levels().callback_count, 1);
+        bridge.publish_levels(0.0, 0.0);
+        let levels = bridge.levels();
+        assert_eq!(levels.callback_count, 2);
+        assert_eq!(levels.rms, 0.0);
+        assert_eq!(levels.peak, 0.0);
     }
 }

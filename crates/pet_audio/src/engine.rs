@@ -71,6 +71,21 @@ pub fn choose_output_config(candidates: &[OutputConfigCandidate]) -> Option<Sele
         .map(|(_, config)| config)
 }
 
+/// Returns the output endpoint Windows currently considers the default.
+///
+/// A running CPAL stream can remain apparently healthy after its endpoint is
+/// unplugged, so the app periodically compares this value with the endpoint
+/// that owns the stream and rebuilds the stream when they diverge.
+pub fn default_output_device_name() -> Result<String, AudioError> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or(AudioError::NoOutputDevice)?;
+    Ok(device
+        .name()
+        .unwrap_or_else(|_| "unknown output device".into()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioRuntimeEvent {
     StreamError,
@@ -388,6 +403,7 @@ fn fill_f32(
         accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
         write_frame_slice(stereo, frame, |sample| sample);
     }
+    synth.end_callback();
     feedback.publish_levels((energy / count.max(1.0)).sqrt(), peak);
 }
 
@@ -406,6 +422,7 @@ fn fill_i16(
         accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
         write_frame_slice(stereo, frame, to_i16);
     }
+    synth.end_callback();
     feedback.publish_levels((energy / count.max(1.0)).sqrt(), peak);
 }
 
@@ -424,6 +441,7 @@ fn fill_u16(
         accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
         write_frame_slice(stereo, frame, to_u16);
     }
+    synth.end_callback();
     feedback.publish_levels((energy / count.max(1.0)).sqrt(), peak);
 }
 
@@ -583,6 +601,51 @@ mod tests {
             Some(request.performance_seed)
         );
         assert_eq!(feedback.pop_started_request(), None);
+    }
+
+    #[test]
+    fn callback_visuals_latch_a_short_voice_even_when_the_buffer_ends_in_silence() {
+        let genome = lifecore::Genome::from_seed(0x00A1_1D10);
+        let voice = genome.voice.clone();
+        let motifs = lifecore::generate_initial_motifs(&voice);
+        let motif = &motifs[0];
+        let request = VocalRequest {
+            motif_id: motif.id,
+            performance_seed: 0xCA11_BACC,
+            gain: 0.4,
+            pan: 0.0,
+            pitch_scale: 1.0,
+            tempo_scale: 1.0,
+            stress: 0.0,
+            purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 128,
+            style: lifecore::VocalStyle::SocialContact,
+            valence: 0.2,
+            arousal: 0.3,
+            fatigue: 0.0,
+            confidence: 0.8,
+            attachment: 0.5,
+            rhythm_intervals: [0.0; 8],
+        };
+        let command = VoiceCommand::prepare(&voice, motif, &request);
+        let commands = Arc::new(SpscRing::new());
+        commands.push(command).unwrap();
+        let feedback = Arc::new(AudioVisualBridge::default());
+        let mut synth = SynthVoice::with_feedback(commands, 48_000, Arc::clone(&feedback));
+        let mut output = vec![0.0; (command.total_frames(48_000) + 256) * 2];
+
+        fill_f32(&mut synth, &mut output, 2, &feedback);
+
+        let visual = feedback.snapshot();
+        assert!(visual.active);
+        assert_eq!(visual.request_id, request.performance_seed);
+        assert!(visual.mouth_open > 0.20, "mouth_open={}", visual.mouth_open);
+        assert!(visual.envelope > 0.000_1, "envelope={}", visual.envelope);
+
+        let mut silence = [0.0; 256];
+        fill_f32(&mut synth, &mut silence, 2, &feedback);
+        assert_eq!(feedback.snapshot(), AudioVisualFeedback::default());
     }
 
     #[test]

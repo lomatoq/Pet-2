@@ -131,6 +131,7 @@ impl LiquidBodyResonance {
     pub(crate) fn process(
         &mut self,
         tract_output: f32,
+        internal_excitation: f32,
         body: BodyVoiceFrame,
         slosh_noise: f32,
     ) -> BodyResonanceFrame {
@@ -148,6 +149,7 @@ impl LiquidBodyResonance {
             self.previous_events[index] = event;
         }
         let excitation = tract_output * (0.035 + self.anatomy.body_coupling * 0.055)
+            + internal_excitation.clamp(-1.0, 1.0) * 0.80
             + slosh_noise * (body.slosh_energy * 0.020 + body.internal_speed * 0.008)
             + self.event_excitation;
         self.event_excitation *= 0.94;
@@ -190,11 +192,12 @@ mod tests {
         for frame in 0..4_000 {
             let input = if frame == 0 { 0.8 } else { 0.0 };
             let a = attached
-                .process(input, BodyVoiceFrame::default(), 0.0)
+                .process(input, 0.0, BodyVoiceFrame::default(), 0.0)
                 .signal;
             let b = detached
                 .process(
                     input,
+                    0.0,
                     BodyVoiceFrame {
                         component_count: 2,
                         main_mass_ratio: 0.75,
