@@ -84,7 +84,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let ripple_alpha = ripple_visibility
             * field_mask
             * (0.32 + center_density * 0.68)
-            * mix(0.016, 0.041, activity);
+            * mix(0.038, 0.088, activity);
 
         // TODO: sample the renderer's existing desktop backdrop here once its bind
         // group is exposed to the ecology overlay. Keep the local one-draw-call
@@ -93,10 +93,13 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let refract_alpha = 0.0;
 
         let tint = vec3<f32>(0.88, 0.95, 1.00);
+        // A luminous near-white tint vanishes against bright windows. Keep the
+        // soft white field underneath, but give the ripple itself enough violet
+        // absorption contrast to remain legible on both white and dark content.
         let ripple_tint = mix(
-            tint,
-            vec3<f32>(0.72, 0.58, 1.00),
-            mix(0.24, 0.34, activity),
+            vec3<f32>(0.58, 0.38, 0.96),
+            vec3<f32>(0.42, 0.18, 0.84),
+            activity,
         );
         let tint_alpha = field_mask
             * (0.20 + center_density * 0.80)
