@@ -360,7 +360,7 @@ impl GdiBackgroundWorker {
 
     fn submit_and_poll(&mut self, window: &Window) -> Option<DesktopBackgroundFrame> {
         let mut latest = self.frame_rx.try_iter().last();
-        if self.last_submit.elapsed() >= Duration::from_secs_f64(1.0 / 24.0) {
+        if self.last_submit.elapsed() >= Duration::from_secs_f64(1.0 / 30.0) {
             let position = window.outer_position().ok()?;
             let size = window.inner_size();
             if size.width > 0 && size.height > 0 {

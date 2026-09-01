@@ -51,9 +51,9 @@ use pet_audio::{
     global_body_voice_bridge,
 };
 use pet_body::{
-    BodyMaterialSnapshot, BodyRenderMode, EcologyRenderer, LiquidTuningAcknowledgement,
-    LiquidTuningProfile, MaterialVariant, ProceduralBody, RenderOutcome, Renderer, VisualMindInput,
-    VoiceVisualState,
+    BodyMaterialSnapshot, BodyRenderMode, ColorSourceMode, EcologyRenderer,
+    LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant, ProceduralBody,
+    RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
 #[cfg(not(feature = "legacy-expression-fallback"))]
 use pet_ecology::ObjectLifecycle;
@@ -2164,18 +2164,36 @@ impl PetApplication {
         runtime
             .camera_timings
             .observe(runtime.overlay_move_microseconds as f32 / 1_000.0);
-        // The checker is evaluated analytically in the material shader. Its UVs
-        // still use global desktop coordinates, so moving either the Pet or its
-        // camera cannot make the pattern slide across the liquid.
+        // Capture the desktop asynchronously and upload only the newest frame.
+        // The ecology shader uses it locally for the den lens; captured pixels
+        // remain process-local and are never persisted or added to telemetry.
         let background_started = Instant::now();
-        let size = runtime.window.inner_size();
-        let (scale, offset) = background_uv_transform(
-            runtime.acknowledged_window_origin,
-            size,
-            runtime.topology.virtual_physical_bounds,
-        );
-        runtime.renderer.set_background_uv_transform(scale, offset);
-        runtime.renderer.set_background_freshness(0.0);
+        if let Some(frame) = runtime.platform.capture_overlay_background(&runtime.window)
+            && runtime.ecology_renderer.update_background(
+                runtime.renderer.device(),
+                runtime.renderer.queue(),
+                frame.width,
+                frame.height,
+                frame.bytes_per_row,
+                &frame.bgra8,
+            )
+        {
+            runtime.background_capture_timestamp = runtime.normalizer.monotonic_seconds();
+            runtime.background_capture_sequence = frame.sequence;
+            runtime.background_luminance = frame.mean_luminance;
+            runtime.background_contrast = frame.contrast;
+        }
+        let background_age = (runtime.normalizer.monotonic_seconds()
+            - runtime.background_capture_timestamp)
+            .max(0.0) as f32;
+        let background_freshness = if runtime.background_capture_sequence == 0 {
+            0.0
+        } else {
+            (1.0 - background_age / 0.75).clamp(0.0, 1.0)
+        };
+        runtime
+            .ecology_renderer
+            .set_background_freshness(background_freshness);
         runtime.background_capture_microseconds =
             background_started.elapsed().as_secs_f64() * 1_000_000.0;
         runtime
@@ -4859,6 +4877,14 @@ fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningPro
     if stale_material {
         profile.material = reference.material;
     }
+    // The production character's body identity is the authored Black preset.
+    // Affect remains free to tint the soul/rim glow in `render_parameters`, but
+    // persisted genome/blend experiments must not recolor the base material.
+    profile.material.override_genome_colors = true;
+    profile.material.color_source_mode = ColorSourceMode::Authored;
+    profile.material.genome_color_blend = 0.0;
+    profile.material.primary_hsv = reference.material.primary_hsv;
+    profile.material.secondary_hsv = reference.material.secondary_hsv;
     profile
 }
 
@@ -4883,6 +4909,8 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
 
     profile.material.variant = MaterialVariant::CinematicJelly;
     profile.material.override_genome_colors = true;
+    profile.material.color_source_mode = ColorSourceMode::Authored;
+    profile.material.genome_color_blend = 0.0;
     profile.material.primary_hsv = [0.0, 0.0, 0.0];
     profile.material.secondary_hsv = [0.0, 0.39, 0.0];
     profile.material.glow_hsv = [0.0, 0.0, 0.06];
@@ -5442,26 +5470,6 @@ fn aabb_covered(topology: &DisplayTopology, minimum: Vec2, maximum: Vec2) -> boo
             })
         })
     })
-}
-
-fn background_uv_transform(
-    current_origin: PhysicalPosition<i32>,
-    current_size: PhysicalSize<u32>,
-    captured_rect: RectI,
-) -> (Vec2, Vec2) {
-    let capture_size = Vec2::new(
-        captured_rect.width().max(1) as f32,
-        captured_rect.height().max(1) as f32,
-    );
-    let current_origin = Vec2::new(current_origin.x as f32, current_origin.y as f32);
-    let captured_origin = Vec2::new(
-        captured_rect.minimum.x as f32,
-        captured_rect.minimum.y as f32,
-    );
-    (
-        Vec2::new(current_size.width as f32, current_size.height as f32) / capture_size,
-        (current_origin - captured_origin) / capture_size,
-    )
 }
 
 fn configure_visual_motion_space(
@@ -6280,27 +6288,6 @@ mod tests {
     }
 
     #[test]
-    fn one_global_desktop_point_keeps_the_same_capture_texel_after_camera_move() {
-        let captured = RectI {
-            minimum: PhysicalDesktopPoint { x: 800, y: -120 },
-            maximum: PhysicalDesktopPoint { x: 1_952, y: 1_032 },
-        };
-        let size = PhysicalSize::new(1_152, 1_152);
-        let global = Vec2::new(1_500.0, 420.0);
-        let first_origin = PhysicalPosition::new(800, -120);
-        let second_origin = PhysicalPosition::new(940, -40);
-        let (first_scale, first_offset) = background_uv_transform(first_origin, size, captured);
-        let (second_scale, second_offset) = background_uv_transform(second_origin, size, captured);
-        let first_local = (global - Vec2::new(first_origin.x as f32, first_origin.y as f32))
-            / Vec2::splat(1_152.0);
-        let second_local = (global - Vec2::new(second_origin.x as f32, second_origin.y as f32))
-            / Vec2::splat(1_152.0);
-        let first_texel = first_local * first_scale + first_offset;
-        let second_texel = second_local * second_scale + second_offset;
-        assert!(first_texel.distance(second_texel) < 1.0e-6);
-    }
-
-    #[test]
     fn liquid_profile_revision_variant_and_values_survive_restart_apply_path() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
@@ -6309,6 +6296,9 @@ mod tests {
         profile.profile_revision = 27;
         profile.render_mode = BodyRenderMode::ParticlePbf;
         profile.material.variant = MaterialVariant::CinematicJelly;
+        profile.material.override_genome_colors = false;
+        profile.material.color_source_mode = ColorSourceMode::Genome;
+        profile.material.genome_color_blend = 1.0;
         profile.pbf.viscosity = 0.041;
         store.save_liquid_tuning(&profile).unwrap();
 
@@ -6334,6 +6324,13 @@ mod tests {
         assert_eq!(restarted.profile_revision, 27);
         assert_eq!(restarted.render_mode, BodyRenderMode::ParticlePbf);
         assert_eq!(restarted.material.variant, MaterialVariant::CinematicJelly);
+        assert!(restarted.material.override_genome_colors);
+        assert_eq!(
+            restarted.material.color_source_mode,
+            ColorSourceMode::Authored
+        );
+        assert_eq!(restarted.material.genome_color_blend, 0.0);
+        assert_eq!(restarted.material.primary_hsv, [0.0, 0.0, 0.0]);
         assert_eq!(restarted.pbf.viscosity, 0.041);
         assert_eq!(restarted_body.tuning_profile(), &restarted);
     }
@@ -6355,6 +6352,11 @@ mod tests {
 
         assert_eq!(applied.render_mode, BodyRenderMode::ParticlePbf);
         assert_eq!(applied.material.variant, MaterialVariant::CinematicJelly);
+        assert_eq!(
+            applied.material.color_source_mode,
+            ColorSourceMode::Authored
+        );
+        assert_eq!(applied.material.genome_color_blend, 0.0);
         assert_eq!(applied.material.primary_hsv, [0.0, 0.0, 0.0]);
         assert_eq!(applied.material.opacity, 0.6);
         assert_eq!(applied.pbf.flight_stretch, 1.9);

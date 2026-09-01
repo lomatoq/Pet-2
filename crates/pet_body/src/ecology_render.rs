@@ -19,6 +19,14 @@ struct EcologyInstance {
 pub struct EcologyRenderer {
     pipeline: wgpu::RenderPipeline,
     instance_buffer: wgpu::Buffer,
+    background_bind_group_layout: wgpu::BindGroupLayout,
+    background_bind_group: wgpu::BindGroup,
+    background_texture: wgpu::Texture,
+    background_sampler: wgpu::Sampler,
+    background_size: (u32, u32),
+    background_bytes_per_row: u32,
+    smoothed_background_bgra: Vec<u8>,
+    background_freshness: f32,
     den_activity: f32,
     den_activity_integral_seconds: f32,
     last_time_seconds: Option<f32>,
@@ -33,9 +41,31 @@ impl EcologyRenderer {
             label: Some("living desktop ecology object shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("ecology_objects.wgsl").into()),
         });
+        let background_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("living desktop ecology background layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("living desktop ecology object pipeline layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&background_bind_group_layout],
             push_constant_ranges: &[],
         });
         let premultiplied = wgpu::BlendState {
@@ -92,14 +122,112 @@ impl EcologyRenderer {
             contents: bytemuck::cast_slice(&[EcologyInstance::default(); MAX_ECOLOGY_INSTANCES]),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+        let background_texture = create_ecology_background_texture(device, 1, 1);
+        let background_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("living desktop ecology background sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let background_bind_group = create_ecology_background_bind_group(
+            device,
+            &background_bind_group_layout,
+            &background_texture,
+            &background_sampler,
+        );
         Self {
             pipeline,
             instance_buffer,
+            background_bind_group_layout,
+            background_bind_group,
+            background_texture,
+            background_sampler,
+            background_size: (1, 1),
+            background_bytes_per_row: 4,
+            smoothed_background_bgra: Vec::new(),
+            background_freshness: 0.0,
             den_activity: 0.0,
             den_activity_integral_seconds: 0.0,
             last_time_seconds: None,
             stored_orb_hover_offset_px: Vec2::ZERO,
             stored_orb_hover_velocity_px: Vec2::ZERO,
+        }
+    }
+
+    /// Uploads the latest top-down BGRA8 crop captured behind the transparent
+    /// overlay. Pixels remain process-local and are never persisted.
+    pub fn update_background(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        bytes_per_row: u32,
+        bgra8: &[u8],
+    ) -> bool {
+        if width == 0
+            || height == 0
+            || bytes_per_row < width.saturating_mul(4)
+            || bgra8.len() < bytes_per_row as usize * height as usize
+        {
+            return false;
+        }
+        if self.background_size != (width, height) {
+            self.background_texture = create_ecology_background_texture(device, width, height);
+            self.background_size = (width, height);
+            self.background_bind_group = create_ecology_background_bind_group(
+                device,
+                &self.background_bind_group_layout,
+                &self.background_texture,
+                &self.background_sampler,
+            );
+        }
+        let expected_length = bytes_per_row as usize * height as usize;
+        if self.background_size != (width, height)
+            || self.background_bytes_per_row != bytes_per_row
+            || self.smoothed_background_bgra.len() != expected_length
+        {
+            self.smoothed_background_bgra = bgra8[..expected_length].to_vec();
+        } else {
+            temporally_stabilize_background(
+                &mut self.smoothed_background_bgra,
+                bgra8,
+                width,
+                height,
+                bytes_per_row,
+            );
+        }
+        self.background_bytes_per_row = bytes_per_row;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.background_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.smoothed_background_bgra,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.background_freshness = 1.0;
+        true
+    }
+
+    pub fn set_background_freshness(&mut self, freshness: f32) {
+        if freshness.is_finite() {
+            self.background_freshness = freshness.clamp(0.0, 1.0);
         }
     }
 
@@ -179,7 +307,12 @@ impl EcologyRenderer {
         let den_radius_y = 105.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * 2.0;
         let den_scale = state.den.size_scale
             * continuous_den_scale(time_seconds, self.den_activity, state.den.familiarity);
-        let den_color = Vec4::new(0.88, 0.95, 1.0, self.den_activity_integral_seconds);
+        let den_color = Vec4::new(
+            self.background_freshness,
+            0.0,
+            0.0,
+            self.den_activity_integral_seconds,
+        );
         instances[count] = EcologyInstance {
             center_radius: [
                 state.den.anchor.x * 2.0 - 1.0,
@@ -267,9 +400,74 @@ impl EcologyRenderer {
             occlusion_query_set: None,
         });
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.background_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         pass.draw(0..6, 0..count as u32);
     }
+}
+
+fn temporally_stabilize_background(
+    history: &mut [u8],
+    incoming: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+) {
+    // A 3:1 causal EMA removes the visible 24/30 Hz capture stair-step while
+    // keeping the procedural optical field itself fully render-rate smooth.
+    // Only live BGRA pixels are touched; row padding remains irrelevant.
+    let live_row_bytes = width as usize * 4;
+    for row in 0..height as usize {
+        let start = row * bytes_per_row as usize;
+        for index in start..start + live_row_bytes {
+            history[index] =
+                ((u16::from(history[index]) * 3 + u16::from(incoming[index]) + 2) / 4) as u8;
+        }
+    }
+}
+
+fn create_ecology_background_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("living desktop ecology background texture"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn create_ecology_background_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    texture: &wgpu::Texture,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("living desktop ecology background bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 fn advance_stored_orb_hover(
@@ -340,7 +538,7 @@ mod tests {
 
     use super::{
         STORED_ORB_HOVER_MAX_ACCELERATION_PX, STORED_ORB_HOVER_MAX_SPEED_PX,
-        advance_stored_orb_hover, continuous_den_scale,
+        advance_stored_orb_hover, continuous_den_scale, temporally_stabilize_background,
     };
 
     #[test]
@@ -394,5 +592,21 @@ mod tests {
         }
         assert!(minimum < 0.97);
         assert!(maximum > 1.03);
+    }
+
+    #[test]
+    fn captured_background_changes_are_temporally_bounded_and_converge() {
+        let mut history = vec![0_u8; 512];
+        let incoming = vec![255_u8; 512];
+        temporally_stabilize_background(&mut history, &incoming, 2, 2, 256);
+        assert!(history[..8].iter().all(|channel| *channel == 64));
+        assert!(history[256..264].iter().all(|channel| *channel == 64));
+        assert!(history[8..256].iter().all(|channel| *channel == 0));
+        assert!(history[264..].iter().all(|channel| *channel == 0));
+        for _ in 0..24 {
+            temporally_stabilize_background(&mut history, &incoming, 2, 2, 256);
+        }
+        assert!(history[..8].iter().all(|channel| *channel >= 253));
+        assert!(history[256..264].iter().all(|channel| *channel >= 253));
     }
 }

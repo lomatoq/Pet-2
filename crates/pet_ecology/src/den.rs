@@ -1,9 +1,20 @@
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
-use crate::{EcologyError, ObjectId};
+use crate::{
+    EcologyError, MAX_OBJECT_SPEED, ORB_SCREEN_GRAVITY, ObjectId, ObjectKind, ObjectLifecycle,
+    ObjectPhysicsConfig, WorldObject,
+};
 
 pub const DEN_SLOT_COUNT: usize = 3;
+pub const DEN_ATTRACTION_RADIUS_PX: f32 = 190.0;
+pub const DEN_CAPTURE_RADIUS_PX: f32 = 1.25;
+const DEN_ATTRACTION_FULL_STRENGTH_RADIUS_PX: f32 = 50.0;
+const DEN_ATTRACTION_MAX_SPEED: f32 = 0.58;
+/// The visible den has a 105 px authored radius and the canonical orb has a
+/// 31 px radius. This center-radius keeps the entire orb inside the lens before
+/// the den latches it, while remaining forgiving of a real drag/carry handoff.
+pub const DEN_LATCH_RADIUS_PX: f32 = 72.0;
 const STORED_ORB_HOVER_X_PX: f32 = 2.4;
 const STORED_ORB_HOVER_Y_PX: f32 = 1.5;
 const STORED_ORB_HOVER_X_PERIOD_SECONDS: f32 = 17.0;
@@ -86,6 +97,129 @@ impl DenState {
     }
 }
 
+/// Returns whether an orb has physically entered the den's latch volume.
+/// This predicate never moves the object; callers may change only ownership
+/// and velocity after a real overlap has occurred.
+#[must_use]
+pub fn orb_is_inside_den_latch(
+    object: &WorldObject,
+    den_anchor: Vec2,
+    config: ObjectPhysicsConfig,
+) -> bool {
+    if object.kind != ObjectKind::Orb || !object.position.is_finite() || !den_anchor.is_finite() {
+        return false;
+    }
+    let aspect = if config.desktop_aspect.is_finite() {
+        config.desktop_aspect.clamp(0.25, 8.0)
+    } else {
+        16.0 / 9.0
+    };
+    let reference_height = if config.reference_height_px.is_finite() {
+        config.reference_height_px.max(64.0)
+    } else {
+        crate::REFERENCE_DESKTOP_HEIGHT_PX
+    };
+    Vec2::new(
+        (object.position.x - den_anchor.x) * aspect,
+        object.position.y - den_anchor.y,
+    )
+    .length()
+        * reference_height
+        <= DEN_LATCH_RADIUS_PX
+}
+
+/// Applies the den's soft viscous attraction to a released orb and reports the
+/// exact center crossing. User and pet ownership always win; only free/sleeping
+/// motion is affected. The final center correction is at most 1.25 physical px.
+pub fn step_den_attraction(
+    object: &mut WorldObject,
+    den_anchor: Vec2,
+    config: ObjectPhysicsConfig,
+    dt: f32,
+) -> bool {
+    if object.kind != ObjectKind::Orb
+        || !matches!(
+            object.lifecycle,
+            ObjectLifecycle::Free | ObjectLifecycle::Sleeping
+        )
+        || !object.position.is_finite()
+        || !object.velocity.is_finite()
+        || !den_anchor.is_finite()
+    {
+        return false;
+    }
+    let dt = if dt.is_finite() {
+        dt.clamp(0.0, 1.0 / 30.0)
+    } else {
+        0.0
+    };
+    if dt <= 0.0 {
+        return false;
+    }
+    let aspect = if config.desktop_aspect.is_finite() {
+        config.desktop_aspect.clamp(0.25, 8.0)
+    } else {
+        16.0 / 9.0
+    };
+    let reference_height = if config.reference_height_px.is_finite() {
+        config.reference_height_px.max(64.0)
+    } else {
+        crate::REFERENCE_DESKTOP_HEIGHT_PX
+    };
+    let position = Vec2::new(object.position.x * aspect, object.position.y);
+    let anchor = Vec2::new(den_anchor.x * aspect, den_anchor.y);
+    let toward_center = anchor - position;
+    let distance = toward_center.length();
+    let distance_px = distance * reference_height;
+    if distance_px > DEN_ATTRACTION_RADIUS_PX {
+        return false;
+    }
+    if distance_px <= DEN_CAPTURE_RADIUS_PX {
+        object.position = den_anchor;
+        object.velocity = Vec2::ZERO;
+        return true;
+    }
+
+    let proximity = 1.0
+        - smoothstep(
+            DEN_ATTRACTION_FULL_STRENGTH_RADIUS_PX,
+            DEN_ATTRACTION_RADIUS_PX,
+            distance_px,
+        );
+    let inward = toward_center / distance.max(f32::EPSILON);
+    let tangent_sign = if object.id & 1 == 0 { 1.0 } else { -1.0 };
+    let tangent = Vec2::new(-inward.y, inward.x) * tangent_sign;
+    let curve = (distance_px / DEN_ATTRACTION_RADIUS_PX).clamp(0.0, 1.0) * 0.12;
+    let direction = (inward + tangent * curve).normalize_or_zero();
+    let desired_speed = (distance * 4.2).min(DEN_ATTRACTION_MAX_SPEED);
+    let desired_velocity = direction * desired_speed;
+    let response = 4.0 + proximity * 9.0;
+    let alpha = (1.0 - (-response * dt).exp()) * proximity;
+    object.velocity.y -= ORB_SCREEN_GRAVITY * dt * proximity;
+    object.velocity = object
+        .velocity
+        .lerp(desired_velocity, alpha)
+        .clamp_length_max(MAX_OBJECT_SPEED);
+
+    // The small position servo removes the gravity equilibrium while remaining
+    // continuous and bounded; it is the old "тягучае" center pull, not a snap.
+    let position_response = 2.2 + proximity * 3.8;
+    let position_alpha = (1.0 - (-position_response * dt).exp()) * proximity;
+    let curved_pull = toward_center + tangent * distance * curve * 0.35;
+    let radius = (object.radius_px_at_reference / reference_height).clamp(0.001, 0.2);
+    let minimum = Vec2::splat(radius);
+    let maximum = Vec2::new(aspect - radius, 1.0 - radius);
+    let pulled_position = (position + curved_pull * position_alpha).clamp(minimum, maximum);
+    object.position = Vec2::new(pulled_position.x / aspect, pulled_position.y);
+    if (anchor - pulled_position).length() * reference_height <= DEN_CAPTURE_RADIUS_PX {
+        object.position = den_anchor;
+        object.velocity = Vec2::ZERO;
+        return true;
+    }
+    object.lifecycle = ObjectLifecycle::Free;
+    false
+}
+
 /// Very slow world-space hover target for a stored orb. The renderer follows
 /// this target through a bounded damped controller so lifecycle changes never
 /// introduce a positional step.
@@ -120,6 +254,11 @@ pub fn stored_orb_hover_offset(
     )
 }
 
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +276,60 @@ mod tests {
             assert!(step_px <= 1.0 * dt + 1.0e-5);
             previous = current;
         }
+    }
+
+    #[test]
+    fn latch_volume_requires_real_orb_overlap_and_never_changes_position() {
+        let den = DenState::for_seed(42);
+        let config = ObjectPhysicsConfig::default();
+        let mut orb = WorldObject::canonical_orb(42, den.anchor);
+        orb.position = den.anchor
+            + Vec2::new(
+                60.0 / config.reference_height_px / config.desktop_aspect,
+                0.0,
+            );
+        let before = orb.position;
+        assert!(orb_is_inside_den_latch(&orb, den.anchor, config));
+        assert_eq!(orb.position, before);
+
+        orb.position = den.anchor
+            + Vec2::new(
+                90.0 / config.reference_height_px / config.desktop_aspect,
+                0.0,
+            );
+        assert!(!orb_is_inside_den_latch(&orb, den.anchor, config));
+    }
+
+    #[test]
+    fn nearby_free_orb_converges_smoothly_to_the_exact_den_center() {
+        let den = DenState::for_seed(42);
+        let config = ObjectPhysicsConfig::default();
+        let mut orb = WorldObject::canonical_orb(42, den.anchor);
+        orb.position = den.anchor
+            + Vec2::new(
+                130.0 / config.reference_height_px / config.desktop_aspect,
+                -0.01,
+            );
+        orb.velocity = Vec2::ZERO;
+        orb.lifecycle = ObjectLifecycle::Free;
+        let mut captured = false;
+        for _ in 0..1_200 {
+            crate::step_object(&mut orb, config, 1.0 / 120.0);
+            let previous = orb.position;
+            if step_den_attraction(&mut orb, den.anchor, config, 1.0 / 120.0) {
+                captured = true;
+                break;
+            }
+            let step_px = Vec2::new(
+                (orb.position.x - previous.x) * config.desktop_aspect,
+                orb.position.y - previous.y,
+            )
+            .length()
+                * config.reference_height_px;
+            assert!(step_px < 8.0, "center pull stepped {step_px:.3} px");
+        }
+        assert!(captured);
+        assert_eq!(orb.position, den.anchor);
+        assert_eq!(orb.velocity, Vec2::ZERO);
     }
 }

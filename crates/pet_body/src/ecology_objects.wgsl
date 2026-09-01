@@ -5,7 +5,12 @@ struct VertexOutput {
     @location(0) local: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) material: vec4<f32>,
+    @location(3) screen_uv: vec2<f32>,
+    @location(4) local_to_screen: vec2<f32>,
 }
+
+@group(0) @binding(0) var desktop_background: texture_2d<f32>;
+@group(0) @binding(1) var desktop_background_sampler: sampler;
 
 @vertex
 fn vertex_main(
@@ -28,6 +33,8 @@ fn vertex_main(
     output.local = local;
     output.color = color;
     output.material = material;
+    output.screen_uv = output.position.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    output.local_to_screen = center_radius.zw * vec2<f32>(0.5, -0.5);
     return output;
 }
 
@@ -64,11 +71,11 @@ fn den_converging_energy_noise(point: vec2<f32>, phase: f32) -> f32 {
     // The temporal offset exists only on the radial axis, so both octaves move
     // inward. Spatial frequency is intentionally about one third of the prior
     // field: the overlay now reads as large packets of energy, not small grain.
-    let inward_coordinate = direction * (radius * 0.72 + phase * 0.105)
+    let inward_coordinate = direction * (radius * 0.42 + phase * 0.120)
         + vec2<f32>(7.13, 3.71);
-    let inward_primary = noise21(inward_coordinate * 0.94) * 2.0 - 1.0;
-    let inward_detail = noise21(inward_coordinate * 1.45 + vec2<f32>(2.41, 8.17)) * 2.0 - 1.0;
-    return inward_primary * 0.90 + inward_detail * 0.10;
+    let inward_primary = noise21(inward_coordinate * 0.68) * 2.0 - 1.0;
+    let inward_detail = noise21(inward_coordinate * 1.02 + vec2<f32>(2.41, 8.17)) * 2.0 - 1.0;
+    return inward_primary * 0.93 + inward_detail * 0.07;
 }
 
 fn den_concentric_ripple(point: vec2<f32>, phase: f32) -> f32 {
@@ -114,7 +121,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let surface_phase = time * mix(0.105, 0.19, activity) + activity_integral * 0.24;
         let concentric = den_concentric_ripple(local, surface_phase);
         let inward_energy = den_converging_energy_noise(local, surface_phase);
-        let energy_amount = mix(0.22, 0.36, activity);
+        let energy_amount = mix(0.32, 0.52, activity);
         let height = den_surface_height(local, surface_phase, energy_amount);
         let epsilon = 0.026;
         let gradient = vec2<f32>(
@@ -131,20 +138,50 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let center_density = pow(saturate(1.0 - displaced_r), 1.32);
         let normal = normalize(gradient + normalize(local + vec2<f32>(0.0001, 0.0)) * 0.28);
 
-        // There is no desktop capture bound to this pass, so the lens samples a
-        // quiet synthetic backdrop. Offsetting each channel along the same
-        // surface normal creates a restrained fake dispersion instead of grey
-        // contour lines, while remaining a single transparent draw call.
-        let optical_shift = normal * height * mix(0.038, 0.086, activity) * field_mask;
-        let chroma_split = normal * mix(0.032, 0.072, activity) * (0.35 + abs(height) * 0.65);
-        let refracted_red = den_virtual_backdrop(displaced_local + optical_shift + chroma_split, surface_phase).r;
-        let refracted_green = den_virtual_backdrop(displaced_local + optical_shift, surface_phase).g;
-        let refracted_blue = den_virtual_backdrop(displaced_local + optical_shift - chroma_split, surface_phase).b;
-        let refracted = vec3<f32>(refracted_red, refracted_green, refracted_blue);
+        // Sample the actual screen crop behind the transparent overlay. The
+        // vertex-provided UV is screen-global, so the den bends stationary
+        // desktop content instead of a synthetic color field. A quiet analytic
+        // backdrop remains only as a portable/stale-capture fallback.
+        let optical_shift_local = normal * height * mix(0.038, 0.086, activity) * field_mask;
+        let chroma_split_local = normal * mix(0.018, 0.044, activity)
+            * (0.35 + abs(height) * 0.65);
+        let optical_shift = optical_shift_local * input.local_to_screen;
+        let chroma_split = chroma_split_local * input.local_to_screen;
+        let capture_freshness = saturate(input.color.r);
+        let capture_red = textureSample(
+            desktop_background,
+            desktop_background_sampler,
+            clamp(input.screen_uv + optical_shift + chroma_split, vec2<f32>(0.001), vec2<f32>(0.999)),
+        ).r;
+        let capture_green = textureSample(
+            desktop_background,
+            desktop_background_sampler,
+            clamp(input.screen_uv + optical_shift, vec2<f32>(0.001), vec2<f32>(0.999)),
+        ).g;
+        let capture_blue = textureSample(
+            desktop_background,
+            desktop_background_sampler,
+            clamp(input.screen_uv + optical_shift - chroma_split, vec2<f32>(0.001), vec2<f32>(0.999)),
+        ).b;
+        let captured_refracted = vec3<f32>(capture_red, capture_green, capture_blue);
+        let fallback_red = den_virtual_backdrop(displaced_local + optical_shift_local + chroma_split_local, surface_phase).r;
+        let fallback_green = den_virtual_backdrop(displaced_local + optical_shift_local, surface_phase).g;
+        let fallback_blue = den_virtual_backdrop(displaced_local + optical_shift_local - chroma_split_local, surface_phase).b;
+        let fallback_refracted = vec3<f32>(fallback_red, fallback_green, fallback_blue);
+        let refracted = mix(fallback_refracted, captured_refracted, capture_freshness);
         let fresnel = pow(saturate((displaced_r - 0.40) / 0.66), 1.65);
+        // Captured pixels must actually cover the undistorted desktop below the
+        // transparent overlay; otherwise adding a few percent of displaced
+        // color reads as tint, not refraction. Keep the synthetic fallback
+        // subtle, but make a fresh real capture optically legible.
+        let refraction_opacity = mix(
+            mix(0.026, 0.052, activity),
+            mix(0.44, 0.68, activity),
+            capture_freshness,
+        );
         let refract_alpha = field_mask
-            * (0.40 + center_density * 0.60)
-            * mix(0.026, 0.052, activity);
+            * (0.58 + center_density * 0.42)
+            * refraction_opacity;
 
         let tint = mix(
             vec3<f32>(0.24, 0.48, 0.70),
@@ -192,7 +229,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let energy_alpha = energy_visibility
             * field_mask
             * (0.24 + center_density * 0.76)
-            * mix(0.015, 0.036, activity);
+            * mix(0.028, 0.072, activity);
         let energy_tint = mix(
             vec3<f32>(0.12, 0.34, 0.58),
             vec3<f32>(0.42, 0.18, 0.58),
@@ -211,7 +248,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         var particle_rgb = vec3<f32>(0.0);
         var particle_alpha = 0.0;
-        for (var i: u32 = 0u; i < 10u; i = i + 1u) {
+        for (var i: u32 = 0u; i < 14u; i = i + 1u) {
             let fi = f32(i);
             let seed_a = hash11(fi + 1.17);
             let seed_b = hash11(fi + 9.41);
@@ -220,11 +257,11 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
             let base_speed = mix(0.115, 0.195, seed_b);
             let progress = fract(particle_time * base_speed + seed_a);
-            let appear = smoothstep(0.00, 0.10, progress);
-            let shrink = 1.0 - smoothstep(0.70, 0.98, progress);
+            let appear = smoothstep(0.00, 0.08, progress);
+            let shrink = 1.0 - smoothstep(0.88, 1.00, progress);
             let scale = appear * shrink;
 
-            let start_radius = mix(0.34, 0.92, seed_c);
+            let start_radius = mix(0.46, 1.02, seed_c);
             let radius = start_radius * pow(1.0 - progress, 1.32);
             let base_angle = seed_d * TAU;
             let angular_drift = sin(progress * TAU + seed_a * 5.0) * 0.16
@@ -239,12 +276,12 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 particle_size * 0.18,
                 particle_size,
                 particle_distance,
-            )) * 0.105 * field_mask;
+            )) * 0.150 * field_mask;
             let halo_radius = particle_size * mix(4.8, 6.5, seed_b);
             let halo = pow(
                 saturate(1.0 - particle_distance / max(halo_radius, 0.001)),
                 2.25,
-            ) * 0.032 * field_mask;
+            ) * 0.045 * field_mask;
             let particle_energy = core + halo;
             particle_rgb += mix(tint, caustic_tint, seed_a * 0.36) * particle_energy;
             particle_alpha += particle_energy;

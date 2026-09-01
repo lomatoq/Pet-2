@@ -8,7 +8,7 @@ use crate::{
 
 pub const MAX_OBJECT_COMMANDS: usize = 8;
 pub const MAX_OUTCOMES: usize = 8;
-const DEN_HANDOFF_DISTANCE: f32 = 8.0 / crate::REFERENCE_DESKTOP_HEIGHT_PX;
+const DEN_HANDOFF_DISTANCE: f32 = crate::DEN_LATCH_RADIUS_PX / crate::REFERENCE_DESKTOP_HEIGHT_PX;
 const DEN_EXIT_DISTANCE: f32 = 0.085;
 
 #[repr(u8)]
