@@ -17,9 +17,10 @@ use desktop_host::{
 };
 use glam::Vec2;
 use lifecore::{
-    BodyIntent, EmbodiedGestureKind, ExpressionState, FeedbackEvent, InteractionOutcome,
-    InteractionOutcomeKind, InteractionTurnState, LifeCore, LifeSnapshot, LocomotionMode,
-    PoseIntent, SensorFrame, VitaState, stable_hash_bytes,
+    BodyIntent, EmbodiedGestureKind, ExpressionDirector, ExpressionState, FeedbackEvent,
+    InteractionOutcome, InteractionOutcomeKind, InteractionTurnState, LifeCore, LifeSnapshot,
+    LivingStateFrame, LocomotionMode, PhysicalExpressionContext, PoseIntent, SensorFrame,
+    VitaState, stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphWorldInput};
 use pet_audio::{OfflinePcm, OfflineSampleFormat, export_debug_wav, render_motif};
@@ -617,6 +618,7 @@ fn run_replicate(
     let audio_before = progress.progress.audio_render_count;
     let learning_before = progress.progress.learning_update_count;
     let mut audio = OfflineAudioRecorder::new(audio_directory.to_owned(), replicate_index);
+    let mut expression_director = ExpressionDirector::default();
 
     for episode in 0..episode_count {
         let scheduled =
@@ -634,6 +636,7 @@ fn run_replicate(
             &mut intent,
             &mut telemetry_samples,
             &mut audio,
+            &mut expression_director,
         );
         capture_checkpoints(
             &life,
@@ -672,6 +675,7 @@ fn run_replicate(
             &mut quiet_or_no_response_episodes,
             &mut safe_boundary_episodes,
             &mut audio,
+            &mut expression_director,
         );
         completed_episodes = completed_episodes.saturating_add(1);
         progress.progress.stage = EvolutionProgressStage::Episode;
@@ -703,6 +707,7 @@ fn run_replicate(
         &mut intent,
         &mut telemetry_samples,
         &mut audio,
+        &mut expression_director,
     );
     capture_checkpoints(
         &life,
@@ -825,6 +830,7 @@ fn advance_quiet(
     intent: &mut BodyIntent,
     telemetry_samples: &mut u64,
     audio: &mut OfflineAudioRecorder,
+    expression_director: &mut ExpressionDirector,
 ) {
     if target_tick <= *base_tick {
         return;
@@ -848,6 +854,7 @@ fn advance_quiet(
         set_quiet_sensors(sensors, *base_tick, feedback.world_position);
         vita.observe(sensors, &feedback, PERCEPTION_DT);
         if (*base_tick).is_multiple_of(LIFE_DIVISOR) {
+            expression_director.tick(LIFE_DT);
             let morph_output = morph.tick(sensors, &feedback, &life.state, LIFE_DT);
             let mut output = life.tick(sensors, &feedback, LIFE_DT);
             if let Some(request) = output.vocal_request.take() {
@@ -893,6 +900,7 @@ fn run_episode(
     quiet_or_no_response_episodes: &mut u32,
     safe_boundary_episodes: &mut u32,
     audio: &mut OfflineAudioRecorder,
+    expression_director: &mut ExpressionDirector,
 ) {
     let mut fixture = FixtureRuntime::new(kind, seed, episode_index);
     let anticipation = 0.25_f32;
@@ -942,6 +950,7 @@ fn run_episode(
             vita.observe(sensors, &body.simulation.feedback, PERCEPTION_DT);
         }
         if (*base_tick).is_multiple_of(LIFE_DIVISOR) {
+            expression_director.tick(LIFE_DT);
             let morph_output = morph.tick_with_world(
                 sensors,
                 &body.simulation.feedback,
@@ -969,6 +978,12 @@ fn run_episode(
                     interaction_tuning.turn_cooldown_seconds,
                     interaction_tuning.learning_openness,
                 ) {
+                    let phrase = expression_director.direct(
+                        plan,
+                        LivingStateFrame::from_life(&life.state),
+                        PhysicalExpressionContext::from_frames(sensors, &body.simulation.feedback),
+                    );
+                    let plan = phrase.plan;
                     if !responded_episodes.insert(plan.episode_id) {
                         invariants.duplicate_response_failures =
                             invariants.duplicate_response_failures.saturating_add(1);
@@ -1482,6 +1497,7 @@ mod tests {
         let mut telemetry_samples = 0;
         let directory = tempfile::tempdir().unwrap();
         let mut audio = OfflineAudioRecorder::new(directory.path().to_owned(), 0);
+        let mut expression_director = ExpressionDirector::default();
 
         advance_quiet(
             QuietAdvanceMode::Exact,
@@ -1495,6 +1511,7 @@ mod tests {
             &mut intent,
             &mut telemetry_samples,
             &mut audio,
+            &mut expression_director,
         );
 
         assert_eq!(base_tick, 25);

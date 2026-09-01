@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lifecore::{Syllable, VocalMotif, VocalRequest, VoiceGenome};
+use lifecore::{Syllable, VocalMotif, VocalRequest, VoiceGenome, VoiceGesture};
 
 use crate::{
     AudioVisualBridge, AudioVisualFeedback,
@@ -13,8 +13,8 @@ use crate::{
 pub const MAX_SYLLABLES: usize = 6;
 pub const COMMAND_CAPACITY: usize = 32;
 const ROOM_TAIL_MS: f32 = 36.0;
-const MIN_CALL_FUNDAMENTAL_HZ: f32 = 260.0;
-const MAX_CALL_FUNDAMENTAL_HZ: f32 = 8_000.0;
+const MIN_CALL_FUNDAMENTAL_HZ: f32 = 65.0;
+const MAX_CALL_FUNDAMENTAL_HZ: f32 = 620.0;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PreparedSyllable {
@@ -77,6 +77,8 @@ pub struct VoiceCommand {
     pub tempo_scale: f32,
     pub stress: f32,
     pub purr: bool,
+    pub gesture: VoiceGesture,
+    pub glottal_tension: f32,
     pub maximum_loudness: f32,
     pub spectral_drift: f32,
     pub formant_drift: f32,
@@ -117,6 +119,7 @@ impl VoiceCommand {
         let formant_drift = seeded_signed(performance_seed ^ 0x9FB2_1C65_1E98_DF25);
         let envelope_drift = seeded_signed(performance_seed ^ 0xC13F_A9A9_02A6_328F);
         let room_unit = seeded_unit(performance_seed ^ 0x91E1_0DA5_C79E_7B1D);
+        let gesture = gesture_profile(request.gesture);
         Self {
             request_id: request.performance_seed,
             motif_id: motif.id,
@@ -127,16 +130,16 @@ impl VoiceCommand {
                 motif.syllables.len().min(MAX_SYLLABLES) as u8
             },
             syllables,
-            // Normal cat calls cluster around a few hundred hertz and carry
-            // their strongest energy near 1-2 kHz. Very low legacy genomes
-            // produced a mains-like electronic drone, so audible calls enter a
-            // conservative animal-vocal range while motifs retain pitch shape.
-            base_pitch_hz: voice.base_pitch_hz.clamp(320.0, 720.0),
+            // A stable genome identity is projected into a gesture-specific
+            // mammalian register. No semantic class is encoded as a melody.
+            base_pitch_hz: voice
+                .base_pitch_hz
+                .clamp(gesture.minimum_f0, gesture.maximum_f0),
             harmonic_mix: softened_harmonic_mix(voice.harmonic_mix),
-            breathiness: voice.breathiness,
-            roughness: voice.roughness,
-            brightness: voice.brightness,
-            formant_scale: voice.formant_scale,
+            breathiness: (voice.breathiness + gesture.breathiness).clamp(0.0, 0.9),
+            roughness: (voice.roughness + gesture.roughness).clamp(0.0, 0.9),
+            brightness: (voice.brightness * gesture.brightness).clamp(0.0, 1.0),
+            formant_scale: voice.formant_scale * gesture.formant_scale,
             formant_spacing: voice.formant_spacing,
             mouth_resonance: voice.mouth_resonance,
             vibrato_rate: voice.vibrato_rate,
@@ -144,7 +147,7 @@ impl VoiceCommand {
             trill_rate: voice.trill_rate,
             attack_ms: voice.attack_ms * (1.0 + envelope_drift * 0.18),
             release_ms: voice.release_ms * (1.0 - envelope_drift * 0.22),
-            click_amount: voice.click_amount,
+            click_amount: voice.click_amount * gesture.articulation,
             // Purr is amplitude texture, never a directly audible pure tone.
             purr_rate: voice.purr_rate.clamp(24.0, 32.0),
             // Keep rendition dynamics audible. The previous hard 0.45 floor
@@ -154,7 +157,9 @@ impl VoiceCommand {
             pitch_scale: request.pitch_scale,
             tempo_scale: request.tempo_scale,
             stress: request.stress,
-            purr: request.purr,
+            purr: request.purr || request.gesture == VoiceGesture::PurrHum,
+            gesture: request.gesture,
+            glottal_tension: gesture.glottal_tension,
             // Genome loudness already shaped `request.gain`; this is only a
             // transparent safety ceiling, not a second compressor.
             maximum_loudness: 0.68,
@@ -178,6 +183,83 @@ impl VoiceCommand {
             })
             .sum::<usize>()
             + milliseconds_to_frames(ROOM_TAIL_MS, sample_rate.max(1) as f32)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GestureProfile {
+    minimum_f0: f32,
+    maximum_f0: f32,
+    formant_scale: f32,
+    breathiness: f32,
+    roughness: f32,
+    brightness: f32,
+    articulation: f32,
+    glottal_tension: f32,
+}
+
+const fn gesture_profile(gesture: VoiceGesture) -> GestureProfile {
+    match gesture {
+        VoiceGesture::PurrHum => GestureProfile {
+            minimum_f0: 82.0,
+            maximum_f0: 148.0,
+            formant_scale: 0.72,
+            breathiness: 0.02,
+            roughness: 0.18,
+            brightness: 0.46,
+            articulation: 0.08,
+            glottal_tension: 0.34,
+        },
+        VoiceGesture::WarmChuff => GestureProfile {
+            minimum_f0: 118.0,
+            maximum_f0: 255.0,
+            formant_scale: 0.84,
+            breathiness: 0.16,
+            roughness: 0.08,
+            brightness: 0.62,
+            articulation: 0.28,
+            glottal_tension: 0.48,
+        },
+        VoiceGesture::MewWhine => GestureProfile {
+            minimum_f0: 165.0,
+            maximum_f0: 365.0,
+            formant_scale: 0.94,
+            breathiness: 0.06,
+            roughness: 0.02,
+            brightness: 0.68,
+            articulation: 0.18,
+            glottal_tension: 0.62,
+        },
+        VoiceGesture::LowRumble => GestureProfile {
+            minimum_f0: 68.0,
+            maximum_f0: 126.0,
+            formant_scale: 0.66,
+            breathiness: 0.02,
+            roughness: 0.34,
+            brightness: 0.34,
+            articulation: 0.06,
+            glottal_tension: 0.74,
+        },
+        VoiceGesture::ClippedPulse => GestureProfile {
+            minimum_f0: 112.0,
+            maximum_f0: 285.0,
+            formant_scale: 0.80,
+            breathiness: 0.08,
+            roughness: 0.20,
+            brightness: 0.72,
+            articulation: 0.72,
+            glottal_tension: 0.80,
+        },
+        VoiceGesture::ReliefExhale => GestureProfile {
+            minimum_f0: 88.0,
+            maximum_f0: 175.0,
+            formant_scale: 0.76,
+            breathiness: 0.34,
+            roughness: 0.02,
+            brightness: 0.42,
+            articulation: 0.02,
+            glottal_tension: 0.20,
+        },
     }
 }
 
@@ -325,9 +407,19 @@ impl SynthVoice {
             * command.pitch_scale
             * (1.0 + vibrato + trill + organic_jitter).clamp(0.75, 1.25))
         .clamp(MIN_CALL_FUNDAMENTAL_HZ, MAX_CALL_FUNDAMENTAL_HZ);
+        // Bounded glottal source: tension shifts energy from the soft
+        // triangle/sine pair toward the band-limited closing pulse. The
+        // downstream resonators remain the vocal tract (source-filter split).
+        let tension = command.glottal_tension.clamp(0.0, 1.0);
+        let glottal_mix = [
+            command.harmonic_mix[0] * (1.0 - tension * 0.32),
+            command.harmonic_mix[1] * (1.0 - tension * 0.42),
+            command.harmonic_mix[2] + tension * 0.18,
+            command.harmonic_mix[3] * (0.65 + tension * 0.35),
+        ];
         let primary = self
             .oscillator
-            .sample(frequency, self.sample_rate, command.harmonic_mix);
+            .sample(frequency, self.sample_rate, glottal_mix);
         // Two almost-identical oscillators created a perfectly periodic beat
         // that listeners heard as computer hum. Roughness now comes from the
         // already band-limited aspiration path and bounded aperiodic jitter.
@@ -565,7 +657,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepared_calls_avoid_the_legacy_hum_band() {
+    fn prepared_calls_use_the_selected_mammalian_register() {
         let mut voice = lifecore::Genome::from_seed(41).voice;
         voice.base_pitch_hz = 120.0;
         voice.purr_rate = 12.0;
@@ -582,11 +674,14 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: true,
+            gesture: lifecore::VoiceGesture::PurrHum,
+            priority: 128,
             rhythm_intervals: [0.0; 8],
         };
         let command = VoiceCommand::prepare(&voice, &motif, &request);
-        assert_eq!(command.base_pitch_hz, 320.0);
+        assert_eq!(command.base_pitch_hz, 120.0);
         assert_eq!(command.purr_rate, 24.0);
+        assert_eq!(command.gesture, lifecore::VoiceGesture::PurrHum);
     }
 
     #[test]
@@ -606,6 +701,8 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 128,
             rhythm_intervals: requested,
         };
         let command = VoiceCommand::prepare(&voice, &motif, &request);

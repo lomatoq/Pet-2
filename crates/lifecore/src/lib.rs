@@ -11,6 +11,7 @@ mod development;
 mod drives;
 mod genome;
 mod interaction;
+mod language;
 mod memory;
 mod microbrain;
 mod persistence;
@@ -30,6 +31,7 @@ pub use development::*;
 pub use drives::*;
 pub use genome::*;
 pub use interaction::*;
+pub use language::*;
 pub use memory::*;
 pub use microbrain::*;
 pub use persistence::*;
@@ -977,7 +979,6 @@ impl LifeCore {
             VocalTrigger::Action(ActionId::MimicClickRhythm) => (1.02, 1.12, 0.90, false),
             VocalTrigger::Action(ActionId::Chirp) => (1.08, 1.06, 1.0, false),
             VocalTrigger::Action(_) => (1.0, 1.0, 0.88, false),
-            VocalTrigger::Touch => (0.98, 1.02, 0.90, false),
             VocalTrigger::ToyOffer => (1.05, 0.96, 0.85, false),
             VocalTrigger::CatchSuccess => (1.12, 1.18, 0.94, false),
             VocalTrigger::MissAndRetry => (0.94, 0.92, 0.78, false),
@@ -1048,6 +1049,8 @@ impl LifeCore {
                 .clamp(0.62, 1.48),
             stress: affect.stress.max(physical_stress).clamp(0.0, 1.0),
             purr,
+            gesture: VoiceGesture::for_trigger(trigger),
+            priority: trigger.priority(),
             rhythm_intervals: if trigger == VocalTrigger::RhythmEcho {
                 sensors.recent_click_rhythm.map(|interval| {
                     if interval.is_finite() && interval > 0.0 {
@@ -1675,7 +1678,6 @@ fn motif_style_score(motif: &VocalMotif, trigger: VocalTrigger, affect: AffectSt
         }
         VocalTrigger::Action(ActionId::Chirp) => [0.72, 0.28, 0.20, 0.20, 0.24, 0.38, 0.74],
         VocalTrigger::Action(_) => [0.50; 7],
-        VocalTrigger::Touch => [0.44, 0.34, 0.16, 0.12, 0.18, 0.34, 0.62],
         VocalTrigger::ToyOffer => [0.64, 0.34, 0.30, 0.18, 0.18, 0.52, 0.68],
         VocalTrigger::CatchSuccess => [0.78, 0.24, 0.18, 0.22, 0.18, 0.42, 0.78],
         VocalTrigger::MissAndRetry => [0.46, 0.42, 0.34, 0.16, 0.28, 0.46, 0.42],
@@ -2224,7 +2226,7 @@ mod tests {
         let mut heard = Vec::<(u64, u64)>::new();
         for _ in 0..32 {
             let request = core
-                .request_vocalization(VocalTrigger::Touch, &sensors)
+                .request_vocalization(VocalTrigger::SoftTouch, &sensors)
                 .expect("touch has a voice");
             assert!(core.confirm_vocal_request_heard(request.performance_seed));
             let family = motif_family_id(&core.state.vocal_motifs, request.motif_id);
@@ -2261,7 +2263,7 @@ mod tests {
             ..SensorFrame::default()
         };
         let request = core
-            .request_vocalization(VocalTrigger::Touch, &sensors)
+            .request_vocalization(VocalTrigger::SoftTouch, &sensors)
             .expect("touch has a voice");
         assert!(core.confirm_vocal_request_heard(request.performance_seed));
         let credit = core
@@ -2338,7 +2340,7 @@ mod tests {
     fn failed_audio_delivery_cannot_train_a_motif() {
         let mut core = LifeCore::new(Genome::from_seed(54), 94);
         let request = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .expect("touch has a voice");
         let before = core
             .state
@@ -2367,14 +2369,14 @@ mod tests {
         let before_motifs = core.state.vocal_motifs.clone();
         let before_recent = core.state.recent_vocalizations.clone();
         let request = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .expect("touch selects a queued performance");
 
         assert_eq!(core.state.vocal_motifs, before_motifs);
         assert_eq!(core.state.recent_vocalizations, before_recent);
         assert!(core.state.pending_vocal_credit.is_none());
         assert!(
-            core.request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            core.request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
                 .is_none()
         );
         assert!(!core.confirm_vocal_request_heard(request.performance_seed ^ 1));
@@ -2386,7 +2388,7 @@ mod tests {
         assert_eq!(core.state.vocal_motifs, before_motifs);
         assert_eq!(core.state.recent_vocalizations, before_recent);
         assert!(
-            core.request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            core.request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
                 .is_some()
         );
     }
@@ -2396,13 +2398,13 @@ mod tests {
         let mut core = LifeCore::new(Genome::from_seed(541), 941);
         for _ in 0..RECENT_VOCAL_CAPACITY {
             let request = core
-                .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+                .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
                 .unwrap();
             assert!(core.confirm_vocal_request_heard(request.performance_seed));
         }
         let before = core.state.recent_vocalizations.clone();
         let rejected = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .unwrap();
         core.cancel_vocal_request(rejected.performance_seed);
         assert_eq!(core.state.recent_vocalizations, before);
@@ -2412,12 +2414,12 @@ mod tests {
     fn new_audio_session_drops_only_process_owned_vocal_state() {
         let mut core = LifeCore::new(Genome::from_seed(542), 942);
         let heard = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .unwrap();
         assert!(core.confirm_vocal_request_heard(heard.performance_seed));
         let history = core.state.recent_vocalizations.clone();
         let queued = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .unwrap();
         assert_eq!(
             core.state
@@ -2562,7 +2564,7 @@ mod tests {
         let mut seeds = std::collections::HashSet::new();
         for _ in 0..96 {
             let request = core
-                .request_vocalization(VocalTrigger::Touch, &sensors)
+                .request_vocalization(VocalTrigger::SoftTouch, &sensors)
                 .expect("touch has a voice");
             assert!(request.gain.is_finite() && (0.01..=0.5).contains(&request.gain));
             assert!(request.tempo_scale.is_finite() && (0.5..=1.6).contains(&request.tempo_scale));

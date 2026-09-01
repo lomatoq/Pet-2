@@ -764,6 +764,10 @@ pub struct VocalRequest {
     pub tempo_scale: f32,
     pub stress: f32,
     pub purr: bool,
+    #[serde(default)]
+    pub gesture: crate::VoiceGesture,
+    #[serde(default)]
+    pub priority: u8,
     /// Optional normalized inter-onset intervals for a grounded rhythm echo.
     /// Zero entries mean no authored interval; waveform ownership stays in
     /// `pet_audio` and no raw input timing history is retained.
@@ -780,8 +784,6 @@ pub struct VocalRequest {
 pub enum VocalTrigger {
     /// A vocal action selected by the normal action arbitrator.
     Action(ActionId),
-    /// A short, responsive sound after direct material contact.
-    Touch,
     ToyOffer,
     CatchSuccess,
     MissAndRetry,
@@ -807,8 +809,7 @@ impl VocalTrigger {
     pub const fn is_supported(self) -> bool {
         match self {
             Self::Action(action) => action.is_vocal(),
-            Self::Touch
-            | Self::ToyOffer
+            Self::ToyOffer
             | Self::CatchSuccess
             | Self::MissAndRetry
             | Self::NeedHelp
@@ -835,6 +836,27 @@ impl VocalTrigger {
             self,
             Self::Action(ActionId::Chirp | ActionId::MimicClickRhythm) | Self::ToyOffer
         )
+    }
+
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::PhysicalStartle | Self::ComponentDetached => 255,
+            Self::CalmBoundary => 240,
+            Self::NeedHelp | Self::FragmentHelped => 220,
+            Self::ComponentRemerged | Self::FoodAccepted => 190,
+            Self::Action(ActionId::Purr) | Self::HomeReturn | Self::SoftTouch => 150,
+            Self::Action(_)
+            | Self::ToyOffer
+            | Self::CatchSuccess
+            | Self::MissAndRetry
+            | Self::FoodInspect
+            | Self::FoodRefused
+            | Self::SkillMastered
+            | Self::RhythmEcho
+            | Self::VisualNotice
+            | Self::PlayfulRelease => 170,
+        }
     }
 }
 

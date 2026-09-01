@@ -38,8 +38,9 @@ use glam::Vec2;
 use lifecore::MAX_MUTATION_HISTORY;
 use lifecore::{
     ActionId, BodyIntent, CollisionEvent, DebugState, Drives, EmbodiedGestureEvent,
-    EmbodiedGestureKind, ExpressionState, FeedbackEvent, Genome, GestureBoundaryEvent, LIFECORE_HZ,
-    LifeCore, LocomotionMode, PoseIntent, SensorFrame, VitaOutput, VocalTrigger, stable_hash_bytes,
+    EmbodiedGestureKind, ExpressionDirector, ExpressionState, FeedbackEvent, Genome,
+    GestureBoundaryEvent, LIFECORE_HZ, LifeCore, LivingStateFrame, LocomotionMode, PoseIntent,
+    SensorFrame, VitaOutput, VocalArbiter, VocalTrigger, stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
 use pet_audio::{AudioCallbackLevels, AudioEngine, AudioVisualFeedback, SelectedOutputConfig};
@@ -1562,7 +1563,9 @@ struct PetRuntime {
     background_capture_sequence: u64,
     background_luminance: f32,
     background_contrast: f32,
-    last_touch_voice: Option<Instant>,
+    expression_director: ExpressionDirector,
+    vocal_arbiter: VocalArbiter,
+    last_phrase: Option<lifecore::CreaturePhrase>,
     overlay_move_microseconds: f64,
     render_microseconds: f64,
     brain_tick_microseconds: f64,
@@ -1960,7 +1963,6 @@ impl PetApplication {
                 // touch response. The freshly normalized sensor frame gives the
                 // learner the actual contact context instead of the prior poll.
                 apply_shared_feedback(runtime, FeedbackEvent::PettingStarted);
-                enqueue_touch_voice(runtime, now);
             }
             if orb_touched {
                 apply_shared_feedback(runtime, FeedbackEvent::PlayStarted);
@@ -2176,6 +2178,7 @@ impl PetApplication {
                 runtime
                     .life
                     .tick(&runtime.sensors, &runtime.body.simulation.feedback, LIFE_DT);
+            runtime.expression_director.tick(LIFE_DT);
             if let Some((mut event, signature)) = runtime.vita.take_embodied_gesture_observation() {
                 let episode_id = event.classification.episode_id;
                 if let Some(signature) = signature {
@@ -2188,12 +2191,19 @@ impl PetApplication {
                     interaction_tuning.turn_wait_seconds,
                     interaction_tuning.turn_cooldown_seconds,
                     interaction_tuning.learning_openness,
-                ) && runtime.vita.accept_interaction_response(plan)
-                    && output.vocal_request.is_none()
-                {
-                    output.vocal_request = plan.voice_trigger.and_then(|trigger| {
-                        runtime.life.request_vocalization(trigger, &runtime.sensors)
-                    });
+                ) {
+                    let plan = coordinate_interaction_response(runtime, plan);
+                    if runtime.vita.accept_interaction_response(plan) {
+                        if output.vocal_request.is_none() {
+                            output.vocal_request = plan.voice_trigger.and_then(|trigger| {
+                                runtime.life.request_vocalization(trigger, &runtime.sensors)
+                            });
+                        }
+                    } else {
+                        runtime
+                            .vita
+                            .finish_interaction_appraisal_without_response(episode_id);
+                    }
                 } else {
                     runtime
                         .vita
@@ -2279,22 +2289,10 @@ impl PetApplication {
                 if let Some(request) = output.vocal_request.take() {
                     runtime.life.cancel_vocal_request(request.performance_seed);
                 }
-                enqueue_ecology_voice(runtime, trigger);
-            } else if let Some(request) = output.vocal_request
-                && let Some(motif) = runtime
-                    .life
-                    .state
-                    .vocal_motifs
-                    .iter()
-                    .find(|motif| motif.id == request.motif_id)
-            {
-                let accepted =
-                    runtime
-                        .audio
-                        .enqueue(&runtime.life.state.genome.voice, motif, &request);
-                if !accepted {
-                    runtime.life.cancel_vocal_request(request.performance_seed);
-                }
+                output.vocal_request = request_ecology_voice(runtime, trigger);
+            }
+            if let Some(request) = output.vocal_request {
+                enqueue_vocal_candidate(runtime, request);
             }
             runtime.life_accumulator -= LIFE_DT;
         }
@@ -2568,6 +2566,7 @@ impl PetApplication {
                     "fusion": serde_json::Value::Null,
                     "intent_pose": format!("{:?}", runtime.intent.pose),
                     "gaze_mode": format!("{:?}", runtime.body.embodiment.pose.gaze_mode),
+                    "living_language": runtime.last_phrase,
                     "gaze": {
                         "source": runtime.gaze_trace.source.as_str(),
                         "lifecore_target": runtime.gaze_trace.lifecore_target.map(|target| target.to_array()),
@@ -2972,7 +2971,9 @@ impl ApplicationHandler for PetApplication {
             background_capture_sequence: 0,
             background_luminance: 0.5,
             background_contrast: 0.0,
-            last_touch_voice: None,
+            expression_director: ExpressionDirector::default(),
+            vocal_arbiter: VocalArbiter::default(),
+            last_phrase: None,
             overlay_move_microseconds: 0.0,
             render_microseconds: 0.0,
             brain_tick_microseconds: 0.0,
@@ -4421,6 +4422,29 @@ fn synchronize_audio_learning(runtime: &mut PetRuntime) {
     }
 }
 
+#[cfg(not(feature = "legacy-expression-fallback"))]
+fn coordinate_interaction_response(
+    runtime: &mut PetRuntime,
+    plan: lifecore::InteractionResponsePlan,
+) -> lifecore::InteractionResponsePlan {
+    let living = LivingStateFrame::from_life(&runtime.life.state);
+    let physical = lifecore::PhysicalExpressionContext::from_frames(
+        &runtime.sensors,
+        &runtime.body.simulation.feedback,
+    );
+    let phrase = runtime.expression_director.direct(plan, living, physical);
+    runtime.last_phrase = Some(phrase);
+    phrase.plan
+}
+
+#[cfg(feature = "legacy-expression-fallback")]
+fn coordinate_interaction_response(
+    _runtime: &mut PetRuntime,
+    plan: lifecore::InteractionResponsePlan,
+) -> lifecore::InteractionResponsePlan {
+    plan
+}
+
 fn preserve_navigation_during_material_drag(
     previous: &BodyIntent,
     next: &mut BodyIntent,
@@ -4436,40 +4460,10 @@ fn preserve_navigation_during_material_drag(
     next.facing_direction = previous.facing_direction;
 }
 
-fn enqueue_touch_voice(runtime: &mut PetRuntime, now: Instant) {
-    if runtime
-        .last_touch_voice
-        .is_some_and(|previous| now.duration_since(previous) < Duration::from_millis(750))
-    {
-        return;
-    }
-    let Some(request) = runtime
-        .life
-        .request_vocalization(VocalTrigger::Touch, &runtime.sensors)
-    else {
-        return;
-    };
-    let Some(motif) = runtime
-        .life
-        .state
-        .vocal_motifs
-        .iter()
-        .find(|motif| motif.id == request.motif_id)
-        .cloned()
-    else {
-        runtime.life.cancel_vocal_request(request.performance_seed);
-        return;
-    };
-    let voice = runtime.life.state.genome.voice.clone();
-    let accepted = runtime.audio.enqueue(&voice, &motif, &request);
-    if accepted {
-        runtime.last_touch_voice = Some(now);
-    } else {
-        runtime.life.cancel_vocal_request(request.performance_seed);
-    }
-}
-
-fn enqueue_ecology_voice(runtime: &mut PetRuntime, trigger: EcologyVocalTrigger) {
+fn request_ecology_voice(
+    runtime: &mut PetRuntime,
+    trigger: EcologyVocalTrigger,
+) -> Option<lifecore::VocalRequest> {
     let trigger = match trigger {
         EcologyVocalTrigger::ToyOffer => VocalTrigger::ToyOffer,
         EcologyVocalTrigger::CatchSuccess => VocalTrigger::CatchSuccess,
@@ -4483,7 +4477,18 @@ fn enqueue_ecology_voice(runtime: &mut PetRuntime, trigger: EcologyVocalTrigger)
         EcologyVocalTrigger::RhythmEcho => VocalTrigger::RhythmEcho,
         EcologyVocalTrigger::VisualNotice => VocalTrigger::VisualNotice,
     };
-    let Some(request) = runtime.life.request_vocalization(trigger, &runtime.sensors) else {
+    runtime.life.request_vocalization(trigger, &runtime.sensors)
+}
+
+fn enqueue_vocal_candidate(runtime: &mut PetRuntime, request: lifecore::VocalRequest) {
+    let request_id = request.performance_seed;
+    let living = LivingStateFrame::from_life(&runtime.life.state);
+    let Some(request) = runtime.vocal_arbiter.admit(
+        request,
+        runtime.sensors.timestamp.max(0.0),
+        living.quiet_preferred,
+    ) else {
+        runtime.life.cancel_vocal_request(request_id);
         return;
     };
     let Some(motif) = runtime
@@ -5709,6 +5714,8 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 128,
             rhythm_intervals: [0.0; 8],
         };
         assert!(manager.enqueue(&voice, &first_motif, &first_request));

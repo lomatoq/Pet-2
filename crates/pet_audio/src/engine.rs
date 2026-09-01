@@ -494,6 +494,8 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 128,
             rhythm_intervals: [0.0; 8],
         };
         let commands = Arc::new(SpscRing::new());

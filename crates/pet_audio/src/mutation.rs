@@ -16,6 +16,8 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 128,
             rhythm_intervals: [0.0; 8],
         }
     }
@@ -260,5 +262,41 @@ mod tests {
             OfflineSampleFormat::I16,
         );
         assert_ne!(smooth_pcm, textured_pcm);
+    }
+
+    #[test]
+    fn mammalian_voice_gestures_are_pcm_distinct_without_ultrahigh_f0() {
+        let genome = Genome::from_seed(17);
+        let motif = &generate_initial_motifs(&genome.voice)[0];
+        let gestures = [
+            lifecore::VoiceGesture::PurrHum,
+            lifecore::VoiceGesture::WarmChuff,
+            lifecore::VoiceGesture::MewWhine,
+            lifecore::VoiceGesture::LowRumble,
+            lifecore::VoiceGesture::ClippedPulse,
+            lifecore::VoiceGesture::ReliefExhale,
+        ];
+        let rendered = gestures
+            .into_iter()
+            .map(|gesture| {
+                let mut request = request(motif.id);
+                request.gesture = gesture;
+                let command = crate::VoiceCommand::prepare(&genome.voice, motif, &request);
+                assert!((65.0..=365.0).contains(&command.base_pitch_hz));
+                render_motif(
+                    &genome.voice,
+                    motif,
+                    &request,
+                    48_000,
+                    1,
+                    OfflineSampleFormat::I16,
+                )
+            })
+            .collect::<Vec<_>>();
+        for left in 0..rendered.len() {
+            for right in left + 1..rendered.len() {
+                assert_ne!(rendered[left], rendered[right]);
+            }
+        }
     }
 }
