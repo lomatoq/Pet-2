@@ -134,15 +134,22 @@ keyboard hooks:
 - `Cmd/Win + Alt + N`: apply negative debug reward.
 - `Cmd/Win + Alt + D`: toggle bounded causal telemetry logging.
 
-## Body Lab and live brain monitor
+## Pet Lab and live nervous-system monitor
 
-The Windows package keeps one companion tool, `BodyLab.exe`. Run
-`Pet2-Dev.cmd` to start Pet 2 with 5 Hz causal telemetry and open the existing
-Body Lab directly on its Live Brain view. If a normal Pet 2 instance is already
-running, close it first because the desktop organism is single-instance.
+The Windows package keeps the body, den/home, voice/sounds, and nervous-system
+readability controls together in `PetLab.exe`. Run `Pet2-Dev.cmd` to start Pet 2
+with 5 Hz causal telemetry and open Pet Lab on its four calibration tabs. Press
+`F12` when you want to switch the same window to Live Nervous System telemetry.
+If a normal Pet 2 instance is already running, close it first because the desktop
+organism is single-instance.
 
-Inside Body Lab, `F12` switches the same window between Liquid Body Lab and Live
-Brain. In Live Brain, `Space`, the arrow keys, the timeline slider, and the
+The four tabs edit one versioned profile and use the production body, voice, and
+den render paths. `Apply selected mode to running Pet` hot-reloads that profile;
+the base authored black pigment stays an identity trait while nervous-system
+color modulation is limited to the soul glow and related runtime light channels.
+
+Inside Pet Lab, `F12` switches the same window between calibration and Live
+Nervous System. In the live view, `Space`, the arrow keys, the timeline slider, and the
 playback-rate buttons replay the captured state. This rewinds the observation,
 not the running organism. The live view follows attention, decisions, drives,
 affect, body and object motion, Morph/VITA/Fusion state, learning, identity, and

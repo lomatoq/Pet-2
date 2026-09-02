@@ -52,6 +52,16 @@ pub trait PlatformBackend {
     fn capture_overlay_background(&mut self, _window: &Window) -> Option<DesktopBackgroundFrame> {
         None
     }
+    /// Temporarily removes the overlay from OS-level desktop capture. Production
+    /// uses this only while seeding the den's clean refraction history, then
+    /// immediately restores normal capture behavior.
+    fn set_overlay_capture_excluded(
+        &mut self,
+        _window: &Window,
+        _excluded: bool,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
     fn apply_overlay_policy(&mut self, window: &Window) -> Result<(), HostError>;
     fn set_cursor_hittest(&mut self, window: &Window, enabled: bool) -> Result<(), HostError> {
         window.set_cursor_hittest(enabled).map_err(|error| {

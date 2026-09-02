@@ -1,3 +1,5 @@
+use glam::Vec2;
+
 use crate::InteractionTuning;
 
 use super::particles::{LiquidParticle, MAX_LIQUID_PARTICLES};
@@ -85,16 +87,17 @@ impl TopologyGuard {
         let mut correction_count = 0_u8;
         if invalid {
             // Reject the invalid predicted transition at the constraint boundary.
-            // `position` is the last accepted physical state, so this neither
-            // teleports particles nor invents/deletes mass. In a valid run it is
-            // a hard admission rule: an oversized or undersized split can never
-            // become authoritative even under an extreme pointer impulse.
-            for particle in &mut particles[..count] {
-                if particle.predicted_position != particle.position {
-                    particle.predicted_position = particle.position;
-                    correction_count = correction_count.saturating_add(1);
-                }
-            }
+            // `position` is the last accepted physical state, but rolling every
+            // particle back to it also destroys the velocity of the unaffected
+            // body when velocity is reconstructed after constraints. Repeated
+            // rejection under a held pointer then looks like a total-body
+            // freeze. Keep the largest predicted continuation of each already
+            // accepted component and roll back only its newly split branches.
+            // This preserves ordinary rigid/deformation motion and the motion of
+            // previously accepted detached components while still making an
+            // oversized or undersized new split non-authoritative.
+            let accepted = predict_current_positions(particles, count, link_distance);
+            correction_count = reject_new_split_branches(particles, count, &accepted, &prediction);
             prediction = predict(particles, count, link_distance);
 
             // A migrated/snapshot state may already violate the new invariant.
@@ -128,6 +131,47 @@ impl TopologyGuard {
     }
 }
 
+fn reject_new_split_branches(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    accepted: &Prediction,
+    predicted: &Prediction,
+) -> u8 {
+    let mut corrections = 0_u8;
+    for accepted_group in 0..accepted.component_count {
+        let mut overlap = [0_u8; MAX_LIQUID_PARTICLES];
+        for index in 0..count {
+            if usize::from(accepted.labels[index]) == accepted_group {
+                let predicted_group = usize::from(predicted.labels[index]);
+                overlap[predicted_group] = overlap[predicted_group].saturating_add(1);
+            }
+        }
+        // A tie is intentionally resolved by the stable prediction label. The
+        // result is deterministic and, unlike face-carrier ownership, cannot
+        // select a tiny pinched patch as the motion-authoritative side.
+        let continuation = overlap[..predicted.component_count]
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(left_group, left_count), (right_group, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| right_group.cmp(left_group))
+            })
+            .map_or(0, |(group, _)| group as u8);
+        for index in 0..count {
+            if usize::from(accepted.labels[index]) == accepted_group
+                && predicted.labels[index] != continuation
+                && particles[index].predicted_position != particles[index].position
+            {
+                particles[index].predicted_position = particles[index].position;
+                corrections = corrections.saturating_add(1);
+            }
+        }
+    }
+    corrections
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Prediction {
     labels: [u8; MAX_LIQUID_PARTICLES],
@@ -141,6 +185,27 @@ fn predict(
     particles: &[LiquidParticle; MAX_LIQUID_PARTICLES],
     count: usize,
     link_distance: f32,
+) -> Prediction {
+    predict_with_positions(particles, count, link_distance, |particle| {
+        particle.predicted_position
+    })
+}
+
+fn predict_current_positions(
+    particles: &[LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    link_distance: f32,
+) -> Prediction {
+    predict_with_positions(particles, count, link_distance, |particle| {
+        particle.position
+    })
+}
+
+fn predict_with_positions(
+    particles: &[LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    link_distance: f32,
+    position_of: impl Fn(&LiquidParticle) -> Vec2,
 ) -> Prediction {
     let mut labels = [u8::MAX; MAX_LIQUID_PARTICLES];
     let mut sizes = [0_usize; MAX_LIQUID_PARTICLES];
@@ -165,9 +230,8 @@ fn predict(
             masses[usize::from(group)] += particles[current].inverse_mass.max(1.0e-5).recip();
             for other in 0..count {
                 if labels[other] != u8::MAX
-                    || particles[current]
-                        .predicted_position
-                        .distance_squared(particles[other].predicted_position)
+                    || position_of(&particles[current])
+                        .distance_squared(position_of(&particles[other]))
                         >= threshold_squared
                 {
                     continue;
@@ -259,7 +323,6 @@ fn constrain_to_main(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Vec2;
 
     #[test]
     fn topology_budget_never_deletes_or_spawns_particles() {
@@ -339,5 +402,87 @@ mod tests {
         let decision = guard.enforce(&mut particles, 6, 0.10, InteractionTuning::default());
         assert!(decision.budget_exhausted);
         assert!(decision.correction_count > 0);
+    }
+
+    #[test]
+    fn rejected_tiny_pinch_preserves_unrelated_body_motion() {
+        for face_carrier in [0, 7] {
+            let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+            let translation = Vec2::new(0.012, 0.006);
+            for (index, particle) in particles[..8].iter_mut().enumerate() {
+                particle.inverse_mass = 1.0;
+                particle.face_weight = if index == face_carrier { 1.0 } else { 0.0 };
+                particle.position = Vec2::new(index as f32 * 0.04, 0.0);
+                particle.predicted_position = particle.position + translation;
+            }
+            // The pointer attempts to pull one particle out as an illegal
+            // singleton. This used to roll all eight predictions back and made
+            // the complete body reconstruct exactly zero velocity every tick.
+            particles[7].predicted_position = Vec2::new(0.72, 0.0);
+            let accepted_main_predictions = particles[..7]
+                .iter()
+                .map(|particle| particle.predicted_position)
+                .collect::<Vec<_>>();
+            let mut guard = TopologyGuard::default();
+
+            let decision = guard.enforce(&mut particles, 8, 0.10, InteractionTuning::default());
+
+            assert!(decision.budget_exhausted);
+            assert_eq!(decision.predicted_component_count, 1);
+            assert_eq!(decision.correction_count, 1);
+            for (particle, expected) in particles[..7].iter().zip(accepted_main_predictions) {
+                assert_eq!(particle.predicted_position, expected);
+                assert_ne!(particle.predicted_position, particle.position);
+            }
+            assert_eq!(particles[7].predicted_position, particles[7].position);
+        }
+    }
+
+    #[test]
+    fn rejected_pinch_does_not_freeze_an_existing_detached_component() {
+        let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+        let main_translation = Vec2::new(0.012, 0.004);
+        let detached_translation = Vec2::new(-0.006, 0.009);
+        for (index, particle) in particles[..24].iter_mut().enumerate() {
+            particle.inverse_mass = 1.0;
+            particle.face_weight = if index == 0 { 1.0 } else { 0.0 };
+            particle.position = if index < 20 {
+                Vec2::new(index as f32 * 0.04, 0.0)
+            } else {
+                Vec2::new(1.0 + (index - 20) as f32 * 0.04, 0.0)
+            };
+            particle.predicted_position = particle.position
+                + if index < 20 {
+                    main_translation
+                } else {
+                    detached_translation
+                };
+        }
+        // A second, illegal one-particle split is attempted from the main
+        // component while a valid four-particle fragment is already moving.
+        particles[19].predicted_position = Vec2::new(2.0, 0.0);
+        let expected_main = particles[..19]
+            .iter()
+            .map(|particle| particle.predicted_position)
+            .collect::<Vec<_>>();
+        let expected_detached = particles[20..24]
+            .iter()
+            .map(|particle| particle.predicted_position)
+            .collect::<Vec<_>>();
+        let mut guard = TopologyGuard::default();
+
+        let decision = guard.enforce(&mut particles, 24, 0.10, InteractionTuning::default());
+
+        assert!(decision.budget_exhausted);
+        assert_eq!(decision.predicted_component_count, 2);
+        assert_eq!(decision.correction_count, 1);
+        for (particle, expected) in particles[..19].iter().zip(expected_main) {
+            assert_eq!(particle.predicted_position, expected);
+        }
+        assert_eq!(particles[19].predicted_position, particles[19].position);
+        for (particle, expected) in particles[20..24].iter().zip(expected_detached) {
+            assert_eq!(particle.predicted_position, expected);
+            assert_ne!(particle.predicted_position, particle.position);
+        }
     }
 }

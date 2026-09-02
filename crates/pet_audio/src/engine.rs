@@ -80,6 +80,10 @@ pub enum AudioRuntimeEvent {
 pub enum AudioError {
     #[error("no default audio output device is available")]
     NoOutputDevice,
+    #[error("could not enumerate audio output devices: {0}")]
+    OutputDevices(#[from] cpal::DevicesError),
+    #[error("audio output device is unavailable: {0}")]
+    OutputDeviceUnavailable(String),
     #[error("could not enumerate output formats: {0}")]
     SupportedConfigs(#[from] cpal::SupportedStreamConfigsError),
     #[error("the output device exposes none of f32, i16, or u16")]
@@ -107,6 +111,33 @@ impl AudioEngine {
         let device = host
             .default_output_device()
             .ok_or(AudioError::NoOutputDevice)?;
+        Self::start_on_device(device)
+    }
+
+    /// Enumerates output names for a transient preview selector. Callers own any
+    /// persistence policy; Pet Lab intentionally keeps this session-only.
+    pub fn output_device_names() -> Result<Vec<String>, AudioError> {
+        let host = cpal::default_host();
+        let mut names = host
+            .output_devices()?
+            .filter_map(|device| device.name().ok())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
+    }
+
+    pub fn try_start_on_device_name(name: &str) -> Result<Self, AudioError> {
+        let host = cpal::default_host();
+        let requested = name.trim();
+        let device = host
+            .output_devices()?
+            .find(|device| device.name().is_ok_and(|candidate| candidate == requested))
+            .ok_or_else(|| AudioError::OutputDeviceUnavailable(requested.to_owned()))?;
+        Self::start_on_device(device)
+    }
+
+    fn start_on_device(device: cpal::Device) -> Result<Self, AudioError> {
         let device_name = device
             .name()
             .unwrap_or_else(|_| "unknown output device".into());

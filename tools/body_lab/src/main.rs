@@ -21,19 +21,19 @@ use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor, wgp
 use egui_winit::State as EguiWinitState;
 use glam::Vec2;
 use lifecore::{
-    AffectState, BodyIntent, EmotionKind, ExpressionState, Genome, InteractionTarget,
-    LocomotionMode, PoseIntent, SensorFrame, VocalRequest, apply_emotion_to_expression,
-    generate_initial_motifs,
+    AffectState, BodyIntent, EmotionKind, ExpressionState, FastPhenotypeActuation, Genome,
+    InteractionTarget, LocomotionMode, PoseIntent, SensorFrame, VocalRequest,
+    apply_emotion_to_expression, generate_initial_motifs,
 };
 use morph_brain::MorphBrainState;
 use pet_audio::AudioEngine;
 use pet_body::{
-    BodyMaterialSnapshot, BodyRenderMode, DebugView, LiquidDiagnostics,
-    LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant, ProceduralBody,
-    RenderOutcome, Renderer, ReviewBackground, TopologyConstraintMode, VisualMindInput,
-    VoiceVisualState,
+    BodyMaterialSnapshot, BodyRenderMode, DebugView, DenVisualTuning, EcologyRenderer,
+    LiquidDiagnostics, LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant,
+    NervousReadabilityTuning, ProceduralBody, RenderOutcome, Renderer, ReviewBackground,
+    TopologyConstraintMode, VisualMindInput, VoiceVisualState,
 };
-use pet_ecology::EcologyState;
+use pet_ecology::{EcologyState, ObjectLifecycle};
 use serde_json::Value;
 use winit::{
     application::ApplicationHandler,
@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Body Lab\n\n  --live-pet            Start in Live Brain (telemetry.jsonl, rotated history, legacy events.jsonl fallback)\n  --data-dir PATH       Use the same overridden Pet 2 data directory\n  --promote-report PATH Promote one validated fork and require a live loaded-hash acknowledgement\n\n  F12 switches Liquid Body Lab ↔ Live Brain"
+                    "Pet Lab\n\n  --live-pet            Start in Live Nervous System telemetry\n  --data-dir PATH       Use the same overridden Pet 2 data directory\n  --promote-report PATH Promote one validated fork and require a live loaded-hash acknowledgement\n\n  One window contains Body, Den, Voice, and Nervous System calibration. F12 toggles calibration ↔ live telemetry."
                 );
                 return Ok(());
             }
@@ -119,6 +119,15 @@ enum LabView {
     Live,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LabSection {
+    #[default]
+    Body,
+    Den,
+    Voice,
+    Nervous,
+}
+
 impl LabView {
     fn toggled(self) -> Self {
         match self {
@@ -131,7 +140,12 @@ impl LabView {
 struct LabRuntime {
     window: Arc<Window>,
     renderer: Renderer,
-    body: ProceduralBody,
+    ecology_renderer: EcologyRenderer,
+    ecology_state: EcologyState,
+    // Keep the particle body off winit's comparatively small Windows event-loop
+    // stack. The startup callback already owns the GPU/profile locals and a
+    // second inline 80 KiB body return can overflow before the first frame.
+    body: Box<ProceduralBody>,
     egui_context: Context,
     egui_state: EguiWinitState,
     egui_renderer: EguiRenderer,
@@ -307,7 +321,96 @@ enum PreviewScenario {
     WindowPressure,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NervousStimulusRig {
+    enabled: bool,
+    pulse: bool,
+    intensity: f32,
+    threat: bool,
+    pain: bool,
+    contact: bool,
+    safety: bool,
+    restraint: bool,
+    fatigue: bool,
+    novelty: bool,
+    startle: bool,
+    agency_success: bool,
+    relief: bool,
+    play: bool,
+}
+
+impl Default for NervousStimulusRig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pulse: true,
+            intensity: 0.82,
+            threat: false,
+            pain: false,
+            contact: false,
+            safety: false,
+            restraint: false,
+            fatigue: false,
+            novelty: true,
+            startle: false,
+            agency_success: false,
+            relief: false,
+            play: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NervousStimulusLevels {
+    threat: f32,
+    pain: f32,
+    contact: f32,
+    safety: f32,
+    restraint: f32,
+    fatigue: f32,
+    novelty: f32,
+    startle: f32,
+    agency: f32,
+    relief: f32,
+    play: f32,
+}
+
+impl NervousStimulusRig {
+    fn levels(self, tuning: NervousReadabilityTuning, elapsed: f32) -> NervousStimulusLevels {
+        if !self.enabled {
+            return NervousStimulusLevels::default();
+        }
+        let pulse = if self.pulse {
+            0.62 + 0.38 * (elapsed * 2.4).sin().max(-0.35)
+        } else {
+            1.0
+        };
+        let strength = self.intensity.clamp(0.0, 1.0) * pulse;
+        let active = |enabled: bool, sensitivity: f32| {
+            if enabled {
+                (strength * sensitivity).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        NervousStimulusLevels {
+            threat: active(self.threat, tuning.threat_sensitivity),
+            pain: active(self.pain, tuning.pain_sensitivity),
+            contact: active(self.contact, tuning.contact_sensitivity),
+            safety: active(self.safety, tuning.safety_sensitivity),
+            restraint: active(self.restraint, tuning.restraint_sensitivity),
+            fatigue: active(self.fatigue, tuning.fatigue_sensitivity),
+            novelty: active(self.novelty, tuning.novelty_sensitivity),
+            startle: active(self.startle, tuning.startle_sensitivity),
+            agency: active(self.agency_success, tuning.agency_sensitivity),
+            relief: active(self.relief, tuning.safety_sensitivity),
+            play: active(self.play, tuning.novelty_sensitivity),
+        }
+    }
+}
+
 struct LabUi {
+    section: LabSection,
     profile: LiquidTuningProfile,
     authored_profile: LiquidTuningProfile,
     store: Option<StateStore>,
@@ -339,9 +442,17 @@ struct LabUi {
     pending_revision: Option<u64>,
     next_ack_poll: Instant,
     test_voice_requested: bool,
+    audio_output_devices: Vec<String>,
+    audio_output_device: String,
+    pending_audio_output_device: Option<String>,
     audio_status: String,
     audio_rms: f32,
     audio_peak: f32,
+    den_preview_activity: f32,
+    live_den_apply: bool,
+    den_live_dirty: bool,
+    next_den_live_apply: Instant,
+    nervous_stimulus: NervousStimulusRig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,9 +513,9 @@ impl ApplicationHandler for BodyLab {
         let window = match event_loop.create_window(
             Window::default_attributes()
                 .with_title(if live_pet {
-                    "PET-2 Live Brain — causal dev panel"
+                    "PET-2 Pet Lab — live nervous system"
                 } else {
-                    "PET-2 Liquid Body Lab — zero-G soft fields"
+                    "PET-2 Pet Lab — body · den · voice · nervous system"
                 })
                 .with_inner_size(if live_pet {
                     LogicalSize::new(1_040.0, 900.0)
@@ -426,7 +537,7 @@ impl ApplicationHandler for BodyLab {
                 return;
             }
         };
-        let mut body = match ProceduralBody::generate(&self.genome) {
+        let mut body = match generate_lab_body(&self.genome) {
             Ok(body) => body,
             Err(error) => {
                 eprintln!("could not generate liquid body: {error}");
@@ -506,6 +617,27 @@ impl ApplicationHandler for BodyLab {
             }
         };
         renderer.set_review_background(BACKGROUNDS[DEFAULT_BACKGROUND]);
+        let mut ecology_renderer = EcologyRenderer::new(
+            renderer.device(),
+            renderer.surface_format(),
+            renderer.premultiplied_output(),
+        );
+        let (background_width, background_height, background_stride, background_pixels) =
+            pet_lab_reference_background(window.inner_size());
+        let _ = ecology_renderer.update_background(
+            renderer.device(),
+            renderer.queue(),
+            background_width,
+            background_height,
+            background_stride,
+            &background_pixels,
+        );
+        ecology_renderer.set_background_freshness(1.0);
+        ecology_renderer.set_den_tuning(profile.den);
+        let mut ecology_state = EcologyState::new(self.genome.identity_seed);
+        ecology_state.den.anchor = Vec2::new(0.335, 0.52);
+        ecology_state.den.size_scale = 1.42;
+        ecology_state.den.familiarity = 0.72;
         let egui_context = Context::default();
         egui_context.set_visuals(egui::Visuals::dark());
         let egui_state = EguiWinitState::new(
@@ -526,12 +658,18 @@ impl ApplicationHandler for BodyLab {
             |store| store.paths.liquid_tuning.display().to_string(),
         );
         let now = Instant::now();
+        let audio_output_devices = AudioEngine::output_device_names().unwrap_or_default();
         let (audio, audio_error) = match AudioEngine::try_start() {
             Ok(engine) => (Some(engine), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let audio_output_device = audio.as_ref().map_or_else(
+            || "Default output".to_owned(),
+            |engine| engine.device_name().to_owned(),
+        );
         let live_monitor = store.as_ref().map(LivePetMonitor::new);
         let ui = LabUi {
+            section: LabSection::Body,
             json_buffer: serde_json::to_string_pretty(&profile).unwrap_or_default(),
             preset_name_buffer: format!("{} copy", profile.name),
             profile,
@@ -566,6 +704,9 @@ impl ApplicationHandler for BodyLab {
             pending_revision: None,
             next_ack_poll: now,
             test_voice_requested: false,
+            audio_output_devices,
+            audio_output_device,
+            pending_audio_output_device: None,
             audio_status: audio.as_ref().map_or_else(
                 || "Failed".to_owned(),
                 |engine| {
@@ -578,10 +719,17 @@ impl ApplicationHandler for BodyLab {
             ),
             audio_rms: 0.0,
             audio_peak: 0.0,
+            den_preview_activity: 0.82,
+            live_den_apply: true,
+            den_live_dirty: false,
+            next_den_live_apply: now,
+            nervous_stimulus: NervousStimulusRig::default(),
         };
         self.runtime = Some(LabRuntime {
             window,
             renderer,
+            ecology_renderer,
+            ecology_state,
             body,
             egui_context,
             egui_state,
@@ -638,6 +786,21 @@ impl ApplicationHandler for BodyLab {
             event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
             return;
         }
+        runtime
+            .ecology_renderer
+            .set_den_tuning(runtime.ui.profile.den);
+        let size = runtime.window.inner_size();
+        let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+        let distance_px = 182.0 - runtime.ui.den_preview_activity.clamp(0.0, 1.0) * 152.0;
+        if let Some(orb) = runtime.ecology_state.objects.first_mut() {
+            orb.lifecycle = ObjectLifecycle::Free;
+            orb.position = runtime.ecology_state.den.anchor
+                + Vec2::new(
+                    distance_px / (pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * aspect),
+                    0.0,
+                );
+            orb.velocity = Vec2::ZERO;
+        }
         let fixed_dt = 1.0 / runtime.ui.profile.pbf.fixed_hz.clamp(30.0, 120.0);
         if runtime.ui.playing || runtime.ui.drag.active {
             runtime.simulation_accumulator = (runtime.simulation_accumulator
@@ -659,11 +822,44 @@ impl ApplicationHandler for BodyLab {
             runtime.ui.reset_requested = false;
             reset_preview_bodies(runtime, &self.genome);
         }
+        if let Some(device_name) = runtime.ui.pending_audio_output_device.take() {
+            match AudioEngine::try_start_on_device_name(&device_name) {
+                Ok(engine) => {
+                    runtime.ui.audio_output_device = device_name.clone();
+                    runtime.ui.audio_status = format!(
+                        "Ready · {} · {:?}",
+                        engine.device_name(),
+                        engine.selected_config()
+                    );
+                    runtime.audio = Some(engine);
+                    runtime.audio_error = None;
+                    runtime.ui.status = format!(
+                        "Pet Lab output changed to {device_name}. This choice is session-only."
+                    );
+                }
+                Err(error) => {
+                    runtime.audio_error = Some(error.to_string());
+                    runtime.ui.status = format!(
+                        "Could not switch to {device_name}; the previous output stays active."
+                    );
+                }
+            }
+        }
         if runtime.ui.test_voice_requested {
             runtime.ui.test_voice_requested = false;
             if runtime.audio.is_none() {
-                match AudioEngine::try_start() {
+                let start = if runtime
+                    .ui
+                    .audio_output_devices
+                    .contains(&runtime.ui.audio_output_device)
+                {
+                    AudioEngine::try_start_on_device_name(&runtime.ui.audio_output_device)
+                } else {
+                    AudioEngine::try_start()
+                };
+                match start {
                     Ok(engine) => {
+                        runtime.ui.audio_output_device = engine.device_name().to_owned();
                         runtime.audio = Some(engine);
                         runtime.audio_error = None;
                     }
@@ -685,7 +881,7 @@ impl ApplicationHandler for BodyLab {
                     let duration_shape = preview_seeded_unit(performance_seed ^ 0x9FB2_1C65);
                     let pitch_shape = preview_seeded_unit(performance_seed ^ 0xC13F_A9A9);
                     let duration_scale = 0.72 + duration_shape * (1.45 - 0.72);
-                    let request = VocalRequest {
+                    let mut request = VocalRequest {
                         motif_id: motif.id,
                         performance_seed,
                         gain: self.genome.voice.maximum_loudness
@@ -704,8 +900,13 @@ impl ApplicationHandler for BodyLab {
                         confidence: 0.8,
                         attachment: 0.4,
                         rhythm_intervals: [0.0; 8],
-                        phenotype: Default::default(),
+                        phenotype: runtime.body.fast_phenotype_actuation().voice,
                     };
+                    runtime
+                        .ui
+                        .profile
+                        .voice
+                        .apply_to_request(&mut request, &self.genome.voice);
                     if let Err(error) = audio.enqueue(&self.genome.voice, motif, &request) {
                         runtime.audio_error = Some(error.to_string());
                     } else {
@@ -747,7 +948,11 @@ impl ApplicationHandler for BodyLab {
         }
         runtime
             .renderer
-            .set_review_background(BACKGROUNDS[runtime.ui.background]);
+            .set_review_background(if runtime.ui.section == LabSection::Den {
+                ReviewBackground::BusyChecker
+            } else {
+                BACKGROUNDS[runtime.ui.background]
+            });
         runtime.window.request_redraw();
         event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
     }
@@ -776,6 +981,17 @@ impl ApplicationHandler for BodyLab {
                         }
                     }
                     runtime.renderer.resize(size);
+                    let (background_width, background_height, background_stride, pixels) =
+                        pet_lab_reference_background(size);
+                    let _ = runtime.ecology_renderer.update_background(
+                        runtime.renderer.device(),
+                        runtime.renderer.queue(),
+                        background_width,
+                        background_height,
+                        background_stride,
+                        &pixels,
+                    );
+                    runtime.ecology_renderer.set_background_freshness(1.0);
                     sync_preview_viewport(
                         &mut runtime.body,
                         size,
@@ -834,14 +1050,14 @@ fn update_window_for_view(runtime: &mut LabRuntime) {
         LabView::Body => {
             runtime
                 .window
-                .set_title("PET-2 Liquid Body Lab — zero-G soft fields");
+                .set_title("PET-2 Pet Lab — body · den · voice · nervous system");
             runtime.window.set_window_level(WindowLevel::Normal);
             let _ = runtime.window.request_inner_size(runtime.body_window_size);
         }
         LabView::Live => {
             runtime
                 .window
-                .set_title("PET-2 Live Brain — causal dev panel");
+                .set_title("PET-2 Pet Lab — live nervous system");
             runtime.window.set_window_level(WindowLevel::AlwaysOnTop);
             let _ = runtime.window.request_inner_size(runtime.live_window_size);
         }
@@ -854,6 +1070,12 @@ fn sync_preview_space(body: &mut ProceduralBody, size: PhysicalSize<u32>) {
     let height = size.height.max(1) as f32;
     body.set_render_aspect(width / height);
     body.set_desktop_motion_space(Vec2::new(width, height), height);
+}
+
+fn generate_lab_body(genome: &Genome) -> Result<Box<ProceduralBody>, String> {
+    ProceduralBody::generate(genome)
+        .map(Box::new)
+        .map_err(|error| error.to_string())
 }
 
 fn sync_preview_viewport(
@@ -872,7 +1094,7 @@ fn sync_preview_viewport(
 }
 
 fn reset_preview_bodies(runtime: &mut LabRuntime, genome: &Genome) {
-    match ProceduralBody::generate(genome) {
+    match generate_lab_body(genome) {
         Ok(mut body) => {
             runtime.ui.profile.render_mode = BodyRenderMode::ParticlePbf;
             let _ = body.apply_tuning_profile(runtime.ui.profile.clone());
@@ -934,6 +1156,149 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
     if runtime.ui.focus_lock {
         expression.pupil_focus = 1.0;
     }
+    let mut fast = FastPhenotypeActuation::default();
+    fast.expression = expression;
+    if runtime.ui.section == LabSection::Nervous {
+        let levels = runtime
+            .ui
+            .nervous_stimulus
+            .levels(runtime.ui.profile.nervous, runtime.elapsed);
+        let negative = levels
+            .threat
+            .max(levels.pain)
+            .max(levels.restraint)
+            .max(levels.startle);
+        let positive = levels
+            .contact
+            .max(levels.safety)
+            .max(levels.relief)
+            .max(levels.play);
+        let arousal = runtime
+            .ui
+            .emotional_arousal
+            .max(0.78 * negative + 0.42 * levels.play + 0.34 * levels.novelty)
+            .clamp(0.0, 1.0);
+        let interest = runtime
+            .ui
+            .interest
+            .max(levels.novelty)
+            .max(levels.play * 0.85)
+            .clamp(0.0, 1.0);
+        if levels.threat > 0.01 || levels.pain > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Fear,
+                levels.threat.max(levels.pain),
+            );
+        }
+        if levels.startle > 0.01 {
+            apply_emotion_to_expression(&mut fast.expression, EmotionKind::Alarm, levels.startle);
+        }
+        if levels.restraint > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Frustration,
+                levels.restraint,
+            );
+        }
+        if levels.novelty > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Curiosity,
+                levels.novelty,
+            );
+        }
+        if levels.play > 0.01 {
+            apply_emotion_to_expression(&mut fast.expression, EmotionKind::Delight, levels.play);
+        }
+        if levels.contact > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Affection,
+                levels.contact,
+            );
+        }
+        if levels.safety > 0.01 || levels.relief > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Contentment,
+                levels.safety.max(levels.relief),
+            );
+        }
+        if levels.fatigue > 0.01 {
+            apply_emotion_to_expression(&mut fast.expression, EmotionKind::Boredom, levels.fatigue);
+        }
+        fast.analytic.body_length_scale =
+            1.0 + arousal * 0.030 + interest * 0.018 - levels.fatigue * 0.035;
+        fast.analytic.body_width_scale = (1.0 / fast.analytic.body_length_scale).clamp(0.95, 1.06);
+        fast.analytic.roundness_bias = positive * 0.08 - negative * 0.07;
+        fast.analytic.softness_bias = positive * 0.10 - levels.restraint * 0.12;
+        fast.pbf.idle_breath_amplitude_multiplier =
+            0.82 + arousal * 0.46 - levels.pain * 0.18 + levels.relief * 0.20;
+        fast.pbf.idle_breath_speed_multiplier =
+            0.72 + arousal * 0.70 + levels.startle * 0.24 - levels.fatigue * 0.25;
+        fast.pbf.density_compliance_multiplier =
+            1.0 + 0.16 * (levels.play + levels.fatigue) - 0.12 * negative;
+        fast.pbf.viscosity_multiplier =
+            1.0 + 0.24 * levels.fatigue + 0.12 * levels.safety - 0.18 * arousal;
+        fast.pbf.surface_tension_multiplier =
+            1.0 + 0.18 * (levels.safety + levels.contact + levels.pain) - 0.14 * levels.play;
+        fast.pbf.flight_inertia_multiplier = 1.0 + 0.16 * levels.fatigue - 0.10 * levels.startle;
+        fast.pbf.flight_stretch_multiplier =
+            1.0 + 0.24 * levels.play + 0.18 * levels.novelty + 0.14 * levels.startle
+                - 0.12 * levels.restraint;
+        fast.pbf.flight_damping_multiplier =
+            1.0 + 0.22 * levels.fatigue + 0.12 * levels.safety - 0.16 * levels.startle;
+        fast.pbf.flight_max_lag_multiplier =
+            1.0 + 0.20 * levels.startle + 0.14 * levels.play - 0.12 * levels.restraint;
+        fast.pbf.motor_gain_multiplier = 1.0 + 0.14 * levels.agency + 0.10 * levels.play
+            - 0.18 * levels.fatigue
+            - 0.12 * levels.restraint;
+        fast.pbf.shape_recovery_delta =
+            0.16 * negative + 0.10 * levels.agency + 0.08 * levels.relief;
+        fast.pbf.upright_stabilization_delta =
+            0.14 * levels.agency + 0.12 * levels.safety - 0.10 * levels.startle;
+        fast.material.emission_multiplier =
+            0.78 + arousal * 0.34 + interest * 0.10 + positive * 0.12;
+        fast.material.soul_glow_strength_multiplier =
+            0.80 + arousal * 0.20 + interest * 0.16 + positive * 0.22;
+        fast.material.soul_glow_pulse_multiplier = 0.76 + arousal * 0.38 + levels.startle * 0.18;
+        fast.material.internal_flow_multiplier =
+            0.72 + arousal * 0.36 + interest * 0.24 + levels.play * 0.18;
+        fast.material.internal_orb_speed_multiplier =
+            0.70 + arousal * 0.34 + levels.novelty * 0.28 + levels.startle * 0.20;
+        fast.visual_physiology.pulse_amplitude = 0.14 + arousal * 0.48 + levels.startle * 0.18;
+        fast.visual_physiology.flow_strength_multiplier = fast.material.internal_flow_multiplier;
+        fast.visual_physiology.flow_speed_multiplier = 0.75 + arousal * 0.42 + interest * 0.18;
+        fast.visual_physiology.droplet_energy =
+            0.16 + arousal * 0.38 + levels.play * 0.26 + levels.startle * 0.18;
+        fast.visual_physiology.droplet_spread = 0.12 + levels.play * 0.42 + levels.startle * 0.22;
+        fast.visual_physiology.droplet_cohesion =
+            0.50 + levels.safety * 0.22 + levels.contact * 0.16 - levels.play * 0.14;
+        fast.action.approach =
+            (levels.contact + levels.safety + levels.novelty * 0.55).clamp(0.0, 1.0);
+        fast.action.avoid = (levels.threat + levels.pain + levels.restraint * 0.65).clamp(0.0, 1.0);
+        fast.action.speed = (0.22 + arousal * 0.66 - levels.fatigue * 0.32).clamp(0.0, 1.0);
+        fast.action.play = levels.play;
+        fast.action.settle = (levels.safety + levels.relief + levels.fatigue * 0.4).clamp(0.0, 1.0);
+        fast.action.protect = negative;
+        fast.action.explore = levels.novelty;
+        fast.interaction.recoil = levels.startle.max(levels.pain).max(levels.threat);
+        fast.interaction.resistance = levels.restraint.max(levels.pain);
+        fast.interaction.cooperation = levels.safety.max(levels.contact).max(levels.agency);
+        fast.interaction.local_pulse = levels.contact.max(levels.startle);
+        fast.voice.pitch_multiplier = 0.96 + arousal * 0.10;
+        fast.voice.phrase_speed_multiplier = 0.88 + arousal * 0.24;
+        fast.voice.release_multiplier = 0.96 + (1.0 - arousal) * 0.24;
+        fast.voice.breathiness_delta =
+            (arousal - 0.5) * 0.12 + levels.fatigue * 0.10 + levels.pain * 0.08;
+        fast.voice.roughness_delta = levels.pain * 0.16 + levels.restraint * 0.12;
+        fast.voice.brightness_delta = levels.play * 0.12 + levels.novelty * 0.08;
+        fast.apparent_scale = 0.98 + arousal * 0.045 - levels.fatigue * 0.035;
+        runtime.ui.profile.nervous.apply(&mut fast);
+        expression = fast.expression;
+        body.set_fast_phenotype_actuation(fast);
+    }
     let interaction_target = if runtime.ui.focus_distance < -0.25 {
         Some(InteractionTarget::Cursor)
     } else if runtime.ui.focus_distance > 0.25 {
@@ -941,7 +1306,7 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
     } else {
         None
     };
-    let intent = BodyIntent {
+    let mut intent = BodyIntent {
         locomotion: LocomotionMode::Hover,
         target_position: body_position,
         target_surface: None,
@@ -974,6 +1339,10 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
         mean_luminance: Some(runtime.ui.scene_luminance),
         ..SensorFrame::default()
     };
+    if runtime.ui.section == LabSection::Nervous {
+        body.fast_phenotype_actuation()
+            .apply_to_intent(&mut intent, &sensors, body_position);
+    }
     let mind = VisualMindInput {
         curiosity: runtime.ui.interest,
         attachment: 0.55,
@@ -1219,9 +1588,36 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     let mut parameters = runtime.body.render_parameters(genome, 0.35);
     parameters.render_mode = BodyRenderMode::ParticlePbf;
     parameters.debug_view = runtime.ui.debug_view;
+    let show_den = runtime.ui.section == LabSection::Den;
+    if show_den {
+        // Keep the physical liquid advancing unchanged, but move only its
+        // presentation outside the surface while reviewing the den. A zero
+        // scale is not a visibility switch: the production renderer clamps it
+        // to 0.5 and used to leave collapsed PBF fragments at the window edge.
+        parameters.presentation_offset = Vec2::splat(8.0);
+    }
+    let desktop_aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+    let ecology_time = runtime.elapsed;
+    let ecology_state = &runtime.ecology_state;
+    let ecology_renderer = &mut runtime.ecology_renderer;
     let renderer = &mut runtime.renderer;
     let egui_renderer = &mut runtime.egui_renderer;
     let outcome = renderer.render_with_overlay(parameters, |device, queue, encoder, view| {
+        if show_den {
+            // Review exactly the same pixels sampled by the optics shader. This
+            // makes refraction falsifiable: displaced and undistorted regions
+            // originate from one texture instead of two similar-looking but
+            // spatially unrelated checker implementations.
+            ecology_renderer.render_reference_background(encoder, view);
+            ecology_renderer.render(
+                queue,
+                encoder,
+                view,
+                ecology_state,
+                desktop_aspect,
+                ecology_time,
+            );
+        }
         let callbacks = egui_renderer.update_buffers(device, queue, encoder, &paint_jobs, &screen);
         debug_assert!(callbacks.is_empty());
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2340,9 +2736,9 @@ fn is_telemetry_frame(event: &Value) -> bool {
 
 fn show_live_pet_unavailable(context: &Context) {
     egui::CentralPanel::default().show(context, |ui| {
-        ui.heading("PET-2 Live Brain");
+        ui.heading("PET-2 Pet Lab · Live Nervous System");
         ui.label("Pet data directory is unavailable; telemetry cannot be discovered.");
-        ui.label("Press F12 to return to Liquid Body Lab.");
+        ui.label("Press F12 to return to Body / Den / Voice / Nervous calibration.");
     });
 }
 
@@ -2351,7 +2747,7 @@ fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
         .frame(egui::Frame::default().fill(egui::Color32::from_rgb(12, 15, 22)))
         .show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("PET-2 Live Brain");
+                ui.heading("PET-2 Pet Lab · Live Nervous System");
                 let stale = monitor.stale_seconds().is_none_or(|seconds| seconds > 1.2);
                 ui.colored_label(
                     if stale {
@@ -2364,7 +2760,7 @@ fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
             });
             ui.label("perception → arbitration → intent → motor → body / object");
             ui.small(format!(
-                "{} · F12: Liquid Body Lab ↔ Live Brain",
+                "{} · F12: Calibration ↔ live causal telemetry",
                 monitor.active_path().display()
             ));
             ui.small(&monitor.status);
@@ -4762,6 +5158,42 @@ fn format_number(value: &Value, pointer: &str, decimals: usize) -> String {
     number(value, pointer).map_or_else(|| "—".into(), |value| format!("{value:.decimals$}"))
 }
 
+fn pet_lab_reference_background(size: PhysicalSize<u32>) -> (u32, u32, u32, Vec<u8>) {
+    let width = size.width.max(1);
+    let height = size.height.max(1);
+    let bytes_per_row = width.saturating_mul(4).div_ceil(256) * 256;
+    let mut pixels = vec![0_u8; bytes_per_row as usize * height as usize];
+    for y in 0..height {
+        for x in 0..width {
+            // Match `liquid_surface.wgsl::background_for_mode(..., 4.0)`
+            // exactly. The den then samples a displaced copy of the same
+            // pixels visible under it; a mismatched decorative reference can
+            // look animated while proving no optical refraction at all.
+            let checker_x = x as f32 / 64.0;
+            let checker_y = y as f32 / 64.0;
+            let alternating = ((checker_x.floor() as i32 + checker_y.floor() as i32) & 1) == 0;
+            let value = if alternating { 0.72_f32 } else { 0.18_f32 };
+            let accent = 0.04 * (checker_x * 2.17 + checker_y * 1.83).sin();
+            let srgb = linear_to_srgb_byte((value + accent).clamp(0.0, 1.0));
+            let index = (y * bytes_per_row + x * 4) as usize;
+            pixels[index] = srgb;
+            pixels[index + 1] = srgb;
+            pixels[index + 2] = srgb;
+            pixels[index + 3] = 255;
+        }
+    }
+    (width, height, bytes_per_row, pixels)
+}
+
+fn linear_to_srgb_byte(value: f32) -> u8 {
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 fn array_number(value: &Value, pointer: &str, index: usize, decimals: usize) -> String {
     value
         .pointer(pointer)
@@ -4820,28 +5252,56 @@ impl LabUi {
             .min_width(330.0)
             .resizable(true)
             .show(context, |ui| {
-                ui.heading("PET-2 Liquid Body Lab");
-                ui.label("Zero-G soft-field liquid · finite cohesion · no fixed particle tethers");
+                ui.heading("PET-2 Pet Lab");
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.section, LabSection::Body, "Body");
+                    ui.selectable_value(&mut self.section, LabSection::Den, "Den / home");
+                    ui.selectable_value(&mut self.section, LabSection::Voice, "Voice + sounds");
+                    ui.selectable_value(&mut self.section, LabSection::Nervous, "Nervous → body");
+                });
+                ui.small(match self.section {
+                    LabSection::Body => "PBF body, material, face, contact and compositor.",
+                    LabSection::Den => "The exact production den shader over a captured-style reference backdrop.",
+                    LabSection::Voice => "The production procedural voice path with the immutable genome loudness cap.",
+                    LabSection::Nervous => "Readable downstream calibration plus live causal telemetry on F12.",
+                });
                 ui.separator();
                 self.transport(ui);
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.preset_controls(ui);
-                        self.body_communication_controls(ui);
-                        self.physics_controls(ui);
-                        self.material_controls(ui);
-                        self.face_controls(ui);
-                        self.compositor_controls(ui);
-                        self.diagnostics(
-                            ui,
-                            diagnostics,
-                            pupil_size,
-                            pupil_asymmetry,
-                            fps,
-                            p95_frame_ms,
-                        );
+                        match self.section {
+                            LabSection::Body => {
+                                self.preset_controls(ui);
+                                self.body_communication_controls(ui);
+                                self.physics_controls(ui);
+                                self.material_controls(ui);
+                                self.face_controls(ui);
+                                self.compositor_controls(ui);
+                                self.diagnostics(
+                                    ui,
+                                    diagnostics,
+                                    pupil_size,
+                                    pupil_asymmetry,
+                                    fps,
+                                    p95_frame_ms,
+                                );
+                            }
+                            LabSection::Den => self.den_controls(ui),
+                            LabSection::Voice => self.voice_controls(ui),
+                            LabSection::Nervous => {
+                                self.nervous_controls(ui);
+                                self.diagnostics(
+                                    ui,
+                                    diagnostics,
+                                    pupil_size,
+                                    pupil_asymmetry,
+                                    fps,
+                                    p95_frame_ms,
+                                );
+                            }
+                        }
                         self.persistence_controls(ui);
                     });
             });
@@ -4855,6 +5315,31 @@ impl LabUi {
             .frame(egui::Frame::NONE)
             .show(context, |ui| {
                 let canvas = ui.max_rect();
+                if self.section != LabSection::Body {
+                    self.drag.active = false;
+                    self.drag.velocity_normalized *= 0.72;
+                    ui.allocate_rect(canvas, Sense::hover());
+                    let label = match self.section {
+                        LabSection::Den => {
+                            "Exact production den shader · large noise advects inward · refraction bends the reference backdrop"
+                        }
+                        LabSection::Voice => {
+                            "Production body + mouth feedback from the actual audio callback"
+                        }
+                        LabSection::Nervous => {
+                            "Toggle stimuli and sensitivities · watch metaball motion, separation, face, glow and action · F12 opens the live causal trace"
+                        }
+                        LabSection::Body => unreachable!(),
+                    };
+                    ui.painter().text(
+                        canvas.left_top() + egui::vec2(14.0, 14.0),
+                        egui::Align2::LEFT_TOP,
+                        label,
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::from_white_alpha(205),
+                    );
+                    return;
+                }
                 let response = ui.allocate_rect(canvas, Sense::drag());
                 let content = context.content_rect();
                 let size = content.size().max(egui::Vec2::splat(1.0));
@@ -4919,6 +5404,52 @@ impl LabUi {
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
+        match self.section {
+            LabSection::Den => {
+                ui.add(
+                    Slider::new(&mut self.den_preview_activity, 0.0..=1.0)
+                        .text("Orb proximity / den activity"),
+                );
+                ui.small("The orb drives the same activity response used by the desktop Pet.");
+                return;
+            }
+            LabSection::Voice => {
+                ui.horizontal(|ui| {
+                    if ui.button("🔊 Test next voice").clicked() {
+                        self.test_voice_requested = true;
+                    }
+                    ui.label(format!(
+                        "{} · RMS {:.3} · peak {:.3}",
+                        self.audio_status, self.audio_rms, self.audio_peak
+                    ));
+                });
+                ui.add(Slider::new(&mut self.emotional_arousal, 0.0..=1.0).text("Voice arousal"));
+                ui.add(Slider::new(&mut self.interest, 0.0..=1.0).text("Voice interest"));
+                return;
+            }
+            LabSection::Nervous => {
+                egui::ComboBox::from_label("Demonstration emotion")
+                    .selected_text(emotion_name(self.preview_emotion))
+                    .show_ui(ui, |ui| {
+                        for emotion in all_preview_emotions() {
+                            ui.selectable_value(
+                                &mut self.preview_emotion,
+                                emotion,
+                                emotion_name(emotion),
+                            );
+                        }
+                    });
+                ui.add(
+                    Slider::new(&mut self.preview_emotion_intensity, 0.0..=1.0)
+                        .text("Emotion intensity"),
+                );
+                ui.add(Slider::new(&mut self.emotional_arousal, 0.0..=1.0).text("Arousal"));
+                ui.add(Slider::new(&mut self.interest, 0.0..=1.0).text("Interest"));
+                ui.checkbox(&mut self.focus_lock, "Attention lock");
+                return;
+            }
+            LabSection::Body => {}
+        }
         ui.horizontal(|ui| {
             if ui
                 .button(if self.playing { "Pause" } else { "Play" })
@@ -5224,6 +5755,360 @@ impl LabUi {
             }
             Err(error) => self.status = format!("Preset delete failed: {error}"),
         }
+    }
+
+    fn den_controls(&mut self, ui: &mut egui::Ui) {
+        let previous_tuning = self.profile.den;
+        CollapsingHeader::new("Den distortion / energy field")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.checkbox(
+                    &mut self.live_den_apply,
+                    "LIVE → running desktop Pet (auto-apply sliders)",
+                );
+                ui.small("These sliders feed the exact production WGSL shader. LIVE writes a debounced shared profile while you drag; den physics and orb storage stay unchanged.");
+                let tuning = &mut self.profile.den;
+                ui.label("Converging energy noise");
+                ui.add(Slider::new(&mut tuning.noise_size, 0.60..=5.0).text("Noise packet size"));
+                ui.add(Slider::new(&mut tuning.noise_strength, 0.0..=2.0).text("Noise height / warp"));
+                ui.add(Slider::new(&mut tuning.inward_speed, 0.0..=1.0).text("Noise speed to centre"));
+                ui.add(Slider::new(&mut tuning.noise_detail_scale, 1.0..=4.0).text("Detail scale"));
+                ui.add(Slider::new(&mut tuning.noise_detail_mix, 0.0..=1.0).text("Fine detail mix"));
+                ui.add(Slider::new(&mut tuning.noise_warp, 0.0..=1.0).text("Radial warp"));
+                ui.add(
+                    Slider::new(&mut tuning.noise_band_width, 0.0..=100.0)
+                        .step_by(1.0)
+                        .text("Noise width"),
+                );
+                ui.separator();
+                ui.label("Concentric ripple");
+                ui.add(Slider::new(&mut tuning.ripple_strength, 0.0..=1.5).text("Concentric ripple height"));
+                ui.add(Slider::new(&mut tuning.ripple_inward_speed, 0.0..=1.0).text("Wave speed to centre"));
+                ui.add(Slider::new(&mut tuning.ripple_opacity, 0.0..=1.0).text("Blue-violet ripple opacity"));
+                ui.add(
+                    Slider::new(&mut tuning.orb_speedup_fraction, 0.0..=0.50)
+                        .text("Orb speed-up fraction"),
+                );
+                ui.add(
+                    Slider::new(&mut tuning.orb_attack_seconds, 0.08..=3.0)
+                        .text("Orb acceleration smoothing (s)"),
+                );
+                ui.add(
+                    Slider::new(&mut tuning.orb_release_seconds, 0.08..=5.0)
+                        .text("Orb slowdown smoothing (s)"),
+                );
+                ui.separator();
+                ui.label("Displacement + refraction");
+                ui.add(Slider::new(&mut tuning.displacement_strength, 0.0..=2.5).text("Background displacement"));
+                ui.add(Slider::new(&mut tuning.displacement_blur, 0.012..=0.14).text("Displacement sampling width"));
+                ui.add(Slider::new(&mut tuning.displacement_noise_mix, 0.0..=1.0).text("Noise in displacement"));
+                ui.add(Slider::new(&mut tuning.displacement_radius, 0.45..=1.30).text("Displacement radius"));
+                ui.add(Slider::new(&mut tuning.refraction_strength, 0.0..=1.5).text("Refraction coverage"));
+                ui.add(Slider::new(&mut tuning.refraction_opacity, 0.0..=1.5).text("Displacement visibility / opacity"));
+                ui.add(Slider::new(&mut tuning.dispersion_strength, 0.0..=1.5).text("RGB dispersion"));
+                ui.separator();
+                ui.label("Centre exclusion mask");
+                ui.add(Slider::new(&mut tuning.center_mask_radius, 0.0..=0.72).text("Hidden centre radius"));
+                ui.add(Slider::new(&mut tuning.center_mask_feather, 0.01..=0.80).text("Large feather"));
+                ui.add(Slider::new(&mut tuning.center_mask_opacity, 0.0..=1.0).text("Mask strength"));
+                ui.separator();
+                ui.label("Material + light");
+                ui.add(Slider::new(&mut tuning.tint_strength, 0.0..=2.0).text("Blue-violet tint"));
+                ui.add(Slider::new(&mut tuning.caustic_strength, 0.0..=2.0).text("Fake dispersion caustic"));
+                ui.add(Slider::new(&mut tuning.glow_strength, 0.0..=1.0).text("Energy glow"));
+                ui.add(Slider::new(&mut tuning.particle_count, 0..=24).text("Particles to centre"));
+                ui.add(Slider::new(&mut tuning.particle_brightness, 0.0..=2.0).text("Particle brightness"));
+                ui.horizontal(|ui| {
+                    if ui.button("Strong noisy lens").clicked() {
+                        *tuning = Default::default();
+                    }
+                    if ui.button("Refraction A/B").clicked() {
+                        tuning.noise_size = 3.4;
+                        tuning.noise_strength = 1.45;
+                        tuning.inward_speed = 0.62;
+                        tuning.ripple_inward_speed = 0.52;
+                        tuning.noise_detail_mix = 0.10;
+                        tuning.noise_band_width = 1.10;
+                        tuning.ripple_strength = 0.0;
+                        tuning.ripple_opacity = 0.0;
+                        tuning.displacement_strength = 2.15;
+                        tuning.displacement_noise_mix = 1.0;
+                        tuning.displacement_radius = 1.12;
+                        tuning.refraction_strength = 1.35;
+                        tuning.refraction_opacity = 0.82;
+                        tuning.dispersion_strength = 0.42;
+                        tuning.tint_strength = 0.0;
+                        tuning.caustic_strength = 0.0;
+                        tuning.glow_strength = 0.0;
+                        tuning.particle_brightness = 0.0;
+                        tuning.particle_count = 0;
+                        tuning.center_mask_radius = 0.10;
+                        tuning.center_mask_feather = 0.28;
+                        tuning.center_mask_opacity = 0.88;
+                    }
+                    if ui.button("Quiet lens").clicked() {
+                        tuning.noise_size = 3.0;
+                        tuning.noise_strength = 0.82;
+                        tuning.inward_speed = 0.34;
+                        tuning.ripple_inward_speed = 0.30;
+                        tuning.noise_detail_mix = 0.08;
+                        tuning.noise_band_width = 1.10;
+                        tuning.ripple_strength = 0.18;
+                        tuning.ripple_opacity = 0.12;
+                        tuning.displacement_strength = 1.05;
+                        tuning.displacement_noise_mix = 0.90;
+                        tuning.refraction_strength = 0.86;
+                        tuning.refraction_opacity = 0.78;
+                        tuning.dispersion_strength = 0.45;
+                        tuning.tint_strength = 0.34;
+                        tuning.caustic_strength = 0.45;
+                        tuning.glow_strength = 0.12;
+                        tuning.particle_brightness = 0.82;
+                        tuning.particle_count = 14;
+                        tuning.center_mask_radius = 0.18;
+                        tuning.center_mask_feather = 0.42;
+                        tuning.center_mask_opacity = 0.96;
+                    }
+                });
+                ui.small("Default is noise-dominant: broad inward packets, weak blue-violet ripple, low glow, and a feathered transparent centre.");
+            });
+        if self.profile.den != previous_tuning {
+            self.den_live_dirty = true;
+        }
+        self.flush_live_den_apply();
+    }
+
+    fn flush_live_den_apply(&mut self) {
+        if !self.live_den_apply || !self.den_live_dirty {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.next_den_live_apply {
+            return;
+        }
+        // The runtime polls at a coarser cadence; writing ten complete JSON
+        // profiles per second only stalls the preview and cannot update the Pet
+        // any faster. Keep the control interactive without I/O thrash.
+        self.next_den_live_apply = now + Duration::from_millis(250);
+        match self.save_active_den() {
+            Ok(revision) => {
+                self.den_live_dirty = false;
+                self.status = format!(
+                    "LIVE den revision {revision} saved · desktop Pet updates within 250 ms"
+                );
+            }
+            Err(error) => self.status = format!("LIVE den apply failed: {error}"),
+        }
+    }
+
+    fn voice_controls(&mut self, ui: &mut egui::Ui) {
+        CollapsingHeader::new("Procedural voice calibration")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("Pet Lab audio output");
+                let selected_device = self.audio_output_device.clone();
+                let devices = self.audio_output_devices.clone();
+                egui::ComboBox::from_id_salt("pet_lab_audio_output")
+                    .selected_text(&selected_device)
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for device in devices {
+                            if ui
+                                .selectable_label(device == selected_device, &device)
+                                .clicked()
+                            {
+                                self.pending_audio_output_device = Some(device);
+                            }
+                        }
+                    });
+                ui.small("Session only: this output is never written to the Pet profile or genome.");
+                ui.separator();
+                ui.small("These trims are applied after emotional prosody. The genome voice identity and maximum_loudness remain authoritative.");
+                let tuning = &mut self.profile.voice;
+                ui.add(Slider::new(&mut tuning.pitch_multiplier, 0.75..=1.30).text("Pitch"));
+                ui.add(Slider::new(&mut tuning.formant_multiplier, 0.94..=1.06).text("Body / formant size"));
+                ui.add(Slider::new(&mut tuning.tempo_multiplier, 0.65..=1.35).text("Phrase speed"));
+                ui.add(Slider::new(&mut tuning.loudness_multiplier, 0.30..=1.25).text("Relative loudness"));
+                ui.add(Slider::new(&mut tuning.attack_multiplier, 0.72..=1.28).text("Attack softness"));
+                ui.add(Slider::new(&mut tuning.release_multiplier, 0.75..=1.40).text("Physical release / tail"));
+                ui.add(Slider::new(&mut tuning.breathiness_delta, -0.35..=0.35).text("Breathiness"));
+                ui.add(Slider::new(&mut tuning.roughness_delta, -0.35..=0.35).text("Roughness"));
+                ui.add(Slider::new(&mut tuning.brightness_delta, -0.35..=0.35).text("Brightness"));
+                ui.horizontal(|ui| {
+                    if ui.button("Reset embodied voice").clicked() {
+                        *tuning = Default::default();
+                    }
+                    if ui.button("Long soft tail").clicked() {
+                        tuning.attack_multiplier = 1.10;
+                        tuning.release_multiplier = 1.34;
+                        tuning.tempo_multiplier = 0.90;
+                        tuning.breathiness_delta = 0.06;
+                    }
+                });
+                ui.small("RMS/peak above come from the real callback, not an estimated envelope.");
+            });
+    }
+
+    fn nervous_controls(&mut self, ui: &mut egui::Ui) {
+        CollapsingHeader::new("Stimulus rig · immediate A/B test")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("Turn on any stimulus to drive the preview immediately. Multiple stimuli may be combined; Pulse makes the response breathe so a frozen visual cannot hide it.");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.nervous_stimulus.enabled, "Stimulate");
+                    ui.checkbox(&mut self.nervous_stimulus.pulse, "Pulse");
+                });
+                ui.add(
+                    Slider::new(&mut self.nervous_stimulus.intensity, 0.0..=1.0)
+                        .text("Stimulus intensity"),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.nervous_stimulus.threat, "Threat");
+                    ui.checkbox(&mut self.nervous_stimulus.pain, "Pain");
+                    ui.checkbox(&mut self.nervous_stimulus.restraint, "Restraint");
+                    ui.checkbox(&mut self.nervous_stimulus.startle, "Startle");
+                    ui.checkbox(&mut self.nervous_stimulus.fatigue, "Fatigue");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.nervous_stimulus.contact, "Warm contact");
+                    ui.checkbox(&mut self.nervous_stimulus.safety, "Safety");
+                    ui.checkbox(&mut self.nervous_stimulus.relief, "Relief");
+                    ui.checkbox(&mut self.nervous_stimulus.novelty, "Novelty");
+                    ui.checkbox(&mut self.nervous_stimulus.play, "Play");
+                    ui.checkbox(&mut self.nervous_stimulus.agency_success, "Agency success");
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Clear all").clicked() {
+                        let enabled = self.nervous_stimulus.enabled;
+                        let pulse = self.nervous_stimulus.pulse;
+                        let intensity = self.nervous_stimulus.intensity;
+                        self.nervous_stimulus = NervousStimulusRig {
+                            enabled,
+                            pulse,
+                            intensity,
+                            ..NervousStimulusRig::default()
+                        };
+                        self.nervous_stimulus.novelty = false;
+                    }
+                    if ui.button("Threat test").clicked() {
+                        self.nervous_stimulus = NervousStimulusRig {
+                            threat: true,
+                            startle: true,
+                            ..NervousStimulusRig::default()
+                        };
+                        self.nervous_stimulus.novelty = false;
+                    }
+                    if ui.button("Safe contact test").clicked() {
+                        self.nervous_stimulus = NervousStimulusRig {
+                            contact: true,
+                            safety: true,
+                            agency_success: true,
+                            ..NervousStimulusRig::default()
+                        };
+                        self.nervous_stimulus.novelty = false;
+                    }
+                });
+                let now = ui.input(|input| input.time as f32);
+                let levels = self
+                    .nervous_stimulus
+                    .levels(self.profile.nervous, now);
+                ui.separator();
+                ui.label("Weighted felt-state inputs");
+                stimulus_meter(ui, "threat", levels.threat.max(levels.startle));
+                stimulus_meter(ui, "pain / restraint", levels.pain.max(levels.restraint));
+                stimulus_meter(ui, "contact / safety", levels.contact.max(levels.safety));
+                stimulus_meter(ui, "novelty / play", levels.novelty.max(levels.play));
+                stimulus_meter(ui, "fatigue", levels.fatigue);
+                stimulus_meter(ui, "agency / relief", levels.agency.max(levels.relief));
+                ui.small("The body preview is the output monitor: silhouette, parcel motion, dynamic parcel separation, glow/flow, face, approach/recoil, breathing and voice all receive the same packet.");
+            });
+
+        CollapsingHeader::new("Input sensitivity")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("Sensitivity changes how strongly evidence enters the Lab stimulus chain. 1.0 is neutral; 0 disables that channel.");
+                let tuning = &mut self.profile.nervous;
+                ui.add(Slider::new(&mut tuning.threat_sensitivity, 0.0..=3.0).text("Threat sensitivity"));
+                ui.add(Slider::new(&mut tuning.pain_sensitivity, 0.0..=3.0).text("Pain sensitivity"));
+                ui.add(Slider::new(&mut tuning.contact_sensitivity, 0.0..=3.0).text("Contact sensitivity"));
+                ui.add(Slider::new(&mut tuning.safety_sensitivity, 0.0..=3.0).text("Safety / relief sensitivity"));
+                ui.add(Slider::new(&mut tuning.restraint_sensitivity, 0.0..=3.0).text("Restraint sensitivity"));
+                ui.add(Slider::new(&mut tuning.fatigue_sensitivity, 0.0..=3.0).text("Fatigue sensitivity"));
+                ui.add(Slider::new(&mut tuning.novelty_sensitivity, 0.0..=3.0).text("Novelty / play sensitivity"));
+                ui.add(Slider::new(&mut tuning.startle_sensitivity, 0.0..=3.0).text("Startle sensitivity"));
+                ui.add(Slider::new(&mut tuning.agency_sensitivity, 0.0..=3.0).text("Agency sensitivity"));
+            });
+
+        CollapsingHeader::new("Nervous → body response gains")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("The 36 closed loops already run. These bounded gains make each physical output legible without changing particle_count, fixed_hz, solver iterations, identity, or learning rate.");
+                let tuning = &mut self.profile.nervous;
+                ui.label("Body / metaballs");
+                ui.add(Slider::new(&mut tuning.shape_gain, 0.0..=3.0).text("Silhouette / apparent scale"));
+                ui.add(Slider::new(&mut tuning.breathing_gain, 0.0..=3.0).text("Breathing amplitude + rate"));
+                ui.add(Slider::new(&mut tuning.particle_motion_gain, 0.0..=3.0).text("Metaball motion / slosh / lag"));
+                ui.add(Slider::new(&mut tuning.particle_spacing_response_gain, 0.0..=3.0).text("Dynamic metaball separation"));
+                ui.add(Slider::new(&mut tuning.viscosity_response_gain, 0.0..=3.0).text("Viscosity response"));
+                ui.add(Slider::new(&mut tuning.cohesion_response_gain, 0.0..=3.0).text("Cohesion response"));
+                ui.add(Slider::new(&mut tuning.recovery_response_gain, 0.0..=3.0).text("Shape recovery / upright"));
+                ui.small("Dynamic separation uses bounded density compliance. Structural rest spacing remains authored and is never emotion-coupled.");
+                ui.separator();
+                ui.label("Material / expression / action");
+                ui.add(Slider::new(&mut tuning.material_gain, 0.0..=3.0).text("Material hue / emission"));
+                ui.add(Slider::new(&mut tuning.soul_glow_gain, 0.0..=3.0).text("Soul glow strength + pulse"));
+                ui.add(Slider::new(&mut tuning.internal_flow_gain, 0.0..=3.0).text("Internal flow speed + strength"));
+                ui.add(Slider::new(&mut tuning.pulse_gain, 0.0..=3.0).text("Metabolic pulse"));
+                ui.add(Slider::new(&mut tuning.expression_gain, 0.0..=2.5).text("Face expression"));
+                ui.add(Slider::new(&mut tuning.motion_gain, 0.0..=2.5).text("Approach / recoil / gesture"));
+                ui.add(Slider::new(&mut tuning.voice_gain, 0.0..=2.5).text("Emotional prosody"));
+                ui.horizontal(|ui| {
+                    if ui.button("Readable").clicked() {
+                        *tuning = Default::default();
+                    }
+                    if ui.button("Subtle").clicked() {
+                        tuning.shape_gain = 1.0;
+                        tuning.breathing_gain = 1.0;
+                        tuning.particle_motion_gain = 1.0;
+                        tuning.particle_spacing_response_gain = 1.0;
+                        tuning.viscosity_response_gain = 1.0;
+                        tuning.cohesion_response_gain = 1.0;
+                        tuning.recovery_response_gain = 1.0;
+                        tuning.material_gain = 1.0;
+                        tuning.soul_glow_gain = 1.0;
+                        tuning.internal_flow_gain = 1.0;
+                        tuning.pulse_gain = 1.0;
+                        tuning.expression_gain = 1.0;
+                        tuning.motion_gain = 1.0;
+                        tuning.voice_gain = 1.0;
+                    }
+                    if ui.button("Diagnostic preview").clicked() {
+                        tuning.shape_gain = 2.8;
+                        tuning.breathing_gain = 2.6;
+                        tuning.particle_motion_gain = 2.5;
+                        tuning.particle_spacing_response_gain = 2.5;
+                        tuning.viscosity_response_gain = 2.2;
+                        tuning.cohesion_response_gain = 2.2;
+                        tuning.recovery_response_gain = 2.4;
+                        tuning.material_gain = 2.8;
+                        tuning.soul_glow_gain = 2.6;
+                        tuning.internal_flow_gain = 2.6;
+                        tuning.pulse_gain = 2.5;
+                        tuning.expression_gain = 2.1;
+                        tuning.motion_gain = 2.0;
+                        tuning.voice_gain = 1.8;
+                    }
+                });
+                ui.small("Diagnostic preview stays fully visible in Lab. The desktop Pet applies live-safe caps to continuous motion, startle, fatigue and face gain, so background evidence cannot become permanent flight or closed eyes.");
+                ui.separator();
+                ui.label("Visible outputs");
+                ui.small("• silhouette/scale and area-preserving breath\n• metaball motion and dynamic separation, viscosity, cohesion, stretch, recovery and slosh\n• soul/rim hue, metabolic pulse, flow, droplets and opacity\n• gaze, pupils, brows, mouth, asymmetry and fatigue\n• approach/avoid/recoil/lean and voice prosody");
+                ui.colored_label(
+                    egui::Color32::from_rgb(126, 209, 255),
+                    "Base body pigment stays authored black; mood changes the soul/rim glow.",
+                );
+                ui.small("Press F12 for live FeltStateV1, 22 emotional readouts, fast_actuation, reason traces, actual BodyFeedbackV2 and efference-copy error.");
+            });
     }
 
     fn body_communication_controls(&mut self, ui: &mut egui::Ui) {
@@ -5961,6 +6846,37 @@ impl LabUi {
         Ok(self.profile.profile_revision)
     }
 
+    fn save_active_den(&mut self) -> Result<u64, String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "Pet data directory is unavailable".to_owned())?;
+        let active = store
+            .load_liquid_tuning::<LiquidTuningProfile>()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "active Pet profile is unavailable".to_owned())?;
+        let profile =
+            merge_live_den_profile(active, self.profile.den, self.profile.profile_revision)?;
+        store
+            .save_liquid_tuning(&profile)
+            .map_err(|error| error.to_string())?;
+        let saved = store
+            .load_liquid_tuning::<LiquidTuningProfile>()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "saved profile could not be reread".to_owned())?;
+        if saved.profile_revision != profile.profile_revision
+            || saved.schema_version != profile.schema_version
+            || saved.den != profile.den
+        {
+            return Err("saved den profile verification mismatch".to_owned());
+        }
+        self.profile.profile_revision = profile.profile_revision;
+        self.profile.schema_version = profile.schema_version;
+        self.pending_revision = Some(profile.profile_revision);
+        self.next_ack_poll = Instant::now();
+        Ok(profile.profile_revision)
+    }
+
     fn poll_pet_acknowledgement(&mut self) {
         let Some(expected_revision) = self.pending_revision else {
             return;
@@ -6552,6 +7468,19 @@ fn save_profile_file(path: &Path, profile: &LiquidTuningProfile) -> Result<(), S
     Ok(())
 }
 
+fn merge_live_den_profile(
+    mut active: LiquidTuningProfile,
+    den: DenVisualTuning,
+    source_revision: u64,
+) -> Result<LiquidTuningProfile, String> {
+    active.den = den;
+    active.profile_revision = active
+        .profile_revision
+        .max(source_revision)
+        .saturating_add(1);
+    active.sanitized().map_err(|error| error.to_string())
+}
+
 fn load_profile_file(path: &Path) -> Result<LiquidTuningProfile, String> {
     let reader = BufReader::new(File::open(path).map_err(|error| error.to_string())?);
     let profile: LiquidTuningProfile =
@@ -6604,6 +7533,17 @@ fn scenario_name(scenario: PreviewScenario) -> &'static str {
         PreviewScenario::DetachAndRemerge => "Detach / re-merge",
         PreviewScenario::WindowPressure => "Window pressure",
     }
+}
+
+fn stimulus_meter(ui: &mut egui::Ui, label: &str, value: f32) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label:>18}"));
+        ui.add(
+            egui::ProgressBar::new(value.clamp(0.0, 1.0))
+                .desired_width(150.0)
+                .show_percentage(),
+        );
+    });
 }
 
 fn all_preview_emotions() -> [Option<EmotionKind>; 12] {
@@ -6686,6 +7626,33 @@ fn preview_seeded_unit(mut value: u64) -> f32 {
 mod tests {
     use super::*;
     use lifecore::LifeCore;
+
+    #[test]
+    fn lab_runtime_keeps_large_simulation_state_off_the_event_loop_stack() {
+        assert!(std::mem::size_of::<LabRuntime>() < 32 * 1_024);
+        assert!(std::mem::size_of::<ProceduralBody>() > 64 * 1_024);
+    }
+
+    #[test]
+    fn live_den_merge_cannot_replace_the_active_character_profile() {
+        let mut active = LiquidTuningProfile::for_seed(42);
+        active.name = "current production character".to_owned();
+        active.profile_revision = 12;
+        active.pbf.viscosity = 0.015;
+        active.material.opacity = 0.60;
+        active.nervous.shape_gain = 2.50;
+        let mut den = active.den;
+        den.noise_band_width = 2.0;
+
+        let merged = merge_live_den_profile(active.clone(), den, 20).unwrap();
+
+        assert_eq!(merged.profile_revision, 21);
+        assert_eq!(merged.den, den);
+        assert_eq!(merged.name, active.name);
+        assert_eq!(merged.pbf, active.pbf);
+        assert_eq!(merged.material, active.material);
+        assert_eq!(merged.nervous, active.nervous);
+    }
 
     fn write_test_promotion_bundle(root: &Path, seed: u64) -> (StateStore, u64) {
         let store = StateStore::at(root);

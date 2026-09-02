@@ -1,6 +1,6 @@
-# PET-2 Liquid Body Lab
+# PET-2 Pet Lab
 
-Run the liquid editor with:
+Run the unified body, den/home, voice/sounds, and nervous-system editor with:
 
 ```powershell
 cargo run -p body_lab
@@ -13,7 +13,14 @@ cargo run -p pet2 -- --dev-mode
 cargo run -p body_lab -- --live-pet
 ```
 
-`F12` switches the same window between Liquid Body Lab and Live Brain without
+The four top tabs edit one versioned profile. The Den/Home tab renders the exact
+production shader over a reference desktop background, Voice/Sounds uses the
+production audio path, and Nervous -> Body exposes perceptual gain calibration
+for shape, PBF material, expression, motion, and voice. These gains amplify only
+bounded runtime phenotype outputs: solver counts, topology limits, identity
+pigment, learning rates, seeds, and the genome loudness ceiling remain locked.
+
+`F12` switches the same window between Pet Lab and Live Nervous System without
 discarding either view's state. In Live Brain, `Space` plays or pauses the
 captured timeline, the left/right arrows step frames, and the slider and speed
 buttons scrub the bounded history. Replay changes only what the monitor shows;
@@ -80,6 +87,9 @@ after release.
 `Save JSON` and `Load JSON` work with an arbitrary profile path. `Apply selected
 mode to running Pet` validates and atomically writes the shared
 `liquid-tuning.json`; a running Pet hot-reloads the last valid profile within 250 ms.
+The Den / home panel additionally has a `LIVE` toggle. While enabled, changed den
+sliders are debounced to 10 writes per second and applied to the same running Pet
+without rebuilding; unchanged body, voice, physics, and storage settings are kept.
 Each apply increments the profile revision, rereads the atomic save, and reports
 `Saved`, `Waiting for Pet`, or `Applied by Pet` from the Pet acknowledgement file.
 Startup and hot reload share the same migrate/sanitize/apply path. The lab does not

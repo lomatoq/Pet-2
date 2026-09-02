@@ -23,7 +23,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $dist 'config/embodiment') 
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'licenses') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'voice-lab') | Out-Null
 Copy-Item -Force (Join-Path $workspace "target/$Target/release/pet2.exe") (Join-Path $dist 'Pet2.exe')
-Copy-Item -Force (Join-Path $workspace "target/$Target/release/body_lab.exe") (Join-Path $dist 'BodyLab.exe')
+Copy-Item -Force (Join-Path $workspace "target/$Target/release/body_lab.exe") (Join-Path $dist 'PetLab.exe')
 Copy-Item -Force (Join-Path $workspace "target/$Target/release/voice_lab.exe") (Join-Path $dist 'VoiceLab.exe')
 Copy-Item -Force (Join-Path $workspace 'README.md') (Join-Path $dist 'README.txt')
 Copy-Item -Force (Join-Path $workspace 'PET2_ORGANIC_VOICE_IMPLEMENTATION.md') (Join-Path $dist 'ORGANIC_VOICE.md')
@@ -34,6 +34,6 @@ Copy-Item -Force (Join-Path $workspace 'config/embodiment/active-liquid-profile-
 Copy-Item -Force (Join-Path $workspace 'config/embodiment/brain-body-parameter-catalog.json') (Join-Path $dist 'config/embodiment/brain-body-parameter-catalog.json')
 Copy-Item -Force (Join-Path $workspace 'config/embodiment/brain-body-coupling-proposal.json') (Join-Path $dist 'config/embodiment/brain-body-coupling-proposal.json')
 Copy-Item -Force (Join-Path $voiceLabOutput '*') (Join-Path $dist 'voice-lab')
-Set-Content -Encoding ascii -Path (Join-Path $dist 'Pet2-Dev.cmd') -Value @('@echo off', 'start "" "%~dp0Pet2.exe" --dev-mode', 'start "" "%~dp0BodyLab.exe" --live-pet')
+Set-Content -Encoding ascii -Path (Join-Path $dist 'Pet2-Dev.cmd') -Value @('@echo off', 'start "" "%~dp0Pet2.exe" --dev-mode', 'start "" "%~dp0PetLab.exe"')
 Compress-Archive -Force -Path (Join-Path $dist '*') -DestinationPath $archive
 Write-Output $archive

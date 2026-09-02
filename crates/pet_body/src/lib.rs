@@ -21,7 +21,7 @@ pub use animation::{AnimationRuntime, JointState};
 pub use droplets::{
     DropletLifecycle, DropletMotion, DropletRenderState, DropletRuntime, DropletState, MAX_DROPLETS,
 };
-pub use ecology_render::EcologyRenderer;
+pub use ecology_render::{EcologyCaptureExclusion, EcologyRenderer};
 pub use embodiment::{EmbodiedPose, EmbodiedRuntime, GazeMode, VoiceVisualState};
 pub use expression::ExpressionRuntime;
 pub use graph::{BodyGraph, BodyNode, BodyPart};
@@ -43,10 +43,11 @@ pub use renderer::{
     RendererCaptureError, RendererError, ReviewBackground,
 };
 pub use tuning::{
-    AnalyticTuning, BodyRenderMode, ColorSourceMode, CompositorTuning, DropletTuning, FaceTuning,
-    InteractionTuning, LIQUID_TUNING_SCHEMA_VERSION, LiquidTuningAcknowledgement,
-    LiquidTuningProfile, MaterialTuning, MaterialVariant, PbfTuning, TopologyConstraintMode,
-    TuningProfileError,
+    AnalyticTuning, BodyRenderMode, ColorSourceMode, CompositorTuning, DenVisualTuning,
+    DropletTuning, FaceTuning, InteractionTuning, LIQUID_TUNING_SCHEMA_VERSION,
+    LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialTuning, MaterialVariant,
+    NervousReadabilityTuning, PbfTuning, TopologyConstraintMode, TuningProfileError,
+    VoicePresentationTuning,
 };
 pub use visual_traits::DerivedVisualTraits;
 
@@ -1004,9 +1005,11 @@ impl ProceduralBody {
             material_edge_light_width: material.edge_light_width,
             material_caustic_strength: material.caustic_strength,
             material_caustic_scale: material.caustic_scale,
-            material_caustic_speed: (material.caustic_speed
-                * fast.material.caustic_speed_multiplier)
-                .clamp(0.0, 4.0),
+            // The dispersive caustic is an authored material pattern, not an
+            // affect display. Nervous-system arousal/novelty may modulate the
+            // organic flow channels, but must not retime this pattern: changing
+            // its phase velocity reads as temporal flicker.
+            material_caustic_speed: material.caustic_speed.clamp(0.0, 4.0),
             material_caustic_dispersion: material.caustic_dispersion,
             material_rounded_highlight_strength: material.rounded_highlight_strength,
             material_highlight_tint: material.highlight_tint,
@@ -1363,6 +1366,7 @@ mod tests {
         fast.analytic.modal_amplitude_multiplier = 1.32;
         fast.material.emission_multiplier = 1.35;
         fast.material.hue_shift_turns = 0.02;
+        fast.material.caustic_speed_multiplier = 1.8;
         fast.visual_physiology.pulse_amplitude = 0.9;
         fast.visual_physiology.droplet_energy = 0.85;
         fast.apparent_scale = 1.04;
@@ -1383,6 +1387,10 @@ mod tests {
         assert_eq!(effective.secondary_hsv, baseline.secondary_hsv);
         assert_ne!(effective.glow_hsv, baseline.glow_hsv);
         assert!(effective.pulse > baseline.pulse);
+        assert_eq!(
+            effective.material_caustic_speed,
+            baseline.material_caustic_speed
+        );
         assert_eq!(body.embodiment.physiology.pose.droplet_energy, 0.85);
         assert_eq!(
             (

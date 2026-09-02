@@ -51,9 +51,9 @@ use pet_audio::{
     global_body_voice_bridge,
 };
 use pet_body::{
-    BodyMaterialSnapshot, BodyRenderMode, ColorSourceMode, EcologyRenderer,
-    LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant, ProceduralBody,
-    RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
+    BodyMaterialSnapshot, BodyRenderMode, ColorSourceMode, EcologyCaptureExclusion,
+    EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant,
+    ProceduralBody, RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
 #[cfg(not(feature = "legacy-expression-fallback"))]
 use pet_ecology::ObjectLifecycle;
@@ -107,6 +107,14 @@ const PRODUCTION_RENDER_SCALE: u32 = 1;
 const DEBUG_LOG_INTERVAL: f32 = 1.0;
 const DEV_MODE_LOG_INTERVAL: f32 = 0.20;
 const LAB_CONTROL_POLL_INTERVAL_SECONDS: f32 = 0.10;
+// DXGI desktop duplication can hand us a stale/empty first frame while DWM is
+// still committing the just-created transparent overlay. Debug startup logging
+// used to hide that race by accident. Let the overlay present a few frames,
+// then keep it excluded from capture while several clean desktop frames
+// converge before enabling ordinary live capture around the den.
+const BACKGROUND_CAPTURE_WARMUP_PRESENTS: u64 = 3;
+const BACKGROUND_CLEAN_SEED_FRAMES: u8 = 6;
+const BACKGROUND_CAPTURE_FALLBACK_SECONDS: f64 = 0.75;
 const CAUSAL_TELEMETRY_SCHEMA_VERSION: u32 = 4;
 const TELEMETRY_RECENT_MEMORY_LIMIT: usize = 16;
 const TELEMETRY_EPISODE_MEMORY_LIMIT: usize = 16;
@@ -1585,6 +1593,8 @@ struct PetRuntime {
     background_capture_microseconds: f64,
     background_capture_timestamp: f64,
     background_capture_sequence: u64,
+    background_clean_seed_frames: u8,
+    background_capture_affinity_released: bool,
     background_luminance: f32,
     background_contrast: f32,
     expression_director: ExpressionDirector,
@@ -2168,24 +2178,98 @@ impl PetApplication {
         // The ecology shader uses it locally for the den lens; captured pixels
         // remain process-local and are never persisted or added to telemetry.
         let background_started = Instant::now();
-        if let Some(frame) = runtime.platform.capture_overlay_background(&runtime.window)
-            && runtime.ecology_renderer.update_background(
-                runtime.renderer.device(),
-                runtime.renderer.queue(),
-                frame.width,
-                frame.height,
-                frame.bytes_per_row,
-                &frame.bgra8,
-            )
+        if background_capture_is_armed(runtime.presented_pose.frame_count)
+            && let Some(frame) = runtime.platform.capture_overlay_background(&runtime.window)
         {
-            runtime.background_capture_timestamp = runtime.normalizer.monotonic_seconds();
-            runtime.background_capture_sequence = frame.sequence;
-            runtime.background_luminance = frame.mean_luminance;
-            runtime.background_contrast = frame.contrast;
+            let den = &runtime.ecology.state().den;
+            // The visible den, displaced rim and glow fit inside this authored
+            // 210 px diameter at the 1080 px reference height. Retain the last
+            // clean pixels in that region while live capture continues around
+            // it, preventing recursive optical feedback without freezing the
+            // rest of the desktop texture.
+            let exclusion_radius = frame.height as f32
+                * (105.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX)
+                * den.size_scale
+                * den_capture_exclusion_scale(
+                    runtime.body.tuning_profile().den.displacement_radius,
+                );
+            let exclusion_feather =
+                frame.height as f32 * (36.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX);
+            let exclusion =
+                EcologyCaptureExclusion::new(den.anchor, exclusion_radius, exclusion_feather);
+            let seeding_clean_background =
+                background_capture_needs_clean_seed(runtime.background_clean_seed_frames);
+            let background_updated = if seeding_clean_background {
+                // The overlay is still WDA_EXCLUDEFROMCAPTURE here, so the
+                // whole frame is clean. Do not apply the den retention mask
+                // until the history has converged; otherwise one bad startup
+                // sample is frozen under the lens for the entire process.
+                runtime.ecology_renderer.update_background(
+                    runtime.renderer.device(),
+                    runtime.renderer.queue(),
+                    frame.width,
+                    frame.height,
+                    frame.bytes_per_row,
+                    &frame.bgra8,
+                )
+            } else {
+                runtime.ecology_renderer.update_background_excluding(
+                    runtime.renderer.device(),
+                    runtime.renderer.queue(),
+                    frame.width,
+                    frame.height,
+                    frame.bytes_per_row,
+                    &frame.bgra8,
+                    exclusion,
+                )
+            };
+            if background_updated {
+                runtime.background_capture_timestamp = runtime.normalizer.monotonic_seconds();
+                runtime.background_capture_sequence = frame.sequence;
+                runtime.background_luminance = frame.mean_luminance;
+                runtime.background_contrast = frame.contrast;
+                if seeding_clean_background {
+                    runtime.background_clean_seed_frames = runtime
+                        .background_clean_seed_frames
+                        .saturating_add(1)
+                        .min(BACKGROUND_CLEAN_SEED_FRAMES);
+                }
+                if runtime.background_clean_seed_frames >= BACKGROUND_CLEAN_SEED_FRAMES
+                    && !runtime.background_capture_affinity_released
+                    && let Err(error) = runtime
+                        .platform
+                        .set_overlay_capture_excluded(&runtime.window, false)
+                {
+                    eprintln!(
+                        "could not restore overlay desktop-capture visibility after stable den seed: {error}"
+                    );
+                } else if runtime.background_clean_seed_frames >= BACKGROUND_CLEAN_SEED_FRAMES {
+                    runtime.background_capture_affinity_released = true;
+                }
+            }
         }
-        let background_age = (runtime.normalizer.monotonic_seconds()
-            - runtime.background_capture_timestamp)
-            .max(0.0) as f32;
+        let background_now = runtime.normalizer.monotonic_seconds();
+        // Unsupported capture implementations must not leave the overlay
+        // permanently excluded from screenshots. This path is deliberately
+        // slower than the normal multi-frame seed barrier above.
+        if background_now > BACKGROUND_CAPTURE_FALLBACK_SECONDS
+            && runtime.background_clean_seed_frames < BACKGROUND_CLEAN_SEED_FRAMES
+            && !runtime.background_capture_affinity_released
+        {
+            if let Err(error) = runtime
+                .platform
+                .set_overlay_capture_excluded(&runtime.window, false)
+            {
+                eprintln!(
+                    "could not restore overlay desktop-capture visibility after capture fallback: {error}"
+                );
+            } else {
+                runtime.background_capture_affinity_released = true;
+                runtime.background_clean_seed_frames = BACKGROUND_CLEAN_SEED_FRAMES;
+            }
+        }
+        let background_age =
+            (background_now - runtime.background_capture_timestamp).max(0.0) as f32;
         let background_freshness = if runtime.background_capture_sequence == 0 {
             0.0
         } else {
@@ -2218,11 +2302,13 @@ impl PetApplication {
                 .tuning_profile()
                 .interaction
                 .soft_touch_pressure_max;
+            let nervous_calibration = runtime.body.tuning_profile().nervous.for_live_runtime();
             runtime.nervous_system.prepare_cognition_tick(
                 &mut runtime.life,
                 &mut runtime.vita,
                 &mut runtime.morph,
                 soft_touch_pressure_max,
+                nervous_calibration,
                 LIFE_DT,
             );
             // Lab drive pulses are an observational experiment layer, never a
@@ -2346,19 +2432,26 @@ impl PetApplication {
                 runtime.sensors.pet_dragged,
             );
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
-            let phenotype = runtime.nervous_system.resolve_actuation(
+            let mut phenotype = runtime.nervous_system.resolve_actuation(
                 &runtime.life,
                 &runtime.vita,
                 &runtime.morph,
                 vita_interaction,
                 soft_touch_pressure_max,
+                nervous_calibration,
                 LIFE_DT,
             );
+            // The director owns causality and bounded targets. This downstream
+            // calibration only changes perceptual readability around neutral;
+            // it cannot touch identity, solver cadence/counts, learning rates,
+            // topology limits, or the genome loudness ceiling.
+            nervous_calibration.apply(&mut phenotype);
             phenotype.apply_to_intent(
                 &mut output.body_intent,
                 &runtime.sensors,
                 runtime.body.simulation.feedback.world_position,
             );
+            keep_eyes_available_during_active_locomotion(&mut output.body_intent);
             // The nervous action blend can move the semantic target after the
             // ecology projection, so enforce the monitor-union invariant once
             // more at the final intent boundary.
@@ -2666,6 +2759,7 @@ impl PetApplication {
                         "source_frame_id": nervous_snapshot.source_frame_id,
                         "source_episode_id": nervous_snapshot.source_episode_id,
                         "fast_actuation": nervous_actuation,
+                        "readability_calibration": runtime.body.tuning_profile().nervous,
                     },
                     "fusion": serde_json::Value::Null,
                     "intent_pose": format!("{:?}", runtime.intent.pose),
@@ -2994,7 +3088,11 @@ impl ApplicationHandler for PetApplication {
         // remains transparent in the final compositor; only the refracted liquid
         // sees the screen-anchored checker.
         renderer.set_studio_material_backdrop(true);
-        let ecology_renderer = EcologyRenderer::new(renderer.device(), renderer.surface_format());
+        let ecology_renderer = EcologyRenderer::new(
+            renderer.device(),
+            renderer.surface_format(),
+            renderer.premultiplied_output(),
+        );
         // A hidden Win32 composition surface may never become presentable, which would
         // deadlock the old "show after Presented" startup path. At this point the GPU
         // surface, transparent clear color, pipeline, and mesh are all ready, so making
@@ -3072,6 +3170,8 @@ impl ApplicationHandler for PetApplication {
             background_capture_microseconds: 0.0,
             background_capture_timestamp: 0.0,
             background_capture_sequence: 0,
+            background_clean_seed_frames: 0,
+            background_capture_affinity_released: false,
             background_luminance: 0.5,
             background_contrast: 0.0,
             expression_director: ExpressionDirector::default(),
@@ -3332,18 +3432,32 @@ impl ApplicationHandler for PetApplication {
                 let desktop_aspect = bounds.width().max(1) as f32 / bounds.height().max(1) as f32;
                 let ecology_state = runtime.ecology.state();
                 let ecology_renderer = &mut runtime.ecology_renderer;
+                ecology_renderer.set_den_tuning(runtime.body.tuning_profile().den);
                 let ecology_time = runtime.normalizer.monotonic_seconds() as f32;
-                let render_outcome = runtime.renderer.render_with_overlay(
+                ecology_renderer.prepare(
+                    runtime.renderer.queue(),
+                    ecology_state,
+                    desktop_aspect,
+                    ecology_time,
+                );
+                let ecology_renderer: &EcologyRenderer = ecology_renderer;
+                // The first asynchronous screen capture is the clean history
+                // seed. Do not draw the den into that seed; unsupported capture
+                // platforms fall back after a short bounded startup delay.
+                let ecology_ready = runtime.background_clean_seed_frames
+                    >= BACKGROUND_CLEAN_SEED_FRAMES
+                    || runtime.normalizer.monotonic_seconds() > BACKGROUND_CAPTURE_FALLBACK_SECONDS;
+                let render_outcome = runtime.renderer.render_with_layers(
                     parameters,
-                    |_device, queue, encoder, view| {
-                        ecology_renderer.render(
-                            queue,
-                            encoder,
-                            view,
-                            ecology_state,
-                            desktop_aspect,
-                            ecology_time,
-                        );
+                    |_device, _queue, encoder, view| {
+                        if ecology_ready {
+                            ecology_renderer.render_prepared_den(encoder, view);
+                        }
+                    },
+                    |_device, _queue, encoder, view| {
+                        if ecology_ready {
+                            ecology_renderer.render_prepared_objects(encoder, view);
+                        }
                     },
                 );
                 runtime.render_microseconds = render_started.elapsed().as_secs_f64() * 1_000_000.0;
@@ -4594,6 +4708,20 @@ fn preserve_navigation_during_material_drag(
     next.facing_direction = previous.facing_direction;
 }
 
+fn keep_eyes_available_during_active_locomotion(intent: &mut BodyIntent) {
+    if matches!(
+        intent.locomotion,
+        LocomotionMode::Sleep | LocomotionMode::Cocoon
+    ) {
+        return;
+    }
+    // Persistent lid aperture and squint describe state; blink_left/right are
+    // the natural transient closure channel and remain untouched. A moving
+    // organism therefore stays visually attentive without losing blinks.
+    intent.expression.eye_aperture = intent.expression.eye_aperture.max(0.42);
+    intent.expression.squint = intent.expression.squint.min(0.68);
+}
+
 fn request_ecology_voice(
     runtime: &mut PetRuntime,
     trigger: EcologyVocalTrigger,
@@ -4619,6 +4747,11 @@ fn enqueue_vocal_candidate(runtime: &mut PetRuntime, mut request: lifecore::Voca
     runtime
         .nervous_system
         .actuation()
+        .voice
+        .apply_to_request(&mut request, &voice);
+    runtime
+        .body
+        .tuning_profile()
         .voice
         .apply_to_request(&mut request, &voice);
     let request_id = request.performance_seed;
@@ -4843,6 +4976,24 @@ fn load_migrate_apply_liquid_tuning(
     Ok(Some(applied))
 }
 
+fn den_capture_exclusion_scale(displacement_radius: f32) -> f32 {
+    if !displacement_radius.is_finite() {
+        return 1.0;
+    }
+    // WGSL fades the den at 1.055 × the authored displacement radius. Match
+    // that support in the clean desktop history so expanding past 1.0 never
+    // exposes recursive overlay pixels at the new circular edge.
+    (displacement_radius.clamp(0.45, 1.30) * 1.055).max(1.0)
+}
+
+fn background_capture_is_armed(presented_frames: u64) -> bool {
+    presented_frames >= BACKGROUND_CAPTURE_WARMUP_PRESENTS
+}
+
+fn background_capture_needs_clean_seed(clean_seed_frames: u8) -> bool {
+    clean_seed_frames < BACKGROUND_CLEAN_SEED_FRAMES
+}
+
 fn load_restore_body_state(store: &StateStore, body: &mut ProceduralBody) -> Result<bool, String> {
     let identity_seed = body.tuning_profile().seed;
     let tuning_schema = body.tuning_profile().schema_version;
@@ -4995,6 +5146,38 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.compositor.shadow_opacity = 0.31;
     profile.compositor.shadow_color = [1.0, 1.0, 1.0];
     profile.compositor.exposure = 1.0;
+
+    // Keep the user-approved den optics as the production fallback. The live
+    // AppData profile still wins when present, while a clean install now opens
+    // with the same broad inward noise, refraction, and restrained orb response.
+    profile.den.noise_size = 5.0;
+    profile.den.noise_strength = 0.57;
+    profile.den.inward_speed = 1.0;
+    profile.den.ripple_inward_speed = 0.71;
+    profile.den.noise_detail_scale = 2.0;
+    profile.den.noise_detail_mix = 0.65;
+    profile.den.noise_warp = 0.81;
+    profile.den.noise_band_width = 15.0;
+    profile.den.ripple_strength = 1.5;
+    profile.den.ripple_opacity = 1.0;
+    profile.den.displacement_strength = 1.9;
+    profile.den.displacement_blur = 0.085;
+    profile.den.displacement_noise_mix = 0.7;
+    profile.den.displacement_radius = 1.15;
+    profile.den.refraction_strength = 1.5;
+    profile.den.refraction_opacity = 1.5;
+    profile.den.dispersion_strength = 1.5;
+    profile.den.tint_strength = 2.0;
+    profile.den.caustic_strength = 1.8;
+    profile.den.glow_strength = 1.0;
+    profile.den.particle_brightness = 2.0;
+    profile.den.particle_count = 22;
+    profile.den.center_mask_radius = 0.72;
+    profile.den.center_mask_feather = 0.56;
+    profile.den.center_mask_opacity = 0.66;
+    profile.den.orb_speedup_fraction = 0.5;
+    profile.den.orb_attack_seconds = 3.0;
+    profile.den.orb_release_seconds = 5.0;
     profile
 }
 
@@ -6057,6 +6240,30 @@ mod tests {
     }
 
     #[test]
+    fn active_locomotion_cannot_keep_both_eyes_persistently_closed() {
+        let mut flying = neutral_intent();
+        flying.expression.eye_aperture = 0.0;
+        flying.expression.squint = 1.0;
+        flying.expression.blink_left = 0.35;
+        flying.expression.blink_right = 0.65;
+
+        keep_eyes_available_during_active_locomotion(&mut flying);
+
+        assert_eq!(flying.expression.eye_aperture, 0.42);
+        assert_eq!(flying.expression.squint, 0.68);
+        assert_eq!(flying.expression.blink_left, 0.35);
+        assert_eq!(flying.expression.blink_right, 0.65);
+
+        let mut sleeping = neutral_intent();
+        sleeping.locomotion = LocomotionMode::Sleep;
+        sleeping.expression.eye_aperture = 0.0;
+        sleeping.expression.squint = 1.0;
+        keep_eyes_available_during_active_locomotion(&mut sleeping);
+        assert_eq!(sleeping.expression.eye_aperture, 0.0);
+        assert_eq!(sleeping.expression.squint, 1.0);
+    }
+
+    #[test]
     fn presented_pose_monitor_detects_a_to_b_to_a_flash() {
         let mut monitor = PresentedPoseMonitor::default();
         for center in [
@@ -6392,5 +6599,34 @@ mod tests {
                 .unwrap(),
             applied
         );
+    }
+
+    #[test]
+    fn den_capture_support_tracks_displacement_beyond_one() {
+        assert_eq!(den_capture_exclusion_scale(0.80), 1.0);
+        assert!((den_capture_exclusion_scale(1.0) - 1.055).abs() < 1.0e-6);
+        assert!((den_capture_exclusion_scale(1.30) - 1.3715).abs() < 1.0e-6);
+        assert_eq!(den_capture_exclusion_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn background_capture_waits_for_presented_dwm_frames() {
+        assert!(!background_capture_is_armed(
+            BACKGROUND_CAPTURE_WARMUP_PRESENTS - 1
+        ));
+        assert!(background_capture_is_armed(
+            BACKGROUND_CAPTURE_WARMUP_PRESENTS
+        ));
+    }
+
+    #[test]
+    fn background_capture_keeps_full_clean_seed_until_threshold() {
+        assert!(background_capture_needs_clean_seed(0));
+        assert!(background_capture_needs_clean_seed(
+            BACKGROUND_CLEAN_SEED_FRAMES - 1
+        ));
+        assert!(!background_capture_needs_clean_seed(
+            BACKGROUND_CLEAN_SEED_FRAMES
+        ));
     }
 }

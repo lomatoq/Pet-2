@@ -13,7 +13,7 @@ use lifecore::{
 };
 use morph_brain::{MorphBrain, nervous_system_frame};
 use pet_audio::{AudioCallbackLevels, AudioVisualFeedback};
-use pet_body::ProceduralBody;
+use pet_body::{NervousReadabilityTuning, ProceduralBody};
 
 use crate::vita_runtime::VitaRuntime;
 
@@ -201,9 +201,10 @@ impl NervousSystemRuntime {
         vita: &mut VitaRuntime,
         morph: &mut MorphBrain,
         soft_touch_pressure_max: f32,
+        calibration: NervousReadabilityTuning,
         dt: f32,
     ) {
-        let source = self.source(life, vita, morph, soft_touch_pressure_max);
+        let source = self.source(life, vita, morph, soft_touch_pressure_max, calibration);
         self.snapshot = self.interoception.tick(&source, dt);
         let mut episode = self.episode;
         episode.user_absent = f32::from(!self.body_feedback.environment.user_present);
@@ -249,9 +250,10 @@ impl NervousSystemRuntime {
         morph: &MorphBrain,
         vita_interaction: InteractionBodyActuation,
         soft_touch_pressure_max: f32,
+        calibration: NervousReadabilityTuning,
         dt: f32,
     ) -> FastPhenotypeActuation {
-        let source = self.source(life, vita, morph, soft_touch_pressure_max);
+        let source = self.source(life, vita, morph, soft_touch_pressure_max, calibration);
         let mut actuation = self.phenotype.tick(&source, self.snapshot, dt);
         merge_interaction(&mut actuation.interaction, vita_interaction);
         self.actuation = actuation.clone();
@@ -279,12 +281,13 @@ impl NervousSystemRuntime {
         vita: &VitaRuntime,
         morph: &MorphBrain,
         soft_touch_pressure_max: f32,
+        calibration: NervousReadabilityTuning,
     ) -> EmbodimentSourceFrame {
         let vita_state = vita.state();
         let self_model = &vita_state.self_model;
         let mut episode = self.episode;
         episode.user_absent = f32::from(!self.body_feedback.environment.user_present);
-        EmbodimentSourceFrame {
+        let mut source = EmbodimentSourceFrame {
             frame_id: self.body_feedback.frame_id,
             affect: life.state.affect,
             drives: life.state.drives,
@@ -309,8 +312,101 @@ impl NervousSystemRuntime {
             episode,
             perception: self.perception,
             soft_touch_pressure_max: soft_touch_pressure_max.clamp(0.03, 0.50),
-        }
+        };
+        apply_input_sensitivity(&mut source, calibration);
+        source
     }
+}
+
+fn apply_input_sensitivity(
+    source: &mut EmbodimentSourceFrame,
+    calibration: NervousReadabilityTuning,
+) {
+    let scaled = |value: f32, gain: f32| (value * gain).clamp(0.0, 1.0);
+    let around_half = |value: f32, gain: f32| (0.5 + (value - 0.5) * gain).clamp(0.0, 1.0);
+
+    source.affect.stress = scaled(source.affect.stress, calibration.threat_sensitivity);
+    source.drives.safety = scaled(source.drives.safety, calibration.threat_sensitivity);
+    source.vita.appraisal.threat =
+        scaled(source.vita.appraisal.threat, calibration.threat_sensitivity);
+    source.episode.reward_negative = scaled(
+        source.episode.reward_negative,
+        calibration.threat_sensitivity,
+    );
+
+    source.body.contact.pressure =
+        scaled(source.body.contact.pressure, calibration.pain_sensitivity);
+    source.body.shape.maximum_strain = scaled(
+        source.body.shape.maximum_strain,
+        calibration.pain_sensitivity,
+    );
+    source.body.shape.neck_tension =
+        scaled(source.body.shape.neck_tension, calibration.pain_sensitivity);
+    source.body.shape.deformation_energy = scaled(
+        source.body.shape.deformation_energy,
+        calibration.pain_sensitivity,
+    );
+
+    source.body.contact.area = scaled(source.body.contact.area, calibration.contact_sensitivity);
+    source.body.contact.tangential_speed = scaled(
+        source.body.contact.tangential_speed,
+        calibration.contact_sensitivity,
+    );
+
+    source.episode.safe_social_exchange = scaled(
+        source.episode.safe_social_exchange,
+        calibration.safety_sensitivity,
+    );
+    source.episode.safe_predictable_episode = scaled(
+        source.episode.safe_predictable_episode,
+        calibration.safety_sensitivity,
+    );
+    source.episode.reward_positive = scaled(
+        source.episode.reward_positive,
+        calibration.safety_sensitivity,
+    );
+
+    source.body.environment.clipped_fraction = scaled(
+        source.body.environment.clipped_fraction,
+        calibration.restraint_sensitivity,
+    );
+    source.body.environment.available_motion_radius = (1.0
+        - (1.0 - source.body.environment.available_motion_radius)
+            * calibration.restraint_sensitivity)
+        .clamp(0.0, 1.0);
+    source.episode.boundary_violation = scaled(
+        source.episode.boundary_violation,
+        calibration.restraint_sensitivity,
+    );
+
+    source.drives.sleep = scaled(source.drives.sleep, calibration.fatigue_sensitivity);
+    source.vita.mood.fatigue = scaled(source.vita.mood.fatigue, calibration.fatigue_sensitivity);
+
+    source.vita.appraisal.novelty = scaled(
+        source.vita.appraisal.novelty,
+        calibration.novelty_sensitivity,
+    );
+    source.gesture.novelty = scaled(source.gesture.novelty, calibration.novelty_sensitivity);
+    source.perception.selected_salience = scaled(
+        source.perception.selected_salience,
+        calibration.novelty_sensitivity,
+    );
+
+    source.body.motion.collision_impulse = scaled(
+        source.body.motion.collision_impulse,
+        calibration.startle_sensitivity,
+    );
+    source.body.environment.cursor_loom_rate = scaled(
+        source.body.environment.cursor_loom_rate,
+        calibration.startle_sensitivity,
+    );
+
+    source.vita.agency = around_half(source.vita.agency, calibration.agency_sensitivity);
+    source.vita.body_schema_confidence = around_half(
+        source.vita.body_schema_confidence,
+        calibration.agency_sensitivity,
+    );
+    source.body.sanitize();
 }
 
 fn merge_interaction(phenotype: &mut InteractionBodyActuation, vita: InteractionBodyActuation) {
@@ -376,5 +472,52 @@ mod tests {
         assert_eq!(runtime.episode.episode_id, 9);
         assert!(runtime.episode.reward_negative > 0.7);
         assert!(runtime.episode.reward_positive <= 0.01);
+    }
+
+    #[test]
+    fn profile_sensitivity_scales_real_source_evidence_and_default_is_no_op() {
+        let life = LifeCore::new(lifecore::Genome::from_seed(17), 19);
+        let vita = VitaRuntime::new(life.state.genome.identity_seed, None);
+        let morph = MorphBrain::new(life.state.genome.identity_seed, None).unwrap();
+        let mut runtime = NervousSystemRuntime::default();
+        runtime.body_feedback.contact.pressure = 0.32;
+        runtime.body_feedback.contact.area = 0.40;
+        runtime.body_feedback.shape.maximum_strain = 0.24;
+        runtime.body_feedback.motion.collision_impulse = 0.30;
+        runtime.body_feedback.environment.cursor_loom_rate = 0.20;
+        runtime.perception.selected_salience = 0.35;
+
+        let neutral = runtime.source(
+            &life,
+            &vita,
+            &morph,
+            0.24,
+            NervousReadabilityTuning::default(),
+        );
+        assert_eq!(neutral.body.contact.pressure, 0.32);
+        assert_eq!(neutral.body.contact.area, 0.40);
+        assert_eq!(neutral.body.shape.maximum_strain, 0.24);
+        assert_eq!(neutral.body.motion.collision_impulse, 0.30);
+        assert_eq!(neutral.perception.selected_salience, 0.35);
+
+        let amplified = runtime.source(
+            &life,
+            &vita,
+            &morph,
+            0.24,
+            NervousReadabilityTuning {
+                pain_sensitivity: 2.0,
+                contact_sensitivity: 1.5,
+                novelty_sensitivity: 2.0,
+                startle_sensitivity: 2.0,
+                ..NervousReadabilityTuning::default()
+            },
+        );
+        assert_eq!(amplified.body.contact.pressure, 0.64);
+        assert_eq!(amplified.body.contact.area, 0.60);
+        assert_eq!(amplified.body.shape.maximum_strain, 0.48);
+        assert_eq!(amplified.body.motion.collision_impulse, 0.60);
+        assert_eq!(amplified.body.environment.cursor_loom_rate, 0.40);
+        assert_eq!(amplified.perception.selected_salience, 0.70);
     }
 }
