@@ -14,10 +14,46 @@ pub struct DesktopBackgroundFrame {
     pub bytes_per_row: u32,
     pub bgra8: Vec<u8>,
     pub physical_rect: RectI,
+    /// The captured rectangle in overlay-local normalized coordinates, encoded
+    /// as `[minimum_x, minimum_y, width, height]`. The den shader uses this to
+    /// map its screen-global UVs into the compact capture texture.
+    pub normalized_region: [f32; 4],
     pub sequence: u64,
     pub timestamp: f64,
     pub mean_luminance: f32,
     pub contrast: f32,
+}
+
+/// A compact overlay-local region requested for desktop-background capture.
+/// Keeping the maximum texture dimension explicit prevents a small optical
+/// effect from uploading a virtual-desktop-sized image every render frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DesktopBackgroundCaptureRegion {
+    pub minimum_normalized: Vec2,
+    pub maximum_normalized: Vec2,
+    pub maximum_output_dimension: u32,
+}
+
+impl DesktopBackgroundCaptureRegion {
+    #[must_use]
+    pub fn new(
+        minimum_normalized: Vec2,
+        maximum_normalized: Vec2,
+        maximum_output_dimension: u32,
+    ) -> Option<Self> {
+        let value = Self {
+            minimum_normalized,
+            maximum_normalized,
+            maximum_output_dimension,
+        };
+        (minimum_normalized.is_finite()
+            && maximum_normalized.is_finite()
+            && minimum_normalized.cmpge(Vec2::ZERO).all()
+            && maximum_normalized.cmple(Vec2::ONE).all()
+            && maximum_normalized.cmpgt(minimum_normalized).all()
+            && maximum_output_dimension > 0)
+            .then_some(value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +85,11 @@ pub trait PlatformBackend {
     ) -> Option<DesktopVisualFrame> {
         None
     }
-    fn capture_overlay_background(&mut self, _window: &Window) -> Option<DesktopBackgroundFrame> {
+    fn capture_overlay_background(
+        &mut self,
+        _window: &Window,
+        _region: DesktopBackgroundCaptureRegion,
+    ) -> Option<DesktopBackgroundFrame> {
         None
     }
     /// Temporarily removes the overlay from OS-level desktop capture. Production

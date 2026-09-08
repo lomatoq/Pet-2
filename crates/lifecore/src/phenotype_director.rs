@@ -268,6 +268,7 @@ const fn default_true() -> bool {
     true
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> FastPhenotypeActuation {
     let d = i.derived;
     let f = i.felt;
@@ -431,8 +432,11 @@ fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> Fast
     expression.pupil_size = (0.42 + 0.34 * d.arousal + 0.12 * d.neural_threat).clamp(0.32, 0.92);
     expression.eye_scale =
         (0.96 + 0.10 * e.interest + 0.08 * f.surprise - 0.08 * d.fatigue).clamp(0.88, 1.18);
-    expression.eye_aperture = (0.72 + 0.18 * f.surprise + 0.12 * e.interest + 0.16 * f.startle
-        - 0.28 * d.fatigue
+    // One is the neutral aperture in the renderer and readability calibration
+    // amplifies deviations around that neutral. A 0.72 base therefore made a
+    // fully awake animal look chronically drowsy even at near-zero fatigue.
+    expression.eye_aperture = (0.94 + 0.18 * f.surprise + 0.12 * e.interest + 0.16 * f.startle
+        - 0.34 * d.fatigue
         - 0.14 * e.sadness)
         .clamp(0.28, 1.0);
     expression.squint = unit(0.15 + 0.42 * f.pain_like + 0.20 * e.protest + 0.12 * d.stress);
@@ -1762,6 +1766,7 @@ fn build_trace(
     records
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record(
     source: &EmbodimentSourceFrame,
     target_path: &str,
@@ -2177,6 +2182,22 @@ mod tests {
         assert!((0.94..=1.05).contains(&output.analytic.body_length_scale));
         assert!((0.70..=1.35).contains(&output.material.emission_multiplier));
         assert!(output.material.hue_shift_turns.abs() <= 0.0222);
+    }
+
+    #[test]
+    fn awake_eyes_are_open_and_fatigue_remains_visibly_distinct() {
+        let s = source();
+        let awake = raw_targets(&s, InteroceptionSnapshot::default());
+        let mut drowsy_state = InteroceptionSnapshot::default();
+        drowsy_state.derived.fatigue = 1.0;
+        let drowsy = raw_targets(&s, drowsy_state);
+
+        assert!(awake.expression.eye_aperture >= 0.90);
+        assert!(drowsy.expression.eye_aperture <= 0.65);
+        assert!(
+            awake.expression.eye_aperture - drowsy.expression.eye_aperture >= 0.30,
+            "awake and drowsy eyelids must remain perceptually separable"
+        );
     }
 
     #[test]

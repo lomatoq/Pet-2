@@ -10,3 +10,6 @@ cpal.workspace = true
 lifecore = { path = "../lifecore" }
 serde.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.54", features = ["implement", "Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem"] }

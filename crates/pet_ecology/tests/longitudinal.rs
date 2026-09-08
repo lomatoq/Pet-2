@@ -2,7 +2,7 @@ use glam::Vec2;
 use lifecore::{ActionId, BodyIntent, ExpressionState, LocomotionMode, PoseIntent};
 use pet_ecology::{
     EcologyBehaviorFrame, EcologyState, EpisodeDirector, EpisodeGoal, METABOLIC_RESERVE_FLOOR,
-    ObjectLifecycle,
+    ObjectLifecycle, PhysicalGrabFrame,
 };
 
 fn intent(position: Vec2) -> BodyIntent {
@@ -25,6 +25,10 @@ fn frame(action: ActionId, position: Vec2, timestamp: f64) -> EcologyBehaviorFra
         pet_position: position,
         pet_velocity: Vec2::ZERO,
         desktop_aspect: 16.0 / 9.0,
+        orb_physical: PhysicalGrabFrame {
+            socket_position: Vec2::splat(0.5),
+            ..PhysicalGrabFrame::default()
+        },
         cursor_position: Vec2::new(0.68, 0.42),
         pointer_down: false,
         user_activity: 0.35,
@@ -93,12 +97,20 @@ fn fixed_seed_seven_day_schedule_change_is_replay_deterministic() {
                 ActionId::SelfPlay
             };
             let timestamp = slot as f64 * 900.0;
-            let _ = director.tick(
-                &mut state,
-                frame(action, position, timestamp),
-                intent(position),
-                0.25,
-            );
+            let orb_position = state.objects[0].position;
+            let mut behavior = frame(action, position, timestamp);
+            // This coarse 15-minute schedule intentionally keeps the pet at one
+            // position. Supply the measured overlap that the real runtime would
+            // publish instead of resurrecting the removed center-distance grab.
+            behavior.orb_physical = PhysicalGrabFrame {
+                contact: true,
+                socket_position: orb_position,
+                body_surface_position: orb_position,
+                normal_world: Vec2::X,
+                penetration_px: 8.0,
+                ..PhysicalGrabFrame::default()
+            };
+            let _ = director.tick(&mut state, behavior, intent(position), 0.25);
             state.metabolism.advance(60.0);
         }
         state

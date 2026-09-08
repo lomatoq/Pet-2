@@ -14,6 +14,7 @@ struct VertexOutput {
     @location(8) den_noise: vec4<f32>,
     @location(9) den_material: vec4<f32>,
     @location(10) den_mask: vec4<f32>,
+    @location(11) background_uv_rect: vec4<f32>,
 }
 
 @group(0) @binding(0) var desktop_background: texture_2d<f32>;
@@ -64,6 +65,7 @@ fn vertex_main(
     @location(6) den_noise: vec4<f32>,
     @location(7) den_material: vec4<f32>,
     @location(8) den_mask: vec4<f32>,
+    @location(9) background_uv_rect: vec4<f32>,
 ) -> VertexOutput {
     var corners = array<vec2<f32>, 6>(
         vec2<f32>(-1.50, -1.50),
@@ -87,6 +89,7 @@ fn vertex_main(
     output.den_noise = den_noise;
     output.den_material = den_material;
     output.den_mask = den_mask;
+    output.background_uv_rect = background_uv_rect;
     return output;
 }
 
@@ -339,28 +342,30 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             * optics.x * optical_edge_fade;
         let chroma_split_local = normal * mix(0.032, 0.044, reactive_activity) * optics.z
             * (0.35 + abs(height) * 0.65) * optical_edge_fade;
-        let optical_shift = optical_shift_local * input.local_to_screen;
-        let chroma_split = chroma_split_local * input.local_to_screen;
+        let capture_extent = max(input.background_uv_rect.zw, vec2<f32>(0.0001));
+        let capture_uv = (input.screen_uv - input.background_uv_rect.xy) / capture_extent;
+        let optical_shift = optical_shift_local * input.local_to_screen / capture_extent;
+        let chroma_split = chroma_split_local * input.local_to_screen / capture_extent;
         let capture_freshness = saturate(input.color.r);
         let captured_base = textureSample(
             desktop_background,
             desktop_background_sampler,
-            clamp(input.screen_uv, vec2<f32>(0.001), vec2<f32>(0.999)),
+            clamp(capture_uv, vec2<f32>(0.001), vec2<f32>(0.999)),
         ).rgb;
         let capture_red = textureSample(
             desktop_background,
             desktop_background_sampler,
-            clamp(input.screen_uv + optical_shift + chroma_split, vec2<f32>(0.001), vec2<f32>(0.999)),
+            clamp(capture_uv + optical_shift + chroma_split, vec2<f32>(0.001), vec2<f32>(0.999)),
         ).r;
         let capture_green = textureSample(
             desktop_background,
             desktop_background_sampler,
-            clamp(input.screen_uv + optical_shift, vec2<f32>(0.001), vec2<f32>(0.999)),
+            clamp(capture_uv + optical_shift, vec2<f32>(0.001), vec2<f32>(0.999)),
         ).g;
         let capture_blue = textureSample(
             desktop_background,
             desktop_background_sampler,
-            clamp(input.screen_uv + optical_shift - chroma_split, vec2<f32>(0.001), vec2<f32>(0.999)),
+            clamp(capture_uv + optical_shift - chroma_split, vec2<f32>(0.001), vec2<f32>(0.999)),
         ).b;
         let captured_refracted = vec3<f32>(capture_red, capture_green, capture_blue);
         let fallback_red = den_virtual_backdrop(displaced_local + optical_shift_local + chroma_split_local, noise_phase).r;

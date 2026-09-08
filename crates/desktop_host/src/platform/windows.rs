@@ -17,7 +17,7 @@ use windows::{
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
-                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+                D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
                 D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
                 D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
                 ID3D11Texture2D,
@@ -55,14 +55,15 @@ use windows_sys::Win32::{
         },
     },
 };
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Window, WindowAttributes};
 
 use crate::{
-    ApplicationInfo, DesktopBackgroundFrame, DesktopSnapshot, DesktopSurface, DesktopVisualFrame,
-    DesktopVisualSample, DisplayTopology, HostError, PhysicalDesktopPoint, PlatformBackend,
-    PlatformCapabilities, PlatformKind, RectI, VISUAL_GRID_CELLS, VISUAL_GRID_HEIGHT,
-    VISUAL_GRID_WIDTH, VisualCell,
+    ApplicationInfo, DesktopBackgroundCaptureRegion, DesktopBackgroundFrame, DesktopSnapshot,
+    DesktopSurface, DesktopVisualFrame, DesktopVisualSample, DisplayTopology, HostError,
+    PhysicalDesktopPoint, PlatformBackend, PlatformCapabilities, PlatformKind, RectI,
+    VISUAL_GRID_CELLS, VISUAL_GRID_HEIGHT, VISUAL_GRID_WIDTH, VisualCell,
 };
 
 const VISUAL_CAPTURE_SAMPLES_PER_AXIS: usize = 4;
@@ -200,8 +201,14 @@ impl PlatformBackend for WindowsBackend {
             .submit_and_poll(topology, pet_position)
     }
 
-    fn capture_overlay_background(&mut self, window: &Window) -> Option<DesktopBackgroundFrame> {
-        self.background_worker.as_mut()?.submit_and_poll(window)
+    fn capture_overlay_background(
+        &mut self,
+        window: &Window,
+        region: DesktopBackgroundCaptureRegion,
+    ) -> Option<DesktopBackgroundFrame> {
+        self.background_worker
+            .as_mut()?
+            .submit_and_poll(window, region)
     }
 
     fn set_overlay_capture_excluded(
@@ -396,6 +403,67 @@ struct CaptureRequest {
     physical_rect: RectI,
     width: u32,
     height: u32,
+    normalized_region: [f32; 4],
+}
+
+fn capture_request(
+    window_position: PhysicalPosition<i32>,
+    window_size: PhysicalSize<u32>,
+    region: DesktopBackgroundCaptureRegion,
+) -> Option<CaptureRequest> {
+    if window_size.width == 0 || window_size.height == 0 {
+        return None;
+    }
+
+    let minimum = region.minimum_normalized.clamp(Vec2::ZERO, Vec2::ONE);
+    let maximum = region.maximum_normalized.clamp(Vec2::ZERO, Vec2::ONE);
+    if !maximum.cmpgt(minimum).all() || region.maximum_output_dimension == 0 {
+        return None;
+    }
+
+    let minimum_x = (minimum.x * window_size.width as f32)
+        .floor()
+        .clamp(0.0, window_size.width.saturating_sub(1) as f32) as u32;
+    let minimum_y = (minimum.y * window_size.height as f32)
+        .floor()
+        .clamp(0.0, window_size.height.saturating_sub(1) as f32) as u32;
+    let maximum_x = (maximum.x * window_size.width as f32)
+        .ceil()
+        .clamp((minimum_x + 1) as f32, window_size.width as f32) as u32;
+    let maximum_y = (maximum.y * window_size.height as f32)
+        .ceil()
+        .clamp((minimum_y + 1) as f32, window_size.height as f32) as u32;
+    let source_width = maximum_x - minimum_x;
+    let source_height = maximum_y - minimum_y;
+    let scale =
+        (region.maximum_output_dimension as f32 / source_width.max(source_height) as f32).min(1.0);
+    let width = (source_width as f32 * scale).round().max(1.0) as u32;
+    let height = (source_height as f32 * scale).round().max(1.0) as u32;
+
+    let minimum_x_i32 = i32::try_from(minimum_x).unwrap_or(i32::MAX);
+    let minimum_y_i32 = i32::try_from(minimum_y).unwrap_or(i32::MAX);
+    let maximum_x_i32 = i32::try_from(maximum_x).unwrap_or(i32::MAX);
+    let maximum_y_i32 = i32::try_from(maximum_y).unwrap_or(i32::MAX);
+    Some(CaptureRequest {
+        physical_rect: RectI {
+            minimum: PhysicalDesktopPoint {
+                x: window_position.x.saturating_add(minimum_x_i32),
+                y: window_position.y.saturating_add(minimum_y_i32),
+            },
+            maximum: PhysicalDesktopPoint {
+                x: window_position.x.saturating_add(maximum_x_i32),
+                y: window_position.y.saturating_add(maximum_y_i32),
+            },
+        },
+        width,
+        height,
+        normalized_region: [
+            minimum_x as f32 / window_size.width as f32,
+            minimum_y as f32 / window_size.height as f32,
+            source_width as f32 / window_size.width as f32,
+            source_height as f32 / window_size.height as f32,
+        ],
+    })
 }
 
 struct GdiBackgroundWorker {
@@ -421,33 +489,25 @@ impl GdiBackgroundWorker {
         }
     }
 
-    fn submit_and_poll(&mut self, window: &Window) -> Option<DesktopBackgroundFrame> {
+    fn submit_and_poll(
+        &mut self,
+        window: &Window,
+        region: DesktopBackgroundCaptureRegion,
+    ) -> Option<DesktopBackgroundFrame> {
         let mut latest = self.frame_rx.try_iter().last();
+        // A local den-sized crop is small enough to follow desktop motion at
+        // display cadence. This restores fluid displacement without resuming
+        // full virtual-desktop uploads on the render thread.
         if self.last_submit.elapsed() >= Duration::from_secs_f64(1.0 / 60.0) {
             let position = window.outer_position().ok()?;
             let size = window.inner_size();
-            if size.width > 0 && size.height > 0 {
-                let request = CaptureRequest {
-                    physical_rect: RectI {
-                        minimum: PhysicalDesktopPoint {
-                            x: position.x,
-                            y: position.y,
-                        },
-                        maximum: PhysicalDesktopPoint {
-                            x: position.x.saturating_add(size.width as i32),
-                            y: position.y.saturating_add(size.height as i32),
-                        },
-                    },
-                    width: size.width.div_ceil(2),
-                    height: size.height.div_ceil(2),
-                };
-                if self
+            if let Some(request) = capture_request(position, size, region)
+                && self
                     .request_tx
                     .as_ref()
                     .is_some_and(|sender| sender.send(request).is_ok())
-                {
-                    self.last_submit = Instant::now();
-                }
+            {
+                self.last_submit = Instant::now();
             }
             latest = self.frame_rx.try_iter().last().or(latest);
         }
@@ -494,8 +554,10 @@ fn background_capture_loop(
             last_dxgi_attempt = Instant::now();
             match DxgiBackgroundCapture::new(request.physical_rect) {
                 Ok(capture) => {
-                    dxgi_capture = Some(capture);
-                    dxgi_failure_reported = false;
+                    if capture.covers(request.physical_rect) {
+                        dxgi_capture = Some(capture);
+                        dxgi_failure_reported = false;
+                    }
                 }
                 Err(error) => {
                     if !dxgi_failure_reported {
@@ -565,6 +627,7 @@ fn background_capture_loop(
                 timestamp: started.elapsed().as_secs_f64(),
                 mean_luminance,
                 contrast,
+                normalized_region: request.normalized_region,
             })
             .is_err()
         {
@@ -581,6 +644,8 @@ struct DxgiBackgroundCapture {
     staging_desc: Option<D3D11_TEXTURE2D_DESC>,
     output_rect: RectI,
     last_frame: Option<Vec<u8>>,
+    last_request_rect: Option<RectI>,
+    last_request_size: (u32, u32),
 }
 
 impl DxgiBackgroundCapture {
@@ -660,15 +725,16 @@ impl DxgiBackgroundCapture {
             staging_desc: None,
             output_rect,
             last_frame: None,
+            last_request_rect: None,
+            last_request_size: (0, 0),
         })
     }
 
     fn covers(&self, rect: RectI) -> bool {
-        let center = PhysicalDesktopPoint {
-            x: rect.minimum.x.saturating_add(rect.width() / 2),
-            y: rect.minimum.y.saturating_add(rect.height() / 2),
-        };
-        self.output_rect.contains(center)
+        rect.minimum.x >= self.output_rect.minimum.x
+            && rect.minimum.y >= self.output_rect.minimum.y
+            && rect.maximum.x <= self.output_rect.maximum.x
+            && rect.maximum.y <= self.output_rect.maximum.y
     }
 
     fn capture(&mut self, request: &CaptureRequest) -> Result<Option<Vec<u8>>, String> {
@@ -680,7 +746,10 @@ impl DxgiBackgroundCapture {
         };
         if let Err(error) = acquired {
             if error.code() == DXGI_ERROR_WAIT_TIMEOUT {
-                return Ok(self.last_frame.clone());
+                return Ok((self.last_request_rect == Some(request.physical_rect)
+                    && self.last_request_size == (request.width, request.height))
+                    .then(|| self.last_frame.clone())
+                    .flatten());
             }
             return Err(format!("AcquireNextFrame failed: {error}"));
         }
@@ -694,13 +763,20 @@ impl DxgiBackgroundCapture {
             let mut source_desc = D3D11_TEXTURE2D_DESC::default();
             unsafe { texture.GetDesc(&mut source_desc) };
 
+            let source_left = (request.physical_rect.minimum.x - self.output_rect.minimum.x) as u32;
+            let source_top = (request.physical_rect.minimum.y - self.output_rect.minimum.y) as u32;
+            let source_width = request.physical_rect.width().max(1) as u32;
+            let source_height = request.physical_rect.height().max(1) as u32;
+
             let needs_staging = self.staging_desc.is_none_or(|desc| {
-                desc.Width != source_desc.Width
-                    || desc.Height != source_desc.Height
+                desc.Width != source_width
+                    || desc.Height != source_height
                     || desc.Format != source_desc.Format
             });
             if needs_staging {
                 let staging_desc = D3D11_TEXTURE2D_DESC {
+                    Width: source_width,
+                    Height: source_height,
                     Usage: D3D11_USAGE_STAGING,
                     BindFlags: 0,
                     CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -720,7 +796,26 @@ impl DxgiBackgroundCapture {
                 .staging
                 .as_ref()
                 .ok_or_else(|| "D3D11 returned no staging texture".to_owned())?;
-            unsafe { self.context.CopyResource(staging, &texture) };
+            let source_box = D3D11_BOX {
+                left: source_left,
+                top: source_top,
+                front: 0,
+                right: source_left.saturating_add(source_width),
+                bottom: source_top.saturating_add(source_height),
+                back: 1,
+            };
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    staging,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &texture,
+                    0,
+                    Some(&source_box),
+                )
+            };
 
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             unsafe {
@@ -730,9 +825,9 @@ impl DxgiBackgroundCapture {
             .map_err(|error| format!("Map(staging) failed: {error}"))?;
             let tight = copy_dxgi_region(
                 &mapped,
-                source_desc.Width,
-                source_desc.Height,
-                self.output_rect,
+                source_width,
+                source_height,
+                request.physical_rect,
                 request,
             );
             unsafe { self.context.Unmap(staging, 0) };
@@ -744,6 +839,8 @@ impl DxgiBackgroundCapture {
         }
         let tight = result?;
         self.last_frame = Some(tight.clone());
+        self.last_request_rect = Some(request.physical_rect);
+        self.last_request_size = (request.width, request.height);
         Ok(Some(tight))
     }
 }
@@ -1394,6 +1491,47 @@ fn classify_application(name: &str) -> AppCategory {
 #[cfg(test)]
 mod visual_sampling_tests {
     use super::*;
+
+    #[test]
+    fn den_capture_request_is_local_and_bounded() {
+        let region =
+            DesktopBackgroundCaptureRegion::new(Vec2::new(0.40, 0.25), Vec2::new(0.60, 0.75), 512)
+                .unwrap();
+        let request = capture_request(
+            PhysicalPosition::new(-1920, 0),
+            PhysicalSize::new(3840, 1080),
+            region,
+        )
+        .unwrap();
+
+        assert_eq!(request.physical_rect.width(), 768);
+        assert_eq!(request.physical_rect.height(), 540);
+        assert_eq!(request.width, 512);
+        assert_eq!(request.height, 360);
+        assert_eq!(request.physical_rect.minimum.x, -384);
+        assert!((request.normalized_region[0] - 0.40).abs() < 1.0e-6);
+        assert!((request.normalized_region[2] - 0.20).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn den_capture_request_clips_safely_at_overlay_edge() {
+        let region =
+            DesktopBackgroundCaptureRegion::new(Vec2::new(0.0, 0.0), Vec2::new(0.08, 0.12), 512)
+                .unwrap();
+        let request = capture_request(
+            PhysicalPosition::new(100, -900),
+            PhysicalSize::new(1920, 1080),
+            region,
+        )
+        .unwrap();
+
+        assert_eq!(request.physical_rect.minimum.x, 100);
+        assert_eq!(request.physical_rect.minimum.y, -900);
+        assert_eq!(request.physical_rect.width(), 154);
+        assert_eq!(request.physical_rect.height(), 130);
+        assert_eq!(request.width, 154);
+        assert_eq!(request.height, 130);
+    }
 
     #[test]
     fn self_mask_covers_the_body_cell_and_its_immediate_neighbors() {

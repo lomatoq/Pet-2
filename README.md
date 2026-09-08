@@ -137,11 +137,13 @@ keyboard hooks:
 ## Pet Lab and live nervous-system monitor
 
 The Windows package keeps the body, den/home, voice/sounds, and nervous-system
-readability controls together in `PetLab.exe`. Run `Pet2-Dev.cmd` to start Pet 2
-with 5 Hz causal telemetry and open Pet Lab on its four calibration tabs. Press
-`F12` when you want to switch the same window to Live Nervous System telemetry.
-If a normal Pet 2 instance is already running, close it first because the desktop
-organism is single-instance.
+readability controls together in `PetLab.exe`. Open Pet Lab, press `F12`, and use
+`Connect to Pet`: it attaches to an already running normal `Pet2.exe`, or starts
+the packaged sibling when Pet is not running. The temporary authenticated lease
+enables 5 Hz telemetry and all 64 motor-program tests without permanent
+`--dev-mode`; `Disconnect` closes it immediately and an abandoned lease expires
+after 10 seconds. The package manifest verifies the Pet2/PetLab binary pair
+before Pet Lab launches its sibling.
 
 The four tabs edit one versioned profile and use the production body, voice, and
 den render paths. `Apply selected mode to running Pet` hot-reloads that profile;
@@ -162,6 +164,13 @@ the living Pet; accepted forks can be promoted only after report validation and
 with a complete rollback backup. The legacy `--simulate-hours` option is now an
 explicit approximate calendar-only compatibility path and cannot generate
 synthetic interaction learning.
+
+The open `Controlled intervention` section in Live Brain also contains the full
+indexed 64-program motor catalog. `Run selected` executes one bounded program
+through the same motor bus and particle PBF body as autonomous behavior; it does
+not play a separate preview animation. The panel displays deterministic numeric
+acceptance, the selected phase grammar, and live program/phase telemetry, while
+`Cancel` returns control to the brain.
 
 Telemetry is written to an 8 MiB `telemetry.jsonl` plus one rotated previous
 file. The older semantic `events.jsonl` is not truncated or rotated and no

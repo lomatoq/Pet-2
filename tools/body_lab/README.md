@@ -29,8 +29,11 @@ it never rolls back the running organism.
 Live Brain reads `telemetry.jsonl` and its single rotated previous file, falling
 back to legacy `events.jsonl` when no bounded stream exists. Its typed Lab
 controls can issue expiring attention cues and drive pulses, clear pulses, set
-focus mode, or apply an explicit learning reward. Controls are enabled only
-while following a fresh incremental live frame.
+focus mode, apply an explicit learning reward, or run any of the 64 indexed
+motor programs through the production particle-body path. The motor panel shows
+the numeric 64/64 acceptance result, phase grammar, live phase, and override
+state; `Cancel` immediately restores autonomous selection. Controls are enabled
+only while following a fresh incremental live frame.
 
 The separate Evolution rewind is also read-only. It exposes the exact bounded
 before/after genome checkpoints and their lifetime snapshots from validated

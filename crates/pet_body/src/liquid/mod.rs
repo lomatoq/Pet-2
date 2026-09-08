@@ -28,6 +28,10 @@ use lifecore::{
     SensorFrame,
 };
 use pet_ecology::EmbodiedEnvironmentFrame;
+use pet_motor::{
+    BehaviorProgramId, CompletionReason, FieldSpace, SomaticActuationPacket, SomaticFieldKind,
+    SomaticPerformanceFeedback,
+};
 
 use crate::{
     DerivedVisualTraits, DropletMotion, FaceTuning, InteractionTuning, MaterialVariant,
@@ -292,6 +296,11 @@ pub struct LiquidMorphRuntime {
     pending_structural_tuning: Option<PendingLiquidTuning>,
     environment: EmbodiedEnvironmentFrame,
     runtime_actuation: PbfRuntimeActuation,
+    somatic_actuation: SomaticActuationPacket,
+    somatic_feedback: SomaticPerformanceFeedback,
+    support_key: u64,
+    support_stable_seconds: f32,
+    supported_seconds: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -300,6 +309,15 @@ struct PendingLiquidTuning {
     interaction: InteractionTuning,
     face: FaceTuning,
     material_variant: MaterialVariant,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SomaticStepMetrics {
+    contact_fraction: f32,
+    anchor_error: f32,
+    local_energy: f32,
+    local_energy_inside: f32,
+    total_field_energy: f32,
 }
 
 #[allow(dead_code)]
@@ -380,6 +398,11 @@ impl LiquidMorphRuntime {
             pending_structural_tuning: None,
             environment: EmbodiedEnvironmentFrame::default(),
             runtime_actuation: PbfRuntimeActuation::default(),
+            somatic_actuation: SomaticActuationPacket::default(),
+            somatic_feedback: SomaticPerformanceFeedback::default(),
+            support_key: 0,
+            support_stable_seconds: 0.0,
+            supported_seconds: 0.0,
         };
         runtime.snap_render_proxies();
         runtime
@@ -445,6 +468,11 @@ impl LiquidMorphRuntime {
             replacement.recovery_count = recovery_count;
             replacement.interaction_tuning = interaction_tuning;
             replacement.pending_structural_tuning = None;
+            replacement.somatic_actuation = self.somatic_actuation.clone();
+            replacement.somatic_feedback = self.somatic_feedback;
+            replacement.support_key = self.support_key;
+            replacement.support_stable_seconds = self.support_stable_seconds;
+            replacement.supported_seconds = self.supported_seconds;
             *self = replacement;
         } else {
             self.tuning = tuning;
@@ -488,6 +516,16 @@ impl LiquidMorphRuntime {
 
     pub fn set_runtime_actuation(&mut self, actuation: PbfRuntimeActuation) {
         self.runtime_actuation = sanitize_runtime_actuation(actuation);
+    }
+
+    pub fn set_somatic_actuation(&mut self, mut actuation: SomaticActuationPacket) {
+        actuation.sanitize();
+        self.somatic_actuation = actuation;
+    }
+
+    #[must_use]
+    pub const fn somatic_feedback(&self) -> SomaticPerformanceFeedback {
+        self.somatic_feedback
     }
 
     fn effective_material_parameters(&self) -> MaterialParameters {
@@ -760,6 +798,17 @@ impl LiquidMorphRuntime {
             self.local_containment_bounds,
             self.interaction_tuning,
         );
+        let somatic_step = apply_somatic_actuation(
+            &mut self.particles,
+            self.particle_count,
+            self.body_origin,
+            self.components,
+            self.material_grab.readback().contact_center,
+            feedback.world_position,
+            motion.world_to_body_scale,
+            &self.somatic_actuation,
+            dt,
+        );
         if sensors.interaction_actuation.local_pulse > 0.0
             || sensors.interaction_actuation.recoil > 0.0
         {
@@ -938,6 +987,7 @@ impl LiquidMorphRuntime {
             dt,
         );
         self.update_diagnostics(parameters, stress, motion.velocity.length());
+        self.update_somatic_feedback(somatic_step, feedback, dt);
         let grab_readback = self.material_grab.readback();
         self.interaction_probe.update(
             &self.particles,
@@ -2592,6 +2642,94 @@ impl LiquidMorphRuntime {
         }
     }
 
+    fn update_somatic_feedback(
+        &mut self,
+        metrics: SomaticStepMetrics,
+        body: &BodyFeedback,
+        dt: f32,
+    ) {
+        let support_key = self
+            .somatic_actuation
+            .support
+            .as_ref()
+            .map_or(0, |support| stable_text_hash(&support.surface_id.0));
+        if support_key == 0 || support_key != self.support_key {
+            self.support_stable_seconds = 0.0;
+            self.supported_seconds = 0.0;
+            self.support_key = support_key;
+        }
+        // In a 2D 96-particle body, a genuine surface patch is one boundary
+        // layer (typically 7-12% of total mass), not 20% of every particle.
+        // Contact particles are sampled inside one contact-depth band.  Their
+        // mean normalized distance is therefore naturally around one half;
+        // requiring <= 0.26 rejected a well-centred, measured surface patch.
+        // Keep a 0.60 centring gate plus the other independent gates and the
+        // 300 ms dwell so a passing touch still cannot masquerade as support.
+        let stable = support_key != 0
+            && metrics.contact_fraction >= 0.07
+            && metrics.anchor_error <= 0.60
+            && body.velocity.length() <= 0.16
+            && self.diagnostics.maximum_bond_strain <= 0.72;
+        if stable {
+            self.support_stable_seconds = (self.support_stable_seconds + dt).min(8.0);
+        } else {
+            self.support_stable_seconds = (self.support_stable_seconds - dt * 2.5).max(0.0);
+        }
+        let supported = self.support_stable_seconds >= 0.30;
+        if supported {
+            self.supported_seconds = (self.supported_seconds + dt).min(86_400.0);
+        } else {
+            self.supported_seconds = 0.0;
+        }
+        let interaction = self.interaction_probe.latest();
+        let motor_error = self
+            .somatic_actuation
+            .locomotion
+            .target_position
+            .map_or(0.0, |target| target.distance(body.world_position) / 0.35)
+            .clamp(0.0, 1.0);
+        let completion_reason = if supported {
+            CompletionReason::SupportConfirmed
+        } else if self.somatic_actuation.program
+            == Some(BehaviorProgramId::DefenseFragmentTrackAndRemerge)
+            && self.components.component_count <= 1
+        {
+            CompletionReason::IntegrityRestored
+        } else {
+            CompletionReason::None
+        };
+        self.somatic_feedback = SomaticPerformanceFeedback {
+            frame_id: self.somatic_actuation.frame_id,
+            program_id: self.somatic_actuation.program,
+            phase: self.somatic_actuation.phase,
+            phase_progress: self.somatic_actuation.phase_progress,
+            target_locked: self.somatic_actuation.locomotion.target_locked,
+            contact_fraction: metrics.contact_fraction,
+            support_stability: (self.support_stable_seconds / 0.35).clamp(0.0, 1.0),
+            supported,
+            supported_seconds: self.supported_seconds,
+            local_deformation_energy: metrics.local_energy.clamp(0.0, 1.0),
+            locality_fraction: if metrics.total_field_energy > 1.0e-6 {
+                (metrics.local_energy_inside / metrics.total_field_energy).clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
+            maximum_strain: interaction.material.maximum_strain.clamp(0.0, 1.0),
+            mass_conservation_error: interaction.material.mass_conservation_error.clamp(0.0, 1.0),
+            completion_reason,
+            motor_error,
+            user_response_credit: if interaction.contact.active
+                && interaction.material.maximum_strain < 0.55
+            {
+                (interaction.contact.area_fraction * (1.0 - interaction.material.maximum_strain))
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+        };
+        self.somatic_feedback.sanitize();
+    }
+
     fn update_diagnostics(
         &mut self,
         parameters: MaterialParameters,
@@ -2702,6 +2840,192 @@ impl LiquidMorphRuntime {
             finite,
         };
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_somatic_actuation(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    particle_count: usize,
+    body_origin: Vec2,
+    components: ComponentSummary,
+    pointer_contact_center: Vec2,
+    body_world_position: Vec2,
+    world_to_body_scale: Vec2,
+    packet: &SomaticActuationPacket,
+    dt: f32,
+) -> SomaticStepMetrics {
+    let mut metrics = SomaticStepMetrics::default();
+    let count = particle_count.min(MAX_LIQUID_PARTICLES);
+    if count == 0 {
+        return metrics;
+    }
+    let scale = if world_to_body_scale.is_finite() {
+        world_to_body_scale.clamp(Vec2::splat(-64.0), Vec2::splat(64.0))
+    } else {
+        Vec2::ONE
+    };
+    let safe_dt = if dt.is_finite() {
+        dt.clamp(0.0, 0.05)
+    } else {
+        0.0
+    };
+    for field in packet.fields.iter().flatten() {
+        let component_center = field
+            .target_component
+            .map_or(components.main_com, |component| {
+                component_center(particles, count, component).unwrap_or(components.main_com)
+            });
+        let center = match field.space {
+            FieldSpace::World => body_origin + (field.center - body_world_position) * scale,
+            FieldSpace::BodyLocal => body_origin + field.center,
+            FieldSpace::SurfaceTangentNormal => packet.support.as_ref().map_or(body_origin, |s| {
+                body_origin + (s.anchor_point - body_world_position) * scale + field.center
+            }),
+            FieldSpace::ComponentLocal => component_center + field.center,
+            FieldSpace::PointerContact => pointer_contact_center + field.center,
+        };
+        let axis = match field.space {
+            FieldSpace::World | FieldSpace::SurfaceTangentNormal => {
+                (field.axis * scale.signum()).normalize_or_zero()
+            }
+            _ => field.axis.normalize_or_zero(),
+        };
+        let radius = field.radius.max(0.04);
+        for particle in &mut particles[..count] {
+            if let Some(component) = field.target_component
+                && particle.component_id != component
+            {
+                continue;
+            }
+            let offset = particle.position - center;
+            let distance = offset.length();
+            if distance >= radius {
+                continue;
+            }
+            let weight = (1.0 - distance / radius)
+                .clamp(0.0, 1.0)
+                .powf(field.falloff.clamp(0.5, 6.0));
+            let radial = if distance > 1.0e-5 {
+                offset / distance
+            } else {
+                Vec2::ZERO
+            };
+            let phase_wave = if field.frequency_hz > 0.0 {
+                (std::f32::consts::TAU * (field.phase_01 + safe_dt * field.frequency_hz)).sin()
+            } else {
+                1.0
+            };
+            let direction = match field.kind {
+                SomaticFieldKind::Attract
+                | SomaticFieldKind::Anchor
+                | SomaticFieldKind::Gather
+                | SomaticFieldKind::Grip => -radial,
+                SomaticFieldKind::Repel | SomaticFieldKind::Pulse => radial,
+                SomaticFieldKind::Flatten => -axis * offset.dot(axis) / radius.max(1.0e-5),
+                SomaticFieldKind::Shear => axis,
+                SomaticFieldKind::Curl | SomaticFieldKind::Orbit => {
+                    let spin = if axis.y.abs() > 1.0e-5 {
+                        axis.y.signum()
+                    } else {
+                        1.0
+                    };
+                    Vec2::new(-radial.y, radial.x) * spin
+                }
+                SomaticFieldKind::Wave => radial * phase_wave,
+                SomaticFieldKind::Brace => -particle.velocity * 0.45 - radial * distance * 0.35,
+                SomaticFieldKind::Bud
+                | SomaticFieldKind::MassShift
+                | SomaticFieldKind::GravityBias => axis,
+            };
+            let force = (direction * field.strength * weight * 2.4).clamp_length_max(2.4);
+            particle.force += force;
+            let energy = force.length() * safe_dt;
+            metrics.total_field_energy += energy;
+            metrics.local_energy_inside += energy;
+            metrics.local_energy += energy / count as f32;
+        }
+    }
+
+    if let Some(support) = &packet.support {
+        let anchor = body_origin + (support.anchor_point - body_world_position) * scale;
+        let mut normal = (support.normal * scale.signum()).normalize_or_zero();
+        if normal.length_squared() <= 1.0e-6 {
+            normal = Vec2::NEG_Y;
+        }
+        let mut tangent = (support.tangent * scale.signum()).normalize_or_zero();
+        if tangent.length_squared() <= 1.0e-6 {
+            tangent = Vec2::new(-normal.y, normal.x);
+        }
+        let band_radius = 0.25 + support.target_contact_fraction * 0.80;
+        let contact_depth = 0.055 + support.normal_compliance * 0.12;
+        let mut contact_count = 0_usize;
+        let mut anchor_error = 0.0_f32;
+        for particle in &mut particles[..count] {
+            if particle.component_id != components.main_component {
+                continue;
+            }
+            let offset = particle.position - anchor;
+            let tangent_distance = offset.dot(tangent).abs();
+            let normal_distance = offset.dot(normal);
+            let tangent_weight = (1.0 - tangent_distance / band_radius).clamp(0.0, 1.0);
+            if tangent_weight <= 0.0 {
+                continue;
+            }
+            let proximity = (1.0 - normal_distance.abs() / (contact_depth * 3.0)).clamp(0.0, 1.0);
+            let normal_error = normal_distance.clamp(-contact_depth * 2.0, contact_depth * 2.0);
+            let normal_force = -normal * normal_error * (5.0 - support.normal_compliance * 2.4);
+            let friction =
+                -tangent * particle.velocity.dot(tangent) * support.tangent_friction * 0.65;
+            let load = -normal * support.load_fraction * 0.72;
+            let adhesion = -normal * normal_distance.max(0.0) * support.adhesion * 2.2;
+            let force = ((normal_force + friction + load + adhesion)
+                * tangent_weight
+                * proximity.max(0.18))
+            .clamp_length_max(2.8);
+            particle.force += force;
+            let energy = force.length() * safe_dt;
+            metrics.total_field_energy += energy;
+            if normal_distance.abs() <= contact_depth {
+                contact_count += 1;
+                anchor_error += normal_distance.abs();
+                metrics.local_energy_inside += energy;
+            }
+        }
+        metrics.contact_fraction = contact_count as f32 / count as f32;
+        metrics.anchor_error = if contact_count > 0 {
+            (anchor_error / contact_count as f32 / contact_depth.max(1.0e-5)).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+    }
+    metrics.local_energy = metrics.local_energy.clamp(0.0, 1.0);
+    metrics
+}
+
+fn component_center(
+    particles: &[LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    component: u8,
+) -> Option<Vec2> {
+    let mut weighted = Vec2::ZERO;
+    let mut mass = 0.0_f32;
+    for particle in &particles[..count.min(MAX_LIQUID_PARTICLES)] {
+        if particle.component_id != component {
+            continue;
+        }
+        let particle_mass = particle.inverse_mass.max(1.0e-5).recip();
+        weighted += particle.position * particle_mass;
+        mass += particle_mass;
+    }
+    (mass > 0.0).then_some(weighted / mass.max(1.0e-5))
+}
+
+fn stable_text_hash(text: &str) -> u64 {
+    text.as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 #[allow(dead_code)]
@@ -3035,6 +3359,108 @@ mod flight_field_tests {
                 .tuning
                 .particle_count,
             requested.particle_count
+        );
+    }
+
+    #[test]
+    fn somatic_field_is_local_and_cannot_inject_global_force() {
+        let mut runtime = LiquidMorphRuntime::new(0xF13D);
+        for particle in &mut runtime.particles[..runtime.particle_count] {
+            particle.force = Vec2::ZERO;
+        }
+        let center = runtime.components.main_com;
+        let mut packet = SomaticActuationPacket::default();
+        packet.fields[0] = Some(pet_motor::LocalSomaticField {
+            kind: SomaticFieldKind::Pulse,
+            space: FieldSpace::BodyLocal,
+            center: center - runtime.body_origin,
+            axis: Vec2::X,
+            radius: 0.12,
+            strength: 0.8,
+            falloff: 2.0,
+            frequency_hz: 0.0,
+            phase_01: 0.0,
+            target_component: None,
+        });
+        let metrics = apply_somatic_actuation(
+            &mut runtime.particles,
+            runtime.particle_count,
+            runtime.body_origin,
+            runtime.components,
+            Vec2::ZERO,
+            Vec2::splat(0.5),
+            Vec2::ONE,
+            &packet,
+            1.0 / 120.0,
+        );
+        let affected = runtime.particles[..runtime.particle_count]
+            .iter()
+            .filter(|particle| particle.force.length_squared() > 1.0e-10)
+            .count();
+        assert!(affected > 0);
+        assert!(affected < runtime.particle_count / 2);
+        assert!(metrics.total_field_energy > 0.0);
+        assert_eq!(metrics.total_field_energy, metrics.local_energy_inside);
+    }
+
+    #[test]
+    fn surface_support_requires_a_sustained_measured_boundary_layer() {
+        let mut runtime = LiquidMorphRuntime::new(0x5A77);
+        runtime.somatic_actuation.support = Some(pet_motor::SurfaceAttachmentCommand {
+            surface_id: lifecore::SurfaceId("test-support".to_owned()),
+            anchor_point: Vec2::splat(0.5),
+            normal: Vec2::NEG_Y,
+            tangent: Vec2::X,
+            target_contact_fraction: 0.30,
+            normal_compliance: 0.25,
+            tangent_friction: 0.55,
+            adhesion: 0.18,
+            load_fraction: 0.30,
+            break_force: 0.75,
+            release_half_life: 0.25,
+        });
+        let body = BodyFeedback {
+            velocity: Vec2::ZERO,
+            ..BodyFeedback::default()
+        };
+        let stable_metrics = SomaticStepMetrics {
+            contact_fraction: 0.08,
+            anchor_error: 0.50,
+            ..SomaticStepMetrics::default()
+        };
+        for _ in 0..35 {
+            runtime.update_somatic_feedback(stable_metrics, &body, 1.0 / 120.0);
+        }
+        assert!(!runtime.somatic_feedback.supported);
+        runtime.update_somatic_feedback(stable_metrics, &body, 1.0 / 120.0);
+        assert!(runtime.somatic_feedback.supported);
+        assert_eq!(
+            runtime.somatic_feedback.completion_reason,
+            CompletionReason::SupportConfirmed
+        );
+        runtime.update_somatic_feedback(
+            SomaticStepMetrics {
+                contact_fraction: 0.08,
+                anchor_error: 0.75,
+                ..SomaticStepMetrics::default()
+            },
+            &body,
+            0.20,
+        );
+        assert!(!runtime.somatic_feedback.supported);
+        runtime.update_somatic_feedback(
+            SomaticStepMetrics {
+                contact_fraction: 0.06,
+                anchor_error: 0.10,
+                ..SomaticStepMetrics::default()
+            },
+            &body,
+            0.20,
+        );
+        assert!(!runtime.somatic_feedback.supported);
+        assert_eq!(
+            runtime.somatic_feedback.completion_reason,
+            CompletionReason::None
         );
     }
 }

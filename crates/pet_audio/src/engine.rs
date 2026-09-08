@@ -106,6 +106,16 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    pub fn default_output_device_name() -> Result<String, AudioError> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or(AudioError::NoOutputDevice)?;
+        Ok(device
+            .name()
+            .unwrap_or_else(|_| "unknown output device".into()))
+    }
+
     pub fn try_start() -> Result<Self, AudioError> {
         let host = cpal::default_host();
         let device = host

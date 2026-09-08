@@ -2,6 +2,35 @@ use glam::Vec2;
 use lifecore::{BodyFeedback, BodyGenome, BodyIntent, LocomotionMode, SensorFrame, SurfaceRect};
 
 const BODY_SCREEN_GRAVITY: f32 = 0.16;
+/// User-facing body tempo. This scales navigation and flight only; face, blink,
+/// gaze and mouth smoothing continue to consume unscaled real time.
+pub const BODY_MOVEMENT_TEMPO: f32 = 2.0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LocomotionDiagnostics {
+    /// Physical screen-space acceleration change applied by the last fixed tick.
+    pub acceleration_delta_px_s2: Vec2,
+    /// Physical screen-space jerk after the controller's mode-specific limiter.
+    pub jerk_px_s3: Vec2,
+    pub acceleration_limited: bool,
+    pub jerk_limited: bool,
+    pub acceleration_limit_events: u64,
+    pub jerk_limit_events: u64,
+    pub fixed_steps: u64,
+}
+
+impl LocomotionDiagnostics {
+    #[must_use]
+    pub fn saturation_fraction(self) -> f32 {
+        if self.fixed_steps == 0 {
+            0.0
+        } else {
+            (self.acceleration_limit_events.max(self.jerk_limit_events) as f32
+                / self.fixed_steps as f32)
+                .clamp(0.0, 1.0)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodySimulation {
@@ -15,6 +44,10 @@ pub struct BodySimulation {
     /// body must not turn that discrete decision into a screen-space velocity
     /// discontinuity, so the embodied target has its own continuous state.
     embodied_target: Option<Vec2>,
+    /// Controller acceleration is kept in physical pixel space so its slew rate
+    /// remains invariant across aspect ratios and monitor layouts.
+    commanded_acceleration_px_s2: Vec2,
+    diagnostics: LocomotionDiagnostics,
 }
 
 impl BodySimulation {
@@ -25,7 +58,14 @@ impl BodySimulation {
             wander_phase: seed as u32 as f32 / u32::MAX as f32 * std::f32::consts::TAU,
             motion_space_pixels: None,
             embodied_target: None,
+            commanded_acceleration_px_s2: Vec2::ZERO,
+            diagnostics: LocomotionDiagnostics::default(),
         }
+    }
+
+    #[must_use]
+    pub const fn diagnostics(&self) -> LocomotionDiagnostics {
+        self.diagnostics
     }
 
     pub fn set_motion_space_pixels(&mut self, size: Vec2) {
@@ -64,11 +104,13 @@ impl BodySimulation {
             .clamp(Vec2::splat(0.02), Vec2::splat(0.98));
         if matches!(
             intent.locomotion,
-            LocomotionMode::SurfaceApproach | LocomotionMode::Landing | LocomotionMode::EdgeCling
+            LocomotionMode::SurfaceApproach | LocomotionMode::EdgeCling
         ) && let Some(surface) = select_surface(intent, &sensors.visible_surfaces)
         {
             requested_target = surface_target(surface, intent.locomotion);
         }
+        // Travel is 2x, controller stiffness is not. Multiplying both produced
+        // clipped, nearly identical acceleration pulses at every target change.
         let target_response = match intent.locomotion {
             LocomotionMode::Flee => 8.0,
             LocomotionMode::Seek
@@ -94,21 +136,27 @@ impl BodySimulation {
             0.32
         };
         let purposeful_effort = ((intent.desired_speed - 0.12) / 0.40).clamp(0.0, 1.0);
-        let base_speed_cap = match intent.locomotion {
-            LocomotionMode::Flee => 0.11 + purposeful_effort * 0.21,
-            LocomotionMode::Seek => 0.09 + purposeful_effort * 0.21,
-            LocomotionMode::SurfaceApproach
-            | LocomotionMode::Landing
-            | LocomotionMode::EdgeCling => 0.080 + purposeful_effort * 0.070,
-            LocomotionMode::Orbit => 0.095 + purposeful_effort * 0.165,
-            LocomotionMode::Arrive => 0.090 + purposeful_effort * 0.100,
-            _ => 0.085,
-        };
+        let base_speed_cap = BODY_MOVEMENT_TEMPO
+            * match intent.locomotion {
+                // One shared factor makes every navigation mode faster without 64
+                // independent visual calibrations. Landing still uses arrival
+                // braking below, so the final contact remains soft.
+                LocomotionMode::Flee => 0.11 + purposeful_effort * 0.21,
+                LocomotionMode::Seek => 0.09 + purposeful_effort * 0.21,
+                LocomotionMode::SurfaceApproach
+                | LocomotionMode::Landing
+                | LocomotionMode::EdgeCling => 0.080 + purposeful_effort * 0.070,
+                LocomotionMode::Orbit => 0.095 + purposeful_effort * 0.165,
+                LocomotionMode::Arrive => 0.090 + purposeful_effort * 0.100,
+                _ => 0.085,
+            };
         // The expression comes from the authoritative affect/brain pipeline.
         // Let it modulate actuator effort as well as the face so high arousal is
         // physically quicker while low energy remains visibly heavier.
-        let speed_cap = base_speed_cap * (0.82 + expression_energy * 0.28);
-        let desired_speed = intent.desired_speed.clamp(0.0, speed_cap) * reference_span;
+        let expression_effort = 0.82 + expression_energy * 0.28;
+        let speed_cap = base_speed_cap * expression_effort;
+        let desired_speed =
+            (intent.desired_speed * BODY_MOVEMENT_TEMPO).clamp(0.0, speed_cap) * reference_span;
         match intent.locomotion {
             LocomotionMode::Hover => {
                 target += Vec2::new(self.wander_phase.cos(), (self.wander_phase * 1.31).sin())
@@ -116,7 +164,7 @@ impl BodySimulation {
                 desired_velocity = arrive(
                     position,
                     target,
-                    desired_speed.max(0.06 * reference_span),
+                    desired_speed.max(BODY_MOVEMENT_TEMPO * 0.06 * reference_span),
                     0.18 * reference_span,
                 );
             }
@@ -124,7 +172,7 @@ impl BodySimulation {
                 desired_velocity = direction(position, target) * desired_speed;
             }
             LocomotionMode::Arrive => {
-                desired_velocity = arrive(position, target, desired_speed, 0.18 * reference_span);
+                desired_velocity = arrive(position, target, desired_speed, 0.08 * reference_span);
             }
             LocomotionMode::Flee => {
                 desired_velocity = -direction(position, target) * desired_speed;
@@ -144,7 +192,7 @@ impl BodySimulation {
                 desired_velocity = arrive(
                     position,
                     target,
-                    desired_speed.max(0.05 * reference_span),
+                    desired_speed.max(BODY_MOVEMENT_TEMPO * 0.05 * reference_span),
                     0.18 * reference_span,
                 );
             }
@@ -155,8 +203,8 @@ impl BodySimulation {
                     desired_velocity = arrive(
                         position,
                         target,
-                        desired_speed.max(0.05 * reference_span),
-                        0.18 * reference_span,
+                        desired_speed.max(BODY_MOVEMENT_TEMPO * 0.05 * reference_span),
+                        0.06 * reference_span,
                     );
                     let close = position.distance(target) < 0.018 * reference_span;
                     self.feedback.current_surface = Some(surface.id.clone());
@@ -165,7 +213,7 @@ impl BodySimulation {
                         close && intent.locomotion == LocomotionMode::EdgeCling;
                 } else {
                     desired_velocity =
-                        arrive(position, target, desired_speed, 0.18 * reference_span);
+                        arrive(position, target, desired_speed, 0.06 * reference_span);
                 }
             }
             LocomotionMode::Sleep | LocomotionMode::Cocoon => {
@@ -199,14 +247,45 @@ impl BodySimulation {
             0.0
         };
         let purposeful_response = requested_response.max(braking_response);
-        let maximum_acceleration = ((0.48 / genome.inertia.max(0.2)).clamp(0.18, 1.30)
+        let unclamped_maximum_acceleration = (0.48 / genome.inertia.max(0.2)).clamp(0.18, 1.30)
             * reference_span
             * (0.84 + expression_energy * 0.32)
-            * (1.0 + purposeful_response * 0.58))
-            .min(1.85 * reference_span);
+            // Purposeful launch/braking keeps its authored actuator reserve,
+            // but it is no longer multiplied by the 2x travel tempo.
+            * (1.0 + purposeful_response * 0.85);
+        let maximum_acceleration = unclamped_maximum_acceleration.min(1.85 * reference_span);
+        let jerk_per_reference_span = match intent.locomotion {
+            LocomotionMode::Seek | LocomotionMode::Flee | LocomotionMode::Orbit => 48.0,
+            LocomotionMode::Landing | LocomotionMode::Sleep | LocomotionMode::Cocoon => 18.0,
+            _ => 32.0,
+        };
+        let maximum_jerk = jerk_per_reference_span * reference_span;
+
+        if matches!(
+            intent.locomotion,
+            LocomotionMode::Hover
+                | LocomotionMode::Wander
+                | LocomotionMode::Arrive
+                | LocomotionMode::SurfaceApproach
+                | LocomotionMode::Landing
+                | LocomotionMode::EdgeCling
+        ) {
+            let distance = position.distance(target);
+            let braking_speed = jerk_aware_braking_speed(
+                distance,
+                velocity.length(),
+                maximum_acceleration,
+                maximum_jerk,
+            );
+            desired_velocity = desired_velocity.clamp_length_max(braking_speed);
+        }
+
         let velocity_response = 5.8 + purposeful_response * 3.2;
-        let motor_acceleration = ((desired_velocity - velocity) * velocity_response)
-            .clamp_length_max(maximum_acceleration);
+        let requested_motor_acceleration = (desired_velocity - velocity) * velocity_response;
+        let acceleration_limited =
+            requested_motor_acceleration.length() > maximum_acceleration + 1.0e-4;
+        let motor_acceleration =
+            requested_motor_acceleration.clamp_length_max(maximum_acceleration);
         let supported = self.feedback.grounded
             || self.feedback.clinging
             || (was_grounded
@@ -225,9 +304,35 @@ impl BodySimulation {
         } else {
             BODY_SCREEN_GRAVITY * reference_span * (1.0 - lift_fraction)
         };
+        let requested_acceleration = motor_acceleration + Vec2::Y * gravity;
+        let requested_acceleration =
+            requested_acceleration.clamp_length_max(maximum_acceleration * 1.10);
+        let previous_acceleration = self.commanded_acceleration_px_s2;
+        let maximum_acceleration_delta = maximum_jerk * dt;
+        let requested_delta = requested_acceleration - previous_acceleration;
+        let jerk_limited = requested_delta.length() > maximum_acceleration_delta + 1.0e-4;
         let acceleration =
-            (motor_acceleration + Vec2::Y * gravity).clamp_length_max(maximum_acceleration * 1.10);
-        let velocity = (velocity + acceleration * dt).clamp_length_max(1.2 * reference_span);
+            previous_acceleration + requested_delta.clamp_length_max(maximum_acceleration_delta);
+        self.commanded_acceleration_px_s2 = acceleration;
+        self.diagnostics.acceleration_delta_px_s2 = acceleration - previous_acceleration;
+        self.diagnostics.jerk_px_s3 = if dt > f32::EPSILON {
+            self.diagnostics.acceleration_delta_px_s2 / dt
+        } else {
+            Vec2::ZERO
+        };
+        self.diagnostics.acceleration_limited = acceleration_limited;
+        self.diagnostics.jerk_limited = jerk_limited;
+        self.diagnostics.fixed_steps = self.diagnostics.fixed_steps.saturating_add(1);
+        self.diagnostics.acceleration_limit_events = self
+            .diagnostics
+            .acceleration_limit_events
+            .saturating_add(u64::from(acceleration_limited));
+        self.diagnostics.jerk_limit_events = self
+            .diagnostics
+            .jerk_limit_events
+            .saturating_add(u64::from(jerk_limited));
+        let velocity = (velocity + acceleration * dt)
+            .clamp_length_max(BODY_MOVEMENT_TEMPO * 1.2 * reference_span);
         let position = position + velocity * dt;
         self.feedback.acceleration = acceleration / scale;
         self.feedback.velocity = velocity / scale;
@@ -244,6 +349,7 @@ impl BodySimulation {
                 0.0
             } else {
                 self.feedback = BodyFeedback::default();
+                self.commanded_acceleration_px_s2 = Vec2::ZERO;
                 1.0
             };
         &self.feedback
@@ -258,6 +364,30 @@ fn arrive(position: Vec2, target: Vec2, speed: f32, arrival_radius: f32) -> Vec2
     let delta = target - position;
     let distance = delta.length();
     delta.normalize_or_zero() * speed * (distance / arrival_radius.max(1.0e-5)).clamp(0.0, 1.0)
+}
+
+fn jerk_aware_braking_speed(
+    distance: f32,
+    current_speed: f32,
+    maximum_acceleration: f32,
+    maximum_jerk: f32,
+) -> f32 {
+    if !distance.is_finite()
+        || !current_speed.is_finite()
+        || !maximum_acceleration.is_finite()
+        || !maximum_jerk.is_finite()
+    {
+        return 0.0;
+    }
+    let maximum_acceleration = maximum_acceleration.max(1.0e-4);
+    let maximum_jerk = maximum_jerk.max(1.0e-4);
+    // Reserve the distance travelled while acceleration slews from its current
+    // sign toward braking. The remaining distance uses the ordinary constant-
+    // acceleration stopping bound. This is conservative and frame invariant.
+    let slew_seconds = maximum_acceleration / maximum_jerk;
+    let slew_distance = current_speed.max(0.0) * slew_seconds * 0.5;
+    let usable_distance = (distance.max(0.0) - slew_distance).max(0.0);
+    (2.0 * maximum_acceleration * usable_distance).sqrt()
 }
 
 fn select_surface<'a>(intent: &BodyIntent, surfaces: &'a [SurfaceRect]) -> Option<&'a SurfaceRect> {
@@ -323,9 +453,47 @@ fn avoid_surfaces(
 
 #[cfg(test)]
 mod tests {
-    use lifecore::{ExpressionState, Genome, PoseIntent};
+    use lifecore::{ExpressionState, Genome, PoseIntent, Rect, SurfaceId};
 
     use super::*;
+
+    #[test]
+    fn landing_preserves_the_motor_locked_edge_target() {
+        let genome = Genome::from_seed(95);
+        let mut simulation = BodySimulation::new(95);
+        simulation.feedback.world_position = Vec2::new(0.50, 0.60);
+        let surface_id = SurfaceId("window-edge".into());
+        let sensors = SensorFrame {
+            visible_surfaces: vec![SurfaceRect {
+                id: surface_id.clone(),
+                rect: Rect {
+                    minimum: Vec2::new(0.60, 0.30),
+                    maximum: Vec2::new(0.80, 0.80),
+                },
+            }],
+            ..SensorFrame::default()
+        };
+        let intent = BodyIntent {
+            locomotion: LocomotionMode::Landing,
+            // The motor selected the left face at the body's current height.
+            // Legacy landing used to replace this with the window's top centre.
+            target_position: Vec2::new(0.562, 0.60),
+            target_surface: Some(surface_id),
+            desired_speed: 0.35,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Landing,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+
+        let feedback = simulation.fixed_update(&genome.body, &intent, &sensors, 1.0 / 60.0);
+
+        assert!(feedback.velocity.x > 0.0);
+        // Screen gravity may add positive Y during landing; a negative Y would
+        // reveal the removed legacy rewrite toward the surface's top centre.
+        assert!(feedback.velocity.y >= 0.0);
+    }
 
     #[test]
     fn wander_arrives_at_its_waypoint_instead_of_hitting_desktop_edges() {
@@ -386,7 +554,10 @@ mod tests {
         let regular_speed = regular.feedback.velocity.x * 1_920.0;
         let ultrawide_speed = ultrawide.feedback.velocity.x * 3_440.0;
         assert!((regular_speed - ultrawide_speed).abs() < 0.5);
-        assert!((80.0..=90.0).contains(&regular_speed));
+        assert!(
+            (150.0..=180.0).contains(&regular_speed),
+            "2x flight speed={regular_speed} px/s"
+        );
     }
 
     #[test]
@@ -419,7 +590,7 @@ mod tests {
             after > 0.0,
             "waypoint switch reversed {before} px/s to {after} px/s"
         );
-        assert!((after - before).abs() < 8.0);
+        assert!((after - before).abs() < 16.0);
     }
 
     #[test]
@@ -489,8 +660,11 @@ mod tests {
         let physical_scale = Vec2::new(1_920.0, 1_080.0);
         let low_speed = (low.feedback.velocity * physical_scale).length();
         let high_speed = (high.feedback.velocity * physical_scale).length();
-        assert!(high_speed > low_speed + 8.0);
-        assert!(high_speed < 120.0);
+        assert!(
+            high_speed > low_speed + 16.0,
+            "low={low_speed} high={high_speed} px/s"
+        );
+        assert!(high_speed < 240.0, "high={high_speed} px/s");
     }
 
     #[test]
@@ -536,8 +710,8 @@ mod tests {
         let purposeful_speed = (purposeful.feedback.velocity * physical_scale).length();
         assert!(purposeful_speed > ambient_speed * 2.5);
         assert!(
-            (270.0..=310.0).contains(&purposeful_speed),
-            "purposeful seek speed={purposeful_speed} px/s"
+            (540.0..=620.0).contains(&purposeful_speed),
+            "2x purposeful seek speed={purposeful_speed} px/s"
         );
     }
 
@@ -580,8 +754,8 @@ mod tests {
         let seek_speed = (regular_seek.feedback.velocity * regular_scale).length();
         let ultrawide_seek_speed = (ultrawide_seek.feedback.velocity * ultrawide_scale).length();
         assert!(
-            (270.0..=310.0).contains(&seek_speed),
-            "seek={seek_speed} px/s"
+            (540.0..=620.0).contains(&seek_speed),
+            "2x seek={seek_speed} px/s"
         );
         assert!((seek_speed - ultrawide_seek_speed).abs() < 0.75);
 
@@ -601,8 +775,8 @@ mod tests {
         }
         let flee_speed = (flee.feedback.velocity * regular_scale).length();
         assert!(
-            (290.0..=335.0).contains(&flee_speed),
-            "flee={flee_speed} px/s"
+            (580.0..=670.0).contains(&flee_speed),
+            "2x flee={flee_speed} px/s"
         );
 
         let mut orbit = BodySimulation::new(0xFA57);
@@ -621,8 +795,8 @@ mod tests {
         }
         let orbit_speed = (orbit.feedback.velocity * regular_scale).length();
         assert!(
-            (235.0..=285.0).contains(&orbit_speed),
-            "orbit={orbit_speed} px/s"
+            (470.0..=570.0).contains(&orbit_speed),
+            "2x orbit={orbit_speed} px/s"
         );
     }
 
@@ -649,7 +823,7 @@ mod tests {
             simulation.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
         }
         let launch_speed = (simulation.feedback.velocity * scale).length();
-        assert!(launch_speed > 175.0, "launch={launch_speed} px/s");
+        assert!(launch_speed > 350.0, "2x launch={launch_speed} px/s");
         assert!(
             simulation
                 .embodied_target

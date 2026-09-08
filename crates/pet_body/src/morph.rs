@@ -67,7 +67,8 @@ pub struct ModalDynamics {
     velocity2: Vec2,
     velocity3: Vec2,
     velocity4: Vec2,
-    previous_acceleration: Vec2,
+    filtered_acceleration: Vec2,
+    previous_filtered_acceleration: Vec2,
     tuning: AnalyticTuning,
 }
 
@@ -78,7 +79,8 @@ impl Default for ModalDynamics {
             velocity2: Vec2::ZERO,
             velocity3: Vec2::ZERO,
             velocity4: Vec2::ZERO,
-            previous_acceleration: Vec2::ZERO,
+            filtered_acceleration: Vec2::ZERO,
+            previous_filtered_acceleration: Vec2::ZERO,
             tuning: AnalyticTuning::default(),
         }
     }
@@ -100,9 +102,17 @@ impl ModalDynamics {
         }
 
         let softness = softness.clamp(0.0, 1.0);
-        let acceleration = finite_vec2(feedback.acceleration).clamp_length_max(4.0);
-        let jerk = ((acceleration - self.previous_acceleration) / dt).clamp_length_max(28.0);
-        self.previous_acceleration = acceleration;
+        let raw_acceleration = finite_vec2(feedback.acceleration).clamp_length_max(4.0);
+        // A 14 Hz inertial lane removes fixed-step stair-steps without delaying
+        // contact, which is carried independently by `feedback.collision`.
+        let acceleration_alpha = 1.0 - (-std::f32::consts::TAU * 14.0 * dt).exp();
+        self.filtered_acceleration = self
+            .filtered_acceleration
+            .lerp(raw_acceleration, acceleration_alpha);
+        let acceleration = self.filtered_acceleration;
+        let raw_jerk = (acceleration - self.previous_filtered_acceleration) / dt;
+        let jerk = soft_limit_vec2(raw_jerk, 28.0);
+        self.previous_filtered_acceleration = acceleration;
         let impact = feedback
             .collision
             .as_ref()
@@ -216,6 +226,16 @@ fn harmonic(direction: Vec2, order: u32) -> Vec2 {
 
 fn finite_vec2(value: Vec2) -> Vec2 {
     if value.is_finite() { value } else { Vec2::ZERO }
+}
+
+fn soft_limit_vec2(value: Vec2, limit: f32) -> Vec2 {
+    let magnitude = value.length();
+    if magnitude <= f32::EPSILON || !magnitude.is_finite() || limit <= 0.0 {
+        return Vec2::ZERO;
+    }
+    // Unlike clamp_length_max, the rational knee retains amplitude differences
+    // above the nominal limit instead of turning every turn into the same pulse.
+    value * (limit / (limit + magnitude))
 }
 
 fn lerp(start: f32, end: f32, amount: f32) -> f32 {

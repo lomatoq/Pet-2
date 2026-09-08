@@ -16,6 +16,7 @@ impl Default for ProsodyCurve {
 }
 
 impl ProsodyCurve {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_targets(
         start: f32,
         peak: f32,

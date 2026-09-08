@@ -34,6 +34,10 @@ use pet_body::{
     TopologyConstraintMode, VisualMindInput, VoiceVisualState,
 };
 use pet_ecology::{EcologyState, ObjectLifecycle};
+use pet_motor::{
+    BehaviorProgramId, CatalogValidationSummary, definition as motor_definition, validate_catalog,
+};
+use serde::Deserialize;
 use serde_json::Value;
 use winit::{
     application::ApplicationHandler,
@@ -195,6 +199,8 @@ struct LivePetMonitor {
     control_drive_duration: f32,
     control_attention_duration: f32,
     control_reward: f32,
+    control_motor_program: BehaviorProgramId,
+    motor_validation: CatalogValidationSummary,
     control_counter: u64,
     last_sent_command_id: u64,
     pending_command_id: Option<u64>,
@@ -208,6 +214,35 @@ struct LivePetMonitor {
     status: String,
     last_poll: Instant,
     last_received: Option<Instant>,
+    connection: LabConnectionState,
+    session_token: Option<String>,
+    expected_session_id: Option<u64>,
+    connect_started: Option<Instant>,
+    last_session_command: Option<Instant>,
+    launched_for_connect: bool,
+    runtime_session_id: Option<u64>,
+    runtime_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LabConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    PetNotRunning,
+    VersionMismatch,
+}
+
+impl LabConnectionState {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Disconnected => "Disconnected",
+            Self::Connecting => "Connecting",
+            Self::Connected => "Connected",
+            Self::PetNotRunning => "Pet not running",
+            Self::VersionMismatch => "Version mismatch",
+        }
+    }
 }
 
 struct AcceleratedLearningState {
@@ -1156,8 +1191,10 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
     if runtime.ui.focus_lock {
         expression.pupil_focus = 1.0;
     }
-    let mut fast = FastPhenotypeActuation::default();
-    fast.expression = expression;
+    let mut fast = FastPhenotypeActuation {
+        expression,
+        ..FastPhenotypeActuation::default()
+    };
     if runtime.ui.section == LabSection::Nervous {
         let levels = runtime
             .ui
@@ -1690,6 +1727,8 @@ impl LivePetMonitor {
             control_drive_duration: 4.0,
             control_attention_duration: 2.0,
             control_reward: 0.25,
+            control_motor_program: BehaviorProgramId::MoveOrientReflex,
+            motor_validation: validate_catalog(0x6400_2026),
             control_counter: 0,
             last_sent_command_id: store
                 .load_lab_control()
@@ -1707,6 +1746,163 @@ impl LivePetMonitor {
             status: format!("Waiting for {}", store.paths.telemetry.display()),
             last_poll: Instant::now() - Duration::from_secs(1),
             last_received: None,
+            connection: LabConnectionState::Disconnected,
+            session_token: None,
+            expected_session_id: None,
+            connect_started: None,
+            last_session_command: None,
+            launched_for_connect: false,
+            runtime_session_id: None,
+            runtime_sequence: None,
+        }
+    }
+
+    fn connect(&mut self) {
+        let token = format!("{:032x}", rand::random::<u128>());
+        self.expected_session_id = Some(desktop_host::lab_session_id(&token));
+        self.session_token = Some(token);
+        self.connection = LabConnectionState::Connecting;
+        self.connect_started = Some(Instant::now());
+        self.last_session_command = None;
+        self.launched_for_connect = false;
+        self.control_status = "Connecting to the normal Pet release…".into();
+        self.maintain_connection();
+    }
+
+    fn disconnect(&mut self) {
+        if self.session_token.is_some() {
+            let _ = self.write_session_command(LabControlCommand::CloseSession);
+        }
+        self.connection = LabConnectionState::Disconnected;
+        self.session_token = None;
+        self.expected_session_id = None;
+        self.connect_started = None;
+        self.last_session_command = None;
+        self.launched_for_connect = false;
+        self.pending_command_id = None;
+        self.pending_command_sent_at = None;
+        self.control_status =
+            "Disconnected; the Pet lease will close immediately or expire within 10 s.".into();
+    }
+
+    fn write_session_command(&mut self, command: LabControlCommand) -> Result<u64, String> {
+        let Some(token) = self.session_token.clone() else {
+            return Err("no Lab session token".into());
+        };
+        let issued_unix_ms = unix_time_ms();
+        self.control_counter = self.control_counter.wrapping_add(1).max(1);
+        let command_id = next_lab_command_id(
+            issued_unix_ms,
+            self.control_counter,
+            self.last_sent_command_id,
+        );
+        let envelope = build_lab_control_envelope(command_id, issued_unix_ms, Some(token), command);
+        self.control_store
+            .save_lab_control(&envelope)
+            .map_err(|error| error.to_string())?;
+        self.last_sent_command_id = command_id;
+        self.last_session_command = Some(Instant::now());
+        Ok(command_id)
+    }
+
+    fn maintain_connection(&mut self) {
+        if self.connection == LabConnectionState::Disconnected
+            || self.connection == LabConnectionState::VersionMismatch
+        {
+            return;
+        }
+        if self.connection == LabConnectionState::Connected {
+            if self.stale_seconds().is_none_or(|seconds| seconds > 2.0) {
+                self.connection = LabConnectionState::Connecting;
+                self.connect_started.get_or_insert_with(Instant::now);
+            } else if self.pending_command_id.is_none()
+                && self.last_session_command.is_none_or(|at| {
+                    at.elapsed()
+                        >= Duration::from_secs(u64::from(desktop_host::LAB_SESSION_RENEW_SECONDS))
+                })
+                && let Err(error) = self.write_session_command(LabControlCommand::RenewSession {
+                    lease_seconds: desktop_host::LAB_SESSION_LEASE_SECONDS,
+                })
+            {
+                self.control_status = format!("Lease renewal failed: {error}");
+            }
+            return;
+        }
+
+        let now_ms = unix_time_ms();
+        let acknowledgement = self
+            .control_store
+            .load_runtime_ack::<RuntimeLoadAcknowledgement>()
+            .ok()
+            .flatten();
+        let running = acknowledgement.as_ref().filter(|ack| {
+            ack.status == RuntimeLoadStatus::Running
+                && now_ms.saturating_sub(ack.updated_unix_ms) <= 2_000
+        });
+        if let Some(running) = running {
+            if running.executable_version != env!("CARGO_PKG_VERSION") {
+                self.connection = LabConnectionState::VersionMismatch;
+                self.control_status = format!(
+                    "Version mismatch: Lab {} / Pet {}. Existing Pet was not stopped.",
+                    env!("CARGO_PKG_VERSION"),
+                    running.executable_version
+                );
+                return;
+            }
+            if self
+                .last_session_command
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+            {
+                match self.write_session_command(LabControlCommand::OpenSession {
+                    protocol_version: desktop_host::LAB_SESSION_PROTOCOL_VERSION,
+                    lease_seconds: desktop_host::LAB_SESSION_LEASE_SECONDS,
+                }) {
+                    Ok(command_id) => {
+                        self.control_status = format!(
+                            "Session request {command_id} sent to Pet PID {}; waiting for 5 Hz telemetry.",
+                            running.pid
+                        );
+                    }
+                    Err(error) => self.control_status = format!("Connect write failed: {error}"),
+                }
+            }
+            if self
+                .connect_started
+                .is_some_and(|started| started.elapsed() >= Duration::from_secs(6))
+            {
+                self.connection = LabConnectionState::VersionMismatch;
+                self.control_status = "Pet is running but did not accept LabControl protocol v2; existing Pet was left untouched.".into();
+            }
+            return;
+        }
+
+        if !self.launched_for_connect {
+            self.launched_for_connect = true;
+            match launch_desktop_pet_at(&self.control_store) {
+                Ok((path, pid)) => {
+                    self.connection = LabConnectionState::Connecting;
+                    self.control_status = format!(
+                        "Started sibling Pet PID {pid} from {}; waiting for runtime heartbeat.",
+                        path.display()
+                    );
+                }
+                Err(error) => {
+                    if error.starts_with("Version mismatch:") {
+                        self.connection = LabConnectionState::VersionMismatch;
+                        self.control_status = error;
+                    } else {
+                        self.connection = LabConnectionState::PetNotRunning;
+                        self.control_status = format!("Pet not running and launch failed: {error}");
+                    }
+                }
+            }
+        } else if self
+            .connect_started
+            .is_some_and(|started| started.elapsed() >= Duration::from_secs(8))
+        {
+            self.connection = LabConnectionState::PetNotRunning;
+            self.control_status =
+                "Pet not running: no fresh runtime heartbeat after launch.".into();
         }
     }
 
@@ -1715,6 +1911,7 @@ impl LivePetMonitor {
         self.expire_pending_control();
         self.poll_canonical_evolution();
         self.accelerated_learning.poll();
+        self.maintain_connection();
         if self.last_poll.elapsed() < Duration::from_millis(80) {
             return;
         }
@@ -1743,7 +1940,7 @@ impl LivePetMonitor {
         }
 
         if self.using_legacy && !self.legacy_path.exists() {
-            self.status = "No telemetry yet. Start Pet2.exe with --dev-mode.".into();
+            self.status = "No telemetry yet. Click Connect to Pet.".into();
             return;
         }
 
@@ -1804,6 +2001,28 @@ impl LivePetMonitor {
 
     fn ingest(&mut self, event: Value) {
         self.observe_control_acknowledgement(&event);
+        self.runtime_session_id = event
+            .pointer("/details/runtime_session_id")
+            .and_then(Value::as_u64)
+            .or(self.runtime_session_id);
+        self.runtime_sequence = event
+            .pointer("/details/sequence")
+            .and_then(Value::as_u64)
+            .or(self.runtime_sequence);
+        let observed_lab_session = event
+            .pointer("/details/lab_session/session_id")
+            .and_then(Value::as_u64);
+        let lab_active = event
+            .pointer("/details/lab_session/active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if lab_active
+            && observed_lab_session.is_some()
+            && observed_lab_session == self.expected_session_id
+        {
+            self.connection = LabConnectionState::Connected;
+            self.connect_started = None;
+        }
         let frame_bytes = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len());
         let velocity = vector2(&event, "/details/screen_velocity_px");
         let orb_velocity = vector2(&event, "/details/ecology/orb_velocity");
@@ -1978,11 +2197,12 @@ impl LivePetMonitor {
     }
 
     fn can_send_control(&self) -> bool {
-        self.pending_command_id.is_none()
+        self.connection == LabConnectionState::Connected
+            && self.pending_command_id.is_none()
             && self.follow_live
             && !self.frames.is_empty()
             && self.selected == self.frames.len().saturating_sub(1)
-            && self.stale_seconds().is_some_and(|seconds| seconds <= 1.2)
+            && self.stale_seconds().is_some_and(|seconds| seconds <= 2.0)
     }
 
     fn send_control(&mut self, command: LabControlCommand) {
@@ -1998,7 +2218,12 @@ impl LivePetMonitor {
             self.control_counter,
             self.last_sent_command_id,
         );
-        let envelope = build_lab_control_envelope(command_id, issued_unix_ms, command);
+        let envelope = build_lab_control_envelope(
+            command_id,
+            issued_unix_ms,
+            self.session_token.clone(),
+            command,
+        );
         let description = lab_control_description(&envelope.command);
         match self.control_store.save_lab_control(&envelope) {
             Ok(()) => {
@@ -2052,6 +2277,14 @@ impl LivePetMonitor {
                 "No telemetry acknowledgement for command {pending} within {} s; slot unlocked without assuming it applied.",
                 LAB_CONTROL_ACK_TIMEOUT.as_secs()
             );
+        }
+    }
+}
+
+impl Drop for LivePetMonitor {
+    fn drop(&mut self) {
+        if self.session_token.is_some() {
+            let _ = self.write_session_command(LabControlCommand::CloseSession);
         }
     }
 }
@@ -2603,9 +2836,13 @@ fn next_lab_command_id(issued_unix_ms: u64, counter: u64, last_sent_id: u64) -> 
 fn build_lab_control_envelope(
     command_id: u64,
     issued_unix_ms: u64,
+    session_token: Option<String>,
     command: LabControlCommand,
 ) -> LabControlEnvelope {
     let expires_after_ms = match &command {
+        LabControlCommand::OpenSession { .. }
+        | LabControlCommand::RenewSession { .. }
+        | LabControlCommand::CloseSession => 5_000,
         LabControlCommand::CueAttention {
             duration_seconds, ..
         }
@@ -2615,6 +2852,8 @@ fn build_lab_control_envelope(
         LabControlCommand::Reward { .. }
         | LabControlCommand::FocusMode { .. }
         | LabControlCommand::ClearDrivePulses
+        | LabControlCommand::RunMotorProgram { .. }
+        | LabControlCommand::CancelMotorProgram
         | LabControlCommand::DeleteGestureConvention { .. }
         | LabControlCommand::RollbackGestureConventions { .. }
         | LabControlCommand::ClearGestureConventions => 5_000,
@@ -2631,12 +2870,16 @@ fn build_lab_control_envelope(
         command_id: command_id.max(1),
         issued_unix_ms,
         expires_after_ms,
+        session_token,
         command,
     }
 }
 
 fn lab_control_description(command: &LabControlCommand) -> String {
     match command {
+        LabControlCommand::OpenSession { .. } => "open Lab session".into(),
+        LabControlCommand::RenewSession { .. } => "renew Lab session".into(),
+        LabControlCommand::CloseSession => "close Lab session".into(),
         LabControlCommand::CueAttention { position, .. } => {
             format!("attention cue @ {:.2}, {:.2}", position[0], position[1])
         }
@@ -2653,6 +2896,10 @@ fn lab_control_description(command: &LabControlCommand) -> String {
             intensity,
             duration_seconds,
         } => format!("fixture {gesture:?}, intensity {intensity:.2}, {duration_seconds:.2} s"),
+        LabControlCommand::RunMotorProgram { program } => {
+            format!("motor fixture {}", program.wire_name())
+        }
+        LabControlCommand::CancelMotorProgram => "cancel motor fixture".into(),
         LabControlCommand::DeleteGestureConvention { convention_id } => {
             format!("delete gesture convention {convention_id}")
         }
@@ -2748,7 +2995,7 @@ fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
         .show(context, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("PET-2 Pet Lab · Live Nervous System");
-                let stale = monitor.stale_seconds().is_none_or(|seconds| seconds > 1.2);
+                let stale = monitor.stale_seconds().is_none_or(|seconds| seconds > 2.0);
                 ui.colored_label(
                     if stale {
                         egui::Color32::from_rgb(255, 118, 105)
@@ -2757,6 +3004,37 @@ fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
                     },
                     if stale { "OFFLINE / STALE" } else { "LIVE" },
                 );
+            });
+            ui.horizontal_wrapped(|ui| {
+                let connected = monitor.connection == LabConnectionState::Connected;
+                if ui
+                    .button(if connected || monitor.connection == LabConnectionState::Connecting {
+                        "Disconnect"
+                    } else {
+                        "Connect to Pet"
+                    })
+                    .clicked()
+                {
+                    if connected || monitor.connection == LabConnectionState::Connecting {
+                        monitor.disconnect();
+                    } else {
+                        monitor.connect();
+                    }
+                }
+                let color = match monitor.connection {
+                    LabConnectionState::Connected => egui::Color32::from_rgb(105, 232, 172),
+                    LabConnectionState::Connecting => egui::Color32::from_rgb(255, 202, 105),
+                    LabConnectionState::Disconnected => egui::Color32::from_gray(180),
+                    LabConnectionState::PetNotRunning | LabConnectionState::VersionMismatch => {
+                        egui::Color32::from_rgb(255, 118, 105)
+                    }
+                };
+                ui.colored_label(color, monitor.connection.label());
+                if let (Some(runtime_session), Some(sequence)) =
+                    (monitor.runtime_session_id, monitor.runtime_sequence)
+                {
+                    ui.small(format!("runtime {runtime_session:016x} · seq {sequence}"));
+                }
             });
             ui.label("perception → arbitration → intent → motor → body / object");
             ui.small(format!(
@@ -2776,7 +3054,7 @@ fn show_live_pet(context: &Context, monitor: &mut LivePetMonitor) {
             let Some(latest) = monitor.frames.get(selected_frame) else {
                 ui.add_space(20.0);
                 ui.heading("Waiting for the organism");
-                ui.label("Close the normal Pet 2 instance, then run Pet2-Dev.cmd.");
+                ui.label("Click Connect to Pet; Lab will attach to or start the normal release.");
                 ui.label(
                     "No screen captures/pixel buffers, typed text, raw audio, or native window IDs are stored; legacy numeric desktop coordinates remain.",
                 );
@@ -3187,7 +3465,7 @@ fn live_timeline(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
 
 fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
     CollapsingHeader::new("Controlled intervention")
-        .default_open(false)
+        .default_open(true)
         .show(ui, |ui| {
             let enabled = monitor.can_send_control();
             ui.label(
@@ -3210,6 +3488,7 @@ fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor)
             let mut pending_command = None;
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Drive pulse");
+                let previous_drive = monitor.control_drive;
                 egui::ComboBox::from_id_salt("lab_control_drive")
                     .selected_text(lab_drive_label(monitor.control_drive))
                     .show_ui(ui, |ui| {
@@ -3230,6 +3509,19 @@ fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor)
                             );
                         }
                     });
+                if monitor.control_drive != previous_drive {
+                    if monitor.control_drive == LabDrive::Sleep {
+                        // Fresh homeostasis starts near 0.12 and Sleep is not an
+                        // eligible action below 0.46. The lab preset must cross
+                        // that causal threshold long enough for arbitration;
+                        // it still changes only the drive, never the action id.
+                        monitor.control_drive_delta = 0.85;
+                        monitor.control_drive_duration = 8.0;
+                    } else {
+                        monitor.control_drive_delta = 0.25;
+                        monitor.control_drive_duration = 4.0;
+                    }
+                }
                 ui.label("Δ");
                 ui.add(
                     DragValue::new(&mut monitor.control_drive_delta)
@@ -3318,20 +3610,114 @@ fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor)
             });
 
             ui.separator();
+            ui.strong(format!(
+                "Motor catalog · {} / {} numerically verified",
+                monitor.motor_validation.passed_program_count,
+                monitor.motor_validation.catalog_program_count
+            ));
+            ui.small(
+                "Runs one selected catalog bout through the live production motor → PBF body. Brain state keeps advancing, but it cannot replace the fixture until completion; Cancel returns control immediately.",
+            );
+            ui.small(format!(
+                "Deterministic acceptance: max {} local fields / {} allowed · max {} surface attachment · failures: {}",
+                monitor.motor_validation.maximum_local_fields_observed,
+                pet_motor::LOCAL_FIELD_BUDGET,
+                monitor.motor_validation.maximum_surface_attachments_observed,
+                if monitor.motor_validation.failed_programs.is_empty() {
+                    "none".to_owned()
+                } else {
+                    monitor.motor_validation.failed_programs.join(", ")
+                }
+            ));
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("lab_motor_program")
+                    .width(280.0)
+                    .selected_text(format!(
+                        "{:02} · {}",
+                        monitor.control_motor_program.index() + 1,
+                        monitor.control_motor_program.wire_name()
+                    ))
+                    .show_ui(ui, |ui| {
+                        let mut previous_family = None;
+                        for program in BehaviorProgramId::ALL {
+                            let family = program.family();
+                            if previous_family != Some(family) {
+                                if previous_family.is_some() {
+                                    ui.separator();
+                                }
+                                ui.strong(format!("{family:?}"));
+                                previous_family = Some(family);
+                            }
+                            ui.selectable_value(
+                                &mut monitor.control_motor_program,
+                                program,
+                                format!("{:02}  {}", program.index() + 1, program.wire_name()),
+                            );
+                        }
+                    });
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Run selected"))
+                    .clicked()
+                {
+                    pending_command = Some(LabControlCommand::RunMotorProgram {
+                        program: monitor.control_motor_program,
+                    });
+                }
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    pending_command = Some(LabControlCommand::CancelMotorProgram);
+                }
+            });
+            let definition = motor_definition(monitor.control_motor_program);
+            ui.small(format!(
+                "{:?} · {:?} · {} phases · cooldown {:.2} s",
+                monitor.control_motor_program.family(),
+                definition.priority,
+                definition.phases.len(),
+                definition.cooldown_seconds
+            ));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Phases:");
+                for phase in definition.phases {
+                    ui.monospace(phase.name);
+                }
+            });
+            if let Some(frame) = monitor.selected_frame() {
+                ui.small(format!(
+                    "Live: program={} · phase={} · Lab override={}",
+                    text(frame, "/details/motor/packet/program"),
+                    text(frame, "/details/motor/packet/phase_name"),
+                    text(frame, "/details/motor/lab_program_override")
+                ));
+            }
+
+            ui.separator();
             ui.strong("Body Communication fixtures");
             ui.small(
                 "Each button runs a predefined fixed-seed pointer fixture through real body physics; no classifier label is injected.",
             );
             ui.horizontal_wrapped(|ui| {
                 for (gesture, duration) in [
-                    (LabGesture::SoftTouch, 0.7),
+                    // Keep the authored contact brief in pet2 while retaining
+                    // enough live time to observe release and recovery at 5 Hz.
+                    (LabGesture::SoftTouch, 2.0),
                     (LabGesture::SlowStretch, 1.5),
                     (LabGesture::Tickle, 1.2),
                     (LabGesture::ThreeBeatRhythm, 1.8),
                     (LabGesture::CircularTwist, 1.5),
                     (LabGesture::SharpFlick, 0.45),
-                    (LabGesture::Hold, 1.4),
-                    (LabGesture::PullRelease, 1.2),
+                    // A sustained-hold fixture must stay active long enough for
+                    // an operator to observe both the contact plateau and the
+                    // motor response in the 5 Hz live telemetry panel.  The
+                    // previous 1.4 s pulse had usually ended before a cold
+                    // Body Lab refresh completed, hiding the causal evidence.
+                    (LabGesture::Hold, 5.0),
+                    // Preserve the authored waveform while giving the 5 Hz
+                    // operator view enough time to show tether, extension,
+                    // release, and rebound as separate causal phases.
+                    (LabGesture::PullRelease, 4.0),
                     (LabGesture::RealSplitRemerge, 3.6),
                     (LabGesture::FragmentHelp, 3.6),
                     (LabGesture::OverstrainBoundary, 1.2),
@@ -3448,8 +3834,8 @@ const fn lab_gesture_label(gesture: LabGesture) -> &'static str {
 
 fn live_blockers(latest: &Value, stale_seconds: Option<f32>) -> Vec<(u8, String)> {
     let mut blockers = Vec::new();
-    if stale_seconds.is_none_or(|seconds| seconds > 1.2) {
-        blockers.push((2, "TELEMETRY STALE — the pet is not in --dev-mode".into()));
+    if stale_seconds.is_none_or(|seconds| seconds > 2.0) {
+        blockers.push((2, "TELEMETRY STALE — reconnect the Lab session".into()));
     }
     let body_mode = text(latest, "/details/body_render_mode");
     let material = text(latest, "/details/material_variant");
@@ -7259,6 +7645,76 @@ fn resolve_pet_executable(current_exe: &Path, workspace_root: &Path) -> Result<P
         })
 }
 
+#[derive(Debug, Deserialize)]
+struct ReleaseManifest {
+    schema: String,
+    release_version: String,
+    lab_control_protocol: u32,
+    compatible_pair: bool,
+    files: ReleaseManifestFiles,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseManifestFiles {
+    #[serde(rename = "Pet2.exe")]
+    pet: ReleaseManifestFile,
+    #[serde(rename = "PetLab.exe")]
+    lab: ReleaseManifestFile,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseManifestFile {
+    sha256: String,
+    size: u64,
+}
+
+/// A package manifest is authoritative only when Lab and Pet are siblings.
+/// Development target directories intentionally have no manifest and retain
+/// the existing runtime version/protocol handshake.
+fn verify_packaged_release_pair(current_exe: &Path, pet_exe: &Path) -> Result<(), String> {
+    if current_exe.parent() != pet_exe.parent() {
+        return Ok(());
+    }
+    let Some(parent) = current_exe.parent() else {
+        return Ok(());
+    };
+    let manifest_path = parent.join("release-manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let manifest: ReleaseManifest = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .map_err(|error| format!("Version mismatch: cannot read release manifest: {error}"))?,
+    )
+    .map_err(|error| format!("Version mismatch: invalid release manifest: {error}"))?;
+    if manifest.schema != "pet2.release_manifest.v1"
+        || manifest.release_version != env!("CARGO_PKG_VERSION")
+        || manifest.lab_control_protocol != desktop_host::LAB_SESSION_PROTOCOL_VERSION
+        || !manifest.compatible_pair
+    {
+        return Err(format!(
+            "Version mismatch: manifest version/protocol is incompatible with Pet Lab {}.",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    for (label, path, expected) in [
+        ("Pet2.exe", pet_exe, &manifest.files.pet),
+        ("PetLab.exe", current_exe, &manifest.files.lab),
+    ] {
+        let actual_size = fs::metadata(path)
+            .map_err(|error| format!("Version mismatch: cannot inspect {label}: {error}"))?
+            .len();
+        let actual_hash = executable_sha256(path)
+            .map_err(|error| format!("Version mismatch: cannot hash {label}: {error}"))?;
+        if actual_size != expected.size || !actual_hash.eq_ignore_ascii_case(&expected.sha256) {
+            return Err(format!(
+                "Version mismatch: {label} does not match release-manifest.json; existing Pet was not stopped."
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn executable_sha256(path: &Path) -> Result<String, String> {
     let output = if cfg!(windows) {
         Command::new("certutil.exe")
@@ -7309,6 +7765,7 @@ fn launch_desktop_pet_at(store: &StateStore) -> Result<(PathBuf, u32), String> {
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let executable = resolve_pet_executable(&current_exe, &workspace_root)?;
+    verify_packaged_release_pair(&current_exe, &executable)?;
     let data_root = fs::canonicalize(&store.paths.root).map_err(|error| {
         format!(
             "cannot resolve promoted data directory {}: {error}",
@@ -7339,6 +7796,7 @@ fn stop_live_runtime_for_promotion(store: &StateStore) -> Result<Option<u32>, St
         command_id: now.max(1),
         issued_unix_ms: now,
         expires_after_ms: 15_000,
+        session_token: None,
         command: LabControlCommand::ShutdownForPromotion,
     };
     store
@@ -7890,6 +8348,37 @@ mod tests {
     }
 
     #[test]
+    fn packaged_pair_manifest_accepts_exact_hashes_and_rejects_a_stale_pet() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pet = temporary.path().join("Pet2.exe");
+        let lab = temporary.path().join("PetLab.exe");
+        fs::write(&pet, b"pet release fixture").unwrap();
+        fs::write(&lab, b"lab release fixture").unwrap();
+        let pet_hash = executable_sha256(&pet).unwrap();
+        let lab_hash = executable_sha256(&lab).unwrap();
+        let manifest = serde_json::json!({
+            "schema": "pet2.release_manifest.v1",
+            "release_version": env!("CARGO_PKG_VERSION"),
+            "lab_control_protocol": desktop_host::LAB_SESSION_PROTOCOL_VERSION,
+            "compatible_pair": true,
+            "files": {
+                "Pet2.exe": { "sha256": pet_hash, "size": fs::metadata(&pet).unwrap().len() },
+                "PetLab.exe": { "sha256": lab_hash, "size": fs::metadata(&lab).unwrap().len() }
+            }
+        });
+        fs::write(
+            temporary.path().join("release-manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        verify_packaged_release_pair(&lab, &pet).unwrap();
+        fs::write(&pet, b"stale or replaced pet").unwrap();
+        let error = verify_packaged_release_pair(&lab, &pet).unwrap_err();
+        assert!(error.starts_with("Version mismatch:"));
+    }
+
+    #[test]
     fn preview_projection_is_centered_in_the_actual_canvas_not_the_hidden_window() {
         let genome = Genome::from_seed(7);
         let mut body = ProceduralBody::generate(&genome).unwrap();
@@ -8138,6 +8627,7 @@ mod tests {
         let envelope = build_lab_control_envelope(
             0,
             42_000,
+            Some("0123456789abcdef0123456789abcdef".into()),
             LabControlCommand::DrivePulse {
                 drive: LabDrive::Curiosity,
                 delta: 0.35,

@@ -257,6 +257,23 @@ impl Lab {
     }
 
     fn tick(&mut self, tick: u64, dt: f32) {
+        // The headless lab uses the same 58x72 ellipse as its 1280x720 preview.
+        let desktop = Vec2::new(1280.0, 720.0);
+        let offset = (self.orb().position - self.pet_position) * desktop;
+        let normal = offset.try_normalize().unwrap_or(Vec2::X);
+        let body_radius = 1.0 / (normal / Vec2::new(58.0, 72.0)).length();
+        let orb_radius = self.orb().radius_px_at_reference * 720.0 / 1_152.0;
+        let surface = self.pet_position + normal * body_radius / desktop;
+        let orb_physical = pet_ecology::PhysicalGrabFrame {
+            contact: offset.length() <= body_radius + orb_radius,
+            // This reduced ecology harness carries at the point-mass center;
+            // the desktop runtime supplies the measured liquid-body socket.
+            socket_position: self.pet_position,
+            body_surface_position: surface,
+            normal_world: normal,
+            penetration_px: (body_radius + orb_radius - offset.length()).max(0.0),
+            ..Default::default()
+        };
         let brain_intent = BodyIntent {
             locomotion: LocomotionMode::Hover,
             target_position: self.pet_position,
@@ -273,6 +290,7 @@ impl Lab {
             pet_position: self.pet_position,
             pet_velocity: self.pet_velocity,
             desktop_aspect: LAB_DESKTOP_ASPECT,
+            orb_physical,
             cursor_position: self.cursor,
             pointer_down: false,
             user_activity: self.user_activity,

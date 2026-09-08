@@ -159,12 +159,12 @@ fn reject_new_split_branches(
                     .then_with(|| right_group.cmp(left_group))
             })
             .map_or(0, |(group, _)| group as u8);
-        for index in 0..count {
+        for (index, particle) in particles.iter_mut().enumerate().take(count) {
             if usize::from(accepted.labels[index]) == accepted_group
                 && predicted.labels[index] != continuation
-                && particles[index].predicted_position != particles[index].position
+                && particle.predicted_position != particle.position
             {
-                particles[index].predicted_position = particles[index].position;
+                particle.predicted_position = particle.position;
                 corrections = corrections.saturating_add(1);
             }
         }

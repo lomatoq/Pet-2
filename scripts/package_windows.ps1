@@ -34,6 +34,40 @@ Copy-Item -Force (Join-Path $workspace 'config/embodiment/active-liquid-profile-
 Copy-Item -Force (Join-Path $workspace 'config/embodiment/brain-body-parameter-catalog.json') (Join-Path $dist 'config/embodiment/brain-body-parameter-catalog.json')
 Copy-Item -Force (Join-Path $workspace 'config/embodiment/brain-body-coupling-proposal.json') (Join-Path $dist 'config/embodiment/brain-body-coupling-proposal.json')
 Copy-Item -Force (Join-Path $voiceLabOutput '*') (Join-Path $dist 'voice-lab')
-Set-Content -Encoding ascii -Path (Join-Path $dist 'Pet2-Dev.cmd') -Value @('@echo off', 'start "" "%~dp0Pet2.exe" --dev-mode', 'start "" "%~dp0PetLab.exe"')
+Set-Content -Encoding ascii -Path (Join-Path $dist 'Pet2-Dev.cmd') -Value @('@echo off', 'start "" "%~dp0Pet2.exe" --dev-mode', 'start "" "%~dp0PetLab.exe" --live-pet')
+$sourcePet = Join-Path $workspace "target/$Target/release/pet2.exe"
+$sourceLab = Join-Path $workspace "target/$Target/release/body_lab.exe"
+$packagedPet = Join-Path $dist 'Pet2.exe'
+$packagedLab = Join-Path $dist 'PetLab.exe'
+$sourcePetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourcePet).Hash.ToLowerInvariant()
+$sourceLabHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceLab).Hash.ToLowerInvariant()
+$packagedPetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedPet).Hash.ToLowerInvariant()
+$packagedLabHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedLab).Hash.ToLowerInvariant()
+if ($sourcePetHash -ne $packagedPetHash -or $sourceLabHash -ne $packagedLabHash) {
+    throw 'release copy hash verification failed'
+}
+$versionMatch = Select-String -LiteralPath (Join-Path $workspace 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+if (-not $versionMatch) { throw 'workspace release version was not found' }
+$releaseVersion = $versionMatch.Matches[0].Groups[1].Value
+$releaseManifest = [ordered]@{
+    schema = 'pet2.release_manifest.v1'
+    release_version = $releaseVersion
+    lab_control_protocol = 2
+    built_utc = [DateTime]::UtcNow.ToString('o')
+    compatible_pair = $true
+    files = [ordered]@{
+        'Pet2.exe' = [ordered]@{
+            sha256 = $packagedPetHash
+            size = (Get-Item -LiteralPath $packagedPet).Length
+        }
+        'PetLab.exe' = [ordered]@{
+            sha256 = $packagedLabHash
+            size = (Get-Item -LiteralPath $packagedLab).Length
+        }
+    }
+}
+$releaseManifestJson = $releaseManifest | ConvertTo-Json -Depth 5
+$utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+[IO.File]::WriteAllText((Join-Path $dist 'release-manifest.json'), $releaseManifestJson, $utf8WithoutBom)
 Compress-Archive -Force -Path (Join-Path $dist '*') -DestinationPath $archive
 Write-Output $archive

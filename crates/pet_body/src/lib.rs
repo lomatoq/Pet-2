@@ -59,6 +59,7 @@ use lifecore::{
     FastPhenotypeActuation, Genome, MaterialRuntimeActuation, PoseIntent, SensorFrame,
 };
 use pet_ecology::EmbodiedEnvironmentFrame;
+use pet_motor::{SomaticActuationPacket, SomaticPerformanceFeedback};
 
 const BODY_LAB_EYE_SIZE: f32 = 0.134_631_28;
 const BODY_LAB_EYE_SPACING: f32 = 0.341_251_4;
@@ -124,6 +125,26 @@ pub struct LiquidVisualBounds {
     pub maximum: Vec2,
     pub main_minimum: Vec2,
     pub main_maximum: Vec2,
+}
+
+/// Geometry used by object interaction. Unlike [`LiquidVisualBounds`], this
+/// contains only the main liquid component and never includes bubbles, rim,
+/// bloom, shadow, or compositor padding.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LiquidPhysicalHull {
+    pub minimum: Vec2,
+    pub maximum: Vec2,
+    pub particle_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LiquidPhysicalContact {
+    /// Outward screen-space normal, from the body toward the object.
+    pub normal: Vec2,
+    /// Point on the unpadded main-liquid surface, in pixels from body center.
+    pub body_point: Vec2,
+    pub penetration_px: f32,
+    pub swept: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -223,6 +244,20 @@ impl ProceduralBody {
 
     pub fn set_embodied_environment(&mut self, environment: &EmbodiedEnvironmentFrame) {
         self.embodiment.liquid.set_embodied_environment(environment);
+    }
+
+    /// Installs the immutable phase packet consumed by the authoritative body
+    /// on subsequent fixed steps. The packet cannot alter solver structure.
+    pub fn set_somatic_actuation(&mut self, actuation: SomaticActuationPacket) {
+        self.embodiment.liquid.set_somatic_actuation(actuation);
+    }
+
+    /// Returns measured consequences of the most recently applied somatic
+    /// packet. Cognition consumes this on the next tick, never algebraically on
+    /// the same tick that produced the actuation.
+    #[must_use]
+    pub const fn somatic_feedback(&self) -> SomaticPerformanceFeedback {
+        self.embodiment.liquid.somatic_feedback()
     }
 
     #[must_use]
@@ -780,6 +815,123 @@ impl ProceduralBody {
             main_minimum,
             main_maximum,
         }
+    }
+
+    /// Returns the unpadded physical body hull. Cosmetic render parameters are
+    /// intentionally absent from this path so changing glow cannot move a
+    /// collision or grab frame.
+    #[must_use]
+    pub fn liquid_physical_hull_pixels(&self, viewport_height: f32) -> LiquidPhysicalHull {
+        if !viewport_height.is_finite() || viewport_height <= 0.0 {
+            return LiquidPhysicalHull::default();
+        }
+        let liquid = self.embodiment.liquid.render_state();
+        let pixels_per_local = viewport_height / (2.0 * self.projection_scale().max(1.0e-5));
+        let mut minimum = Vec2::splat(f32::INFINITY);
+        let mut maximum = Vec2::splat(f32::NEG_INFINITY);
+        let mut particle_count = 0;
+        for particle in liquid.particles[..liquid.particle_count]
+            .iter()
+            .filter(|particle| particle.main_component)
+        {
+            let center = Vec2::new(particle.position.x, -particle.position.y) * pixels_per_local;
+            let radius = particle.major_radius.max(particle.minor_radius) * pixels_per_local;
+            let extent = Vec2::splat(radius);
+            minimum = minimum.min(center - extent);
+            maximum = maximum.max(center + extent);
+            particle_count += 1;
+        }
+        if particle_count == 0 || !minimum.is_finite() || !maximum.is_finite() {
+            return LiquidPhysicalHull::default();
+        }
+        LiquidPhysicalHull {
+            minimum,
+            maximum,
+            particle_count,
+        }
+    }
+
+    /// Tests a physical circle against the main liquid component, including a
+    /// swept segment from the previous circle center. Cosmetic glow is absent.
+    #[must_use]
+    pub fn liquid_physical_circle_contact_pixels(
+        &self,
+        previous_circle_center: Vec2,
+        circle_center: Vec2,
+        circle_radius_px: f32,
+        viewport_height: f32,
+    ) -> Option<LiquidPhysicalContact> {
+        if !previous_circle_center.is_finite()
+            || !circle_center.is_finite()
+            || !circle_radius_px.is_finite()
+            || circle_radius_px <= 0.0
+            || !viewport_height.is_finite()
+            || viewport_height <= 0.0
+        {
+            return None;
+        }
+        let liquid = self.embodiment.liquid.render_state();
+        let pixels_per_local = viewport_height / (2.0 * self.projection_scale().max(1.0e-5));
+        let segment = circle_center - previous_circle_center;
+        let segment_length_squared = segment.length_squared();
+        let mut best: Option<(f32, LiquidPhysicalContact)> = None;
+        for particle in liquid.particles[..liquid.particle_count]
+            .iter()
+            .filter(|particle| particle.main_component)
+        {
+            let center = Vec2::new(particle.position.x, -particle.position.y) * pixels_per_local;
+            let body_radius = particle.major_radius.max(particle.minor_radius) * pixels_per_local;
+            let t = if segment_length_squared > 1.0e-6 {
+                ((center - previous_circle_center).dot(segment) / segment_length_squared)
+                    .clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let swept_center = previous_circle_center + segment * t;
+            let delta = swept_center - center;
+            let distance = delta.length();
+            let combined_radius = body_radius + circle_radius_px;
+            if distance > combined_radius {
+                continue;
+            }
+            let normal = delta.normalize_or(circle_center.normalize_or(Vec2::new(1.0, 0.0)));
+            let contact = LiquidPhysicalContact {
+                normal,
+                body_point: center + normal * body_radius,
+                penetration_px: (combined_radius - distance).max(0.0),
+                swept: t < 1.0 - 1.0e-4,
+            };
+            let score = combined_radius - distance;
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score > *best_score)
+            {
+                best = Some((score, contact));
+            }
+        }
+        best.map(|(_, contact)| contact)
+    }
+
+    /// Finds the main-liquid support point in a screen-space direction.
+    #[must_use]
+    pub fn liquid_physical_support_pixels(&self, direction: Vec2, viewport_height: f32) -> Vec2 {
+        if !direction.is_finite() || !viewport_height.is_finite() || viewport_height <= 0.0 {
+            return Vec2::ZERO;
+        }
+        let direction = direction.normalize_or(Vec2::new(1.0, 0.0));
+        let liquid = self.embodiment.liquid.render_state();
+        let pixels_per_local = viewport_height / (2.0 * self.projection_scale().max(1.0e-5));
+        liquid.particles[..liquid.particle_count]
+            .iter()
+            .filter(|particle| particle.main_component)
+            .map(|particle| {
+                let center =
+                    Vec2::new(particle.position.x, -particle.position.y) * pixels_per_local;
+                let radius = particle.major_radius.max(particle.minor_radius) * pixels_per_local;
+                center + direction * radius
+            })
+            .max_by(|left, right| left.dot(direction).total_cmp(&right.dot(direction)))
+            .unwrap_or(Vec2::ZERO)
     }
 
     fn projection_scale(&self) -> f32 {

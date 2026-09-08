@@ -14,6 +14,7 @@ use lifecore::{
 use morph_brain::{MorphBrain, nervous_system_frame};
 use pet_audio::{AudioCallbackLevels, AudioVisualFeedback};
 use pet_body::{NervousReadabilityTuning, ProceduralBody};
+use pet_motor::{SomaticActuationBus, SomaticActuationPacket};
 
 use crate::vita_runtime::VitaRuntime;
 
@@ -243,12 +244,14 @@ impl NervousSystemRuntime {
     /// packet and merges the existing VITA gesture response at the same owner
     /// boundary.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_actuation(
         &mut self,
         life: &LifeCore,
         vita: &VitaRuntime,
         morph: &MorphBrain,
         vita_interaction: InteractionBodyActuation,
+        motor_actuation: &SomaticActuationPacket,
         soft_touch_pressure_max: f32,
         calibration: NervousReadabilityTuning,
         dt: f32,
@@ -256,6 +259,7 @@ impl NervousSystemRuntime {
         let source = self.source(life, vita, morph, soft_touch_pressure_max, calibration);
         let mut actuation = self.phenotype.tick(&source, self.snapshot, dt);
         merge_interaction(&mut actuation.interaction, vita_interaction);
+        SomaticActuationBus::compose(&mut actuation, motor_actuation);
         self.actuation = actuation.clone();
         actuation
     }

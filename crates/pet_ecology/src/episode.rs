@@ -246,6 +246,7 @@ pub struct EcologyBehaviorFrame {
     /// Desktop width / height. All proximity decisions use height-space so a
     /// threshold means the same physical distance on 16:9 and ultrawide hosts.
     pub desktop_aspect: f32,
+    pub orb_physical: PhysicalGrabFrame,
     pub cursor_position: Vec2,
     pub pointer_down: bool,
     pub user_activity: f32,
@@ -270,6 +271,16 @@ pub struct EcologyBehaviorFrame {
     pub autonomous_play_ready: bool,
     pub click_rhythm: Option<crate::RhythmSignature>,
     pub timestamp: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PhysicalGrabFrame {
+    pub contact: bool,
+    pub swept_contact: bool,
+    pub socket_position: Vec2,
+    pub body_surface_position: Vec2,
+    pub normal_world: Vec2,
+    pub penetration_px: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -966,7 +977,7 @@ fn drive_episode(
                 EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.28 => {
                     set_phase(active, EpisodePhase::Approach);
                 }
-                EpisodePhase::Approach if frame.pet_position.distance(orb.position) <= 0.15 => {
+                EpisodePhase::Approach if frame.orb_physical.contact => {
                     set_phase(active, EpisodePhase::Manipulate);
                 }
                 EpisodePhase::Manipulate if active.phase_elapsed_seconds >= 0.35 => {
@@ -1059,7 +1070,7 @@ fn drive_episode(
                 active.expected_outcome = ExpectedOutcome::ObjectMoves;
                 return EpisodeStep::Continue;
             }
-            if orb_distance <= 0.15 && orb.lifecycle != ObjectLifecycle::GrabbedByUser {
+            if frame.orb_physical.contact && orb.lifecycle != ObjectLifecycle::GrabbedByUser {
                 let contact_axis = (orb.position - frame.pet_position).normalize_or_zero();
                 let authored_tap = Vec2::new(
                     if active.attempts.is_multiple_of(2) {
@@ -1107,7 +1118,6 @@ fn drive_episode(
             let orb_id = orb.id;
             let orb_position = orb.position;
             let orb_velocity = orb.velocity;
-            let catch_distance = frame.pet_position.distance(orb_position);
             output.body_intent.gaze_target = Some(orb_position);
             output.body_intent.pose = PoseIntent::Playful;
             output.body_intent.locomotion = LocomotionMode::Seek;
@@ -1128,7 +1138,7 @@ fn drive_episode(
                 EpisodePhase::Execute => {
                     let target = active.target_position.unwrap_or(orb_position);
                     output.body_intent.target_position = target;
-                    if catch_distance <= 0.12 {
+                    if frame.orb_physical.contact {
                         push_command(
                             output,
                             ObjectCommand::ApplyImpulse {
@@ -1204,7 +1214,7 @@ fn drive_episode(
                 output,
                 ObjectCommand::MoveToward {
                     object_id: orb_id,
-                    target: frame.pet_position,
+                    target: frame.orb_physical.socket_position,
                     speed: 4.0,
                 },
             );
@@ -1253,7 +1263,7 @@ fn drive_episode(
                 EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.20 => {
                     set_phase(active, EpisodePhase::Approach);
                 }
-                EpisodePhase::Approach if frame.pet_position.distance(orb.position) <= 0.15 => {
+                EpisodePhase::Approach if frame.orb_physical.contact => {
                     set_phase(active, EpisodePhase::Manipulate);
                 }
                 EpisodePhase::Manipulate => {
@@ -1311,11 +1321,11 @@ fn drive_episode(
             let Some(orb_id) = active.object_id else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
-            let Some(orb_position) = state
+            let Some((orb_position, orb_lifecycle)) = state
                 .objects
                 .iter()
                 .find(|object| object.id == orb_id)
-                .map(|object| object.position)
+                .map(|object| (object.position, object.lifecycle))
             else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
@@ -1327,6 +1337,7 @@ fn drive_episode(
                 output.body_intent.locomotion = LocomotionMode::Arrive;
                 if desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect)
                     <= 0.045
+                    && frame.orb_physical.contact
                 {
                     active.target_position = Some(den_exit_target(
                         state.den.anchor,
@@ -1340,7 +1351,7 @@ fn drive_episode(
                         output,
                         ObjectCommand::MoveToward {
                             object_id: orb_id,
-                            target: frame.pet_position,
+                            target: frame.orb_physical.socket_position,
                             speed: 5.0,
                         },
                     );
@@ -1352,20 +1363,24 @@ fn drive_episode(
                 output.body_intent.target_position = target;
                 output.body_intent.gaze_target = Some(target);
                 output.body_intent.locomotion = LocomotionMode::Arrive;
-                push_command(
-                    output,
-                    ObjectCommand::MoveToward {
-                        object_id: orb_id,
-                        target: frame.pet_position,
-                        speed: 5.0,
-                    },
-                );
+                if orb_lifecycle == ObjectLifecycle::CarriedByPet || frame.orb_physical.contact {
+                    push_command(
+                        output,
+                        ObjectCommand::MoveToward {
+                            object_id: orb_id,
+                            target: frame.orb_physical.socket_position,
+                            speed: 5.0,
+                        },
+                    );
+                }
                 let pet_has_exited =
                     desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect)
                         >= DEN_EXIT_DISTANCE;
-                let orb_is_in_hand =
-                    desktop_distance(orb_position, frame.pet_position, frame.desktop_aspect)
-                        <= 0.018;
+                let orb_is_in_hand = desktop_distance(
+                    orb_position,
+                    frame.orb_physical.socket_position,
+                    frame.desktop_aspect,
+                ) <= 0.018;
                 if pet_has_exited && orb_is_in_hand {
                     push_command(
                         output,
@@ -1990,6 +2005,10 @@ mod tests {
             pet_position: Vec2::splat(0.5),
             pet_velocity: Vec2::ZERO,
             desktop_aspect: 16.0 / 9.0,
+            orb_physical: PhysicalGrabFrame {
+                socket_position: Vec2::splat(0.5),
+                ..PhysicalGrabFrame::default()
+            },
             cursor_position: Vec2::new(0.72, 0.44),
             pointer_down: false,
             user_activity: 0.5,
@@ -2051,6 +2070,14 @@ mod tests {
             frame.play_drive = 0.78;
             frame.curiosity_drive = 0.52;
             frame.pet_position = orb_position;
+            frame.orb_physical = PhysicalGrabFrame {
+                contact: true,
+                socket_position: orb_position,
+                body_surface_position: orb_position,
+                normal_world: Vec2::X,
+                penetration_px: 8.0,
+                ..PhysicalGrabFrame::default()
+            };
             let output = director.tick(&mut state, frame, representative_intent(), 0.05);
             if output.debug.active_goal == Some(EpisodeGoal::SoloOrbPlay) {
                 saw_orb_attention_owner |=
@@ -2272,6 +2299,14 @@ mod tests {
         state.den.slots[0] = Some(orb_id);
         let mut frame = behavior_frame(ActionId::BringProceduralOrb);
         frame.pet_position = state.den.anchor;
+        frame.orb_physical = PhysicalGrabFrame {
+            contact: true,
+            socket_position: frame.pet_position,
+            body_surface_position: frame.pet_position,
+            normal_world: Vec2::X,
+            penetration_px: 8.0,
+            ..PhysicalGrabFrame::default()
+        };
         let mut director = EpisodeDirector::default();
         let output = director.tick(&mut state, frame, representative_intent(), 0.05);
         assert!(output.object_commands[..output.object_command_count]
@@ -2323,6 +2358,14 @@ mod tests {
         let mut frame = behavior_frame(ActionId::IdleHover);
         frame.orb_trapped = true;
         frame.pet_position = orb_position;
+        frame.orb_physical = PhysicalGrabFrame {
+            contact: true,
+            socket_position: orb_position,
+            body_surface_position: orb_position,
+            normal_world: Vec2::X,
+            penetration_px: 8.0,
+            ..PhysicalGrabFrame::default()
+        };
         let mut director = EpisodeDirector::default();
         let mut help_seen = false;
         for _ in 0..16 {
