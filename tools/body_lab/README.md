@@ -19,6 +19,14 @@ timeline, the left/right arrows step frames, and the slider and speed buttons
 scrub bounded history. Replay changes only what the console shows; it never
 rolls back the running organism.
 
+The four top tabs edit one versioned profile. The Den/Home tab renders the exact
+production shader over a reference desktop background, Voice/Sounds uses the
+production audio path, and Nervous -> Body exposes perceptual gain calibration
+for shape, PBF material, expression, motion, and voice. These gains amplify only
+bounded runtime phenotype outputs: solver counts, topology limits, identity
+pigment, learning rates, seeds, and the genome loudness ceiling remain locked.
+
+
 Dev Console reads `telemetry.jsonl` and its single rotated previous file, falling
 back to legacy `events.jsonl` when no bounded stream exists. Its typed Lab
 controls can issue expiring attention cues and drive pulses, clear pulses, set
@@ -30,6 +38,16 @@ before/after genome checkpoints and their lifetime snapshots from validated
 `state.json` (at most 64 records), gated by lineage and truncated to the selected
 telemetry frame's mutation count/generation so replay never leaks a future
 mutation into the past.
+
+The `Accelerated Learning` panel is a separate, explicit workflow from that
+read-only rewind. It writes a typed schema-1 config, launches `pet2` as a
+separate headless process, and reports the exact 120/60/20/5 Hz clock mode,
+episode/gesture distribution, bounded learning updates, consolidations,
+eligibility, invariant failures, performance, and state hashes. The default is
+`Dry run`; `Fork` keeps accepted state under `evolution-runs`, and promotion is
+enabled only for a parsed report whose invariants passed. Promotion first makes
+a complete recovery backup, and `Rollback` restores that backup. Synthetic
+curricula never modify the user gesture-convention library.
 
 New telemetry groups contain normalized or
 aggregate state, not pixels, typed text, raw audio, or native window IDs.
@@ -70,8 +88,16 @@ after release.
 `Save JSON` and `Load JSON` work with an arbitrary profile path. `Apply selected
 mode to running Pet` validates and atomically writes the shared
 `liquid-tuning.json`; a running Pet hot-reloads the last valid profile within 250 ms.
+The Den / home panel additionally has a `LIVE` toggle. While enabled, changed den
+sliders are debounced to 10 writes per second and applied to the same running Pet
+without rebuilding; unchanged body, voice, physics, and storage settings are kept.
 Each apply increments the profile revision, rereads the atomic save, and reports
 `Saved`, `Waiting for Pet`, or `Applied by Pet` from the Pet acknowledgement file.
-Startup and hot reload share the same migrate/sanitize/apply path. The lab does not
+Startup and hot reload share the same migrate/sanitize/apply path. With den LIVE disabled, the lab does not
 change production until that Apply button is pressed. Invalid or partial writes do
 not replace the last valid runtime profile.
+
+R12 integration note: Character keeps the four calibration subsections inside
+F1; F4 Diagnostics adds the live nervous-system readouts and accelerated runner.
+The offline curriculum and pointer fixtures preserve their R11 interaction loop;
+their invariant checks do not certify the full live R12 phenotype response.

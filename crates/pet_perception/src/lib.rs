@@ -4,16 +4,18 @@
 //! stores typed characters, key codes, screenshots, microphone recordings, window
 //! text, accessibility names, clipboard contents, or document content.
 
+mod embodied_gesture;
 mod visual_grid;
 
+pub use embodied_gesture::*;
 pub use visual_grid::*;
 
 use std::collections::{BTreeMap, VecDeque};
 
 use glam::Vec2;
 use lifecore::{
-    BodyFeedback, PointerGesturePercept, Rect, SensorFrame, StimulusEvent, StimulusKind,
-    VitaPerceptFrame, stable_hash_bytes,
+    BodyFeedback, EmbodiedGestureEvent, PointerGesturePercept, Rect, SensorFrame, StimulusEvent,
+    StimulusKind, VitaPerceptFrame, stable_hash_bytes,
 };
 use pet_ecology::{
     NormalizedRect, RhythmSignature, WindowAffordance, WindowAffordanceFrame, WindowId,
@@ -97,6 +99,9 @@ pub struct PerceptionRuntime {
     window_affordances: WindowAffordanceFrame,
     spatial_visual: Option<SpatialVisualFrame>,
     spatial_attention: SpatialAttentionRuntime,
+    embodied_gestures: EmbodiedGestureClassifier,
+    pending_embodied_gesture: Option<EmbodiedGestureEvent>,
+    pending_embodied_signature: Option<pet_ecology::GestureSignature>,
 }
 
 impl Default for PerceptionRuntime {
@@ -121,11 +126,18 @@ impl Default for PerceptionRuntime {
             window_affordances: WindowAffordanceFrame::default(),
             spatial_visual: None,
             spatial_attention: SpatialAttentionRuntime::default(),
+            embodied_gestures: EmbodiedGestureClassifier::default(),
+            pending_embodied_gesture: None,
+            pending_embodied_signature: None,
         }
     }
 }
 
 impl PerceptionRuntime {
+    pub fn set_embodied_gesture_tuning(&mut self, tuning: EmbodiedGestureClassifierTuning) {
+        self.embodied_gestures.set_tuning(tuning);
+    }
+
     /// Adds an abstract keyboard-activity timestamp. The caller must discard the key
     /// code and character before invoking this method.
     pub fn note_key_activity(&mut self, timestamp: f64) {
@@ -196,6 +208,24 @@ impl PerceptionRuntime {
         RhythmSignature::from_onsets(&onsets[..count])
     }
 
+    /// Returns a physical gesture edge once. Repeated perception updates cannot
+    /// replay a response-producing event into LifeCore.
+    pub fn take_embodied_gesture(&mut self) -> Option<EmbodiedGestureEvent> {
+        self.pending_embodied_gesture.take()
+    }
+
+    /// Returns the normalized, body-local convention signature paired with the
+    /// most recently emitted physical edge. It contains no native identifiers
+    /// or desktop coordinates.
+    pub fn take_embodied_gesture_signature(&mut self) -> Option<pet_ecology::GestureSignature> {
+        self.pending_embodied_signature.take()
+    }
+
+    #[must_use]
+    pub const fn latest_embodied_gesture(&self) -> lifecore::GestureClassification {
+        self.embodied_gestures.latest()
+    }
+
     #[must_use]
     pub const fn window_affordances(&self) -> &WindowAffordanceFrame {
         &self.window_affordances
@@ -217,6 +247,13 @@ impl PerceptionRuntime {
                 .map_or(0.0, |sample| sample.timestamp + f64::from(dt))
         };
         self.observe_cursor(sensors, timestamp);
+        if sensors.embodied_interaction.sequence > 0 {
+            self.pending_embodied_gesture =
+                self.embodied_gestures.ingest(sensors.embodied_interaction);
+            if self.pending_embodied_gesture.is_some() {
+                self.pending_embodied_signature = self.embodied_gestures.take_latest_signature();
+            }
+        }
         self.infer_private_input_activity(sensors, timestamp);
         if sensors.pointer_pressed {
             self.note_click(timestamp);

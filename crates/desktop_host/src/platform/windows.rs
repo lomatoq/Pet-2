@@ -11,12 +11,31 @@ use directories::ProjectDirs;
 use glam::Vec2;
 use lifecore::AppCategory;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows::{
+    Win32::{
+        Foundation::HMODULE,
+        Graphics::{
+            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D11::{
+                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+                ID3D11Texture2D,
+            },
+            Dxgi::{
+                DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter,
+                IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+            },
+        },
+    },
+    core::Interface,
+};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT},
+    Foundation::{CloseHandle, GetLastError, HWND, LPARAM, POINT, RECT},
     Graphics::{
         Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         Gdi::{
-            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
             DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HALFTONE, HBITMAP, HDC, HGDIOBJ,
             NOMIRRORBITMAP, ReleaseDC, SRCCOPY, SelectObject, SetStretchBltMode, StretchBlt,
         },
@@ -30,8 +49,9 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             EnumWindows, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
             GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible,
-            SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW,
-            SetWindowPos, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowDisplayAffinity,
+            SetWindowLongPtrW, SetWindowPos, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -52,6 +72,7 @@ use crate::{
 pub struct WindowsBackend {
     started: Instant,
     overlay_hwnd: Option<HWND>,
+    overlay_capture_excluded: Option<bool>,
     cursor_hittest_enabled: Option<bool>,
     visual_worker: Option<VisualSampleWorker>,
     background_worker: Option<GdiBackgroundWorker>,
@@ -72,6 +93,7 @@ impl Default for WindowsBackend {
         Self {
             started: Instant::now(),
             overlay_hwnd: None,
+            overlay_capture_excluded: None,
             cursor_hittest_enabled: None,
             visual_worker: None,
             background_worker: None,
@@ -112,6 +134,12 @@ impl PlatformBackend for WindowsBackend {
             return Err(HostError::WindowHandle("expected a Win32 HWND".into()));
         };
         self.overlay_hwnd = Some(handle.hwnd.get() as HWND);
+        // The first desktop frame seeds the immutable history beneath the den.
+        // Exclude this top-level overlay before it is shown so Desktop Duplication
+        // reveals the real wallpaper/application pixels instead of an empty or
+        // self-captured composition surface. The app clears the affinity as soon
+        // as that clean frame has uploaded.
+        self.set_overlay_capture_excluded(window, true)?;
         // A virtual-desktop-sized transparent host must start click-through. The
         // liquid hit-test enables input only while the pointer is over the Pet or
         // an already captured drag is active.
@@ -176,6 +204,33 @@ impl PlatformBackend for WindowsBackend {
         self.background_worker.as_mut()?.submit_and_poll(window)
     }
 
+    fn set_overlay_capture_excluded(
+        &mut self,
+        _window: &Window,
+        excluded: bool,
+    ) -> Result<(), HostError> {
+        if self.overlay_capture_excluded == Some(excluded) {
+            return Ok(());
+        }
+        let hwnd = self
+            .overlay_hwnd
+            .ok_or_else(|| HostError::WindowHandle("backend is not initialized".into()))?;
+        let affinity = if excluded {
+            WDA_EXCLUDEFROMCAPTURE
+        } else {
+            WDA_NONE
+        };
+        let success = unsafe { SetWindowDisplayAffinity(hwnd, affinity) };
+        if success == 0 {
+            return Err(HostError::Platform(format!(
+                "SetWindowDisplayAffinity({affinity:#x}) failed with Win32 error {}",
+                unsafe { GetLastError() }
+            )));
+        }
+        self.overlay_capture_excluded = Some(excluded);
+        Ok(())
+    }
+
     fn apply_overlay_policy(&mut self, _window: &Window) -> Result<(), HostError> {
         let hwnd = self
             .overlay_hwnd
@@ -223,6 +278,14 @@ impl PlatformBackend for WindowsBackend {
     }
 
     fn shutdown(&mut self) {
+        if self.overlay_capture_excluded == Some(true)
+            && let Some(hwnd) = self.overlay_hwnd
+        {
+            unsafe {
+                SetWindowDisplayAffinity(hwnd, WDA_NONE);
+            }
+            self.overlay_capture_excluded = Some(false);
+        }
         if let Some(mut worker) = self.visual_worker.take() {
             worker.shutdown();
         }
@@ -360,7 +423,7 @@ impl GdiBackgroundWorker {
 
     fn submit_and_poll(&mut self, window: &Window) -> Option<DesktopBackgroundFrame> {
         let mut latest = self.frame_rx.try_iter().last();
-        if self.last_submit.elapsed() >= Duration::from_secs_f64(1.0 / 24.0) {
+        if self.last_submit.elapsed() >= Duration::from_secs_f64(1.0 / 60.0) {
             let position = window.outer_position().ok()?;
             let size = window.inner_size();
             if size.width > 0 && size.height > 0 {
@@ -410,27 +473,73 @@ fn background_capture_loop(
     requests: &Receiver<CaptureRequest>,
     frames: &Sender<DesktopBackgroundFrame>,
 ) {
-    let mut capture: Option<GdiBackgroundCapture> = None;
+    let mut dxgi_capture: Option<DxgiBackgroundCapture> = None;
+    let mut gdi_fallback: Option<GdiBackgroundCapture> = None;
+    let mut last_dxgi_attempt = Instant::now() - Duration::from_secs(2);
+    let mut dxgi_failure_reported = false;
     let mut sequence = 0_u64;
     while let Ok(mut request) = requests.recv() {
         for newer in requests.try_iter() {
             request = newer;
         }
-        let resize = capture.as_ref().is_none_or(|capture| {
-            capture.width != request.width || capture.height != request.height
-        });
-        if resize {
-            capture = GdiBackgroundCapture::new(request.width, request.height);
+
+        if dxgi_capture
+            .as_ref()
+            .is_some_and(|capture| !capture.covers(request.physical_rect))
+        {
+            dxgi_capture = None;
         }
-        let Some(capture) = capture.as_mut() else {
-            continue;
-        };
-        let Some(tight) = capture.capture(
-            request.physical_rect.minimum.x,
-            request.physical_rect.minimum.y,
-            request.physical_rect.width().max(1) as u32,
-            request.physical_rect.height().max(1) as u32,
-        ) else {
+
+        if dxgi_capture.is_none() && last_dxgi_attempt.elapsed() >= Duration::from_secs(1) {
+            last_dxgi_attempt = Instant::now();
+            match DxgiBackgroundCapture::new(request.physical_rect) {
+                Ok(capture) => {
+                    dxgi_capture = Some(capture);
+                    dxgi_failure_reported = false;
+                }
+                Err(error) => {
+                    if !dxgi_failure_reported {
+                        eprintln!("DXGI desktop capture unavailable; using GDI fallback: {error}");
+                        dxgi_failure_reported = true;
+                    }
+                }
+            }
+        }
+
+        let mut tight = None;
+        if let Some(capture) = dxgi_capture.as_mut() {
+            match capture.capture(&request) {
+                Ok(frame) => tight = frame,
+                Err(error) => {
+                    if !dxgi_failure_reported {
+                        eprintln!("DXGI desktop capture interrupted; retrying: {error}");
+                        dxgi_failure_reported = true;
+                    }
+                    dxgi_capture = None;
+                }
+            }
+        }
+
+        if tight.is_none() {
+            let resize = gdi_fallback.as_ref().is_none_or(|capture| {
+                capture.width != request.width || capture.height != request.height
+            });
+            if resize {
+                gdi_fallback = GdiBackgroundCapture::new(request.width, request.height);
+            }
+            tight = gdi_fallback.as_mut().and_then(|capture| {
+                capture
+                    .capture(
+                        request.physical_rect.minimum.x,
+                        request.physical_rect.minimum.y,
+                        request.physical_rect.width().max(1) as u32,
+                        request.physical_rect.height().max(1) as u32,
+                    )
+                    .map(<[u8]>::to_vec)
+            });
+        }
+
+        let Some(tight) = tight else {
             continue;
         };
         let tight_row = request.width as usize * 4;
@@ -464,14 +573,227 @@ fn background_capture_loop(
     }
 }
 
+struct DxgiBackgroundCapture {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    duplication: IDXGIOutputDuplication,
+    staging: Option<ID3D11Texture2D>,
+    staging_desc: Option<D3D11_TEXTURE2D_DESC>,
+    output_rect: RectI,
+    last_frame: Option<Vec<u8>>,
+}
+
+impl DxgiBackgroundCapture {
+    fn new(request_rect: RectI) -> Result<Self, String> {
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        }
+        .map_err(|error| format!("D3D11CreateDevice failed: {error}"))?;
+        let device = device.ok_or_else(|| "D3D11 returned no device".to_owned())?;
+        let context = context.ok_or_else(|| "D3D11 returned no immediate context".to_owned())?;
+
+        let dxgi_device: IDXGIDevice = device
+            .cast()
+            .map_err(|error| format!("ID3D11Device -> IDXGIDevice failed: {error}"))?;
+        let adapter = unsafe { dxgi_device.GetAdapter() }
+            .map_err(|error| format!("IDXGIDevice::GetAdapter failed: {error}"))?;
+        let requested_center = PhysicalDesktopPoint {
+            x: request_rect
+                .minimum
+                .x
+                .saturating_add(request_rect.width() / 2),
+            y: request_rect
+                .minimum
+                .y
+                .saturating_add(request_rect.height() / 2),
+        };
+
+        let mut selected = None;
+        for index in 0..16 {
+            let Ok(output) = (unsafe { adapter.EnumOutputs(index) }) else {
+                break;
+            };
+            let mut desc = DXGI_OUTPUT_DESC::default();
+            if unsafe { output.GetDesc(&mut desc) }.is_err() || !desc.AttachedToDesktop.as_bool() {
+                continue;
+            }
+            let rect = RectI {
+                minimum: PhysicalDesktopPoint {
+                    x: desc.DesktopCoordinates.left,
+                    y: desc.DesktopCoordinates.top,
+                },
+                maximum: PhysicalDesktopPoint {
+                    x: desc.DesktopCoordinates.right,
+                    y: desc.DesktopCoordinates.bottom,
+                },
+            };
+            selected.get_or_insert_with(|| (output.clone(), rect));
+            if rect.contains(requested_center) {
+                selected = Some((output, rect));
+                break;
+            }
+        }
+        let (output, output_rect) = selected.ok_or_else(|| "no attached DXGI output".to_owned())?;
+        let output1: IDXGIOutput1 = output
+            .cast()
+            .map_err(|error| format!("IDXGIOutput -> IDXGIOutput1 failed: {error}"))?;
+        let duplication = unsafe { output1.DuplicateOutput(&device) }
+            .map_err(|error| format!("DuplicateOutput failed: {error}"))?;
+
+        Ok(Self {
+            device,
+            context,
+            duplication,
+            staging: None,
+            staging_desc: None,
+            output_rect,
+            last_frame: None,
+        })
+    }
+
+    fn covers(&self, rect: RectI) -> bool {
+        let center = PhysicalDesktopPoint {
+            x: rect.minimum.x.saturating_add(rect.width() / 2),
+            y: rect.minimum.y.saturating_add(rect.height() / 2),
+        };
+        self.output_rect.contains(center)
+    }
+
+    fn capture(&mut self, request: &CaptureRequest) -> Result<Option<Vec<u8>>, String> {
+        let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut desktop_resource: Option<IDXGIResource> = None;
+        let acquired = unsafe {
+            self.duplication
+                .AcquireNextFrame(8, &mut frame_info, &mut desktop_resource)
+        };
+        if let Err(error) = acquired {
+            if error.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                return Ok(self.last_frame.clone());
+            }
+            return Err(format!("AcquireNextFrame failed: {error}"));
+        }
+
+        let result = (|| {
+            let resource = desktop_resource
+                .ok_or_else(|| "AcquireNextFrame returned no desktop resource".to_owned())?;
+            let texture: ID3D11Texture2D = resource
+                .cast()
+                .map_err(|error| format!("desktop resource is not Texture2D: {error}"))?;
+            let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { texture.GetDesc(&mut source_desc) };
+
+            let needs_staging = self.staging_desc.is_none_or(|desc| {
+                desc.Width != source_desc.Width
+                    || desc.Height != source_desc.Height
+                    || desc.Format != source_desc.Format
+            });
+            if needs_staging {
+                let staging_desc = D3D11_TEXTURE2D_DESC {
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                    ..source_desc
+                };
+                let mut staging = None;
+                unsafe {
+                    self.device
+                        .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                }
+                .map_err(|error| format!("CreateTexture2D(staging) failed: {error}"))?;
+                self.staging = staging;
+                self.staging_desc = Some(staging_desc);
+            }
+            let staging = self
+                .staging
+                .as_ref()
+                .ok_or_else(|| "D3D11 returned no staging texture".to_owned())?;
+            unsafe { self.context.CopyResource(staging, &texture) };
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            unsafe {
+                self.context
+                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            }
+            .map_err(|error| format!("Map(staging) failed: {error}"))?;
+            let tight = copy_dxgi_region(
+                &mapped,
+                source_desc.Width,
+                source_desc.Height,
+                self.output_rect,
+                request,
+            );
+            unsafe { self.context.Unmap(staging, 0) };
+            tight
+        })();
+        let release_result = unsafe { self.duplication.ReleaseFrame() };
+        if let Err(error) = release_result {
+            return Err(format!("ReleaseFrame failed: {error}"));
+        }
+        let tight = result?;
+        self.last_frame = Some(tight.clone());
+        Ok(Some(tight))
+    }
+}
+
+fn copy_dxgi_region(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    source_width: u32,
+    source_height: u32,
+    output_rect: RectI,
+    request: &CaptureRequest,
+) -> Result<Vec<u8>, String> {
+    if mapped.pData.is_null() || mapped.RowPitch < source_width.saturating_mul(4) {
+        return Err("DXGI mapped desktop has an invalid row pitch".to_owned());
+    }
+    let source_length = mapped.RowPitch as usize * source_height as usize;
+    let source = unsafe { std::slice::from_raw_parts(mapped.pData.cast::<u8>(), source_length) };
+    let mut tight = vec![0_u8; request.width as usize * request.height as usize * 4];
+    let request_width = request.physical_rect.width().max(1) as i64;
+    let request_height = request.physical_rect.height().max(1) as i64;
+    for y in 0..request.height {
+        let physical_y = request.physical_rect.minimum.y as i64
+            + (y as i64 * request_height / request.height.max(1) as i64);
+        let source_y = physical_y - output_rect.minimum.y as i64;
+        if !(0..source_height as i64).contains(&source_y) {
+            continue;
+        }
+        for x in 0..request.width {
+            let physical_x = request.physical_rect.minimum.x as i64
+                + (x as i64 * request_width / request.width.max(1) as i64);
+            let source_x = physical_x - output_rect.minimum.x as i64;
+            if !(0..source_width as i64).contains(&source_x) {
+                continue;
+            }
+            let source_index = source_y as usize * mapped.RowPitch as usize + source_x as usize * 4;
+            let target_index = (y as usize * request.width as usize + x as usize) * 4;
+            tight[target_index..target_index + 4]
+                .copy_from_slice(&source[source_index..source_index + 4]);
+        }
+    }
+    Ok(tight)
+}
+
 struct GdiBackgroundCapture {
-    screen_dc: HDC,
     memory_dc: HDC,
     bitmap: HBITMAP,
     previous_bitmap: HGDIOBJ,
     bits: *mut u8,
     width: u32,
     height: u32,
+    copy_failure_reported: bool,
 }
 
 impl GdiBackgroundCapture {
@@ -481,10 +803,16 @@ impl GdiBackgroundCapture {
         }
         let screen_dc = unsafe { GetDC(std::ptr::null_mut()) };
         if screen_dc.is_null() {
+            eprintln!("desktop capture GetDC(NULL) failed: {}", unsafe {
+                GetLastError()
+            });
             return None;
         }
         let memory_dc = unsafe { CreateCompatibleDC(screen_dc) };
         if memory_dc.is_null() {
+            eprintln!("desktop capture CreateCompatibleDC failed: {}", unsafe {
+                GetLastError()
+            });
             unsafe { ReleaseDC(std::ptr::null_mut(), screen_dc) };
             return None;
         }
@@ -514,6 +842,9 @@ impl GdiBackgroundCapture {
             )
         };
         if bitmap.is_null() || bits.is_null() {
+            eprintln!("desktop capture CreateDIBSection failed: {}", unsafe {
+                GetLastError()
+            });
             unsafe {
                 DeleteDC(memory_dc);
                 ReleaseDC(std::ptr::null_mut(), screen_dc);
@@ -522,6 +853,9 @@ impl GdiBackgroundCapture {
         }
         let previous_bitmap = unsafe { SelectObject(memory_dc, bitmap) };
         if previous_bitmap.is_null() || previous_bitmap.addr() == usize::MAX {
+            eprintln!("desktop capture SelectObject failed: {}", unsafe {
+                GetLastError()
+            });
             unsafe {
                 DeleteObject(bitmap);
                 DeleteDC(memory_dc);
@@ -529,37 +863,73 @@ impl GdiBackgroundCapture {
             }
             return None;
         }
+        unsafe { ReleaseDC(std::ptr::null_mut(), screen_dc) };
         Some(Self {
-            screen_dc,
             memory_dc,
             bitmap,
             previous_bitmap,
             bits: bits.cast(),
             width,
             height,
+            copy_failure_reported: false,
         })
     }
 
     fn capture(&mut self, x: i32, y: i32, source_width: u32, source_height: u32) -> Option<&[u8]> {
-        unsafe { SetStretchBltMode(self.memory_dc, HALFTONE) };
-        let copied = unsafe {
-            StretchBlt(
-                self.memory_dc,
-                0,
-                0,
-                self.width as i32,
-                self.height as i32,
-                self.screen_dc,
-                x,
-                y,
-                source_width as i32,
-                source_height as i32,
-                SRCCOPY | NOMIRRORBITMAP,
-            )
-        };
-        if copied == 0 {
+        // A display DC can be invalidated when WGPU/DirectComposition finishes
+        // configuring the transparent swapchain. Acquire it for exactly one
+        // copy and release it on this worker thread instead of retaining a
+        // startup handle indefinitely.
+        let screen_dc = unsafe { GetDC(std::ptr::null_mut()) };
+        if screen_dc.is_null() {
             return None;
         }
+        unsafe { SetStretchBltMode(self.memory_dc, HALFTONE) };
+        let copied = if self.width == source_width && self.height == source_height {
+            unsafe {
+                BitBlt(
+                    self.memory_dc,
+                    0,
+                    0,
+                    self.width as i32,
+                    self.height as i32,
+                    screen_dc,
+                    x,
+                    y,
+                    SRCCOPY | NOMIRRORBITMAP,
+                )
+            }
+        } else {
+            unsafe {
+                StretchBlt(
+                    self.memory_dc,
+                    0,
+                    0,
+                    self.width as i32,
+                    self.height as i32,
+                    screen_dc,
+                    x,
+                    y,
+                    source_width as i32,
+                    source_height as i32,
+                    SRCCOPY | NOMIRRORBITMAP,
+                )
+            }
+        };
+        unsafe { ReleaseDC(std::ptr::null_mut(), screen_dc) };
+        if copied == 0 {
+            if !self.copy_failure_reported {
+                eprintln!(
+                    "desktop capture BitBlt/StretchBlt failed ({}x{} <- {source_width}x{source_height} at {x},{y}): {}",
+                    self.width,
+                    self.height,
+                    unsafe { GetLastError() }
+                );
+                self.copy_failure_reported = true;
+            }
+            return None;
+        }
+        self.copy_failure_reported = false;
         let length = self.width as usize * self.height as usize * 4;
         Some(unsafe { std::slice::from_raw_parts(self.bits, length) })
     }
@@ -571,7 +941,6 @@ impl Drop for GdiBackgroundCapture {
             SelectObject(self.memory_dc, self.previous_bitmap);
             DeleteObject(self.bitmap);
             DeleteDC(self.memory_dc);
-            ReleaseDC(std::ptr::null_mut(), self.screen_dc);
         }
     }
 }

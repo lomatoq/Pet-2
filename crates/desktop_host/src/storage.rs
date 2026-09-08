@@ -34,7 +34,7 @@ impl PortablePetState {
                 expected: PORTABLE_STATE_SCHEMA_VERSION,
             });
         }
-        self.life.validate()?;
+        self.life.validate_with_additive_voice_repair()?;
         if let Some(vita) = &self.vita
             && !vita.is_valid()
         {
@@ -89,11 +89,17 @@ pub struct StoragePaths {
     pub liquid_tuning_status: PathBuf,
     pub morph_brain: PathBuf,
     pub ecology_state: PathBuf,
+    pub body_state: PathBuf,
+    pub body_backup: PathBuf,
+    pub interaction_replays: PathBuf,
+    pub evolution_runs: PathBuf,
     pub events: PathBuf,
     pub telemetry: PathBuf,
     pub telemetry_previous: PathBuf,
     pub lab_control: PathBuf,
     pub lab_control_backup: PathBuf,
+    pub runtime_load_ack: PathBuf,
+    pub runtime_load_ack_backup: PathBuf,
     pub backup: PathBuf,
     pub ecology_backup: PathBuf,
 }
@@ -114,6 +120,8 @@ pub enum StorageError {
     InvalidPosition,
     #[error("portable state contains an invalid VITA mind")]
     InvalidVitaState,
+    #[error("body state failed semantic validation")]
+    InvalidBodyState,
     #[error("telemetry record is {record_bytes} bytes, exceeding the {max_bytes}-byte log cap")]
     TelemetryRecordTooLarge { record_bytes: u64, max_bytes: u64 },
     #[error(transparent)]
@@ -147,11 +155,19 @@ impl StateStore {
                 liquid_tuning_status: root.join("liquid-tuning-applied.json"),
                 morph_brain: root.join("morph-brain.json"),
                 ecology_state: root.join("ecology-state.json"),
+                body_state: root.join("body-state.json"),
+                body_backup: root.join("backups").join("body-state.previous.json"),
+                interaction_replays: root.join("interaction-replays"),
+                evolution_runs: root.join("evolution-runs"),
                 events: root.join("events.jsonl"),
                 telemetry: root.join("telemetry.jsonl"),
                 telemetry_previous: root.join("telemetry.previous.jsonl"),
                 lab_control: root.join("lab-control.json"),
                 lab_control_backup: root.join("backups").join("lab-control.previous.json"),
+                runtime_load_ack: root.join("runtime-load-ack.json"),
+                runtime_load_ack_backup: root
+                    .join("backups")
+                    .join("runtime-load-ack.previous.json"),
                 backup: root.join("backups").join("state.previous.json"),
                 ecology_backup: root.join("backups").join("ecology-state.previous.json"),
                 root,
@@ -296,6 +312,44 @@ impl StateStore {
         )
     }
 
+    pub fn load_body_state<T: DeserializeOwned>(&self) -> Result<Option<T>, StorageError> {
+        self.load_body_state_validated(|_| true)
+    }
+
+    pub fn load_body_state_validated<T: DeserializeOwned>(
+        &self,
+        validate: impl Fn(&T) -> bool,
+    ) -> Result<Option<T>, StorageError> {
+        let load_valid = |path: &Path| -> Result<T, StorageError> {
+            let state = read_json(path)?;
+            if validate(&state) {
+                Ok(state)
+            } else {
+                Err(StorageError::InvalidBodyState)
+            }
+        };
+        if !self.paths.body_state.exists() {
+            return if self.paths.body_backup.exists() {
+                load_valid(&self.paths.body_backup).map(Some)
+            } else {
+                Ok(None)
+            };
+        }
+        match load_valid(&self.paths.body_state) {
+            Ok(state) => Ok(Some(state)),
+            Err(primary_error) if self.paths.body_backup.exists() => {
+                load_valid(&self.paths.body_backup)
+                    .map(Some)
+                    .map_err(|_| primary_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn save_body_state<T: Serialize>(&self, state: &T) -> Result<(), StorageError> {
+        atomic_json(&self.paths.body_state, &self.paths.body_backup, state)
+    }
+
     pub fn load_ecology_state(&self) -> Result<Option<EcologyState>, StorageError> {
         if !self.paths.ecology_state.exists() {
             return if self.paths.ecology_backup.exists() {
@@ -346,6 +400,21 @@ impl StateStore {
             &self.paths.lab_control,
             &self.paths.lab_control_backup,
             control,
+        )
+    }
+
+    pub fn load_runtime_ack<T: DeserializeOwned>(&self) -> Result<Option<T>, StorageError> {
+        if !self.paths.runtime_load_ack.exists() {
+            return Ok(None);
+        }
+        read_json(&self.paths.runtime_load_ack).map(Some)
+    }
+
+    pub fn save_runtime_ack<T: Serialize>(&self, acknowledgement: &T) -> Result<(), StorageError> {
+        atomic_json(
+            &self.paths.runtime_load_ack,
+            &self.paths.runtime_load_ack_backup,
+            acknowledgement,
         )
     }
 
@@ -527,6 +596,69 @@ mod tests {
         assert_eq!(store.load_state().unwrap(), Some(state.clone()));
         store.save_state(&state).unwrap();
         assert!(store.paths.backup.exists());
+    }
+
+    #[test]
+    fn legacy_snapshot_repairs_voice_anatomy_and_gestures() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let life = LifeCore::new(Genome::from_seed(0x001E_6AC7), 0x001E_6AC7);
+        let mut legacy_life = life.snapshot();
+        let expected_pitch = legacy_life.state.genome.voice.base_pitch_hz;
+        let expected_motif_ids = legacy_life
+            .state
+            .vocal_motifs
+            .iter()
+            .map(|motif| motif.id)
+            .collect::<Vec<_>>();
+        let expected_habits = legacy_life.habits.clone();
+        let expected_memories = legacy_life.memories.clone();
+        legacy_life.state.genome.voice.anatomy = lifecore::VoiceAnatomy::default();
+        for motif in &mut legacy_life.state.vocal_motifs {
+            for syllable in &mut motif.syllables {
+                syllable.gesture = lifecore::VocalGesture::default();
+            }
+        }
+        let portable = PortablePetState {
+            schema_version: PORTABLE_STATE_SCHEMA_VERSION,
+            life: legacy_life,
+            vita: None,
+            position: PersistedPetPosition::default(),
+        };
+        fs::create_dir_all(&store.paths.root).unwrap();
+        fs::write(
+            &store.paths.state,
+            serde_json::to_vec_pretty(&portable).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store
+            .load_state()
+            .expect("legacy storage validation accepts additive voice migration")
+            .expect("legacy state exists");
+        let restored = LifeCore::restore(loaded.life).expect("legacy voice repairs in place");
+        let restored_snapshot = restored.snapshot();
+        assert_eq!(restored.state.genome.voice.anatomy.schema, 1);
+        assert_eq!(restored.state.genome.voice.base_pitch_hz, expected_pitch);
+        assert_eq!(
+            restored
+                .state
+                .vocal_motifs
+                .iter()
+                .map(|motif| motif.id)
+                .collect::<Vec<_>>(),
+            expected_motif_ids
+        );
+        assert_eq!(restored_snapshot.habits, expected_habits);
+        assert_eq!(restored_snapshot.memories, expected_memories);
+        assert!(
+            restored
+                .state
+                .vocal_motifs
+                .iter()
+                .flat_map(|motif| &motif.syllables)
+                .any(|syllable| syllable.gesture != lifecore::VocalGesture::default())
+        );
     }
 
     #[test]

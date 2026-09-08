@@ -25,6 +25,25 @@ const INTERMEDIATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Floa
 const MAX_INTERNAL_GLOW_ORBS: usize = 8;
 const MAX_SOUL_GLOW_LOBES: usize = 6;
 
+fn surface_source_over_blend(premultiplied_output: bool) -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: if premultiplied_output {
+                wgpu::BlendFactor::One
+            } else {
+                wgpu::BlendFactor::SrcAlpha
+            },
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Globals {
@@ -334,6 +353,32 @@ pub enum RenderOutcome {
     OutOfMemory,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Tightly packed, straight RGBA8 pixels in top-to-bottom row order.
+    pub rgba8: Vec<u8>,
+}
+
+#[derive(Debug, Error)]
+pub enum RendererCaptureError {
+    #[error("the current presentation surface cannot be copied for capture")]
+    UnsupportedSurface,
+    #[error("the current presentation surface format {0:?} is not an RGBA8/BGRA8 format")]
+    UnsupportedFormat(wgpu::TextureFormat),
+    #[error("the presentation surface was unavailable during capture")]
+    SurfaceUnavailable,
+    #[error("the graphics device ran out of memory during capture")]
+    OutOfMemory,
+    #[error("the capture buffer could not be mapped: {0}")]
+    Map(#[from] wgpu::BufferAsyncError),
+    #[error("the graphics device could not finish the capture: {0}")]
+    Poll(#[from] wgpu::PollError),
+    #[error("the capture callback did not complete")]
+    CallbackUnavailable,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct InternalFeatureFrame {
     orb_position_radius: [[f32; 4]; MAX_INTERNAL_GLOW_ORBS],
@@ -598,8 +643,13 @@ impl Renderer {
         } else {
             capabilities.present_modes[0]
         };
+        let capture_usage = if capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            wgpu::TextureUsages::COPY_SRC
+        } else {
+            wgpu::TextureUsages::empty()
+        };
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | capture_usage,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -1373,7 +1423,7 @@ impl Renderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(surface_source_over_blend(premultiplied_output)),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -1753,6 +1803,16 @@ impl Renderer {
         }
     }
 
+    /// Clears renderer-only temporal history between offline perceptual
+    /// fixtures without altering body physics or authored tuning.
+    pub fn reset_perceptual_capture_state(&mut self) {
+        self.internal_features = InternalFeatureTracker::default();
+        self.previous_liquid_scissor = None;
+        self.density_targets_initialized = false;
+        self.macro_target_initialized = false;
+        self.offscreen_target_initialized = false;
+    }
+
     /// Maps current overlay UVs into the physical desktop rectangle represented by
     /// the latest asynchronous capture.
     pub fn set_background_uv_transform(&mut self, scale: Vec2, offset: Vec2) {
@@ -1780,6 +1840,14 @@ impl Renderer {
     #[must_use]
     pub fn surface_format(&self) -> wgpu::TextureFormat {
         self.config.format
+    }
+
+    /// Reports the alpha convention required by the native composition surface.
+    /// Overlay passes must use the same convention as the final body resolve or
+    /// transparent desktop composition will diverge from the opaque Lab oracle.
+    #[must_use]
+    pub fn premultiplied_output(&self) -> bool {
+        self.premultiplied_output
     }
 
     /// Upload a top-down BGRA8 desktop crop without intermediate conversion.
@@ -1850,12 +1918,78 @@ impl Renderer {
         self.render_with_overlay(parameters, |_, _, _, _| {})
     }
 
+    /// Renders through the exact production GPU pipelines and synchronously
+    /// reads back the final composited surface. This deliberately lives outside
+    /// the real-time path and is intended for deterministic perceptual fixtures.
+    pub fn render_capture(
+        &mut self,
+        parameters: RenderParameters,
+    ) -> Result<CapturedFrame, RendererCaptureError> {
+        self.render_capture_with_overlay(parameters, |_, _, _, _| {})
+    }
+
+    pub fn render_capture_with_overlay<F>(
+        &mut self,
+        parameters: RenderParameters,
+        overlay: F,
+    ) -> Result<CapturedFrame, RendererCaptureError>
+    where
+        F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+    {
+        if !self.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+            return Err(RendererCaptureError::UnsupportedSurface);
+        }
+        let (outcome, capture) = self.render_internal(parameters, |_, _, _, _| {}, overlay, true);
+        match outcome {
+            RenderOutcome::Presented => {
+                capture.expect("a presented capture request always produces a capture result")
+            }
+            RenderOutcome::Skipped => Err(RendererCaptureError::SurfaceUnavailable),
+            RenderOutcome::OutOfMemory => Err(RendererCaptureError::OutOfMemory),
+        }
+    }
+
     pub fn render_with_overlay<F>(
         &mut self,
         parameters: RenderParameters,
         overlay: F,
     ) -> RenderOutcome
     where
+        F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+    {
+        self.render_internal(parameters, |_, _, _, _| {}, overlay, false)
+            .0
+    }
+
+    /// Composites one callback below the organism and one above it. This keeps
+    /// world landmarks such as the den behind the body while portable ecology
+    /// objects remain available as foreground interaction props.
+    pub fn render_with_layers<B, F>(
+        &mut self,
+        parameters: RenderParameters,
+        background: B,
+        foreground: F,
+    ) -> RenderOutcome
+    where
+        B: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+        F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+    {
+        self.render_internal(parameters, background, foreground, false)
+            .0
+    }
+
+    fn render_internal<B, F>(
+        &mut self,
+        parameters: RenderParameters,
+        background: B,
+        foreground: F,
+        capture: bool,
+    ) -> (
+        RenderOutcome,
+        Option<Result<CapturedFrame, RendererCaptureError>>,
+    )
+    where
+        B: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
         F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
     {
         let requested_render_scale = parameters.render_scale.clamp(1, SUPERSAMPLE_SCALE);
@@ -1964,10 +2098,10 @@ impl Renderer {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.config);
-                return RenderOutcome::Skipped;
+                return (RenderOutcome::Skipped, None);
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => return RenderOutcome::OutOfMemory,
-            Err(_) => return RenderOutcome::Skipped,
+            Err(wgpu::SurfaceError::OutOfMemory) => return (RenderOutcome::OutOfMemory, None),
+            Err(_) => return (RenderOutcome::Skipped, None),
         };
         let view = frame
             .texture
@@ -1977,6 +2111,23 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("morphic pet render encoder"),
             });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("transparent surface layer clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
         if use_liquid {
             let scaled = scale_scissor(
                 scissor,
@@ -2170,7 +2321,7 @@ impl Renderer {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -2215,6 +2366,7 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
         }
+        background(&self.device, &self.queue, &mut encoder, &view);
         {
             let compose_scissor = if self.review_background == ReviewBackground::Transparent {
                 scissor
@@ -2228,7 +2380,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2254,8 +2406,50 @@ impl Renderer {
             );
             pass.draw(0..3, 0..1);
         }
-        overlay(&self.device, &self.queue, &mut encoder, &view);
-        self.queue.submit(Some(encoder.finish()));
+        foreground(&self.device, &self.queue, &mut encoder, &view);
+        let capture_format = capture.then_some(match self.config.format {
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Ok(false),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => Ok(true),
+            format => Err(RendererCaptureError::UnsupportedFormat(format)),
+        });
+        let unpadded_bytes_per_row = self.config.width.saturating_mul(4);
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(alignment) * alignment;
+        let capture_buffer = capture_format
+            .as_ref()
+            .and_then(|format| format.as_ref().ok())
+            .map(|_| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("morphic pet perceptual capture readback"),
+                    size: u64::from(padded_bytes_per_row) * u64::from(self.config.height),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            });
+        if let Some(buffer) = &capture_buffer {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row),
+                        rows_per_image: Some(self.config.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.config.width,
+                    height: self.config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let submission = self.queue.submit(Some(encoder.finish()));
         if use_liquid {
             self.density_targets_initialized = true;
         }
@@ -2265,7 +2459,49 @@ impl Renderer {
         self.offscreen_target_initialized = true;
         self.previous_liquid_scissor = use_liquid.then_some(current_scissor);
         frame.present();
-        RenderOutcome::Presented
+        let capture_result = match (capture_format, capture_buffer) {
+            (None, None) => None,
+            (Some(Err(error)), None) => Some(Err(error)),
+            (Some(Ok(bgra)), Some(buffer)) => Some((|| {
+                let slice = buffer.slice(..);
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+                self.device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                })?;
+                receiver
+                    .recv()
+                    .map_err(|_| RendererCaptureError::CallbackUnavailable)??;
+                let mapped = slice.get_mapped_range();
+                let width = self.config.width;
+                let height = self.config.height;
+                let mut rgba8 = vec![0_u8; width as usize * height as usize * 4];
+                for row in 0..height as usize {
+                    let source = &mapped[row * padded_bytes_per_row as usize
+                        ..row * padded_bytes_per_row as usize + unpadded_bytes_per_row as usize];
+                    let target = &mut rgba8[row * unpadded_bytes_per_row as usize
+                        ..(row + 1) * unpadded_bytes_per_row as usize];
+                    target.copy_from_slice(source);
+                    if bgra {
+                        for pixel in target.chunks_exact_mut(4) {
+                            pixel.swap(0, 2);
+                        }
+                    }
+                }
+                drop(mapped);
+                buffer.unmap();
+                Ok(CapturedFrame {
+                    width,
+                    height,
+                    rgba8,
+                })
+            })()),
+            _ => unreachable!("capture format and buffer construction stay paired"),
+        };
+        (RenderOutcome::Presented, capture_result)
     }
 }
 
@@ -3803,6 +4039,23 @@ mod tests {
     use std::mem::{align_of, size_of};
 
     use super::*;
+
+    #[test]
+    fn organism_resolve_uses_source_over_for_background_layers() {
+        let premultiplied = surface_source_over_blend(true);
+        assert_eq!(premultiplied.color.src_factor, wgpu::BlendFactor::One);
+        assert_eq!(
+            premultiplied.color.dst_factor,
+            wgpu::BlendFactor::OneMinusSrcAlpha
+        );
+
+        let straight = surface_source_over_blend(false);
+        assert_eq!(straight.color.src_factor, wgpu::BlendFactor::SrcAlpha);
+        assert_eq!(
+            straight.color.dst_factor,
+            wgpu::BlendFactor::OneMinusSrcAlpha
+        );
+    }
 
     #[test]
     fn identical_or_zero_surface_resize_does_not_reallocate_targets() {

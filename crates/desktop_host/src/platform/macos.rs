@@ -1,9 +1,9 @@
 use std::{
     ffi::c_void,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender, SyncSender},
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use directories::ProjectDirs;
@@ -31,9 +31,9 @@ use winit::window::Window;
 use super::visual_sampling::{CAPTURE_HEIGHT, CAPTURE_WIDTH, frame_from_bgra};
 
 use crate::{
-    ApplicationInfo, DesktopSnapshot, DesktopSurface, DesktopVisualFrame, DisplayTopology,
-    HostError, MonitorId, MonitorInfo, PhysicalDesktopPoint, PlatformBackend, PlatformCapabilities,
-    PlatformKind, RectI,
+    ApplicationInfo, DesktopBackgroundFrame, DesktopSnapshot, DesktopSurface, DesktopVisualFrame,
+    DisplayTopology, HostError, MonitorId, MonitorInfo, PhysicalDesktopPoint, PlatformBackend,
+    PlatformCapabilities, PlatformKind, RectI,
 };
 
 pub(super) fn fallback_display_topology(revision: u64) -> Option<DisplayTopology> {
@@ -85,6 +85,7 @@ pub struct MacOsBackend {
     cursor_hittest_enabled: Option<bool>,
     screen_capture_available: bool,
     visual_worker: Option<VisualSampleWorker>,
+    background_worker: Option<QuartzBackgroundWorker>,
 }
 
 impl Default for MacOsBackend {
@@ -96,6 +97,7 @@ impl Default for MacOsBackend {
             cursor_hittest_enabled: None,
             screen_capture_available: false,
             visual_worker: None,
+            background_worker: None,
         }
     }
 }
@@ -141,6 +143,8 @@ impl PlatformBackend for MacOsBackend {
         self.screen_capture_available = screen_capture_access();
         if self.screen_capture_available {
             self.visual_worker = Some(VisualSampleWorker::new(native.windowNumber() as u32));
+            self.background_worker =
+                Some(QuartzBackgroundWorker::new(native.windowNumber() as u32));
         }
         Ok(())
     }
@@ -211,6 +215,31 @@ impl PlatformBackend for MacOsBackend {
             .submit_and_poll(topology, pet_position)
     }
 
+    fn overlay_background_excludes_pet(&self) -> bool {
+        true
+    }
+
+    fn capture_overlay_background(&mut self, window: &Window) -> Option<DesktopBackgroundFrame> {
+        let native = self.window.as_ref()?;
+        let frame = native.frame();
+        // AppKit is bottom-up in points; Quartz is top-down in points. Using
+        // the native frame avoids dividing a mixed-DPI desktop origin by the
+        // current display scale, which would shift the crop between monitors.
+        let main = CGDisplayBounds(CGMainDisplayID());
+        let bounds = appkit_capture_bounds(
+            [
+                frame.origin.x,
+                frame.origin.y,
+                frame.size.width,
+                frame.size.height,
+            ],
+            main.size.height,
+        );
+        self.background_worker
+            .as_mut()?
+            .submit_and_poll(window, bounds)
+    }
+
     fn apply_overlay_policy(&mut self, _window: &Window) -> Result<(), HostError> {
         let window = self
             .window
@@ -254,6 +283,7 @@ impl PlatformBackend for MacOsBackend {
     }
 
     fn shutdown(&mut self) {
+        self.background_worker.take();
         if let Some(mut worker) = self.visual_worker.take() {
             worker.shutdown();
         }
@@ -268,6 +298,144 @@ fn screen_capture_access() -> bool {
     // supported reduced-capability mode; approval becomes active after restart.
     objc2_core_graphics::CGRequestScreenCaptureAccess()
         && objc2_core_graphics::CGPreflightScreenCaptureAccess()
+}
+
+fn appkit_capture_bounds(frame: [f64; 4], main_height: f64) -> [f64; 4] {
+    [
+        frame[0],
+        main_height - frame[1] - frame[3],
+        frame[2],
+        frame[3],
+    ]
+}
+
+#[derive(Clone, Copy)]
+struct QuartzBackgroundRequest {
+    bounds: [f64; 4],
+    physical_rect: RectI,
+    width: u32,
+    height: u32,
+}
+
+/// One queued request and one queued frame keep captures bounded even while
+/// the UI is suspended. Raw pixels are used only by the den renderer.
+struct QuartzBackgroundWorker {
+    request_tx: Option<SyncSender<QuartzBackgroundRequest>>,
+    frame_rx: Receiver<DesktopBackgroundFrame>,
+    join: Option<JoinHandle<()>>,
+    last_submit: Instant,
+}
+
+impl QuartzBackgroundWorker {
+    fn new(overlay_window: u32) -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel::<QuartzBackgroundRequest>(1);
+        let (frame_tx, frame_rx) = mpsc::sync_channel(1);
+        let join = thread::Builder::new()
+            .name("pet2-quartz-background".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let mut sequence = 0_u64;
+                while let Ok(request) = request_rx.recv() {
+                    let bounds = CGRect {
+                        origin: CGPoint {
+                            x: request.bounds[0],
+                            y: request.bounds[1],
+                        },
+                        size: CGSize {
+                            width: request.bounds[2],
+                            height: request.bounds[3],
+                        },
+                    };
+                    let Some(bgra8) = capture_desktop_bgra(
+                        bounds,
+                        overlay_window,
+                        request.width as usize,
+                        request.height as usize,
+                    ) else {
+                        continue;
+                    };
+                    sequence = sequence.saturating_add(1);
+                    let (mean_luminance, contrast) =
+                        super::visual_sampling::background_luminance_stats(
+                            &bgra8,
+                            request.width,
+                            request.height,
+                            request.width * 4,
+                        );
+                    let frame = DesktopBackgroundFrame {
+                        width: request.width,
+                        height: request.height,
+                        bytes_per_row: request.width * 4,
+                        bgra8,
+                        physical_rect: request.physical_rect,
+                        sequence,
+                        timestamp: started.elapsed().as_secs_f64(),
+                        mean_luminance,
+                        contrast,
+                    };
+                    if let Err(mpsc::TrySendError::Disconnected(_)) = frame_tx.try_send(frame) {
+                        break;
+                    }
+                }
+            })
+            .ok();
+        Self {
+            request_tx: Some(request_tx),
+            frame_rx,
+            join,
+            last_submit: Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+    fn submit_and_poll(
+        &mut self,
+        window: &Window,
+        bounds: [f64; 4],
+    ) -> Option<DesktopBackgroundFrame> {
+        let latest = self.frame_rx.try_recv().ok();
+        if self.last_submit.elapsed() >= Duration::from_secs_f64(1.0 / 30.0) {
+            let position = window.outer_position().ok()?;
+            let size = window.inner_size();
+            if size.width > 0 && size.height > 0 {
+                // Half physical resolution, capped proportionally at 1920×1080.
+                let divisor = 2.0_f64
+                    .max(size.width as f64 / 1920.0)
+                    .max(size.height as f64 / 1080.0);
+                let request = QuartzBackgroundRequest {
+                    bounds,
+                    physical_rect: RectI {
+                        minimum: PhysicalDesktopPoint {
+                            x: position.x,
+                            y: position.y,
+                        },
+                        maximum: PhysicalDesktopPoint {
+                            x: position.x.saturating_add(size.width as i32),
+                            y: position.y.saturating_add(size.height as i32),
+                        },
+                    },
+                    width: (size.width as f64 / divisor).ceil() as u32,
+                    height: (size.height as f64 / divisor).ceil() as u32,
+                };
+                if self
+                    .request_tx
+                    .as_ref()
+                    .is_some_and(|tx| tx.try_send(request).is_ok())
+                {
+                    self.last_submit = Instant::now();
+                }
+            }
+        }
+        latest
+    }
+}
+
+impl Drop for QuartzBackgroundWorker {
+    fn drop(&mut self) {
+        self.request_tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -566,5 +734,31 @@ fn classify_application(identifier: &str) -> AppCategory {
         AppCategory::System
     } else {
         AppCategory::Unknown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_crop_uses_points_and_flips_appkit_y() {
+        // A Retina backing store is twice this size, but Quartz takes points.
+        assert_eq!(
+            appkit_capture_bounds([100.0, 200.0, 800.0, 600.0], 900.0),
+            [100.0, 100.0, 800.0, 600.0]
+        );
+    }
+
+    #[test]
+    fn background_crop_preserves_displays_left_of_and_above_main() {
+        assert_eq!(
+            appkit_capture_bounds([-1280.0, 900.0, 1280.0, 720.0], 900.0),
+            [-1280.0, -720.0, 1280.0, 720.0]
+        );
+        assert_eq!(
+            appkit_capture_bounds([0.0, -600.0, 800.0, 600.0], 900.0),
+            [0.0, 900.0, 800.0, 600.0]
+        );
     }
 }

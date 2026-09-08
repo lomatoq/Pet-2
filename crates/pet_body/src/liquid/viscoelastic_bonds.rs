@@ -1,4 +1,4 @@
-use super::particles::{LiquidParticle, MAX_LIQUID_PARTICLES, two_particles_mut};
+use super::particles::{LiquidParticle, MAX_LIQUID_PARTICLES};
 
 pub const MAX_BONDS: usize = 384;
 const MAX_BONDS_PER_PARTICLE: usize = 6;
@@ -111,7 +111,9 @@ pub fn solve_bonds(
             let delta_lambda = (-constraint - alpha * bond.lambda) / inverse_mass_sum;
             bond.lambda += delta_lambda;
             let correction = delta / distance * delta_lambda.clamp(-0.018, 0.018);
-            let (particle_a, particle_b) = two_particles_mut(particles, a, b);
+            let (before_b, from_b) = particles.split_at_mut(b);
+            let particle_a = &mut before_b[a];
+            let particle_b = &mut from_b[0];
             particle_a.predicted_position -= correction * particle_a.inverse_mass;
             particle_b.predicted_position += correction * particle_b.inverse_mass;
         }
@@ -204,6 +206,7 @@ pub fn update_bonds(
 }
 
 #[must_use]
+#[cfg(test)]
 pub fn active_bond_count(bonds: &[ViscoelasticBond; MAX_BONDS]) -> usize {
     bonds.iter().filter(|bond| bond.active).count()
 }
@@ -256,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn stretched_neck_thins_then_breaks_without_a_phantom_tether() {
+    fn detachment_requires_rising_strain_and_neck_thinning() {
         let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
         particles[0].position = glam::Vec2::ZERO;
         particles[1].position = glam::Vec2::new(PARTICLE_SPACING * 2.2, 0.0);

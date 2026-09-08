@@ -6,6 +6,7 @@
 mod capabilities;
 mod contract;
 mod coordinates;
+mod evolution_control;
 mod lab_control;
 mod overlay;
 mod platform;
@@ -15,6 +16,7 @@ mod storage;
 pub use capabilities::*;
 pub use contract::*;
 pub use coordinates::*;
+pub use evolution_control::*;
 pub use lab_control::*;
 pub use overlay::*;
 pub use platform::{

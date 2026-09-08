@@ -5,6 +5,11 @@
 #![recursion_limit = "512"]
 
 mod ecology_runtime;
+mod evolution_runner;
+mod nervous_system_runtime;
+mod pointer_replay_runner;
+#[allow(dead_code)]
+mod replay;
 mod vita_runtime;
 
 use std::{
@@ -21,10 +26,12 @@ use std::{
 };
 
 use desktop_host::{
-    DesktopVisualFrame, DisplayTopology, EventLogEntry, LabControlCommand, LabControlEnvelope,
-    LabDrive, MonitorId, MonitorInfo, PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition,
-    PhysicalDesktopPoint, PlatformBackend, PointerState, PortablePetState, RectI, SensorNormalizer,
-    StateStore, VISUAL_GRID_HEIGHT as DESKTOP_VISUAL_GRID_HEIGHT,
+    DesktopVisualFrame, DisplayTopology, EventLogEntry, EvolutionPersistence, LabControlCommand,
+    LabControlEnvelope, LabDrive, LabGesture, MonitorId, MonitorInfo,
+    PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition, PhysicalDesktopPoint, PlatformBackend,
+    PointerState, PortablePetState, RUNTIME_LOAD_ACK_SCHEMA_VERSION, RectI,
+    RuntimeLoadAcknowledgement, RuntimeLoadStatus, SensorNormalizer, StateStore,
+    VISUAL_GRID_HEIGHT as DESKTOP_VISUAL_GRID_HEIGHT,
     VISUAL_GRID_WIDTH as DESKTOP_VISUAL_GRID_WIDTH, create_platform_backend,
     prepare_overlay_window_attributes,
 };
@@ -33,21 +40,32 @@ use glam::Vec2;
 #[cfg(test)]
 use lifecore::MAX_MUTATION_HISTORY;
 use lifecore::{
-    ActionId, BodyIntent, CollisionEvent, DebugState, Drives, ExpressionState, FeedbackEvent,
-    Genome, LIFECORE_HZ, LifeCore, LocomotionMode, PoseIntent, SensorFrame, VitaOutput,
-    VocalTrigger, stable_hash_bytes,
+    ActionId, BodyIntent, CollisionEvent, DebugState, Drives, EmbodiedGestureEvent,
+    EmbodiedGestureKind, ExpressionDirector, ExpressionState, FeedbackEvent, Genome,
+    GestureBoundaryEvent, LIFECORE_HZ, LifeCore, LivingStateFrame, LocomotionMode, PoseIntent,
+    SensorFrame, VitaOutput, VocalArbiter, VocalTrigger, persisted_life_snapshot_hash,
+    stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
-use pet_audio::{AudioCallbackLevels, AudioEngine, AudioVisualFeedback, SelectedOutputConfig};
+use nervous_system_runtime::NervousSystemRuntime;
+use pet_audio::{
+    AudioCallbackLevels, AudioEngine, AudioVisualFeedback, BodyVoiceAnalyzer, SelectedOutputConfig,
+    global_body_voice_bridge,
+};
 use pet_body::{
-    BodyRenderMode, EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile,
-    MaterialVariant, ProceduralBody, RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
+    BodyMaterialSnapshot, BodyRenderMode, ColorSourceMode, EcologyCaptureExclusion,
+    EcologyRenderer, LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant,
+    ProceduralBody, RenderOutcome, Renderer, VisualMindInput, VoiceVisualState,
 };
+#[cfg(not(feature = "legacy-expression-fallback"))]
+use pet_ecology::ObjectLifecycle;
 use pet_ecology::{
-    ActionSignature, EcologyOutcome, EcologyVocalTrigger, EpisodeGoal, EpisodePhase, MorselProfile,
-    ObjectKind,
+    ActionSignature, ConventionOutcome, EcologyOutcome, EcologyVocalTrigger, EpisodeGoal,
+    EpisodePhase, GestureConventionMeaning, GestureSignature, MorselProfile, ObjectKind,
 };
-use pet_perception::{SpatialVisualCell, SpatialVisualFrame, VisualFeatureFrame};
+use pet_perception::{
+    EmbodiedGestureClassifierTuning, SpatialVisualCell, SpatialVisualFrame, VisualFeatureFrame,
+};
 use vita_runtime::{BrainMode, VitaRuntime};
 use winit::{
     application::ApplicationHandler,
@@ -91,15 +109,19 @@ const PRODUCTION_RENDER_SCALE: u32 = 1;
 const DEBUG_LOG_INTERVAL: f32 = 1.0;
 const DEV_MODE_LOG_INTERVAL: f32 = 0.20;
 const LAB_CONTROL_POLL_INTERVAL_SECONDS: f32 = 0.10;
-const CAUSAL_TELEMETRY_SCHEMA_VERSION: u32 = 2;
+// DXGI desktop duplication can hand us a stale/empty first frame while DWM is
+// still committing the just-created transparent overlay. Debug startup logging
+// used to hide that race by accident. Let the overlay present a few frames,
+// then keep it excluded from capture while several clean desktop frames
+// converge before enabling ordinary live capture around the den.
+const BACKGROUND_CAPTURE_WARMUP_PRESENTS: u64 = 3;
+const BACKGROUND_CLEAN_SEED_FRAMES: u8 = 6;
+const BACKGROUND_CAPTURE_FALLBACK_SECONDS: f64 = 0.75;
+const CAUSAL_TELEMETRY_SCHEMA_VERSION: u32 = 4;
 const TELEMETRY_RECENT_MEMORY_LIMIT: usize = 16;
 const TELEMETRY_EPISODE_MEMORY_LIMIT: usize = 16;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let Some(_single_instance) = SingleInstanceGuard::acquire()? else {
-        eprintln!("Pet 2 is already running; refusing to create a second desktop organism");
-        return Ok(());
-    };
     let arguments = Arguments::parse(env::args().skip(1))?;
     startup_probe(arguments.debug_log, "arguments parsed");
     if arguments.help {
@@ -112,12 +134,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(StateStore::at)
         .map_or_else(StateStore::discover, Ok)?;
     startup_probe(arguments.debug_log, "state store ready");
-    if arguments.headless
-        || arguments.headless_smoke_seconds.is_some()
-        || arguments.simulate_hours.is_some()
-    {
+    if arguments.pointer_replay.is_some() {
+        let prepared = prepare_state(&arguments, &store)?;
+        return pointer_replay_runner::run(&arguments, &store, prepared);
+    }
+    if arguments.evolution_config.is_some() || arguments.simulate_hours.is_some() {
+        let prepared = prepare_state(&arguments, &store)?;
+        return evolution_runner::run(&arguments, &store, prepared);
+    }
+    if arguments.headless || arguments.headless_smoke_seconds.is_some() {
         return run_headless(arguments, store);
     }
+    let Some(_single_instance) = SingleInstanceGuard::acquire()? else {
+        eprintln!("Pet 2 is already running; refusing to create a second desktop organism");
+        return Ok(());
+    };
     let prepared = prepare_state(&arguments, &store)?;
     startup_probe(arguments.debug_log, "portable state prepared");
     let event_loop = EventLoop::new()?;
@@ -231,12 +262,17 @@ struct Arguments {
     headless: bool,
     headless_smoke_seconds: Option<f32>,
     simulate_hours: Option<f32>,
+    pointer_replay: Option<PathBuf>,
+    evolution_config: Option<PathBuf>,
+    evolution_report: Option<PathBuf>,
+    evolution_progress: Option<PathBuf>,
+    evolution_persist: Option<EvolutionPersistence>,
+    evolution_max_generations: Option<u32>,
     export_state: Option<PathBuf>,
     import_state: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     reset_learning: bool,
     reset_pet: bool,
-    evolve: bool,
     no_audio: bool,
     focus_mode: bool,
     brain_mode: BrainMode,
@@ -266,6 +302,32 @@ impl Arguments {
                     parsed.simulate_hours =
                         Some(value("--simulate-hours", &mut arguments)?.parse()?);
                 }
+                "--pointer-replay" => {
+                    parsed.pointer_replay =
+                        Some(PathBuf::from(value("--pointer-replay", &mut arguments)?));
+                }
+                "--evolution-config" => {
+                    parsed.evolution_config =
+                        Some(PathBuf::from(value("--evolution-config", &mut arguments)?));
+                }
+                "--evolution-report" => {
+                    parsed.evolution_report =
+                        Some(PathBuf::from(value("--evolution-report", &mut arguments)?));
+                }
+                "--evolution-progress" => {
+                    parsed.evolution_progress = Some(PathBuf::from(value(
+                        "--evolution-progress",
+                        &mut arguments,
+                    )?));
+                }
+                "--evolution-persist" => {
+                    parsed.evolution_persist =
+                        Some(value("--evolution-persist", &mut arguments)?.parse()?);
+                }
+                "--evolution-max-generations" => {
+                    parsed.evolution_max_generations =
+                        Some(value("--evolution-max-generations", &mut arguments)?.parse()?);
+                }
                 "--export-state" => {
                     parsed.export_state =
                         Some(PathBuf::from(value("--export-state", &mut arguments)?));
@@ -279,8 +341,13 @@ impl Arguments {
                 }
                 "--reset-learning" => parsed.reset_learning = true,
                 "--reset-pet" => parsed.reset_pet = true,
-                "--evolve" => parsed.evolve = true,
-                "--no-audio" => parsed.no_audio = true,
+                "--evolve" => {
+                    return Err(
+                        "--evolve was retired because an unconditional metamorphosis has no eligibility report; use --evolution-config with an explicit policy"
+                            .into(),
+                    );
+                }
+                "--no-audio" | "--no-audio-output" => parsed.no_audio = true,
                 "--focus-mode" => parsed.focus_mode = true,
                 "--brain-mode" => {
                     parsed.brain_mode = value("--brain-mode", &mut arguments)?.parse()?;
@@ -300,6 +367,7 @@ impl Arguments {
 
 struct PreparedState {
     life: LifeCore,
+    loaded_life_state_hash: u64,
     position: PersistedPetPosition,
     vita: VitaRuntime,
     morph: MorphBrain,
@@ -331,6 +399,7 @@ struct AudioManager {
     rejected_requests: u64,
     recent_rms: f32,
     recent_peak: f32,
+    body_voice_analyzer: BodyVoiceAnalyzer,
 }
 
 enum AudioWorkerCommand {
@@ -508,6 +577,7 @@ impl AudioManager {
             rejected_requests: 0,
             recent_rms: 0.0,
             recent_peak: 0.0,
+            body_voice_analyzer: BodyVoiceAnalyzer::default(),
         };
         if !disabled {
             manager.start_in_background();
@@ -680,6 +750,11 @@ impl AudioManager {
         }
     }
 
+    fn publish_body_voice(&mut self, raw: lifecore::BodyVoiceFrame, dt: f32) {
+        let frame = self.body_voice_analyzer.update(raw, dt);
+        global_body_voice_bridge().publish(frame);
+    }
+
     fn take_unheard_rejection(&mut self) -> Option<u64> {
         self.unheard_rejections.pop_front()
     }
@@ -826,6 +901,10 @@ fn prepare_state(
     } else {
         store.load_state()?
     };
+    let persisted_loaded_hash = saved
+        .as_ref()
+        .map(|saved| persisted_life_snapshot_hash(&saved.life))
+        .transpose()?;
     let (mut life, position, vita_state) = if let Some(saved) = saved {
         (LifeCore::restore(saved.life)?, saved.position, saved.vita)
     } else {
@@ -853,13 +932,12 @@ fn prepare_state(
         life.reset_learning();
         vita.reset_learning(identity_seed);
     }
-    if arguments.evolve {
-        life.trigger_metamorphosis();
-        vita.note_metamorphosis();
-    }
     life.set_focus_mode(arguments.focus_mode);
+    let loaded_life_state_hash =
+        persisted_loaded_hash.map_or_else(|| persisted_life_snapshot_hash(&life.snapshot()), Ok)?;
     Ok(PreparedState {
         life,
+        loaded_life_state_hash,
         position,
         vita,
         morph,
@@ -871,23 +949,20 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     let brain_mode = arguments.brain_mode;
     let PreparedState {
         mut life,
+        loaded_life_state_hash: _,
         position,
         mut vita,
         mut morph,
         mut ecology,
     } = prepare_state(&arguments, &store)?;
     let mut body = ProceduralBody::generate(&life.state.genome)?;
-    let duration_seconds = arguments
-        .simulate_hours
-        .map(|hours| hours.max(0.0) * 3_600.0)
-        .or(arguments.headless_smoke_seconds)
-        .unwrap_or(60.0)
-        .max(0.05);
-    let dt = if arguments.simulate_hours.is_some() {
-        0.25
-    } else {
-        LIFE_DT
-    };
+    load_migrate_apply_liquid_tuning(&store, &mut body)?;
+    vita.set_embodied_gesture_tuning(classifier_tuning(body.tuning_profile().interaction));
+    if !arguments.reset_pet && arguments.import_state.is_none() {
+        load_restore_body_state(&store, &mut body)?;
+    }
+    let duration_seconds = arguments.headless_smoke_seconds.unwrap_or(60.0).max(0.05);
+    let dt = LIFE_DT;
     let tick_count = (duration_seconds / dt).ceil() as u64;
     let mut sensors = SensorFrame::default();
     let mut feedback = body.simulation.feedback.clone();
@@ -931,6 +1006,8 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         sensors.cursor_distance_to_pet = sensors.cursor_position.distance(feedback.world_position);
         sensors.user_idle_seconds = 3.0 + 15.0 * (time * 0.013).sin().abs();
         sensors.user_activity_rate = (1.0 - sensors.user_idle_seconds / 30.0).clamp(0.0, 1.0);
+        sensors.embodied_interaction = body.embodied_interaction_frame();
+        feedback.cursor_contact = sensors.embodied_interaction.contact.active;
         if tick % 11 == 0 {
             vita.note_key_activity(sensors.timestamp);
         }
@@ -965,6 +1042,18 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         }
         previous_morph_command = morph_output.command;
         let mut output = life.tick(&sensors, &feedback, dt);
+        if let Some(event) = vita.take_embodied_gesture() {
+            let episode_id = event.classification.episode_id;
+            if let Some(plan) = life.observe_embodied_gesture(event) {
+                if vita.accept_interaction_response(plan) && output.vocal_request.is_none() {
+                    output.vocal_request = plan
+                        .voice_trigger
+                        .and_then(|trigger| life.request_vocalization(trigger, &sensors));
+                }
+            } else {
+                vita.finish_interaction_appraisal_without_response(episode_id);
+            }
+        }
         if let Some(request) = output.vocal_request.take() {
             life.cancel_vocal_request(request.performance_seed);
         }
@@ -977,6 +1066,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             Some(morph_output),
             dt,
         );
+        sensors.interaction_actuation = vita.interaction_actuation();
         output.body_intent = resolved_intent;
         let ecology_output = ecology.resolve_intent(
             output.body_intent,
@@ -1110,7 +1200,6 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     let ecology_state = ecology.snapshot();
     let ecology_bytes = serde_json::to_vec(&ecology_state)?;
     let behavior_acceptance_required = arguments.headless_smoke_seconds.is_some()
-        && arguments.simulate_hours.is_none()
         && !arguments.focus_mode
         && duration_seconds >= 60.0;
     let behavior_acceptance = HeadlessBehaviorAcceptance {
@@ -1202,6 +1291,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     store.save_state(&portable)?;
     store.save_morph_brain(&morph_state)?;
     store.save_ecology_state(&ecology_state)?;
+    store.save_body_state(&body.body_material_snapshot())?;
     if let Some(path) = &arguments.export_state {
         store.export_state(&portable, path)?;
     }
@@ -1499,6 +1589,7 @@ struct PetRuntime {
     morph: MorphBrain,
     ecology: EcologyRuntime,
     brain_mode: BrainMode,
+    dev_mode: bool,
     body: ProceduralBody,
     audio: AudioManager,
     sensors: SensorFrame,
@@ -1547,9 +1638,14 @@ struct PetRuntime {
     background_capture_microseconds: f64,
     background_capture_timestamp: f64,
     background_capture_sequence: u64,
+    background_clean_seed_frames: u8,
+    background_capture_affinity_released: bool,
     background_luminance: f32,
     background_contrast: f32,
-    last_touch_voice: Option<Instant>,
+    expression_director: ExpressionDirector,
+    nervous_system: NervousSystemRuntime,
+    vocal_arbiter: VocalArbiter,
+    last_phrase: Option<lifecore::CreaturePhrase>,
     overlay_move_microseconds: f64,
     render_microseconds: f64,
     brain_tick_microseconds: f64,
@@ -1564,6 +1660,176 @@ struct PetRuntime {
     desktop_poll_timings: TimingWindow,
     camera_timings: TimingWindow,
     background_timings: TimingWindow,
+    pending_gesture_convention: Option<PendingGestureConvention>,
+    lab_pointer_fixture: Option<LabPointerFixture>,
+    last_convention_update_episode: u64,
+    shutdown_for_promotion: bool,
+    runtime_ack_accumulator: f32,
+    loaded_life_state_hash: u64,
+    loaded_genome_hash: u64,
+}
+
+#[derive(Clone)]
+struct PendingGestureConvention {
+    episode_id: u64,
+    meaning: GestureConventionMeaning,
+    signature: GestureSignature,
+    existing_id: Option<u64>,
+    observed_at: f64,
+}
+
+#[derive(Clone, Copy)]
+struct LabPointerFixture {
+    gesture: LabGesture,
+    intensity: f32,
+    duration_seconds: f32,
+    elapsed_seconds: f32,
+    previous_local: Vec2,
+    previous_down: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LabPointerSample {
+    local: Vec2,
+    velocity_local: Vec2,
+    down: bool,
+    pressed: bool,
+    released: bool,
+    finished: bool,
+}
+
+impl LabPointerFixture {
+    fn new(gesture: LabGesture, intensity: f32, duration_seconds: f32) -> Self {
+        Self {
+            gesture,
+            intensity: intensity.clamp(0.0, 1.0),
+            duration_seconds: duration_seconds.clamp(0.1, 10.0),
+            elapsed_seconds: 0.0,
+            previous_local: Vec2::ZERO,
+            previous_down: false,
+        }
+    }
+
+    fn step(&mut self, dt: f32) -> LabPointerSample {
+        let dt = dt.clamp(1.0 / 240.0, 0.05);
+        let phase = (self.elapsed_seconds / self.duration_seconds).clamp(0.0, 1.0);
+        let strength = 0.35 + self.intensity * 0.65;
+        let (local, mut down) = match self.gesture {
+            LabGesture::SoftTouch => (Vec2::new(-0.07, 0.01), phase < 0.72),
+            LabGesture::SlowStretch => (
+                Vec2::new(-0.06 + phase.min(0.82) * 0.30 * strength, 0.01),
+                phase < 0.84,
+            ),
+            LabGesture::Tickle => (
+                Vec2::new(
+                    -0.03 + (phase * std::f32::consts::TAU * 9.0).sin() * 0.055 * strength,
+                    (phase * std::f32::consts::TAU * 13.0).sin() * 0.035 * strength,
+                ),
+                phase < 0.90,
+            ),
+            LabGesture::ThreeBeatRhythm => {
+                let beat_phase = (phase * 3.0).fract();
+                (Vec2::new(-0.04, 0.015), phase < 0.92 && beat_phase < 0.46)
+            }
+            LabGesture::CircularTwist => {
+                let angle = phase * std::f32::consts::TAU * 1.15;
+                (
+                    Vec2::new(angle.cos(), angle.sin()) * (0.10 + 0.05 * strength),
+                    phase < 0.90,
+                )
+            }
+            LabGesture::SharpFlick => (
+                Vec2::new(-0.10 + phase.min(0.58) / 0.58 * 0.34 * strength, -0.01),
+                phase < 0.58,
+            ),
+            LabGesture::Hold => (Vec2::new(-0.045, 0.02), phase < 0.92),
+            LabGesture::PullRelease => (
+                Vec2::new(-0.05 + phase.min(0.72) / 0.72 * 0.35 * strength, 0.0),
+                phase < 0.72,
+            ),
+            LabGesture::RealSplitRemerge => {
+                let distance = phase.min(0.78) / 0.78 * 0.58 * strength;
+                (Vec2::new(0.24 + distance, 0.03), phase < 0.80)
+            }
+            LabGesture::FragmentHelp => {
+                if phase < 0.55 {
+                    (
+                        Vec2::new(0.24 + phase / 0.55 * 0.58 * strength, 0.025),
+                        true,
+                    )
+                } else if phase < 0.65 {
+                    (Vec2::new(0.82, 0.025), false)
+                } else {
+                    let help = ((phase - 0.65) / 0.30).clamp(0.0, 1.0);
+                    (Vec2::new(0.82 - help * 0.70, 0.025), phase < 0.95)
+                }
+            }
+            LabGesture::OverstrainBoundary => (
+                Vec2::new(-0.04 + phase.min(0.82) / 0.82 * 0.56 * strength, 0.0),
+                phase < 0.84,
+            ),
+            LabGesture::SleepQuietInteraction => (Vec2::new(-0.03, 0.015), phase < 0.38),
+        };
+        self.elapsed_seconds = (self.elapsed_seconds + dt).min(self.duration_seconds);
+        let finished = self.elapsed_seconds >= self.duration_seconds;
+        if finished {
+            down = false;
+        }
+        let velocity_local = (local - self.previous_local) / dt;
+        let sample = LabPointerSample {
+            local,
+            velocity_local,
+            down,
+            pressed: down && !self.previous_down,
+            released: !down && self.previous_down,
+            finished,
+        };
+        self.previous_local = local;
+        self.previous_down = down;
+        sample
+    }
+}
+
+fn apply_lab_pointer_fixture(runtime: &mut PetRuntime, sensors: &mut SensorFrame, dt: f32) {
+    let body_position = runtime.body.simulation.feedback.world_position;
+    let scale = runtime.body.embodiment.world_to_body_scale();
+    let safe_scale = Vec2::new(
+        if scale.x.abs() > 1.0e-5 { scale.x } else { 1.0 },
+        if scale.y.abs() > 1.0e-5 {
+            scale.y
+        } else {
+            -1.0
+        },
+    );
+    let Some(fixture) = runtime.lab_pointer_fixture.as_mut() else {
+        return;
+    };
+    let gesture = fixture.gesture;
+    let fixture_phase = (fixture.elapsed_seconds / fixture.duration_seconds).clamp(0.0, 1.0);
+    let sample = fixture.step(dt);
+    sensors.cursor_position = body_position + sample.local / safe_scale;
+    sensors.cursor_velocity = sample.velocity_local / safe_scale;
+    sensors.cursor_acceleration = Vec2::ZERO;
+    sensors.cursor_distance_to_pet = sensors.cursor_position.distance(body_position);
+    sensors.pointer_down = sample.down;
+    sensors.pointer_pressed = sample.pressed;
+    sensors.pointer_released = sample.released;
+    sensors.pet_hovered = true;
+    sensors.pet_dragged = sample.down;
+    sensors.pet_touched = sample.pressed;
+    if sample.down
+        && (gesture == LabGesture::RealSplitRemerge
+            || (gesture == LabGesture::FragmentHelp && fixture_phase < 0.55))
+    {
+        sensors.interaction_actuation.allow_intentional_bud = true;
+        sensors.interaction_actuation.compliance_delta = 0.25;
+        sensors.interaction_actuation.cohesion_delta = -0.25;
+        sensors.interaction_actuation.cooperation = 1.0;
+        sensors.interaction_actuation.resistance = 0.0;
+    }
+    if sample.finished {
+        runtime.lab_pointer_fixture = None;
+    }
 }
 
 struct PetApplication {
@@ -1610,6 +1876,7 @@ impl PetApplication {
         runtime.save_accumulator += elapsed;
         runtime.tuning_poll_accumulator += elapsed;
         runtime.lab_control_poll_accumulator += elapsed;
+        runtime.runtime_ack_accumulator += elapsed;
         runtime.debug_accumulator += elapsed;
         runtime.fps_accumulator += elapsed;
         runtime.max_frame_gap_ms = runtime.max_frame_gap_ms.max(elapsed * 1_000.0);
@@ -1618,6 +1885,20 @@ impl PetApplication {
         if runtime.lab_control_poll_accumulator >= LAB_CONTROL_POLL_INTERVAL_SECONDS {
             runtime.lab_control_poll_accumulator %= LAB_CONTROL_POLL_INTERVAL_SECONDS;
             poll_lab_control(&self.store, runtime, SystemTime::now(), now);
+        }
+        if runtime.shutdown_for_promotion {
+            runtime.platform.shutdown();
+            runtime.ecology.prepare_shutdown();
+            if let Some(runtime) = self.runtime.as_ref() {
+                self.persist(runtime);
+                write_runtime_ack(&self.store, runtime, RuntimeLoadStatus::Stopped);
+            }
+            event_loop.exit();
+            return;
+        }
+        if runtime.runtime_ack_accumulator >= 1.0 {
+            runtime.runtime_ack_accumulator %= 1.0;
+            write_runtime_ack(&self.store, runtime, RuntimeLoadStatus::Running);
         }
         runtime.lab_interventions.expire_pulses(now);
 
@@ -1754,12 +2035,14 @@ impl PetApplication {
                 runtime.pointer,
                 local_time_01(),
             );
+            runtime.sensors.embodied_interaction = runtime.body.embodied_interaction_frame();
+            runtime.body.simulation.feedback.cursor_contact =
+                runtime.sensors.embodied_interaction.contact.active;
             if petting_started {
                 // Resolve any previous utterance before the mind chooses this
                 // touch response. The freshly normalized sensor frame gives the
                 // learner the actual contact context instead of the prior poll.
                 apply_shared_feedback(runtime, FeedbackEvent::PettingStarted);
-                enqueue_touch_voice(runtime, now);
             }
             if orb_touched {
                 apply_shared_feedback(runtime, FeedbackEvent::PlayStarted);
@@ -1785,12 +2068,16 @@ impl PetApplication {
                 runtime.sensors.mean_luminance = Some(0.5);
                 runtime.sensors.local_luminance = Some(0.5);
             }
+            runtime.vita.set_embodied_gesture_tuning(classifier_tuning(
+                runtime.body.tuning_profile().interaction,
+            ));
             runtime.vita.observe(
                 &runtime.sensors,
                 &runtime.body.simulation.feedback,
                 observation_dt,
             );
             runtime.sensors.desktop_focus_pressure = runtime.vita.desktop_focus_pressure();
+            expire_pending_gesture_convention(runtime);
             let click_rhythm = runtime.vita.recent_click_rhythm();
             runtime.sensors.recent_click_rhythm =
                 click_rhythm.map_or([0.0; 8], |rhythm| rhythm.intervals);
@@ -1854,12 +2141,16 @@ impl PetApplication {
                 runtime.vita.percept().scroll_velocity,
                 runtime.vita.percept().window_pressure,
             );
+            let mut body_sensors = runtime.sensors.clone();
+            apply_lab_pointer_fixture(runtime, &mut body_sensors, body_dt);
             runtime.body.fixed_update(
                 &runtime.life.state.genome,
                 &runtime.intent,
-                &runtime.sensors,
+                &body_sensors,
                 body_dt,
             );
+            let body_voice = body_voice_frame(&runtime.body, &body_sensors);
+            runtime.audio.publish_body_voice(body_voice, body_dt);
             let bounds = runtime.topology.virtual_physical_bounds;
             let desktop_aspect = bounds.width() as f32 / bounds.height().max(1) as f32;
             runtime.ecology.fixed_update(
@@ -1905,6 +2196,9 @@ impl PetApplication {
                 voice,
                 body_dt,
             );
+            runtime
+                .nervous_system
+                .observe_body(&runtime.body, &runtime.intent, &body_sensors);
             runtime.body_accumulator -= body_dt;
             physics_steps += 1;
         }
@@ -1928,26 +2222,144 @@ impl PetApplication {
         runtime
             .camera_timings
             .observe(runtime.overlay_move_microseconds as f32 / 1_000.0);
-        // The checker is evaluated analytically in the material shader. Its UVs
-        // still use global desktop coordinates, so moving either the Pet or its
-        // camera cannot make the pattern slide across the liquid.
+        // Capture the desktop asynchronously and upload only the newest frame.
+        // The ecology shader uses it locally for the den lens; captured pixels
+        // remain process-local and are never persisted or added to telemetry.
         let background_started = Instant::now();
-        let size = runtime.window.inner_size();
-        let (scale, offset) = background_uv_transform(
-            runtime.acknowledged_window_origin,
-            size,
-            runtime.topology.virtual_physical_bounds,
-        );
-        runtime.renderer.set_background_uv_transform(scale, offset);
-        runtime.renderer.set_background_freshness(0.0);
+        if background_capture_is_armed(runtime.presented_pose.frame_count)
+            && let Some(frame) = runtime.platform.capture_overlay_background(&runtime.window)
+        {
+            let den = &runtime.ecology.state().den;
+            // The visible den, displaced rim and glow fit inside this authored
+            // 210 px diameter at the 1080 px reference height. Retain the last
+            // clean pixels in that region while live capture continues around
+            // it, preventing recursive optical feedback without freezing the
+            // rest of the desktop texture.
+            let exclusion_radius = frame.height as f32
+                * (105.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX)
+                * den.size_scale
+                * den_capture_exclusion_scale(
+                    runtime.body.tuning_profile().den.displacement_radius,
+                );
+            let exclusion_feather =
+                frame.height as f32 * (36.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX);
+            let exclusion =
+                EcologyCaptureExclusion::new(den.anchor, exclusion_radius, exclusion_feather);
+            let seeding_clean_background =
+                background_capture_needs_clean_seed(runtime.background_clean_seed_frames);
+            let background_updated =
+                if seeding_clean_background || runtime.platform.overlay_background_excludes_pet() {
+                    // The overlay is still WDA_EXCLUDEFROMCAPTURE here, so the
+                    // whole frame is clean. Do not apply the den retention mask
+                    // until the history has converged; otherwise one bad startup
+                    // sample is frozen under the lens for the entire process.
+                    runtime.ecology_renderer.update_background(
+                        runtime.renderer.device(),
+                        runtime.renderer.queue(),
+                        frame.width,
+                        frame.height,
+                        frame.bytes_per_row,
+                        &frame.bgra8,
+                    )
+                } else {
+                    runtime.ecology_renderer.update_background_excluding(
+                        runtime.renderer.device(),
+                        runtime.renderer.queue(),
+                        frame.width,
+                        frame.height,
+                        frame.bytes_per_row,
+                        &frame.bgra8,
+                        exclusion,
+                    )
+                };
+            if background_updated {
+                runtime.background_capture_timestamp = runtime.normalizer.monotonic_seconds();
+                runtime.background_capture_sequence = frame.sequence;
+                runtime.background_luminance = frame.mean_luminance;
+                runtime.background_contrast = frame.contrast;
+                if seeding_clean_background {
+                    runtime.background_clean_seed_frames = runtime
+                        .background_clean_seed_frames
+                        .saturating_add(1)
+                        .min(BACKGROUND_CLEAN_SEED_FRAMES);
+                }
+                if runtime.background_clean_seed_frames >= BACKGROUND_CLEAN_SEED_FRAMES
+                    && !runtime.background_capture_affinity_released
+                    && let Err(error) = runtime
+                        .platform
+                        .set_overlay_capture_excluded(&runtime.window, false)
+                {
+                    eprintln!(
+                        "could not restore overlay desktop-capture visibility after stable den seed: {error}"
+                    );
+                } else if runtime.background_clean_seed_frames >= BACKGROUND_CLEAN_SEED_FRAMES {
+                    runtime.background_capture_affinity_released = true;
+                }
+            }
+        }
+        let background_now = runtime.normalizer.monotonic_seconds();
+        // Unsupported capture implementations must not leave the overlay
+        // permanently excluded from screenshots. This path is deliberately
+        // slower than the normal multi-frame seed barrier above.
+        if background_now > BACKGROUND_CAPTURE_FALLBACK_SECONDS
+            && runtime.background_clean_seed_frames < BACKGROUND_CLEAN_SEED_FRAMES
+            && !runtime.background_capture_affinity_released
+        {
+            if let Err(error) = runtime
+                .platform
+                .set_overlay_capture_excluded(&runtime.window, false)
+            {
+                eprintln!(
+                    "could not restore overlay desktop-capture visibility after capture fallback: {error}"
+                );
+            } else {
+                runtime.background_capture_affinity_released = true;
+                runtime.background_clean_seed_frames = BACKGROUND_CLEAN_SEED_FRAMES;
+            }
+        }
+        let background_age =
+            (background_now - runtime.background_capture_timestamp).max(0.0) as f32;
+        let background_freshness = if runtime.background_capture_sequence == 0 {
+            0.0
+        } else {
+            (1.0 - background_age / 0.75).clamp(0.0, 1.0)
+        };
+        runtime
+            .ecology_renderer
+            .set_background_freshness(background_freshness);
         runtime.background_capture_microseconds =
             background_started.elapsed().as_secs_f64() * 1_000_000.0;
         runtime
             .background_timings
             .observe(runtime.background_capture_microseconds as f32 / 1_000.0);
         synchronize_audio_learning(runtime);
+        runtime.nervous_system.observe_voice(
+            runtime.audio.visual_feedback(),
+            runtime.audio.callback_levels(),
+            &runtime.life.state.genome.voice,
+        );
+        runtime.nervous_system.set_selected_salience(
+            runtime
+                .vita
+                .visual_attention_target()
+                .map_or(0.0, |target| target.score),
+        );
         while runtime.life_accumulator >= LIFE_DT {
             let tick_started = Instant::now();
+            let soft_touch_pressure_max = runtime
+                .body
+                .tuning_profile()
+                .interaction
+                .soft_touch_pressure_max;
+            let nervous_calibration = runtime.body.tuning_profile().nervous.for_live_runtime();
+            runtime.nervous_system.prepare_cognition_tick(
+                &mut runtime.life,
+                &mut runtime.vita,
+                &mut runtime.morph,
+                soft_touch_pressure_max,
+                nervous_calibration,
+                LIFE_DT,
+            );
             // Lab drive pulses are an observational experiment layer, never a
             // second homeostasis owner. Morph sees a reversible overlay on the
             // pre-LifeCore state, then LifeCore advances from its exact natural
@@ -1972,6 +2384,39 @@ impl PetApplication {
                 runtime
                     .life
                     .tick(&runtime.sensors, &runtime.body.simulation.feedback, LIFE_DT);
+            runtime.expression_director.tick(LIFE_DT);
+            if let Some((mut event, signature)) = runtime.vita.take_embodied_gesture_observation() {
+                let episode_id = event.classification.episode_id;
+                if let Some(signature) = signature {
+                    stage_gesture_convention(runtime, &mut event, signature);
+                }
+                runtime.nervous_system.observe_gesture(&event);
+                let interaction_tuning = runtime.body.tuning_profile().interaction;
+                if let Some(plan) = runtime.life.observe_embodied_gesture_with_tuning(
+                    event,
+                    interaction_tuning.response_amplitude,
+                    interaction_tuning.turn_wait_seconds,
+                    interaction_tuning.turn_cooldown_seconds,
+                    interaction_tuning.learning_openness,
+                ) {
+                    let plan = coordinate_interaction_response(runtime, plan);
+                    if runtime.vita.accept_interaction_response(plan) {
+                        if output.vocal_request.is_none() {
+                            output.vocal_request = plan.voice_trigger.and_then(|trigger| {
+                                runtime.life.request_vocalization(trigger, &runtime.sensors)
+                            });
+                        }
+                    } else {
+                        runtime
+                            .vita
+                            .finish_interaction_appraisal_without_response(episode_id);
+                    }
+                } else {
+                    runtime
+                        .vita
+                        .finish_interaction_appraisal_without_response(episode_id);
+                }
+            }
             let lifecore_gaze = output.body_intent.gaze_target;
             // Resolution gets a second overlay based on the newly advanced
             // natural drives. Restoring by assignment (rather than subtracting
@@ -1989,6 +2434,7 @@ impl PetApplication {
                 Some(morph_output),
                 LIFE_DT,
             );
+            let vita_interaction = runtime.vita.interaction_actuation();
             let vita_gaze = resolved_intent.gaze_target;
             output.body_intent = resolved_intent;
             let ecology_output = runtime.ecology.resolve_intent(
@@ -2036,6 +2482,32 @@ impl PetApplication {
                 runtime.sensors.pet_dragged,
             );
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
+            let mut phenotype = runtime.nervous_system.resolve_actuation(
+                &runtime.life,
+                &runtime.vita,
+                &runtime.morph,
+                vita_interaction,
+                soft_touch_pressure_max,
+                nervous_calibration,
+                LIFE_DT,
+            );
+            // The director owns causality and bounded targets. This downstream
+            // calibration only changes perceptual readability around neutral;
+            // it cannot touch identity, solver cadence/counts, learning rates,
+            // topology limits, or the genome loudness ceiling.
+            nervous_calibration.apply(&mut phenotype);
+            phenotype.apply_to_intent(
+                &mut output.body_intent,
+                &runtime.sensors,
+                runtime.body.simulation.feedback.world_position,
+            );
+            keep_eyes_available_during_active_locomotion(&mut output.body_intent);
+            // The nervous action blend can move the semantic target after the
+            // ecology projection, so enforce the monitor-union invariant once
+            // more at the final intent boundary.
+            project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
+            runtime.sensors.interaction_actuation = phenotype.interaction;
+            runtime.body.set_fast_phenotype_actuation(phenotype);
             runtime.brain_tick_microseconds = tick_started.elapsed().as_secs_f64() * 1_000_000.0;
             runtime.last_debug = Some(output.debug.clone());
             runtime.last_vita = vita_output;
@@ -2051,22 +2523,10 @@ impl PetApplication {
                 if let Some(request) = output.vocal_request.take() {
                     runtime.life.cancel_vocal_request(request.performance_seed);
                 }
-                enqueue_ecology_voice(runtime, trigger);
-            } else if let Some(request) = output.vocal_request
-                && let Some(motif) = runtime
-                    .life
-                    .state
-                    .vocal_motifs
-                    .iter()
-                    .find(|motif| motif.id == request.motif_id)
-            {
-                let accepted =
-                    runtime
-                        .audio
-                        .enqueue(&runtime.life.state.genome.voice, motif, &request);
-                if !accepted {
-                    runtime.life.cancel_vocal_request(request.performance_seed);
-                }
+                output.vocal_request = request_ecology_voice(runtime, trigger);
+            }
+            if let Some(request) = output.vocal_request {
+                enqueue_vocal_candidate(runtime, request);
             }
             runtime.life_accumulator -= LIFE_DT;
         }
@@ -2173,6 +2633,10 @@ impl PetApplication {
                     morph_telemetry_json(runtime.last_morph, runtime.brain_mode, morph_diagnostics);
                 let lab_interventions =
                     lab_interventions_telemetry_json(&runtime.lab_interventions, Instant::now());
+                let body_interaction = body_interaction_telemetry_json(runtime);
+                let nervous_snapshot = runtime.nervous_system.snapshot();
+                let nervous_body_feedback = runtime.nervous_system.body_feedback();
+                let nervous_actuation = runtime.nervous_system.actuation();
                 let mutation_history_count = runtime.life.state.development.mutation_history.len();
                 let latest_mutation = runtime
                     .life
@@ -2343,9 +2807,23 @@ impl PetApplication {
                     "morph": morph_details,
                     "morph_diagnostics": morph_diagnostics,
                     "lab_interventions": lab_interventions,
+                    "body_interaction": body_interaction,
+                    "nervous_system": {
+                        "body_feedback_v2": nervous_body_feedback,
+                        "derived": nervous_snapshot.derived,
+                        "felt_state_v1": nervous_snapshot.felt,
+                        "emotional_readouts": nervous_snapshot.emotions,
+                        "morph_somatic_input": nervous_snapshot.morph_sensors,
+                        "source_frame_id": nervous_snapshot.source_frame_id,
+                        "source_episode_id": nervous_snapshot.source_episode_id,
+                        "fast_actuation": nervous_actuation,
+                        "readability_calibration": runtime.body.tuning_profile().nervous,
+                    },
                     "fusion": serde_json::Value::Null,
                     "intent_pose": format!("{:?}", runtime.intent.pose),
                     "gaze_mode": format!("{:?}", runtime.body.embodiment.pose.gaze_mode),
+                    "living_language": runtime.last_phrase,
+                    "vocal_lexicon": &runtime.life.state.vocal_lexicon,
                     "gaze": {
                         "source": runtime.gaze_trace.source.as_str(),
                         "lifecore_target": runtime.gaze_trace.lifecore_target.map(|target| target.to_array()),
@@ -2627,6 +3105,14 @@ impl ApplicationHandler for PetApplication {
                 "could not load production liquid tuning; using built-in Particle PBF / Cinematic Jelly: {error}"
             );
         }
+        if !self.arguments.reset_pet
+            && self.arguments.import_state.is_none()
+            && let Err(error) = load_restore_body_state(&self.store, &mut body)
+        {
+            eprintln!(
+                "could not restore physical body snapshot; deterministically reinitialized full mass: {error}"
+            );
+        }
         body.set_presentation_scale(production_presentation_scale(initial_size.height));
         body.simulation.feedback.world_position =
             physical_to_virtual_normalized(&topology, initial_center);
@@ -2662,7 +3148,11 @@ impl ApplicationHandler for PetApplication {
         // remains transparent in the final compositor; only the refracted liquid
         // sees the screen-anchored checker.
         renderer.set_studio_material_backdrop(true);
-        let ecology_renderer = EcologyRenderer::new(renderer.device(), renderer.surface_format());
+        let ecology_renderer = EcologyRenderer::new(
+            renderer.device(),
+            renderer.surface_format(),
+            renderer.premultiplied_output(),
+        );
         // A hidden Win32 composition surface may never become presentable, which would
         // deadlock the old "show after Presented" startup path. At this point the GPU
         // surface, transparent clear color, pipeline, and mesh are all ready, so making
@@ -2673,6 +3163,8 @@ impl ApplicationHandler for PetApplication {
         let runtime_started = Instant::now();
         let runtime_started_unix_ms = unix_time_millis(SystemTime::now());
         let last_morph = prepared.morph.last_output();
+        let loaded_life_state_hash = prepared.loaded_life_state_hash;
+        let loaded_genome_hash = prepared.life.state.genome.stable_hash();
         self.runtime = Some(PetRuntime {
             window,
             renderer,
@@ -2688,6 +3180,7 @@ impl ApplicationHandler for PetApplication {
             morph: prepared.morph,
             ecology: prepared.ecology,
             brain_mode: self.arguments.brain_mode,
+            dev_mode: self.arguments.dev_mode,
             audio,
             pointer: PointerState::default(),
             pointer_tracker: DesktopPointerTracker::default(),
@@ -2737,9 +3230,14 @@ impl ApplicationHandler for PetApplication {
             background_capture_microseconds: 0.0,
             background_capture_timestamp: 0.0,
             background_capture_sequence: 0,
+            background_clean_seed_frames: 0,
+            background_capture_affinity_released: false,
             background_luminance: 0.5,
             background_contrast: 0.0,
-            last_touch_voice: None,
+            expression_director: ExpressionDirector::default(),
+            nervous_system: NervousSystemRuntime::default(),
+            vocal_arbiter: VocalArbiter::default(),
+            last_phrase: None,
             overlay_move_microseconds: 0.0,
             render_microseconds: 0.0,
             brain_tick_microseconds: 0.0,
@@ -2754,7 +3252,17 @@ impl ApplicationHandler for PetApplication {
             desktop_poll_timings: TimingWindow::default(),
             camera_timings: TimingWindow::default(),
             background_timings: TimingWindow::default(),
+            pending_gesture_convention: None,
+            lab_pointer_fixture: None,
+            last_convention_update_episode: 0,
+            shutdown_for_promotion: false,
+            runtime_ack_accumulator: 1.0,
+            loaded_life_state_hash,
+            loaded_genome_hash,
         });
+        if let Some(runtime) = self.runtime.as_ref() {
+            write_runtime_ack(&self.store, runtime, RuntimeLoadStatus::Running);
+        }
         startup_probe(self.arguments.debug_log, "native runtime installed");
     }
 
@@ -2984,18 +3492,32 @@ impl ApplicationHandler for PetApplication {
                 let desktop_aspect = bounds.width().max(1) as f32 / bounds.height().max(1) as f32;
                 let ecology_state = runtime.ecology.state();
                 let ecology_renderer = &mut runtime.ecology_renderer;
+                ecology_renderer.set_den_tuning(runtime.body.tuning_profile().den);
                 let ecology_time = runtime.normalizer.monotonic_seconds() as f32;
-                let render_outcome = runtime.renderer.render_with_overlay(
+                ecology_renderer.prepare(
+                    runtime.renderer.queue(),
+                    ecology_state,
+                    desktop_aspect,
+                    ecology_time,
+                );
+                let ecology_renderer: &EcologyRenderer = ecology_renderer;
+                // The first asynchronous screen capture is the clean history
+                // seed. Do not draw the den into that seed; unsupported capture
+                // platforms fall back after a short bounded startup delay.
+                let ecology_ready = runtime.background_clean_seed_frames
+                    >= BACKGROUND_CLEAN_SEED_FRAMES
+                    || runtime.normalizer.monotonic_seconds() > BACKGROUND_CAPTURE_FALLBACK_SECONDS;
+                let render_outcome = runtime.renderer.render_with_layers(
                     parameters,
-                    |_device, queue, encoder, view| {
-                        ecology_renderer.render(
-                            queue,
-                            encoder,
-                            view,
-                            ecology_state,
-                            desktop_aspect,
-                            ecology_time,
-                        );
+                    |_device, _queue, encoder, view| {
+                        if ecology_ready {
+                            ecology_renderer.render_prepared_den(encoder, view);
+                        }
+                    },
+                    |_device, _queue, encoder, view| {
+                        if ecology_ready {
+                            ecology_renderer.render_prepared_objects(encoder, view);
+                        }
                     },
                 );
                 runtime.render_microseconds = render_started.elapsed().as_secs_f64() * 1_000_000.0;
@@ -3069,7 +3591,23 @@ impl ApplicationHandler for PetApplication {
         }
         if let Some(runtime) = self.runtime.as_ref() {
             self.persist(runtime);
+            write_runtime_ack(&self.store, runtime, RuntimeLoadStatus::Stopped);
         }
+    }
+}
+
+fn write_runtime_ack(store: &StateStore, runtime: &PetRuntime, status: RuntimeLoadStatus) {
+    let acknowledgement = RuntimeLoadAcknowledgement {
+        schema_version: RUNTIME_LOAD_ACK_SCHEMA_VERSION,
+        status,
+        pid: std::process::id(),
+        executable_version: env!("CARGO_PKG_VERSION").to_owned(),
+        loaded_life_state_hash: runtime.loaded_life_state_hash,
+        loaded_genome_hash: runtime.loaded_genome_hash,
+        updated_unix_ms: unix_time_millis(SystemTime::now()),
+    };
+    if let Err(error) = store.save_runtime_ack(&acknowledgement) {
+        eprintln!("could not write runtime load acknowledgement: {error}");
     }
 }
 
@@ -3102,6 +3640,9 @@ fn persist_runtime(store: &StateStore, export: Option<&PathBuf>, runtime: &PetRu
     if let Err(error) = store.save_ecology_state(&runtime.ecology.snapshot()) {
         eprintln!("could not save habitat ecology state: {error}");
     }
+    if let Err(error) = store.save_body_state(&runtime.body.body_material_snapshot()) {
+        eprintln!("could not save physical body state: {error}");
+    }
     if let Some(path) = export
         && let Err(error) = store.export_state(&portable, path)
     {
@@ -3121,9 +3662,170 @@ fn apply_shared_feedback(runtime: &mut PetRuntime, event: FeedbackEvent) {
             .ecology
             .observe_explicit_refusal(runtime.sensors.timestamp);
     }
+    apply_gesture_convention_feedback(runtime, &event);
     runtime.vita.apply_feedback(&event);
     runtime.morph.apply_feedback(&event);
     runtime.life.apply_feedback(event);
+}
+
+fn stage_gesture_convention(
+    runtime: &mut PetRuntime,
+    event: &mut EmbodiedGestureEvent,
+    signature: GestureSignature,
+) {
+    let sleeping = runtime.life.state.current_action == ActionId::Sleep;
+    let safety_boundary = event.boundary != GestureBoundaryEvent::None;
+    if sleeping
+        || safety_boundary
+        || event.observation_quality < pet_ecology::GESTURE_CONVENTION_MIN_QUALITY
+    {
+        return;
+    }
+
+    let recognized =
+        runtime
+            .ecology
+            .recognize_gesture_convention(&signature, event.observation_quality, false);
+    let meaning = recognized.map_or_else(
+        || convention_meaning_for_gesture(event.classification.kind),
+        |matched| Some(matched.meaning),
+    );
+    let Some(meaning) = meaning else {
+        return;
+    };
+    if let Some(matched) = recognized {
+        event.classification.kind = gesture_for_convention_meaning(matched.meaning);
+        event.classification.confidence = event.classification.confidence.max(matched.confidence);
+        event.classification.committed = true;
+    }
+    let existing_id = recognized.map(|matched| matched.id).or_else(|| {
+        runtime
+            .ecology
+            .nearest_gesture_convention(meaning, &signature)
+    });
+
+    if runtime
+        .pending_gesture_convention
+        .as_ref()
+        .is_some_and(|pending| pending.episode_id != event.classification.episode_id)
+    {
+        expire_pending_gesture_convention_now(runtime, true);
+    }
+    runtime.pending_gesture_convention = Some(PendingGestureConvention {
+        episode_id: event.classification.episode_id,
+        meaning,
+        signature,
+        existing_id,
+        observed_at: runtime.sensors.timestamp.max(0.0),
+    });
+}
+
+fn convention_meaning_for_gesture(kind: EmbodiedGestureKind) -> Option<GestureConventionMeaning> {
+    match kind {
+        EmbodiedGestureKind::CircularTwist => Some(GestureConventionMeaning::SpinGame),
+        EmbodiedGestureKind::RhythmicTouch => Some(GestureConventionMeaning::RhythmMotif),
+        EmbodiedGestureKind::SharpFlick | EmbodiedGestureKind::PullAndRelease => {
+            Some(GestureConventionMeaning::LaunchReturn)
+        }
+        EmbodiedGestureKind::FragmentHelp => Some(GestureConventionMeaning::FragmentHelp),
+        _ => None,
+    }
+}
+
+const fn gesture_for_convention_meaning(meaning: GestureConventionMeaning) -> EmbodiedGestureKind {
+    match meaning {
+        GestureConventionMeaning::SpinGame => EmbodiedGestureKind::CircularTwist,
+        GestureConventionMeaning::RhythmMotif => EmbodiedGestureKind::RhythmicTouch,
+        GestureConventionMeaning::LaunchReturn => EmbodiedGestureKind::PullAndRelease,
+        GestureConventionMeaning::FragmentHelp => EmbodiedGestureKind::FragmentHelp,
+    }
+}
+
+fn apply_gesture_convention_feedback(runtime: &mut PetRuntime, event: &FeedbackEvent) {
+    let outcome = match event {
+        FeedbackEvent::PlayStarted => Some(ConventionOutcome::Positive),
+        FeedbackEvent::Reward(value) if *value > 0.0 => Some(ConventionOutcome::Positive),
+        FeedbackEvent::PushedAway | FeedbackEvent::MuteOrHide => {
+            Some(ConventionOutcome::ExplicitNegative)
+        }
+        FeedbackEvent::Reward(value) if *value < 0.0 => Some(ConventionOutcome::ExplicitNegative),
+        FeedbackEvent::Ignored | FeedbackEvent::Reward(_) => {
+            Some(ConventionOutcome::AmbiguousOrNoResponse)
+        }
+        _ => None,
+    };
+    let Some(outcome) = outcome else {
+        return;
+    };
+    let Some(pending) = runtime.pending_gesture_convention.take() else {
+        return;
+    };
+    let now = runtime.sensors.timestamp.max(0.0);
+    if now - pending.observed_at > 8.0 {
+        if let Some(id) = pending.existing_id {
+            let _ = runtime.ecology.record_gesture_convention_outcome(
+                id,
+                ConventionOutcome::AmbiguousOrNoResponse,
+                now,
+            );
+        }
+        return;
+    }
+    let episode_id = pending.episode_id;
+    let learning_openness = runtime.body.tuning_profile().interaction.learning_openness;
+    let changed = match outcome {
+        ConventionOutcome::Positive => matches!(
+            runtime.ecology.observe_gesture_convention_success(
+                pending.meaning,
+                pending.signature,
+                now,
+                true,
+                learning_openness,
+            ),
+            Ok(Some(_))
+        ),
+        ConventionOutcome::AmbiguousOrNoResponse | ConventionOutcome::ExplicitNegative => {
+            pending.existing_id.is_some_and(|id| {
+                runtime
+                    .ecology
+                    .record_gesture_convention_outcome(id, outcome, now)
+                    .is_ok()
+            })
+        }
+    };
+    if changed {
+        runtime.last_convention_update_episode = episode_id;
+        runtime.save_accumulator = 30.0;
+    }
+}
+
+fn expire_pending_gesture_convention(runtime: &mut PetRuntime) {
+    let expired = runtime
+        .pending_gesture_convention
+        .as_ref()
+        .is_some_and(|pending| runtime.sensors.timestamp.max(0.0) - pending.observed_at > 8.0);
+    if expired {
+        expire_pending_gesture_convention_now(runtime, true);
+    }
+}
+
+fn expire_pending_gesture_convention_now(runtime: &mut PetRuntime, ambiguous: bool) {
+    let Some(pending) = runtime.pending_gesture_convention.take() else {
+        return;
+    };
+    if ambiguous
+        && let Some(id) = pending.existing_id
+        && runtime
+            .ecology
+            .record_gesture_convention_outcome(
+                id,
+                ConventionOutcome::AmbiguousOrNoResponse,
+                runtime.sensors.timestamp.max(0.0),
+            )
+            .is_ok()
+    {
+        runtime.save_accumulator = 30.0;
+    }
 }
 
 fn poll_lab_control(
@@ -3201,6 +3903,47 @@ fn poll_lab_control(
             runtime.lab_interventions.active_pulses.clear();
             changed
         }
+        LabControlCommand::StimulatePointerGesture {
+            gesture,
+            intensity,
+            duration_seconds,
+        } => {
+            if runtime.dev_mode {
+                runtime.lab_pointer_fixture =
+                    Some(LabPointerFixture::new(gesture, intensity, duration_seconds));
+                true
+            } else {
+                false
+            }
+        }
+        LabControlCommand::DeleteGestureConvention { convention_id } => {
+            let changed = runtime.ecology.delete_gesture_convention(convention_id);
+            if changed {
+                runtime.pending_gesture_convention = None;
+                runtime.save_accumulator = 30.0;
+            }
+            changed
+        }
+        LabControlCommand::RollbackGestureConventions { version } => {
+            let changed = runtime.ecology.rollback_gesture_conventions(version);
+            if changed {
+                runtime.pending_gesture_convention = None;
+                runtime.save_accumulator = 30.0;
+            }
+            changed
+        }
+        LabControlCommand::ClearGestureConventions => {
+            let changed = runtime.ecology.clear_gesture_conventions();
+            if changed {
+                runtime.pending_gesture_convention = None;
+                runtime.save_accumulator = 30.0;
+            }
+            changed
+        }
+        LabControlCommand::ShutdownForPromotion => {
+            runtime.shutdown_for_promotion = true;
+            true
+        }
     };
     runtime.lab_interventions.note_applied(changed);
 }
@@ -3218,6 +3961,11 @@ const fn lab_command_name(command: &LabControlCommand) -> &'static str {
         LabControlCommand::Reward { .. } => "reward",
         LabControlCommand::FocusMode { .. } => "focus_mode",
         LabControlCommand::ClearDrivePulses => "clear_drive_pulses",
+        LabControlCommand::StimulatePointerGesture { .. } => "stimulate_pointer_gesture",
+        LabControlCommand::DeleteGestureConvention { .. } => "delete_gesture_convention",
+        LabControlCommand::RollbackGestureConventions { .. } => "rollback_gesture_conventions",
+        LabControlCommand::ClearGestureConventions => "clear_gesture_conventions",
+        LabControlCommand::ShutdownForPromotion => "shutdown_for_promotion",
     }
 }
 
@@ -3692,6 +4440,154 @@ fn lab_interventions_telemetry_json(
     })
 }
 
+fn body_interaction_telemetry_json(runtime: &PetRuntime) -> serde_json::Value {
+    let frame = runtime.sensors.embodied_interaction;
+    let classification = runtime.vita.latest_embodied_gesture();
+    let turn = runtime.vita.interaction_turn();
+    let persisted = &runtime.life.state.interactions;
+    let plan = runtime
+        .vita
+        .active_interaction_plan()
+        .or(persisted.last_response_plan);
+    let appraisal = persisted.last_appraisal;
+    let components = frame.components[..usize::from(frame.component_observation_count)]
+        .iter()
+        .skip(1)
+        .take(3)
+        .map(|component| {
+            serde_json::json!({
+                "slot": component.component_id,
+                "lifecycle": component.lifecycle,
+                "detach_reason": component.detach_reason,
+                "particle_count": component.particle_count,
+                "mass_fraction": component.mass_fraction,
+                "center_local": component.center_local.to_array(),
+                "velocity_local": component.velocity_local.to_array(),
+                "angular_velocity": component.angular_velocity,
+                "deformation": component.deformation,
+                "age_seconds": component.age_seconds,
+                "distance_to_main": component.distance_to_main,
+                "offscreen_seconds": component.offscreen_seconds,
+                "recovery_stage": component.lifecycle,
+            })
+        })
+        .collect::<Vec<_>>();
+    let conventions = &runtime.ecology.state().gesture_conventions;
+    let convention_items = conventions
+        .conventions
+        .iter()
+        .map(|convention| {
+            serde_json::json!({
+                "id": convention.id,
+                "meaning": convention.meaning,
+                "confidence": convention.confidence,
+                "positive_outcomes": convention.positive_outcomes,
+                "negative_outcomes": convention.negative_outcomes,
+                "demonstrations": convention.demonstrations,
+                "last_used_seconds": convention.last_used_seconds,
+                "version": convention.version,
+                "updated_this_episode": runtime.last_convention_update_episode
+                    == classification.episode_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected_convention = runtime.pending_gesture_convention.as_ref().map(|pending| {
+        serde_json::json!({
+            "meaning": pending.meaning,
+            "existing_id": pending.existing_id,
+            "updated_this_episode": runtime.last_convention_update_episode
+                == pending.episode_id,
+        })
+    });
+    let causes = classification.causes[..usize::from(classification.cause_count)].to_vec();
+
+    serde_json::json!({
+        "episode_id": classification.episode_id,
+        "phase": turn.state,
+        "gesture": {
+            "kind": classification.kind,
+            "confidence": classification.confidence,
+            "second_best": classification.second_best_confidence,
+            "predicted": classification.predicted_kind,
+            "prediction_confidence": classification.prediction_confidence,
+            "prediction_error": classification.prediction_error,
+            "intensity": classification.intensity,
+            "committed": classification.committed,
+            "ended": classification.ended,
+            "causes": causes,
+        },
+        "contact": {
+            "active": frame.contact.active,
+            "point_local": frame.contact.point_local.to_array(),
+            "normal_local": frame.contact.normal_local.to_array(),
+            "area_fraction": frame.contact.area_fraction,
+            "effective_pressure": frame.contact.effective_pressure,
+            "relative_velocity_local": frame.contact.relative_velocity_local.to_array(),
+            "relative_speed": frame.contact.relative_velocity_local.length(),
+            "pointer_speed": frame.contact.pointer_speed,
+            "pointer_acceleration": frame.contact.pointer_acceleration,
+            "pressure_impulse": frame.contact.pressure_impulse,
+            "contact_seconds": frame.contact.contact_seconds,
+        },
+        "material": {
+            "deformation_energy": frame.material.deformation_energy,
+            "deformation_rate": frame.material.deformation_rate,
+            "maximum_strain": frame.material.maximum_strain,
+            "neck_tension": frame.material.neck_tension,
+            "neck_thickness": frame.material.neck_thickness,
+            "slosh_energy": frame.material.slosh_energy,
+            "internal_relative_speed": frame.material.internal_relative_speed,
+            "mass_conservation_error": frame.material.mass_conservation_error,
+            "topology_budget_remaining": frame.material.topology_budget_remaining,
+            "topology_budget_exhausted": frame.material.topology_budget_exhausted,
+        },
+        "components": {
+            "count": frame.material.component_count,
+            "detached_mass_fraction": frame.material.detached_mass_fraction,
+            "main_mass_fraction": (1.0 - frame.material.detached_mass_fraction).clamp(0.0, 1.0),
+            "selected": components,
+            "detached_event": frame.detached_event,
+            "remerge_event": frame.remerge_event,
+            "recovery_event": frame.recovery_event,
+            "emergency_recovery_count": runtime.body.embodiment.liquid.diagnostics().recovery_count,
+        },
+        "appraisal": appraisal,
+        "affect": {
+            "before": persisted.affect_before,
+            "after": persisted.affect_after,
+        },
+        "response": plan.map(|plan| serde_json::json!({
+            "response_id": plan.response_id,
+            "reason": plan.reason,
+            "communicative_intent": plan.communicative_intent,
+            "gaze": plan.gaze,
+            "cooperation": plan.body.cooperation,
+            "resistance": plan.body.resistance,
+            "boundary": appraisal.map_or(0.0, |value| value.boundary_need),
+            "expected_receiver_effect": plan.expected_receiver_effect,
+            "voice_trigger": plan.voice_trigger,
+            "response_emitted": turn.response_emitted,
+        })),
+        "turn": {
+            "state": turn.state,
+            "response_id": turn.response_id,
+            "response_emitted": turn.response_emitted,
+            "fresh_input_required": turn.response_emitted && !turn.fresh_input_after_response,
+            "fresh_input_after_response": turn.fresh_input_after_response,
+            "elapsed_seconds": turn.elapsed_seconds,
+        },
+        "learned_convention": selected_convention,
+        "learned_conventions": {
+            "version": conventions.version,
+            "count": conventions.conventions.len(),
+            "history_count": conventions.history_len(),
+            "rollback_versions": conventions.rollback_versions(),
+            "items": convention_items,
+        },
+        "lab_fixture_active": runtime.lab_pointer_fixture.is_some(),
+    })
+}
+
 fn vita_telemetry_json(runtime: &VitaRuntime, output: Option<&VitaOutput>) -> serde_json::Value {
     let state = runtime.state();
     let percept = runtime.percept();
@@ -3707,6 +4603,7 @@ fn vita_telemetry_json(runtime: &VitaRuntime, output: Option<&VitaOutput>) -> se
         .copied()
         .fold(0_u32, u32::saturating_add);
     let current_model = state.self_model.action_models[state.self_model.last_action.index()];
+    let interaction_turn = runtime.interaction_turn();
 
     serde_json::json!({
         "schema_version": state.schema_version,
@@ -3741,6 +4638,14 @@ fn vita_telemetry_json(runtime: &VitaRuntime, output: Option<&VitaOutput>) -> se
             "successes": successes,
         },
         "favorite_place_count": state.favorite_places.len(),
+        "interaction_turn": {
+            "episode_id": interaction_turn.episode_id,
+            "response_id": interaction_turn.response_id,
+            "state": format!("{:?}", interaction_turn.state),
+            "elapsed_seconds": interaction_turn.elapsed_seconds,
+            "response_emitted": interaction_turn.response_emitted,
+            "fresh_input_after_response": interaction_turn.fresh_input_after_response,
+        },
         "percept": {
             "pointer_gesture": percept.pointer,
             "typing_rate_hz": percept.typing_rate_hz,
@@ -3796,6 +4701,59 @@ fn synchronize_audio_learning(runtime: &mut PetRuntime) {
     }
 }
 
+#[cfg(not(feature = "legacy-expression-fallback"))]
+fn coordinate_interaction_response(
+    runtime: &mut PetRuntime,
+    plan: lifecore::InteractionResponsePlan,
+) -> lifecore::InteractionResponsePlan {
+    let living = LivingStateFrame::from_life(&runtime.life.state);
+    let physical = lifecore::PhysicalExpressionContext::from_frames(
+        &runtime.sensors,
+        &runtime.body.simulation.feedback,
+    );
+    let mut world =
+        lifecore::WorldModelFrame::from_frames(&runtime.sensors, &runtime.body.simulation.feedback);
+    for object in runtime.ecology.state().objects.iter().filter(|object| {
+        !matches!(
+            object.lifecycle,
+            ObjectLifecycle::Consumed | ObjectLifecycle::StoredInDen
+        )
+    }) {
+        let affordance = if object.kind == ObjectKind::Orb {
+            lifecore::WorldAffordance::Play
+        } else {
+            lifecore::WorldAffordance::Approach
+        };
+        let mut entity = lifecore::WorldEntity::point(
+            object.id,
+            lifecore::WorldEntityKind::ProceduralObject,
+            object.position,
+            object.velocity,
+            1.0,
+            (object.novelty * 0.46 + object.familiarity * 0.18 + object.velocity.length() * 0.20)
+                .clamp(0.0, 1.0),
+            affordance,
+            runtime.sensors.timestamp,
+        );
+        entity.novelty = object.novelty;
+        entity.familiarity = object.familiarity;
+        world.observe(entity);
+    }
+    let phrase = runtime
+        .expression_director
+        .direct_world(plan, living, physical, world);
+    runtime.last_phrase = Some(phrase);
+    phrase.plan
+}
+
+#[cfg(feature = "legacy-expression-fallback")]
+fn coordinate_interaction_response(
+    _runtime: &mut PetRuntime,
+    plan: lifecore::InteractionResponsePlan,
+) -> lifecore::InteractionResponsePlan {
+    plan
+}
+
 fn preserve_navigation_during_material_drag(
     previous: &BodyIntent,
     next: &mut BodyIntent,
@@ -3811,40 +4769,24 @@ fn preserve_navigation_during_material_drag(
     next.facing_direction = previous.facing_direction;
 }
 
-fn enqueue_touch_voice(runtime: &mut PetRuntime, now: Instant) {
-    if runtime
-        .last_touch_voice
-        .is_some_and(|previous| now.duration_since(previous) < Duration::from_millis(750))
-    {
+fn keep_eyes_available_during_active_locomotion(intent: &mut BodyIntent) {
+    if matches!(
+        intent.locomotion,
+        LocomotionMode::Sleep | LocomotionMode::Cocoon
+    ) {
         return;
     }
-    let Some(request) = runtime
-        .life
-        .request_vocalization(VocalTrigger::Touch, &runtime.sensors)
-    else {
-        return;
-    };
-    let Some(motif) = runtime
-        .life
-        .state
-        .vocal_motifs
-        .iter()
-        .find(|motif| motif.id == request.motif_id)
-        .cloned()
-    else {
-        runtime.life.cancel_vocal_request(request.performance_seed);
-        return;
-    };
-    let voice = runtime.life.state.genome.voice.clone();
-    let accepted = runtime.audio.enqueue(&voice, &motif, &request);
-    if accepted {
-        runtime.last_touch_voice = Some(now);
-    } else {
-        runtime.life.cancel_vocal_request(request.performance_seed);
-    }
+    // Persistent lid aperture and squint describe state; blink_left/right are
+    // the natural transient closure channel and remain untouched. A moving
+    // organism therefore stays visually attentive without losing blinks.
+    intent.expression.eye_aperture = intent.expression.eye_aperture.max(0.42);
+    intent.expression.squint = intent.expression.squint.min(0.68);
 }
 
-fn enqueue_ecology_voice(runtime: &mut PetRuntime, trigger: EcologyVocalTrigger) {
+fn request_ecology_voice(
+    runtime: &mut PetRuntime,
+    trigger: EcologyVocalTrigger,
+) -> Option<lifecore::VocalRequest> {
     let trigger = match trigger {
         EcologyVocalTrigger::ToyOffer => VocalTrigger::ToyOffer,
         EcologyVocalTrigger::CatchSuccess => VocalTrigger::CatchSuccess,
@@ -3858,7 +4800,29 @@ fn enqueue_ecology_voice(runtime: &mut PetRuntime, trigger: EcologyVocalTrigger)
         EcologyVocalTrigger::RhythmEcho => VocalTrigger::RhythmEcho,
         EcologyVocalTrigger::VisualNotice => VocalTrigger::VisualNotice,
     };
-    let Some(request) = runtime.life.request_vocalization(trigger, &runtime.sensors) else {
+    runtime.life.request_vocalization(trigger, &runtime.sensors)
+}
+
+fn enqueue_vocal_candidate(runtime: &mut PetRuntime, mut request: lifecore::VocalRequest) {
+    let voice = runtime.life.state.genome.voice.clone();
+    runtime
+        .nervous_system
+        .actuation()
+        .voice
+        .apply_to_request(&mut request, &voice);
+    runtime
+        .body
+        .tuning_profile()
+        .voice
+        .apply_to_request(&mut request, &voice);
+    let request_id = request.performance_seed;
+    let living = LivingStateFrame::from_life(&runtime.life.state);
+    let Some(request) = runtime.vocal_arbiter.admit(
+        request,
+        runtime.sensors.timestamp.max(0.0),
+        living.quiet_preferred,
+    ) else {
+        runtime.life.cancel_vocal_request(request_id);
         return;
     };
     let Some(motif) = runtime
@@ -3872,7 +4836,6 @@ fn enqueue_ecology_voice(runtime: &mut PetRuntime, trigger: EcologyVocalTrigger)
         runtime.life.cancel_vocal_request(request.performance_seed);
         return;
     };
-    let voice = runtime.life.state.genome.voice.clone();
     if !runtime.audio.enqueue(&voice, &motif, &request) {
         runtime.life.cancel_vocal_request(request.performance_seed);
     }
@@ -3890,6 +4853,58 @@ fn voice_visual_state(audio: &AudioManager) -> VoiceVisualState {
         noisiness: feedback.noisiness,
         purr: feedback.purr,
     }
+}
+
+fn body_voice_frame(body: &ProceduralBody, sensors: &SensorFrame) -> lifecore::BodyVoiceFrame {
+    let diagnostics = body.embodiment.liquid.diagnostics();
+    let physical = body.embodied_interaction_frame();
+    let total_mass = (diagnostics.main_mass + diagnostics.detached_mass).max(f32::EPSILON);
+    let normalized_strain =
+        ((diagnostics.maximum_bond_strain - 0.06) / (0.55 - 0.06)).clamp(0.0, 1.0);
+    let bond_strain = normalized_strain * normalized_strain * (3.0 - 2.0 * normalized_strain);
+    let collision_impulse = body
+        .simulation
+        .feedback
+        .collision
+        .as_ref()
+        .map_or(0.0, |collision| collision.intensity.clamp(0.0, 1.0));
+    lifecore::BodyVoiceFrame {
+        main_mass_ratio: (diagnostics.main_mass / total_mass).clamp(0.0, 1.0),
+        detached_mass_ratio: (diagnostics.detached_mass / total_mass).clamp(0.0, 1.0),
+        component_count: diagnostics.component_count.clamp(1, 4) as u8,
+        shape_aspect_ratio: diagnostics.stretch_ratio.clamp(1.0, 4.0),
+        stretch: ((diagnostics.stretch_ratio - 1.0) / 0.45).clamp(-1.0, 1.0),
+        compression: diagnostics.maximum_compression.clamp(0.0, 1.0),
+        bond_strain,
+        material_stress: diagnostics
+            .stress_magnitude
+            .max(physical.contact.effective_pressure)
+            .max(physical.material.deformation_energy)
+            .clamp(0.0, 1.0),
+        contact_area: physical.contact.area_fraction.clamp(0.0, 1.0),
+        slosh_energy: physical.material.slosh_energy.clamp(0.0, 1.0),
+        internal_speed: (physical.material.internal_relative_speed / 8.0).clamp(0.0, 1.0),
+        collision_impulse,
+        contact_impulse: 0.0,
+        release_impulse: if sensors.pointer_released {
+            (physical.material.internal_relative_speed / 5.0
+                + physical.contact.effective_pressure * 0.35)
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+        detach_impulse: if physical.detached_event.is_some() {
+            0.82
+        } else {
+            0.0
+        },
+        remerge_impulse: if physical.remerge_event.is_some() {
+            0.86
+        } else {
+            0.0
+        },
+    }
+    .sanitized()
 }
 
 fn perception_visual_frames(frame: DesktopVisualFrame) -> (VisualFeatureFrame, SpatialVisualFrame) {
@@ -4086,6 +5101,41 @@ fn load_migrate_apply_liquid_tuning(
     Ok(Some(applied))
 }
 
+fn den_capture_exclusion_scale(displacement_radius: f32) -> f32 {
+    if !displacement_radius.is_finite() {
+        return 1.0;
+    }
+    // WGSL fades the den at 1.055 × the authored displacement radius. Match
+    // that support in the clean desktop history so expanding past 1.0 never
+    // exposes recursive overlay pixels at the new circular edge.
+    (displacement_radius.clamp(0.45, 1.30) * 1.055).max(1.0)
+}
+
+fn background_capture_is_armed(presented_frames: u64) -> bool {
+    presented_frames >= BACKGROUND_CAPTURE_WARMUP_PRESENTS
+}
+
+fn background_capture_needs_clean_seed(clean_seed_frames: u8) -> bool {
+    clean_seed_frames < BACKGROUND_CLEAN_SEED_FRAMES
+}
+
+fn load_restore_body_state(store: &StateStore, body: &mut ProceduralBody) -> Result<bool, String> {
+    let identity_seed = body.tuning_profile().seed;
+    let tuning_schema = body.tuning_profile().schema_version;
+    let pbf = body.tuning_profile().pbf;
+    let snapshot = store
+        .load_body_state_validated(|snapshot: &BodyMaterialSnapshot| {
+            snapshot.validate(identity_seed, tuning_schema, pbf).is_ok()
+        })
+        .map_err(|error| error.to_string())?;
+    let Some(snapshot) = snapshot else {
+        return Ok(false);
+    };
+    body.restore_body_material_snapshot(&snapshot)
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
 /// Production has one approved body/material pair. The analytic body and safe
 /// material remain available inside Body Lab for diagnostics, but a stale user
 /// profile must not silently switch the desktop organism back to either lane.
@@ -4129,6 +5179,14 @@ fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningPro
         profile.material.broad_rim_strength = reference.material.broad_rim_strength;
         profile.material.edge_light_width = reference.material.edge_light_width;
     }
+    // The production character's body identity is the authored Black preset.
+    // Affect remains free to tint the soul/rim glow in `render_parameters`, but
+    // persisted genome/blend experiments must not recolor the base material.
+    profile.material.override_genome_colors = true;
+    profile.material.color_source_mode = ColorSourceMode::Authored;
+    profile.material.genome_color_blend = 0.0;
+    profile.material.primary_hsv = reference.material.primary_hsv;
+    profile.material.secondary_hsv = reference.material.secondary_hsv;
     profile
 }
 
@@ -4153,6 +5211,8 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
 
     profile.material.variant = MaterialVariant::CinematicJelly;
     profile.material.override_genome_colors = true;
+    profile.material.color_source_mode = ColorSourceMode::Authored;
+    profile.material.genome_color_blend = 0.0;
     profile.material.primary_hsv = [0.0, 0.0, 0.0];
     profile.material.secondary_hsv = [0.0, 0.39, 0.0];
     profile.material.glow_hsv = [0.0, 0.0, 0.06];
@@ -4237,6 +5297,38 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.compositor.shadow_opacity = 0.025;
     profile.compositor.shadow_color = [0.42, 0.46, 0.52];
     profile.compositor.exposure = 1.0;
+
+    // Keep the user-approved den optics as the production fallback. The live
+    // AppData profile still wins when present, while a clean install now opens
+    // with the same broad inward noise, refraction, and restrained orb response.
+    profile.den.noise_size = 5.0;
+    profile.den.noise_strength = 0.57;
+    profile.den.inward_speed = 1.0;
+    profile.den.ripple_inward_speed = 0.71;
+    profile.den.noise_detail_scale = 2.0;
+    profile.den.noise_detail_mix = 0.65;
+    profile.den.noise_warp = 0.81;
+    profile.den.noise_band_width = 15.0;
+    profile.den.ripple_strength = 1.5;
+    profile.den.ripple_opacity = 1.0;
+    profile.den.displacement_strength = 1.9;
+    profile.den.displacement_blur = 0.085;
+    profile.den.displacement_noise_mix = 0.7;
+    profile.den.displacement_radius = 1.15;
+    profile.den.refraction_strength = 1.5;
+    profile.den.refraction_opacity = 1.5;
+    profile.den.dispersion_strength = 1.5;
+    profile.den.tint_strength = 2.0;
+    profile.den.caustic_strength = 1.8;
+    profile.den.glow_strength = 1.0;
+    profile.den.particle_brightness = 2.0;
+    profile.den.particle_count = 22;
+    profile.den.center_mask_radius = 0.72;
+    profile.den.center_mask_feather = 0.56;
+    profile.den.center_mask_opacity = 0.66;
+    profile.den.orb_speedup_fraction = 0.5;
+    profile.den.orb_attack_seconds = 3.0;
+    profile.den.orb_release_seconds = 5.0;
     profile
 }
 
@@ -4719,26 +5811,6 @@ fn aabb_covered(topology: &DisplayTopology, minimum: Vec2, maximum: Vec2) -> boo
     })
 }
 
-fn background_uv_transform(
-    current_origin: PhysicalPosition<i32>,
-    current_size: PhysicalSize<u32>,
-    captured_rect: RectI,
-) -> (Vec2, Vec2) {
-    let capture_size = Vec2::new(
-        captured_rect.width().max(1) as f32,
-        captured_rect.height().max(1) as f32,
-    );
-    let current_origin = Vec2::new(current_origin.x as f32, current_origin.y as f32);
-    let captured_origin = Vec2::new(
-        captured_rect.minimum.x as f32,
-        captured_rect.minimum.y as f32,
-    );
-    (
-        Vec2::new(current_size.width as f32, current_size.height as f32) / capture_size,
-        (current_origin - captured_origin) / capture_size,
-    )
-}
-
 fn configure_visual_motion_space(
     body: &mut ProceduralBody,
     topology: &DisplayTopology,
@@ -4759,6 +5831,21 @@ fn configure_visual_motion_space(
         liquid_motion_desktop_size(bounds),
         overlay_physical_size.height as f32,
     );
+}
+
+fn classifier_tuning(tuning: pet_body::InteractionTuning) -> EmbodiedGestureClassifierTuning {
+    EmbodiedGestureClassifierTuning {
+        window_seconds: tuning.gesture_window_seconds,
+        commit_confidence: tuning.gesture_commit_confidence,
+        ambiguity_margin: tuning.gesture_ambiguity_margin,
+        soft_touch_pressure_max: tuning.soft_touch_pressure_max,
+        stretch_strain_min: tuning.stretch_strain_min,
+        stretch_strain_max: tuning.stretch_strain_max,
+        flick_speed_min: tuning.flick_speed_min,
+        rhythm_interval_cv_max: tuning.rhythm_interval_cv_max,
+        rhythm_min_impulses: tuning.rhythm_min_impulses,
+        boundary_strain: tuning.boundary_strain,
+    }
 }
 
 fn liquid_motion_desktop_size(bounds: RectI) -> Vec2 {
@@ -4801,18 +5888,23 @@ fn print_help() {
          \n  --seed N                 Create a deterministic identity\n\
          \n  --headless               Run a 60-second headless simulation\n\
          \n  --headless-smoke SECONDS Run a bounded headless smoke test\n\
-         \n  --simulate-hours HOURS   Run an accelerated deterministic simulation\n\
+         \n  --simulate-hours HOURS   Compatibility alias for approximate calendar-only evolution\n\
+         \n  --evolution-config PATH  Run a typed deterministic multi-rate curriculum\n\
+         \n  --evolution-report PATH  Write the atomic schema-2 evolution report\n\
+         \n  --evolution-progress PATH Atomically update bounded live progress\n\
+         \n  --evolution-persist MODE dry-run, fork, or save-final\n\
+         \n  --evolution-max-generations N  Override the bounded generation cap\n\
+         \n  --pointer-replay PATH     Replay a bounded body-local physical interaction\n\
          \n  --import-state PATH      Validate and import portable state\n\
          \n  --export-state PATH      Export portable state\n\
          \n  --data-dir PATH          Override the application data directory\n\
          \n  --reset-learning         Reset learned weights, habits, and memories\n\
          \n  --reset-pet              Start a new organism from --seed\n\
-         \n  --evolve                 Trigger one bounded metamorphosis\n\
          \n  --focus-mode             Suppress unsolicited attention\n\
          \n  --brain-mode MODE        classic, morphic, fusion, morph-shadow, or morph-fusion\n\
          \n  --debug-log              Write 1 Hz frame and embodiment diagnostics\n\
          \n  --dev-mode               Start bounded 5 Hz causal telemetry\n\
-         \n  --no-audio               Disable the audio device\n\
+         \n  --no-audio-output        Disable device playback, not offline synthesis\n\
          \n\nHOTKEY: Cmd/Win+Alt+D toggles bounded causal telemetry at runtime\n"
     );
 }
@@ -4822,6 +5914,41 @@ mod tests {
     use pet_body::{BodyRenderMode, MaterialVariant};
 
     use super::*;
+
+    #[test]
+    fn command_line_parses_pointer_replay_and_typed_evolution_controls() {
+        let parsed = Arguments::parse(
+            [
+                "--headless",
+                "--pointer-replay",
+                "fixture.json",
+                "--evolution-config",
+                "config.json",
+                "--evolution-report",
+                "report.json",
+                "--evolution-persist",
+                "dry-run",
+                "--evolution-max-generations",
+                "1",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert!(parsed.headless);
+        assert_eq!(parsed.pointer_replay, Some(PathBuf::from("fixture.json")));
+        assert_eq!(parsed.evolution_config, Some(PathBuf::from("config.json")));
+        assert_eq!(parsed.evolution_report, Some(PathBuf::from("report.json")));
+        assert_eq!(parsed.evolution_persist, Some(EvolutionPersistence::DryRun));
+        assert_eq!(parsed.evolution_max_generations, Some(1));
+    }
+
+    #[test]
+    fn unconditional_evolve_flag_is_rejected() {
+        let error = Arguments::parse(["--evolve".to_owned()].into_iter()).unwrap_err();
+        assert!(error.to_string().contains("eligibility report"));
+    }
 
     #[test]
     fn causal_telemetry_keeps_one_exact_bounded_lineage_history() {
@@ -5107,7 +6234,16 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 128,
+            style: lifecore::VocalStyle::SocialContact,
+            valence: 0.0,
+            arousal: 0.2,
+            fatigue: 0.0,
+            confidence: 0.8,
+            attachment: 0.4,
             rhythm_intervals: [0.0; 8],
+            phenotype: Default::default(),
         };
         assert!(manager.enqueue(&voice, &first_motif, &first_request));
         assert!(matches!(
@@ -5257,6 +6393,30 @@ mod tests {
         assert_eq!(next.facing_direction, previous.facing_direction);
         assert_eq!(next.gaze_target, Some(Vec2::new(0.8, 0.6)));
         assert_eq!(next.expression.brow_raise, 0.8);
+    }
+
+    #[test]
+    fn active_locomotion_cannot_keep_both_eyes_persistently_closed() {
+        let mut flying = neutral_intent();
+        flying.expression.eye_aperture = 0.0;
+        flying.expression.squint = 1.0;
+        flying.expression.blink_left = 0.35;
+        flying.expression.blink_right = 0.65;
+
+        keep_eyes_available_during_active_locomotion(&mut flying);
+
+        assert_eq!(flying.expression.eye_aperture, 0.42);
+        assert_eq!(flying.expression.squint, 0.68);
+        assert_eq!(flying.expression.blink_left, 0.35);
+        assert_eq!(flying.expression.blink_right, 0.65);
+
+        let mut sleeping = neutral_intent();
+        sleeping.locomotion = LocomotionMode::Sleep;
+        sleeping.expression.eye_aperture = 0.0;
+        sleeping.expression.squint = 1.0;
+        keep_eyes_available_during_active_locomotion(&mut sleeping);
+        assert_eq!(sleeping.expression.eye_aperture, 0.0);
+        assert_eq!(sleeping.expression.squint, 1.0);
     }
 
     #[test]
@@ -5491,27 +6651,6 @@ mod tests {
     }
 
     #[test]
-    fn one_global_desktop_point_keeps_the_same_capture_texel_after_camera_move() {
-        let captured = RectI {
-            minimum: PhysicalDesktopPoint { x: 800, y: -120 },
-            maximum: PhysicalDesktopPoint { x: 1_952, y: 1_032 },
-        };
-        let size = PhysicalSize::new(1_152, 1_152);
-        let global = Vec2::new(1_500.0, 420.0);
-        let first_origin = PhysicalPosition::new(800, -120);
-        let second_origin = PhysicalPosition::new(940, -40);
-        let (first_scale, first_offset) = background_uv_transform(first_origin, size, captured);
-        let (second_scale, second_offset) = background_uv_transform(second_origin, size, captured);
-        let first_local = (global - Vec2::new(first_origin.x as f32, first_origin.y as f32))
-            / Vec2::splat(1_152.0);
-        let second_local = (global - Vec2::new(second_origin.x as f32, second_origin.y as f32))
-            / Vec2::splat(1_152.0);
-        let first_texel = first_local * first_scale + first_offset;
-        let second_texel = second_local * second_scale + second_offset;
-        assert!(first_texel.distance(second_texel) < 1.0e-6);
-    }
-
-    #[test]
     fn liquid_profile_revision_variant_and_values_survive_restart_apply_path() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
@@ -5520,6 +6659,9 @@ mod tests {
         profile.profile_revision = 27;
         profile.render_mode = BodyRenderMode::ParticlePbf;
         profile.material.variant = MaterialVariant::CinematicJelly;
+        profile.material.override_genome_colors = false;
+        profile.material.color_source_mode = ColorSourceMode::Genome;
+        profile.material.genome_color_blend = 1.0;
         profile.pbf.viscosity = 0.041;
         store.save_liquid_tuning(&profile).unwrap();
 
@@ -5545,6 +6687,13 @@ mod tests {
         assert_eq!(restarted.profile_revision, 27);
         assert_eq!(restarted.render_mode, BodyRenderMode::ParticlePbf);
         assert_eq!(restarted.material.variant, MaterialVariant::CinematicJelly);
+        assert!(restarted.material.override_genome_colors);
+        assert_eq!(
+            restarted.material.color_source_mode,
+            ColorSourceMode::Authored
+        );
+        assert_eq!(restarted.material.genome_color_blend, 0.0);
+        assert_eq!(restarted.material.primary_hsv, [0.0, 0.0, 0.0]);
         assert_eq!(restarted.pbf.viscosity, 0.041);
         assert_eq!(restarted_body.tuning_profile(), &restarted);
     }
@@ -5566,6 +6715,11 @@ mod tests {
 
         assert_eq!(applied.render_mode, BodyRenderMode::ParticlePbf);
         assert_eq!(applied.material.variant, MaterialVariant::CinematicJelly);
+        assert_eq!(
+            applied.material.color_source_mode,
+            ColorSourceMode::Authored
+        );
+        assert_eq!(applied.material.genome_color_blend, 0.0);
         assert_eq!(applied.material.primary_hsv, [0.0, 0.0, 0.0]);
         assert_eq!(applied.material.opacity, 0.6);
         assert_eq!(applied.material.halo, 0.01);
@@ -5676,5 +6830,34 @@ mod tests {
         assert_eq!(scene["cells"][0].as_array().unwrap().len(), 5);
         assert_eq!(scene["windows"].as_array().unwrap().len(), 1);
         assert!(!scene.to_string().contains("secret-native-window-id"));
+    }
+
+    #[test]
+    fn den_capture_support_tracks_displacement_beyond_one() {
+        assert_eq!(den_capture_exclusion_scale(0.80), 1.0);
+        assert!((den_capture_exclusion_scale(1.0) - 1.055).abs() < 1.0e-6);
+        assert!((den_capture_exclusion_scale(1.30) - 1.3715).abs() < 1.0e-6);
+        assert_eq!(den_capture_exclusion_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn background_capture_waits_for_presented_dwm_frames() {
+        assert!(!background_capture_is_armed(
+            BACKGROUND_CAPTURE_WARMUP_PRESENTS - 1
+        ));
+        assert!(background_capture_is_armed(
+            BACKGROUND_CAPTURE_WARMUP_PRESENTS
+        ));
+    }
+
+    #[test]
+    fn background_capture_keeps_full_clean_seed_until_threshold() {
+        assert!(background_capture_needs_clean_seed(0));
+        assert!(background_capture_needs_clean_seed(
+            BACKGROUND_CLEAN_SEED_FRAMES - 1
+        ));
+        assert!(!background_capture_needs_clean_seed(
+            BACKGROUND_CLEAN_SEED_FRAMES
+        ));
     }
 }

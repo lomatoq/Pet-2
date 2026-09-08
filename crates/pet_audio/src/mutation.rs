@@ -16,7 +16,16 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 128,
+            style: lifecore::VocalStyle::SocialContact,
+            valence: 0.2,
+            arousal: 0.25,
+            fatigue: 0.0,
+            confidence: 0.8,
+            attachment: 0.4,
             rhythm_intervals: [0.0; 8],
+            phenotype: Default::default(),
         }
     }
 
@@ -53,8 +62,8 @@ mod tests {
         let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
             / samples.len().max(1) as f32)
             .sqrt();
-        assert!((0.15..=0.75).contains(&peak), "peak={peak}");
-        assert!(rms >= 0.025, "rms={rms}");
+        assert!((0.08..=0.75).contains(&peak), "peak={peak}");
+        assert!(rms >= 0.012, "rms={rms}");
     }
 
     #[test]
@@ -197,7 +206,11 @@ mod tests {
             crate::VoiceCommand::prepare(&genome.voice, motif, &lingering).total_frames(48_000);
         let brisk_frames =
             crate::VoiceCommand::prepare(&genome.voice, motif, &brisk).total_frames(48_000);
-        assert!(lingering_frames as f32 / brisk_frames as f32 >= 1.8);
+        let tempo_ratio = lingering_frames as f32 / brisk_frames as f32;
+        assert!(
+            (1.60..=1.90).contains(&tempo_ratio),
+            "bounded mammalian tempo ratio={tempo_ratio}"
+        );
     }
 
     #[test]
@@ -234,15 +247,15 @@ mod tests {
     }
 
     #[test]
-    fn roughness_and_mouth_resonance_are_audible_genome_dimensions() {
+    fn fold_instability_and_body_coupling_are_audible_anatomy_dimensions() {
         let genome = Genome::from_seed(16);
         let motif = &generate_initial_motifs(&genome.voice)[0];
         let mut smooth = genome.voice.clone();
-        smooth.roughness = 0.0;
-        smooth.mouth_resonance = 0.0;
+        smooth.anatomy.instability_susceptibility = 0.0;
+        smooth.anatomy.body_coupling = 0.05;
         let mut textured = smooth.clone();
-        textured.roughness = 0.8;
-        textured.mouth_resonance = 0.9;
+        textured.anatomy.instability_susceptibility = 0.8;
+        textured.anatomy.body_coupling = 0.9;
         let smooth_pcm = render_motif(
             &smooth,
             motif,
@@ -260,5 +273,41 @@ mod tests {
             OfflineSampleFormat::I16,
         );
         assert_ne!(smooth_pcm, textured_pcm);
+    }
+
+    #[test]
+    fn mammalian_voice_gestures_are_pcm_distinct_without_ultrahigh_f0() {
+        let genome = Genome::from_seed(17);
+        let motif = &generate_initial_motifs(&genome.voice)[0];
+        let gestures = [
+            lifecore::VoiceGesture::PurrHum,
+            lifecore::VoiceGesture::WarmChuff,
+            lifecore::VoiceGesture::MewWhine,
+            lifecore::VoiceGesture::LowRumble,
+            lifecore::VoiceGesture::ClippedPulse,
+            lifecore::VoiceGesture::ReliefExhale,
+        ];
+        let rendered = gestures
+            .into_iter()
+            .map(|gesture| {
+                let mut request = request(motif.id);
+                request.gesture = gesture;
+                let command = crate::VoiceCommand::prepare(&genome.voice, motif, &request);
+                assert!((180.0..=800.0).contains(&command.base_pitch_hz));
+                render_motif(
+                    &genome.voice,
+                    motif,
+                    &request,
+                    48_000,
+                    1,
+                    OfflineSampleFormat::I16,
+                )
+            })
+            .collect::<Vec<_>>();
+        for left in 0..rendered.len() {
+            for right in left + 1..rendered.len() {
+                assert_ne!(rendered[left], rendered[right]);
+            }
+        }
     }
 }

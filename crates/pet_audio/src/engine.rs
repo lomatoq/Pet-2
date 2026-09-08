@@ -6,12 +6,13 @@ use std::{
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use lifecore::{VocalMotif, VocalRequest, VoiceGenome};
+use lifecore::{BodyVoiceFrame, VocalMotif, VocalRequest, VoiceGenome};
 use thiserror::Error;
 
 use crate::{
-    AudioCallbackLevels, AudioVisualBridge, AudioVisualFeedback, COMMAND_CAPACITY, SpscRing,
-    SynthVoice, VoiceCommand, global_visual_bridge,
+    AudioCallbackLevels, AudioVisualBridge, AudioVisualFeedback, BodyVoiceBridge, COMMAND_CAPACITY,
+    SpscRing, SynthVoice, VoiceCommand, VoiceDiagnostics, global_body_voice_bridge,
+    global_visual_bridge,
 };
 
 const ERROR_CAPACITY: usize = 8;
@@ -79,6 +80,10 @@ pub enum AudioRuntimeEvent {
 pub enum AudioError {
     #[error("no default audio output device is available")]
     NoOutputDevice,
+    #[error("could not enumerate audio output devices: {0}")]
+    OutputDevices(#[from] cpal::DevicesError),
+    #[error("audio output device is unavailable: {0}")]
+    OutputDeviceUnavailable(String),
     #[error("could not enumerate output formats: {0}")]
     SupportedConfigs(#[from] cpal::SupportedStreamConfigsError),
     #[error("the output device exposes none of f32, i16, or u16")]
@@ -106,6 +111,33 @@ impl AudioEngine {
         let device = host
             .default_output_device()
             .ok_or(AudioError::NoOutputDevice)?;
+        Self::start_on_device(device)
+    }
+
+    /// Enumerates output names for a transient preview selector. Callers own any
+    /// persistence policy; Pet Lab intentionally keeps this session-only.
+    pub fn output_device_names() -> Result<Vec<String>, AudioError> {
+        let host = cpal::default_host();
+        let mut names = host
+            .output_devices()?
+            .filter_map(|device| device.name().ok())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
+    }
+
+    pub fn try_start_on_device_name(name: &str) -> Result<Self, AudioError> {
+        let host = cpal::default_host();
+        let requested = name.trim();
+        let device = host
+            .output_devices()?
+            .find(|device| device.name().is_ok_and(|candidate| candidate == requested))
+            .ok_or_else(|| AudioError::OutputDeviceUnavailable(requested.to_owned()))?;
+        Self::start_on_device(device)
+    }
+
+    fn start_on_device(device: cpal::Device) -> Result<Self, AudioError> {
         let device_name = device
             .name()
             .unwrap_or_else(|_| "unknown output device".into());
@@ -120,16 +152,18 @@ impl AudioEngine {
         let commands = Arc::new(SpscRing::new());
         let errors = Arc::new(SpscRing::new());
         let feedback = global_visual_bridge();
+        let body_bridge = global_body_voice_bridge();
         let errors_for_callback = Arc::clone(&errors);
         let error_callback = move |_error: cpal::StreamError| {
             let _ = errors_for_callback.push(AudioRuntimeEvent::StreamError);
         };
         let stream = match selected.sample_format {
             RuntimeSampleFormat::F32 => {
-                let mut synth = SynthVoice::with_feedback(
+                let mut synth = SynthVoice::with_bridges(
                     Arc::clone(&commands),
                     selected.sample_rate,
                     Arc::clone(&feedback),
+                    Arc::clone(&body_bridge),
                 );
                 let channels = usize::from(selected.channels);
                 let feedback_for_levels = Arc::clone(&feedback);
@@ -143,10 +177,11 @@ impl AudioEngine {
                 )?
             }
             RuntimeSampleFormat::I16 => {
-                let mut synth = SynthVoice::with_feedback(
+                let mut synth = SynthVoice::with_bridges(
                     Arc::clone(&commands),
                     selected.sample_rate,
                     Arc::clone(&feedback),
+                    Arc::clone(&body_bridge),
                 );
                 let channels = usize::from(selected.channels);
                 let feedback_for_levels = Arc::clone(&feedback);
@@ -160,10 +195,11 @@ impl AudioEngine {
                 )?
             }
             RuntimeSampleFormat::U16 => {
-                let mut synth = SynthVoice::with_feedback(
+                let mut synth = SynthVoice::with_bridges(
                     Arc::clone(&commands),
                     selected.sample_rate,
                     Arc::clone(&feedback),
+                    Arc::clone(&body_bridge),
                 );
                 let channels = usize::from(selected.channels);
                 let feedback_for_levels = Arc::clone(&feedback);
@@ -246,6 +282,12 @@ pub enum OfflinePcm {
     U16(Vec<u16>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct OfflineRender {
+    pub pcm: OfflinePcm,
+    pub diagnostics: VoiceDiagnostics,
+}
+
 impl OfflinePcm {
     #[must_use]
     pub fn sample_count(&self) -> usize {
@@ -266,23 +308,73 @@ pub fn render_motif(
     channels: u16,
     format: OfflineSampleFormat,
 ) -> OfflinePcm {
+    render_motif_with_body_timeline(
+        voice,
+        motif,
+        request,
+        &[],
+        100,
+        sample_rate,
+        channels,
+        format,
+    )
+    .pcm
+}
+
+/// Deterministically renders one call while publishing a scripted body state.
+///
+/// `body_timeline` is sampled at `body_frame_rate_hz`; an empty slice is the
+/// neutral one-component body. This is the sole offline path used by Voice Lab.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn render_motif_with_body_timeline(
+    voice: &VoiceGenome,
+    motif: &VocalMotif,
+    request: &VocalRequest,
+    body_timeline: &[BodyVoiceFrame],
+    body_frame_rate_hz: u32,
+    sample_rate: u32,
+    channels: u16,
+    format: OfflineSampleFormat,
+) -> OfflineRender {
     let command = VoiceCommand::prepare(voice, motif, request);
     let commands = Arc::new(SpscRing::new());
     commands
         .push(command)
         .expect("fresh offline command ring accepts one command");
-    let mut synth = SynthVoice::new(commands, sample_rate);
+    let feedback = Arc::new(AudioVisualBridge::default());
+    let body_bridge = Arc::new(BodyVoiceBridge::default());
+    let mut synth =
+        SynthVoice::with_bridges(commands, sample_rate, feedback, Arc::clone(&body_bridge));
+    let mut published_body_index = usize::MAX;
+    if let Some(first) = body_timeline.first() {
+        body_bridge.publish(*first);
+        published_body_index = 0;
+    }
+    synth.begin_callback();
     let channels = usize::from(channels.max(1));
     let frame_count = command.total_frames(sample_rate);
     let mut f32_samples = Vec::with_capacity(frame_count * channels);
-    for _ in 0..frame_count {
+    for frame_index in 0..frame_count {
+        if !body_timeline.is_empty() {
+            let body_index = ((frame_index as u64 * u64::from(body_frame_rate_hz.max(1)))
+                / u64::from(sample_rate.max(1))) as usize;
+            let body_index = body_index.min(body_timeline.len() - 1);
+            if body_index != published_body_index {
+                body_bridge.publish(body_timeline[body_index]);
+                synth.begin_callback();
+                published_body_index = body_index;
+            }
+        }
         write_frame_f32(synth.next_stereo_frame(), &mut f32_samples, channels);
     }
-    match format {
+    let diagnostics = synth.diagnostics();
+    let pcm = match format {
         OfflineSampleFormat::F32 => OfflinePcm::F32(f32_samples),
         OfflineSampleFormat::I16 => OfflinePcm::I16(f32_samples.into_iter().map(to_i16).collect()),
         OfflineSampleFormat::U16 => OfflinePcm::U16(f32_samples.into_iter().map(to_u16).collect()),
-    }
+    };
+    OfflineRender { pcm, diagnostics }
 }
 
 pub fn export_debug_wav(
@@ -318,6 +410,7 @@ fn fill_f32(
     channels: usize,
     feedback: &AudioVisualBridge,
 ) {
+    synth.begin_callback();
     let mut energy = 0.0;
     let mut peak = 0.0_f32;
     let mut count = 0.0_f32;
@@ -335,6 +428,7 @@ fn fill_i16(
     channels: usize,
     feedback: &AudioVisualBridge,
 ) {
+    synth.begin_callback();
     let mut energy = 0.0;
     let mut peak = 0.0_f32;
     let mut count = 0.0_f32;
@@ -352,6 +446,7 @@ fn fill_u16(
     channels: usize,
     feedback: &AudioVisualBridge,
 ) {
+    synth.begin_callback();
     let mut energy = 0.0;
     let mut peak = 0.0_f32;
     let mut count = 0.0_f32;
@@ -494,7 +589,16 @@ mod tests {
             tempo_scale: 1.0,
             stress: 0.0,
             purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 128,
+            style: lifecore::VocalStyle::SocialContact,
+            valence: 0.0,
+            arousal: 0.2,
+            fatigue: 0.0,
+            confidence: 0.8,
+            attachment: 0.4,
             rhythm_intervals: [0.0; 8],
+            phenotype: Default::default(),
         };
         let commands = Arc::new(SpscRing::new());
         commands
@@ -511,5 +615,61 @@ mod tests {
             Some(request.performance_seed)
         );
         assert_eq!(feedback.pop_started_request(), None);
+    }
+
+    #[test]
+    fn same_seed_body_timeline_is_sample_exact_deterministic() {
+        let genome = lifecore::Genome::from_seed(0xB0D1);
+        let motifs = lifecore::generate_initial_motifs(&genome.voice);
+        let motif = &motifs[0];
+        let request = VocalRequest {
+            motif_id: motif.id,
+            performance_seed: 0xB0D1_71AE,
+            gain: 0.25,
+            pan: 0.0,
+            pitch_scale: 1.0,
+            tempo_scale: 1.0,
+            stress: 0.2,
+            purr: false,
+            gesture: lifecore::VoiceGesture::WarmChuff,
+            priority: 180,
+            style: lifecore::VocalStyle::SocialContact,
+            valence: 0.3,
+            arousal: 0.4,
+            fatigue: 0.0,
+            confidence: 0.8,
+            attachment: 0.7,
+            rhythm_intervals: [0.0; 8],
+            phenotype: Default::default(),
+        };
+        let timeline = (0..80)
+            .map(|frame| BodyVoiceFrame {
+                stretch: frame as f32 / 79.0 * 0.8,
+                shape_aspect_ratio: 1.0 + frame as f32 / 79.0,
+                bond_strain: frame as f32 / 79.0 * 0.6,
+                ..BodyVoiceFrame::default()
+            })
+            .collect::<Vec<_>>();
+        let first = render_motif_with_body_timeline(
+            &genome.voice,
+            motif,
+            &request,
+            &timeline,
+            100,
+            48_000,
+            1,
+            OfflineSampleFormat::F32,
+        );
+        let second = render_motif_with_body_timeline(
+            &genome.voice,
+            motif,
+            &request,
+            &timeline,
+            100,
+            48_000,
+            1,
+            OfflineSampleFormat::F32,
+        );
+        assert_eq!(first, second);
     }
 }

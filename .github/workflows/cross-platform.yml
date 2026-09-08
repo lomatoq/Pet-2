@@ -45,7 +45,17 @@ jobs:
       - run: bash ./scripts/build_macos.sh
       - run: bash ./scripts/test_headless.sh
       - run: bash ./scripts/package_macos.sh
-      - run: test -x "dist/Pet2-macos-arm64/Pet2.app/Contents/MacOS/Pet2" -a -x "dist/Pet2-macos-arm64/Body Lab.app/Contents/MacOS/BodyLab" -a -x "dist/Pet2-macos-arm64/tools/HabitatLab"
+      - run: |
+          package_dir="$(mktemp -d)"
+          ditto -x -k dist/Pet2-macos-arm64.zip "$package_dir"
+          payload="$package_dir/Pet2-macos-arm64"
+          test -x "$payload/Pet2.app/Contents/MacOS/Pet2"
+          test -x "$payload/Pet2 Dev Console.app/Contents/MacOS/Pet2DevConsole"
+          test -x "$payload/Pet2 Dev Console.app/Contents/Resources/DevConsole"
+          test -x "$payload/tools/HabitatLab"
+          test -x "$payload/tools/VoiceLab"
+          codesign --verify --deep --strict "$payload/Pet2.app"
+          codesign --verify --deep --strict "$payload/Pet2 Dev Console.app"
       - uses: actions/upload-artifact@v4
         with:
           name: Pet2-macos-arm64

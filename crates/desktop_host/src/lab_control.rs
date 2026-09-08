@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Wire-format version for the bounded Body Lab -> Pet command slot.
-pub const LAB_CONTROL_SCHEMA_VERSION: u32 = 1;
+pub const LAB_CONTROL_SCHEMA_VERSION: u32 = 3;
 pub const LAB_CONTROL_MIN_EXPIRY_MS: u32 = 100;
 pub const LAB_CONTROL_MAX_EXPIRY_MS: u32 = 30_000;
 
@@ -10,6 +10,8 @@ const MIN_ATTENTION_DURATION_SECONDS: f32 = 0.1;
 const MAX_ATTENTION_DURATION_SECONDS: f32 = 10.0;
 const MIN_DRIVE_PULSE_DURATION_SECONDS: f32 = 0.1;
 const MAX_DRIVE_PULSE_DURATION_SECONDS: f32 = 30.0;
+const MIN_GESTURE_DURATION_SECONDS: f32 = 0.1;
+const MAX_GESTURE_DURATION_SECONDS: f32 = 10.0;
 
 /// A single, short-lived Lab command. The command id is chosen by the writer
 /// and lets the runtime de-duplicate repeated reads of the same command slot.
@@ -72,6 +74,20 @@ pub enum LabControlCommand {
         enabled: bool,
     },
     ClearDrivePulses,
+    StimulatePointerGesture {
+        gesture: LabGesture,
+        intensity: f32,
+        duration_seconds: f32,
+    },
+    DeleteGestureConvention {
+        convention_id: u64,
+    },
+    RollbackGestureConventions {
+        version: u32,
+    },
+    ClearGestureConventions,
+    /// Graceful persistence barrier used only by validated state promotion.
+    ShutdownForPromotion,
 }
 
 impl LabControlCommand {
@@ -115,9 +131,52 @@ impl LabControlCommand {
                 }
                 Ok(())
             }
-            Self::FocusMode { .. } | Self::ClearDrivePulses => Ok(()),
+            Self::StimulatePointerGesture {
+                intensity,
+                duration_seconds,
+                ..
+            } => {
+                if !intensity.is_finite() || !(0.0..=1.0).contains(intensity) {
+                    return Err(LabControlValidationError::InvalidGestureIntensity);
+                }
+                validate_duration(
+                    *duration_seconds,
+                    MIN_GESTURE_DURATION_SECONDS,
+                    MAX_GESTURE_DURATION_SECONDS,
+                    LabControlValidationError::InvalidGestureDuration,
+                )
+            }
+            Self::DeleteGestureConvention { convention_id } if *convention_id == 0 => {
+                Err(LabControlValidationError::InvalidConventionId)
+            }
+            Self::RollbackGestureConventions { version } if *version == 0 => {
+                Err(LabControlValidationError::InvalidConventionVersion)
+            }
+            Self::FocusMode { .. }
+            | Self::ClearDrivePulses
+            | Self::DeleteGestureConvention { .. }
+            | Self::RollbackGestureConventions { .. }
+            | Self::ClearGestureConventions
+            | Self::ShutdownForPromotion => Ok(()),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LabGesture {
+    SoftTouch,
+    SlowStretch,
+    Tickle,
+    ThreeBeatRhythm,
+    CircularTwist,
+    SharpFlick,
+    Hold,
+    PullRelease,
+    RealSplitRemerge,
+    FragmentHelp,
+    OverstrainBoundary,
+    SleepQuietInteraction,
 }
 
 fn validate_duration(
@@ -164,6 +223,14 @@ pub enum LabControlValidationError {
     InvalidDriveDuration,
     #[error("reward must be finite, non-zero, and between -1 and 1")]
     InvalidReward,
+    #[error("gesture intensity must be finite and between 0 and 1")]
+    InvalidGestureIntensity,
+    #[error("gesture fixture duration is outside its safe range")]
+    InvalidGestureDuration,
+    #[error("gesture convention id must be non-zero")]
+    InvalidConventionId,
+    #[error("gesture convention rollback version must be non-zero")]
+    InvalidConventionVersion,
 }
 
 #[cfg(test)]
@@ -221,7 +288,7 @@ mod tests {
         });
         control.validate().unwrap();
 
-        control.schema_version = 2;
+        control.schema_version = 1;
         assert_eq!(
             control.validate(),
             Err(LabControlValidationError::UnsupportedSchema)

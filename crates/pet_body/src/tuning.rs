@@ -1,7 +1,8 @@
+use lifecore::{ExpressionState, FastPhenotypeActuation, VocalRequest, VoiceGenome};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 16;
+pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 21;
 const OLDEST_MIGRATABLE_LIQUID_TUNING_SCHEMA_VERSION: u32 = 6;
 
 /// Approved Body Lab seed-42 palette. Cinematic intentionally uses this authored
@@ -29,6 +30,15 @@ pub enum MaterialVariant {
     CinematicJelly,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorSourceMode {
+    Authored,
+    Genome,
+    #[default]
+    GenomeAuthoredBlend,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LiquidTuningProfile {
@@ -39,10 +49,148 @@ pub struct LiquidTuningProfile {
     pub render_mode: BodyRenderMode,
     pub analytic: AnalyticTuning,
     pub pbf: PbfTuning,
+    pub interaction: InteractionTuning,
     pub droplets: DropletTuning,
     pub material: MaterialTuning,
     pub face: FaceTuning,
     pub compositor: CompositorTuning,
+    /// Runtime-only visual calibration for the den/home lens. This never owns
+    /// den physics or storage semantics.
+    pub den: DenVisualTuning,
+    /// User-authored presentation trim applied after the nervous-system voice
+    /// phenotype and before the immutable genome loudness ceiling.
+    pub voice: VoicePresentationTuning,
+    /// Readability gain around neutral fast-coupling values. Structural solver
+    /// locks and identity fields are deliberately absent.
+    pub nervous: NervousReadabilityTuning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DenVisualTuning {
+    /// Perceived feature size: larger values produce larger energy packets.
+    pub noise_size: f32,
+    pub noise_strength: f32,
+    pub inward_speed: f32,
+    /// Independent speed of the broad concentric wave fronts moving inward.
+    pub ripple_inward_speed: f32,
+    pub noise_detail_scale: f32,
+    pub noise_detail_mix: f32,
+    pub noise_warp: f32,
+    /// Angular coherence of the inward noise field. Zero permits many narrow
+    /// radial sectors; 100 produces a few broad connected packets without
+    /// attenuating their amplitude.
+    pub noise_band_width: f32,
+    pub ripple_strength: f32,
+    pub ripple_opacity: f32,
+    pub displacement_strength: f32,
+    pub displacement_blur: f32,
+    pub displacement_noise_mix: f32,
+    pub displacement_radius: f32,
+    pub refraction_strength: f32,
+    pub refraction_opacity: f32,
+    pub dispersion_strength: f32,
+    pub tint_strength: f32,
+    pub caustic_strength: f32,
+    pub glow_strength: f32,
+    pub particle_brightness: f32,
+    pub particle_count: u8,
+    pub center_mask_radius: f32,
+    pub center_mask_feather: f32,
+    pub center_mask_opacity: f32,
+    /// Maximum fractional animation-speed lift while an unstored orb enters
+    /// the den. `0.15` means exactly fifteen percent, integrated without a
+    /// phase discontinuity.
+    pub orb_speedup_fraction: f32,
+    pub orb_attack_seconds: f32,
+    pub orb_release_seconds: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoicePresentationTuning {
+    pub pitch_multiplier: f32,
+    pub formant_multiplier: f32,
+    pub tempo_multiplier: f32,
+    pub loudness_multiplier: f32,
+    pub attack_multiplier: f32,
+    pub release_multiplier: f32,
+    pub breathiness_delta: f32,
+    pub roughness_delta: f32,
+    pub brightness_delta: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NervousReadabilityTuning {
+    pub shape_gain: f32,
+    pub breathing_gain: f32,
+    /// Amplifies bounded PBF motion multipliers. This never changes fixed_hz,
+    /// solver iterations, particle_count, or any other structural lock.
+    pub particle_motion_gain: f32,
+    /// Makes emotional compression/expansion legible through dynamic density
+    /// compliance. It deliberately does not alter the authored rest spacing.
+    pub particle_spacing_response_gain: f32,
+    pub viscosity_response_gain: f32,
+    pub cohesion_response_gain: f32,
+    pub recovery_response_gain: f32,
+    pub material_gain: f32,
+    pub soul_glow_gain: f32,
+    pub internal_flow_gain: f32,
+    pub pulse_gain: f32,
+    pub expression_gain: f32,
+    pub motion_gain: f32,
+    pub voice_gain: f32,
+    pub threat_sensitivity: f32,
+    pub pain_sensitivity: f32,
+    pub contact_sensitivity: f32,
+    pub safety_sensitivity: f32,
+    pub restraint_sensitivity: f32,
+    pub fatigue_sensitivity: f32,
+    pub novelty_sensitivity: f32,
+    pub startle_sensitivity: f32,
+    pub agency_sensitivity: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyConstraintMode {
+    ObserveOnly,
+    #[default]
+    GuardedNecks,
+    Viscoelastic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InteractionTuning {
+    pub enabled: bool,
+    pub topology_mode: TopologyConstraintMode,
+    pub contact_weight_floor: f32,
+    pub pressure_reference: f32,
+    pub signal_smoothing_hz: f32,
+    pub gesture_window_seconds: f32,
+    pub gesture_commit_confidence: f32,
+    pub gesture_ambiguity_margin: f32,
+    pub soft_touch_pressure_max: f32,
+    pub stretch_strain_min: f32,
+    pub stretch_strain_max: f32,
+    pub flick_speed_min: f32,
+    pub rhythm_interval_cv_max: f32,
+    pub rhythm_min_impulses: u8,
+    pub maximum_detached_components: u8,
+    pub maximum_detached_mass_fraction: f32,
+    pub minimum_fragment_particles: u8,
+    pub split_hold_seconds: f32,
+    pub boundary_strain: f32,
+    pub boundary_hold_seconds: f32,
+    pub fragment_lifetime_seconds: f32,
+    pub offscreen_recovery_delay_seconds: f32,
+    pub recovery_field_boost: f32,
+    pub turn_wait_seconds: f32,
+    pub turn_cooldown_seconds: f32,
+    pub response_amplitude: f32,
+    pub learning_openness: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +326,12 @@ pub struct MaterialTuning {
     #[serde(default = "safe_material_variant")]
     pub variant: MaterialVariant,
     pub override_genome_colors: bool,
+    pub color_source_mode: ColorSourceMode,
+    /// Weight of inherited Genome color in the circular-HSV identity blend.
+    pub genome_color_blend: f32,
+    /// Presentation-only weight of the bounded R12 mood/material readout.
+    /// Zero preserves the identity palette; one shows the full mood target.
+    pub mood_color_blend: f32,
     pub primary_hsv: [f32; 3],
     pub secondary_hsv: [f32; 3],
     pub glow_hsv: [f32; 3],
@@ -301,10 +455,14 @@ impl LiquidTuningProfile {
             render_mode: BodyRenderMode::AnalyticJelly,
             analytic: AnalyticTuning::default(),
             pbf: PbfTuning::default(),
+            interaction: InteractionTuning::default(),
             droplets: DropletTuning::default(),
             material: MaterialTuning::default(),
             face: FaceTuning::default(),
             compositor: CompositorTuning::default(),
+            den: DenVisualTuning::default(),
+            voice: VoicePresentationTuning::default(),
+            nervous: NervousReadabilityTuning::default(),
         }
     }
 
@@ -319,7 +477,7 @@ impl LiquidTuningProfile {
             // so loading a file cannot silently change its look.
             self.material.variant = MaterialVariant::CurrentSafe;
             self.schema_version = LIQUID_TUNING_SCHEMA_VERSION;
-        } else if (9..=15).contains(&self.schema_version) {
+        } else if (9..=20).contains(&self.schema_version) {
             // Cinematic profiles already opted into their material. Schemas 10
             // through 15 preserve the selected material lane. Schema 16 replaces
             // the unstable mode-switched solver settings below without touching
@@ -337,7 +495,18 @@ impl LiquidTuningProfile {
             self.material.secondary_hsv = BODY_LAB_SECONDARY_HSV;
             self.material.glow_hsv = BODY_LAB_GLOW_HSV;
         }
-        if source_schema < LIQUID_TUNING_SCHEMA_VERSION {
+        if source_schema <= 17 {
+            self.material.color_source_mode = if self.material.override_genome_colors {
+                ColorSourceMode::GenomeAuthoredBlend
+            } else {
+                ColorSourceMode::Genome
+            };
+            self.material.genome_color_blend = 0.65;
+        }
+        if source_schema <= 18 {
+            self.material.mood_color_blend = 0.72;
+        }
+        if source_schema < 17 {
             self.pbf.apply_v16_solver_defaults();
         }
         self.name = self.name.trim().chars().take(64).collect();
@@ -346,11 +515,479 @@ impl LiquidTuningProfile {
         }
         self.analytic.sanitize();
         self.pbf.sanitize();
+        self.interaction.sanitize();
         self.droplets.sanitize();
         self.material.sanitize();
         self.face.sanitize();
         self.compositor.sanitize();
+        self.den.sanitize();
+        self.voice.sanitize();
+        self.nervous.sanitize();
         Ok(self)
+    }
+}
+
+impl Default for DenVisualTuning {
+    fn default() -> Self {
+        Self {
+            noise_size: 2.65,
+            noise_strength: 1.18,
+            inward_speed: 0.48,
+            ripple_inward_speed: 0.42,
+            noise_detail_scale: 1.72,
+            noise_detail_mix: 0.14,
+            noise_warp: 0.30,
+            noise_band_width: 0.82,
+            ripple_strength: 0.30,
+            ripple_opacity: 0.24,
+            displacement_strength: 1.35,
+            displacement_blur: 0.052,
+            displacement_noise_mix: 0.86,
+            displacement_radius: 1.0,
+            refraction_strength: 1.0,
+            refraction_opacity: 0.82,
+            dispersion_strength: 0.72,
+            tint_strength: 0.55,
+            caustic_strength: 0.65,
+            glow_strength: 0.24,
+            particle_brightness: 1.15,
+            particle_count: 18,
+            center_mask_radius: 0.16,
+            center_mask_feather: 0.34,
+            center_mask_opacity: 0.94,
+            orb_speedup_fraction: 0.15,
+            orb_attack_seconds: 0.55,
+            orb_release_seconds: 1.20,
+        }
+    }
+}
+
+impl DenVisualTuning {
+    fn sanitize(&mut self) {
+        self.noise_size = bounded(self.noise_size, 0.60, 5.0, 2.65);
+        self.noise_strength = bounded(self.noise_strength, 0.0, 2.0, 1.18);
+        self.inward_speed = bounded(self.inward_speed, 0.0, 1.0, 0.48);
+        self.ripple_inward_speed = bounded(self.ripple_inward_speed, 0.0, 1.0, 0.42);
+        self.noise_detail_scale = bounded(self.noise_detail_scale, 1.0, 4.0, 1.72);
+        self.noise_detail_mix = bounded(self.noise_detail_mix, 0.0, 1.0, 0.14);
+        self.noise_warp = bounded(self.noise_warp, 0.0, 1.0, 0.30);
+        self.noise_band_width = bounded(self.noise_band_width, 0.0, 100.0, 0.82);
+        self.ripple_strength = bounded(self.ripple_strength, 0.0, 1.5, 0.30);
+        self.ripple_opacity = bounded(self.ripple_opacity, 0.0, 1.0, 0.24);
+        self.displacement_strength = bounded(self.displacement_strength, 0.0, 2.5, 1.35);
+        self.displacement_blur = bounded(self.displacement_blur, 0.012, 0.14, 0.052);
+        self.displacement_noise_mix = bounded(self.displacement_noise_mix, 0.0, 1.0, 0.86);
+        self.displacement_radius = bounded(self.displacement_radius, 0.45, 1.30, 1.0);
+        self.refraction_strength = bounded(self.refraction_strength, 0.0, 1.5, 1.0);
+        self.refraction_opacity = bounded(self.refraction_opacity, 0.0, 1.5, 0.82);
+        self.dispersion_strength = bounded(self.dispersion_strength, 0.0, 1.5, 0.72);
+        self.tint_strength = bounded(self.tint_strength, 0.0, 2.0, 0.55);
+        self.caustic_strength = bounded(self.caustic_strength, 0.0, 2.0, 0.65);
+        self.glow_strength = bounded(self.glow_strength, 0.0, 1.0, 0.24);
+        self.particle_brightness = bounded(self.particle_brightness, 0.0, 2.0, 1.15);
+        self.particle_count = self.particle_count.clamp(0, 24);
+        self.center_mask_radius = bounded(self.center_mask_radius, 0.0, 0.72, 0.16);
+        self.center_mask_feather = bounded(self.center_mask_feather, 0.01, 0.80, 0.34);
+        self.center_mask_opacity = bounded(self.center_mask_opacity, 0.0, 1.0, 0.94);
+        self.orb_speedup_fraction = bounded(self.orb_speedup_fraction, 0.0, 0.50, 0.15);
+        self.orb_attack_seconds = bounded(self.orb_attack_seconds, 0.08, 3.0, 0.55);
+        self.orb_release_seconds = bounded(self.orb_release_seconds, 0.08, 5.0, 1.20);
+    }
+}
+
+impl Default for VoicePresentationTuning {
+    fn default() -> Self {
+        Self {
+            pitch_multiplier: 1.0,
+            formant_multiplier: 1.0,
+            tempo_multiplier: 0.96,
+            loudness_multiplier: 1.0,
+            attack_multiplier: 1.0,
+            release_multiplier: 1.18,
+            breathiness_delta: 0.0,
+            roughness_delta: 0.0,
+            brightness_delta: 0.0,
+        }
+    }
+}
+
+impl VoicePresentationTuning {
+    fn sanitize(&mut self) {
+        self.pitch_multiplier = bounded(self.pitch_multiplier, 0.75, 1.30, 1.0);
+        self.formant_multiplier = bounded(self.formant_multiplier, 0.94, 1.06, 1.0);
+        self.tempo_multiplier = bounded(self.tempo_multiplier, 0.65, 1.35, 0.96);
+        self.loudness_multiplier = bounded(self.loudness_multiplier, 0.30, 1.25, 1.0);
+        self.attack_multiplier = bounded(self.attack_multiplier, 0.72, 1.28, 1.0);
+        self.release_multiplier = bounded(self.release_multiplier, 0.75, 1.40, 1.18);
+        self.breathiness_delta = bounded(self.breathiness_delta, -0.35, 0.35, 0.0);
+        self.roughness_delta = bounded(self.roughness_delta, -0.35, 0.35, 0.0);
+        self.brightness_delta = bounded(self.brightness_delta, -0.35, 0.35, 0.0);
+    }
+
+    pub fn apply_to_request(self, request: &mut VocalRequest, genome: &VoiceGenome) {
+        request.pitch_scale = (request.pitch_scale * self.pitch_multiplier).clamp(0.62, 1.48);
+        request.tempo_scale = (request.tempo_scale * self.tempo_multiplier).clamp(0.50, 1.80);
+        request.gain =
+            (request.gain * self.loudness_multiplier).clamp(0.0, genome.maximum_loudness);
+        request.phenotype.formant_scale_multiplier = (request.phenotype.formant_scale_multiplier
+            * self.formant_multiplier)
+            .clamp(0.94, 1.06);
+        request.phenotype.attack_multiplier =
+            (request.phenotype.attack_multiplier * self.attack_multiplier).clamp(0.62, 1.35);
+        request.phenotype.release_multiplier =
+            (request.phenotype.release_multiplier * self.release_multiplier).clamp(0.65, 1.45);
+        request.phenotype.breathiness_delta =
+            (request.phenotype.breathiness_delta + self.breathiness_delta).clamp(-0.45, 0.45);
+        request.phenotype.roughness_delta =
+            (request.phenotype.roughness_delta + self.roughness_delta).clamp(-0.45, 0.45);
+        request.phenotype.brightness_delta =
+            (request.phenotype.brightness_delta + self.brightness_delta).clamp(-0.45, 0.45);
+    }
+}
+
+impl Default for NervousReadabilityTuning {
+    fn default() -> Self {
+        Self {
+            shape_gain: 1.75,
+            breathing_gain: 1.55,
+            particle_motion_gain: 1.45,
+            particle_spacing_response_gain: 1.40,
+            viscosity_response_gain: 1.35,
+            cohesion_response_gain: 1.35,
+            recovery_response_gain: 1.40,
+            material_gain: 1.65,
+            soul_glow_gain: 1.55,
+            internal_flow_gain: 1.50,
+            pulse_gain: 1.45,
+            expression_gain: 1.28,
+            motion_gain: 1.20,
+            voice_gain: 1.12,
+            threat_sensitivity: 1.0,
+            pain_sensitivity: 1.0,
+            contact_sensitivity: 1.0,
+            safety_sensitivity: 1.0,
+            restraint_sensitivity: 1.0,
+            fatigue_sensitivity: 1.0,
+            novelty_sensitivity: 1.0,
+            startle_sensitivity: 1.0,
+            agency_sensitivity: 1.0,
+        }
+    }
+}
+
+impl NervousReadabilityTuning {
+    /// Runtime guardrail for a free-moving desktop organism. Pet Lab keeps the
+    /// full diagnostic range so every coupling remains inspectable, while the
+    /// live Pet prevents a high-gain preset from turning ordinary background
+    /// fatigue or approach evidence into persistent sleep-face flight.
+    #[must_use]
+    pub fn for_live_runtime(self) -> Self {
+        Self {
+            particle_motion_gain: self.particle_motion_gain.min(2.0),
+            expression_gain: self.expression_gain.min(1.55),
+            motion_gain: self.motion_gain.min(1.35),
+            fatigue_sensitivity: self.fatigue_sensitivity.min(1.25),
+            startle_sensitivity: self.startle_sensitivity.min(1.80),
+            ..self
+        }
+    }
+
+    fn sanitize(&mut self) {
+        self.shape_gain = bounded(self.shape_gain, 0.0, 3.0, 1.75);
+        self.breathing_gain = bounded(self.breathing_gain, 0.0, 3.0, 1.55);
+        self.particle_motion_gain = bounded(self.particle_motion_gain, 0.0, 3.0, 1.45);
+        self.particle_spacing_response_gain =
+            bounded(self.particle_spacing_response_gain, 0.0, 3.0, 1.40);
+        self.viscosity_response_gain = bounded(self.viscosity_response_gain, 0.0, 3.0, 1.35);
+        self.cohesion_response_gain = bounded(self.cohesion_response_gain, 0.0, 3.0, 1.35);
+        self.recovery_response_gain = bounded(self.recovery_response_gain, 0.0, 3.0, 1.40);
+        self.material_gain = bounded(self.material_gain, 0.0, 3.0, 1.65);
+        self.soul_glow_gain = bounded(self.soul_glow_gain, 0.0, 3.0, 1.55);
+        self.internal_flow_gain = bounded(self.internal_flow_gain, 0.0, 3.0, 1.50);
+        self.pulse_gain = bounded(self.pulse_gain, 0.0, 3.0, 1.45);
+        self.expression_gain = bounded(self.expression_gain, 0.0, 2.5, 1.28);
+        self.motion_gain = bounded(self.motion_gain, 0.0, 2.5, 1.20);
+        self.voice_gain = bounded(self.voice_gain, 0.0, 2.5, 1.12);
+        self.threat_sensitivity = bounded(self.threat_sensitivity, 0.0, 3.0, 1.0);
+        self.pain_sensitivity = bounded(self.pain_sensitivity, 0.0, 3.0, 1.0);
+        self.contact_sensitivity = bounded(self.contact_sensitivity, 0.0, 3.0, 1.0);
+        self.safety_sensitivity = bounded(self.safety_sensitivity, 0.0, 3.0, 1.0);
+        self.restraint_sensitivity = bounded(self.restraint_sensitivity, 0.0, 3.0, 1.0);
+        self.fatigue_sensitivity = bounded(self.fatigue_sensitivity, 0.0, 3.0, 1.0);
+        self.novelty_sensitivity = bounded(self.novelty_sensitivity, 0.0, 3.0, 1.0);
+        self.startle_sensitivity = bounded(self.startle_sensitivity, 0.0, 3.0, 1.0);
+        self.agency_sensitivity = bounded(self.agency_sensitivity, 0.0, 3.0, 1.0);
+    }
+
+    pub fn apply(self, actuation: &mut FastPhenotypeActuation) {
+        let around_one = |value: f32, gain: f32, minimum: f32, maximum: f32| {
+            (1.0 + (value - 1.0) * gain).clamp(minimum, maximum)
+        };
+        let unit_gain = |value: f32, neutral: f32, gain: f32| {
+            (neutral + (value - neutral) * gain).clamp(0.0, 1.0)
+        };
+
+        let shape = self.shape_gain;
+        actuation.analytic.body_length_scale =
+            around_one(actuation.analytic.body_length_scale, shape, 0.90, 1.10);
+        actuation.analytic.body_width_scale =
+            around_one(actuation.analytic.body_width_scale, shape, 0.90, 1.10);
+        actuation.analytic.roundness_bias =
+            (actuation.analytic.roundness_bias * shape).clamp(-0.10, 0.14);
+        actuation.analytic.softness_bias =
+            (actuation.analytic.softness_bias * shape).clamp(-0.16, 0.18);
+        actuation.apparent_scale = around_one(actuation.apparent_scale, shape, 0.92, 1.10);
+        let breathing = self.breathing_gain;
+        actuation.pbf.idle_breath_amplitude_multiplier = around_one(
+            actuation.pbf.idle_breath_amplitude_multiplier,
+            breathing,
+            0.55,
+            1.75,
+        );
+        actuation.pbf.idle_breath_speed_multiplier = around_one(
+            actuation.pbf.idle_breath_speed_multiplier,
+            breathing,
+            0.45,
+            1.90,
+        );
+
+        let particle_motion = self.particle_motion_gain;
+        actuation.pbf.flight_inertia_multiplier = around_one(
+            actuation.pbf.flight_inertia_multiplier,
+            particle_motion,
+            0.85,
+            1.20,
+        );
+        actuation.pbf.flight_stretch_multiplier = around_one(
+            actuation.pbf.flight_stretch_multiplier,
+            particle_motion,
+            0.72,
+            1.40,
+        );
+        actuation.pbf.flight_damping_multiplier = around_one(
+            actuation.pbf.flight_damping_multiplier,
+            particle_motion,
+            0.82,
+            1.28,
+        );
+        actuation.pbf.flight_max_lag_multiplier = around_one(
+            actuation.pbf.flight_max_lag_multiplier,
+            particle_motion,
+            0.80,
+            1.35,
+        );
+        actuation.pbf.angular_damping_multiplier = around_one(
+            actuation.pbf.angular_damping_multiplier,
+            particle_motion,
+            0.78,
+            1.35,
+        );
+        actuation.pbf.motor_gain_multiplier = around_one(
+            actuation.pbf.motor_gain_multiplier,
+            particle_motion,
+            0.72,
+            1.16,
+        );
+        actuation.pbf.density_compliance_multiplier = around_one(
+            actuation.pbf.density_compliance_multiplier,
+            self.particle_spacing_response_gain,
+            0.75,
+            1.25,
+        );
+        actuation.pbf.viscosity_multiplier = around_one(
+            actuation.pbf.viscosity_multiplier,
+            self.viscosity_response_gain,
+            0.78,
+            1.30,
+        );
+        actuation.pbf.surface_tension_multiplier = around_one(
+            actuation.pbf.surface_tension_multiplier,
+            self.cohesion_response_gain,
+            0.80,
+            1.25,
+        );
+        actuation.pbf.shape_recovery_delta =
+            (actuation.pbf.shape_recovery_delta * self.recovery_response_gain).clamp(0.0, 0.42);
+        actuation.pbf.upright_stabilization_delta = (actuation.pbf.upright_stabilization_delta
+            * self.recovery_response_gain)
+            .clamp(-0.35, 0.35);
+
+        let material = self.material_gain;
+        actuation.material.hue_shift_turns =
+            (actuation.material.hue_shift_turns * material).clamp(-0.04, 0.04);
+        actuation.material.saturation_delta =
+            (actuation.material.saturation_delta * material).clamp(-0.20, 0.16);
+        actuation.material.value_delta =
+            (actuation.material.value_delta * material).clamp(-0.18, 0.18);
+        actuation.material.emission_multiplier =
+            around_one(actuation.material.emission_multiplier, material, 0.55, 1.65);
+        actuation.material.soul_glow_strength_multiplier = around_one(
+            actuation.material.soul_glow_strength_multiplier,
+            self.soul_glow_gain,
+            0.55,
+            1.60,
+        );
+        actuation.material.soul_glow_pulse_multiplier = around_one(
+            actuation.material.soul_glow_pulse_multiplier,
+            self.soul_glow_gain,
+            0.50,
+            1.60,
+        );
+        actuation.visual_physiology.pulse_amplitude = unit_gain(
+            actuation.visual_physiology.pulse_amplitude,
+            0.16,
+            self.pulse_gain,
+        );
+        actuation.visual_physiology.flow_strength_multiplier = around_one(
+            actuation.visual_physiology.flow_strength_multiplier,
+            self.internal_flow_gain,
+            0.45,
+            1.75,
+        );
+        actuation.visual_physiology.flow_speed_multiplier = around_one(
+            actuation.visual_physiology.flow_speed_multiplier,
+            self.internal_flow_gain,
+            0.45,
+            1.75,
+        );
+        actuation.visual_physiology.droplet_energy =
+            unit_gain(actuation.visual_physiology.droplet_energy, 0.20, material);
+
+        let expression = self.expression_gain;
+        let neutral = ExpressionState::default();
+        macro_rules! expression_unit {
+            ($field:ident) => {
+                actuation.expression.$field =
+                    unit_gain(actuation.expression.$field, neutral.$field, expression);
+            };
+        }
+        macro_rules! expression_signed {
+            ($field:ident) => {
+                actuation.expression.$field =
+                    (actuation.expression.$field * expression).clamp(-1.0, 1.0);
+            };
+        }
+        expression_unit!(squint);
+        expression_unit!(pupil_size);
+        expression_unit!(pupil_focus);
+        expression_unit!(brow_tension);
+        expression_unit!(mouth_tension);
+        expression_unit!(cheek_glow);
+        expression_unit!(body_glow);
+        expression_unit!(eye_aperture);
+        expression_unit!(eye_scale);
+        expression_unit!(mouth_compression);
+        expression_unit!(effort);
+        expression_unit!(relief);
+        expression_signed!(brow_raise);
+        expression_signed!(mouth_curve);
+        expression_signed!(brow_asymmetry);
+        expression_signed!(mouth_asymmetry);
+
+        let motion = self.motion_gain;
+        actuation.action.speed = (actuation.action.speed * motion).clamp(0.0, 1.0);
+        actuation.action.turn = (actuation.action.turn * motion).clamp(-1.0, 1.0);
+        actuation.action.approach = (actuation.action.approach * motion).clamp(0.0, 1.0);
+        actuation.action.avoid = (actuation.action.avoid * motion).clamp(0.0, 1.0);
+        actuation.interaction.lean = (actuation.interaction.lean * motion).clamp(-1.0, 1.0);
+        actuation.interaction.recoil = (actuation.interaction.recoil * motion).clamp(0.0, 1.0);
+        actuation.interaction.local_pulse =
+            (actuation.interaction.local_pulse * motion).clamp(0.0, 1.0);
+
+        let voice = self.voice_gain;
+        actuation.voice.pitch_multiplier =
+            around_one(actuation.voice.pitch_multiplier, voice, 0.68, 1.42);
+        actuation.voice.pitch_variation_multiplier = around_one(
+            actuation.voice.pitch_variation_multiplier,
+            voice,
+            0.55,
+            1.55,
+        );
+        actuation.voice.phrase_speed_multiplier =
+            around_one(actuation.voice.phrase_speed_multiplier, voice, 0.55, 1.60);
+        actuation.voice.loudness_multiplier =
+            around_one(actuation.voice.loudness_multiplier, voice, 0.45, 1.45);
+        actuation.voice.attack_multiplier =
+            around_one(actuation.voice.attack_multiplier, voice, 0.62, 1.35);
+        actuation.voice.release_multiplier =
+            around_one(actuation.voice.release_multiplier, voice, 0.65, 1.45);
+        actuation.voice.breathiness_delta =
+            (actuation.voice.breathiness_delta * voice).clamp(-0.45, 0.45);
+        actuation.voice.roughness_delta =
+            (actuation.voice.roughness_delta * voice).clamp(-0.45, 0.45);
+        actuation.voice.brightness_delta =
+            (actuation.voice.brightness_delta * voice).clamp(-0.45, 0.45);
+    }
+}
+
+impl Default for InteractionTuning {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            topology_mode: TopologyConstraintMode::GuardedNecks,
+            contact_weight_floor: 0.04,
+            pressure_reference: 1.0,
+            signal_smoothing_hz: 14.0,
+            gesture_window_seconds: 2.0,
+            gesture_commit_confidence: 0.62,
+            gesture_ambiguity_margin: 0.12,
+            soft_touch_pressure_max: 0.24,
+            stretch_strain_min: 0.14,
+            stretch_strain_max: 0.58,
+            flick_speed_min: 2.40,
+            rhythm_interval_cv_max: 0.20,
+            rhythm_min_impulses: 3,
+            maximum_detached_components: 3,
+            maximum_detached_mass_fraction: 0.18,
+            minimum_fragment_particles: 4,
+            split_hold_seconds: 0.075,
+            boundary_strain: 0.72,
+            boundary_hold_seconds: 0.45,
+            fragment_lifetime_seconds: 10.0,
+            offscreen_recovery_delay_seconds: 1.25,
+            recovery_field_boost: 1.60,
+            turn_wait_seconds: 1.15,
+            turn_cooldown_seconds: 1.25,
+            response_amplitude: 1.0,
+            learning_openness: 1.0,
+        }
+    }
+}
+
+impl InteractionTuning {
+    fn sanitize(&mut self) {
+        self.contact_weight_floor = bounded(self.contact_weight_floor, 0.0, 0.25, 0.04);
+        self.pressure_reference = bounded(self.pressure_reference, 0.05, 8.0, 1.0);
+        self.signal_smoothing_hz = bounded(self.signal_smoothing_hz, 1.0, 60.0, 14.0);
+        self.gesture_window_seconds = bounded(self.gesture_window_seconds, 0.5, 4.0, 2.0);
+        self.gesture_commit_confidence = bounded(self.gesture_commit_confidence, 0.50, 0.85, 0.62);
+        self.gesture_ambiguity_margin = bounded(self.gesture_ambiguity_margin, 0.05, 0.35, 0.12);
+        self.soft_touch_pressure_max = bounded(self.soft_touch_pressure_max, 0.05, 0.50, 0.24);
+        self.stretch_strain_min = bounded(self.stretch_strain_min, 0.05, 0.45, 0.14);
+        self.stretch_strain_max = bounded(
+            self.stretch_strain_max,
+            self.stretch_strain_min + 0.05,
+            1.20,
+            0.58,
+        );
+        self.flick_speed_min = bounded(self.flick_speed_min, 0.5, 8.0, 2.40);
+        self.rhythm_interval_cv_max = bounded(self.rhythm_interval_cv_max, 0.05, 0.50, 0.20);
+        self.rhythm_min_impulses = self.rhythm_min_impulses.clamp(3, 8);
+        self.maximum_detached_components = self.maximum_detached_components.clamp(1, 3);
+        self.maximum_detached_mass_fraction =
+            bounded(self.maximum_detached_mass_fraction, 0.05, 0.25, 0.18);
+        self.minimum_fragment_particles = self.minimum_fragment_particles.clamp(3, 12);
+        self.split_hold_seconds = bounded(self.split_hold_seconds, 0.025, 0.50, 0.075);
+        self.boundary_strain = bounded(self.boundary_strain, 0.45, 1.20, 0.72);
+        self.boundary_hold_seconds = bounded(self.boundary_hold_seconds, 0.10, 2.0, 0.45);
+        self.fragment_lifetime_seconds = bounded(self.fragment_lifetime_seconds, 3.0, 15.0, 10.0);
+        self.offscreen_recovery_delay_seconds =
+            bounded(self.offscreen_recovery_delay_seconds, 0.25, 5.0, 1.25);
+        self.recovery_field_boost = bounded(self.recovery_field_boost, 1.0, 2.0, 1.60);
+        self.turn_wait_seconds = bounded(self.turn_wait_seconds, 0.45, 2.50, 1.15);
+        self.turn_cooldown_seconds = bounded(self.turn_cooldown_seconds, 0.25, 5.0, 1.25);
+        self.response_amplitude = bounded(self.response_amplitude, 0.25, 1.25, 1.0);
+        self.learning_openness = bounded(self.learning_openness, 0.50, 1.25, 1.0);
     }
 }
 
@@ -607,6 +1244,9 @@ impl Default for MaterialTuning {
         Self {
             variant: MaterialVariant::CinematicJelly,
             override_genome_colors: true,
+            color_source_mode: ColorSourceMode::GenomeAuthoredBlend,
+            genome_color_blend: 0.65,
+            mood_color_blend: 0.72,
             primary_hsv: BODY_LAB_PRIMARY_HSV,
             secondary_hsv: BODY_LAB_SECONDARY_HSV,
             glow_hsv: BODY_LAB_GLOW_HSV,
@@ -669,6 +1309,8 @@ impl Default for MaterialTuning {
 
 impl MaterialTuning {
     fn sanitize(&mut self) {
+        self.genome_color_blend = bounded(self.genome_color_blend, 0.0, 1.0, 0.65);
+        self.mood_color_blend = bounded(self.mood_color_blend, 0.0, 1.0, 0.72);
         sanitize_hsv(&mut self.primary_hsv);
         sanitize_hsv(&mut self.secondary_hsv);
         sanitize_hsv(&mut self.glow_hsv);
@@ -850,9 +1492,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_sixteen_defaults_select_the_single_stable_solver_lane() {
+    fn schema_twenty_one_defaults_keep_the_single_stable_solver_lane() {
         let pbf = PbfTuning::default();
-        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 16);
+        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 21);
         assert_eq!(pbf.substeps, 1);
         assert_eq!(pbf.impact_substeps, 1);
         assert_eq!(pbf.density_iterations, 6);
@@ -866,6 +1508,129 @@ mod tests {
         assert_eq!(pbf.idle_fragment_size, 0.0);
         assert_eq!(pbf.idle_bud_pull_strength, 0.0);
         assert_eq!(pbf.pinch_bounce, 0.0);
+    }
+
+    #[test]
+    fn nervous_readability_amplifies_dynamic_parcel_response_not_structural_settings() {
+        let mut actuation = FastPhenotypeActuation::default();
+        actuation.pbf.density_compliance_multiplier = 1.10;
+        actuation.pbf.viscosity_multiplier = 0.90;
+        actuation.pbf.surface_tension_multiplier = 1.08;
+        actuation.pbf.flight_stretch_multiplier = 1.12;
+        actuation.pbf.shape_recovery_delta = 0.10;
+        actuation.visual_physiology.pulse_amplitude = 0.40;
+        let original = actuation.clone();
+        NervousReadabilityTuning {
+            particle_motion_gain: 2.0,
+            particle_spacing_response_gain: 2.0,
+            viscosity_response_gain: 2.0,
+            cohesion_response_gain: 2.0,
+            recovery_response_gain: 2.0,
+            pulse_gain: 2.0,
+            ..NervousReadabilityTuning::default()
+        }
+        .apply(&mut actuation);
+
+        assert!(
+            (actuation.pbf.density_compliance_multiplier - 1.0).abs()
+                > (original.pbf.density_compliance_multiplier - 1.0).abs()
+        );
+        assert!(
+            (actuation.pbf.viscosity_multiplier - 1.0).abs()
+                > (original.pbf.viscosity_multiplier - 1.0).abs()
+        );
+        assert!(
+            (actuation.pbf.surface_tension_multiplier - 1.0).abs()
+                > (original.pbf.surface_tension_multiplier - 1.0).abs()
+        );
+        assert!(
+            (actuation.pbf.flight_stretch_multiplier - 1.0).abs()
+                > (original.pbf.flight_stretch_multiplier - 1.0).abs()
+        );
+        assert!(actuation.pbf.shape_recovery_delta > original.pbf.shape_recovery_delta);
+        assert!(
+            (actuation.visual_physiology.pulse_amplitude - 0.16).abs()
+                > (original.visual_physiology.pulse_amplitude - 0.16).abs()
+        );
+
+        let profile = LiquidTuningProfile::default();
+        assert_eq!(
+            profile.pbf.particle_count,
+            PbfTuning::default().particle_count
+        );
+        assert_eq!(profile.pbf.fixed_hz, PbfTuning::default().fixed_hz);
+        assert_eq!(
+            profile.pbf.spacing_scale,
+            PbfTuning::default().spacing_scale
+        );
+    }
+
+    #[test]
+    fn live_nervous_guardrail_preserves_visual_diagnostics_but_caps_motion_and_fatigue() {
+        let diagnostic = NervousReadabilityTuning {
+            shape_gain: 2.8,
+            material_gain: 2.8,
+            particle_motion_gain: 2.8,
+            expression_gain: 2.4,
+            motion_gain: 2.4,
+            fatigue_sensitivity: 2.6,
+            startle_sensitivity: 2.7,
+            ..NervousReadabilityTuning::default()
+        };
+
+        let live = diagnostic.for_live_runtime();
+
+        assert_eq!(live.shape_gain, diagnostic.shape_gain);
+        assert_eq!(live.material_gain, diagnostic.material_gain);
+        assert_eq!(live.particle_motion_gain, 2.0);
+        assert_eq!(live.expression_gain, 1.55);
+        assert_eq!(live.motion_gain, 1.35);
+        assert_eq!(live.fatigue_sensitivity, 1.25);
+        assert_eq!(live.startle_sensitivity, 1.80);
+    }
+
+    #[test]
+    fn schema_seventeen_authored_override_migrates_to_identity_blend() {
+        let mut profile = LiquidTuningProfile::for_seed(42);
+        profile.schema_version = 17;
+        profile.material.override_genome_colors = true;
+        profile.material.color_source_mode = ColorSourceMode::Authored;
+        profile.material.genome_color_blend = 0.0;
+        let migrated = profile.sanitized().expect("schema 17 migration");
+        assert_eq!(migrated.schema_version, 21);
+        assert_eq!(
+            migrated.material.color_source_mode,
+            ColorSourceMode::GenomeAuthoredBlend
+        );
+        assert_eq!(migrated.material.genome_color_blend, 0.65);
+        assert_eq!(migrated.material.mood_color_blend, 0.72);
+    }
+
+    #[test]
+    fn schema_eighteen_gains_the_bounded_mood_color_blend() {
+        let mut profile = LiquidTuningProfile::for_seed(42);
+        profile.schema_version = 18;
+        profile.material.mood_color_blend = 0.0;
+        let migrated = profile.sanitized().expect("schema 18 migration");
+        assert_eq!(migrated.schema_version, 21);
+        assert_eq!(migrated.material.mood_color_blend, 0.72);
+    }
+
+    #[test]
+    fn schema_sixteen_gains_safe_interaction_defaults() {
+        let profile = LiquidTuningProfile::for_seed(42);
+        let mut value = serde_json::to_value(&profile).unwrap();
+        value["schema_version"] = serde_json::json!(16);
+        value.as_object_mut().unwrap().remove("interaction");
+        let migrated: LiquidTuningProfile = serde_json::from_value(value).unwrap();
+        let migrated = migrated.sanitized().unwrap();
+        assert_eq!(migrated.schema_version, LIQUID_TUNING_SCHEMA_VERSION);
+        assert_eq!(
+            migrated.interaction.topology_mode,
+            TopologyConstraintMode::GuardedNecks
+        );
+        assert_eq!(migrated.interaction.maximum_detached_components, 3);
+        assert_eq!(migrated.interaction.maximum_detached_mass_fraction, 0.18);
     }
 
     #[test]
@@ -1201,7 +1966,7 @@ mod tests {
 
         let legacy: LiquidTuningProfile = serde_json::from_value(value).unwrap();
         let migrated = legacy.sanitized().unwrap();
-        assert_eq!(migrated.schema_version, 16);
+        assert_eq!(migrated.schema_version, LIQUID_TUNING_SCHEMA_VERSION);
         assert_eq!(migrated.profile_revision, 91);
         assert_eq!(migrated.render_mode, BodyRenderMode::ParticlePbf);
         assert_eq!(migrated.material.variant, MaterialVariant::CinematicJelly);

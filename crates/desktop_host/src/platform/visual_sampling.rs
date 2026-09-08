@@ -72,7 +72,6 @@ pub(super) fn frame_from_bgra(
     frame.is_finite().then_some(frame)
 }
 
-#[cfg(target_os = "windows")]
 pub(super) fn background_luminance_stats(
     bgra8: &[u8],
     width: u32,

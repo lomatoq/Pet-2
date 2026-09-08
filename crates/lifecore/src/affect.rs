@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{BodyFeedback, Drives, SensorFrame, TemperamentGenome};
+use crate::{BodyFeedback, Drives, FeltStateV1, SensorFrame, TemperamentGenome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AffectState {
@@ -81,6 +81,29 @@ impl AffectState {
         self.confidence = smooth(self.confidence, confidence_target, 1.4, dt).clamp(0.0, 1.0);
         self.attachment = smooth(self.attachment, attachment_target, 0.28, dt).clamp(0.0, 1.0);
         self.frustration = smooth(self.frustration, frustration_target, 1.8, dt).clamp(0.0, 1.0);
+    }
+
+    /// Fast bounded somatic evidence. This supplements, rather than replaces,
+    /// the existing drive/event affect model.
+    pub fn integrate_felt_state(&mut self, felt: FeltStateV1, dt: f32) {
+        let threat = (0.45 * felt.pain_like
+            + 0.30 * felt.physical_load
+            + 0.25 * (1.0 - felt.body_integrity))
+            .clamp(0.0, 1.0);
+        let valence_evidence = (0.30 * felt.comfort + 0.35 * felt.relief
+            - 0.55 * felt.pain_like
+            - 0.35 * felt.restraint)
+            .clamp(-1.0, 1.0);
+        let confidence_evidence = (felt.motor_efficacy * felt.agency_match).clamp(0.0, 1.0);
+        let frustration_evidence = (felt.restraint * (1.0 - felt.agency_match)
+            + (1.0 - felt.motor_efficacy) * 0.25)
+            .clamp(0.0, 1.0);
+        let attachment_evidence = (felt.contact_pleasantness * felt.social_safety).clamp(0.0, 1.0);
+        self.valence = smooth(self.valence, valence_evidence, 3.5, dt).clamp(-1.0, 1.0);
+        self.stress = smooth(self.stress, threat, 8.0, dt).clamp(0.0, 1.0);
+        self.confidence = smooth(self.confidence, confidence_evidence, 2.0, dt).clamp(0.0, 1.0);
+        self.frustration = smooth(self.frustration, frustration_evidence, 4.0, dt).clamp(0.0, 1.0);
+        self.attachment = smooth(self.attachment, attachment_evidence, 0.18, dt).clamp(0.0, 1.0);
     }
 
     #[must_use]

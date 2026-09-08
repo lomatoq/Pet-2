@@ -4,8 +4,9 @@ use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ACTION_COUNT, ActionId, BodyFeedback, BodyIntent, ExpressionState, FeedbackEvent,
-    InteractionTarget, LifeState, LocomotionMode, PoseIntent, SensorFrame,
+    ACTION_COUNT, ActionId, BodyFeedback, BodyIntent, EpisodeContextV1, ExpressionState,
+    FeedbackEvent, FeltStateV1, InteractionTarget, LifeState, LocomotionMode, PoseIntent,
+    SensorFrame,
 };
 
 pub const VITA_STATE_SCHEMA_VERSION: u32 = 1;
@@ -1091,6 +1092,99 @@ impl VitaMind {
         self.compose_output(percept, base_intent, influence)
     }
 
+    /// Integrates previous-tick body evidence into self-model, appraisal and
+    /// slow mood channels without turning any one gesture into a mood overwrite.
+    pub fn integrate_felt_state(&mut self, felt: FeltStateV1, episode: EpisodeContextV1, dt: f32) {
+        let dt = finite(dt, 0.0).clamp(0.0, 0.25);
+        let external_force =
+            (0.55 * felt.restraint + 0.45 * (1.0 - felt.agency_match)).clamp(0.0, 1.0);
+        self.state.self_model.prediction_error = smooth(
+            self.state.self_model.prediction_error,
+            1.0 - felt.agency_match,
+            8.0,
+            dt,
+        );
+        self.state.self_model.external_force_likelihood = smooth(
+            self.state.self_model.external_force_likelihood,
+            external_force,
+            9.0,
+            dt,
+        );
+        self.state.self_model.agency = smooth(
+            self.state.self_model.agency,
+            felt.agency_match * (1.0 - self.state.self_model.external_force_likelihood),
+            5.0,
+            dt,
+        );
+        self.state.self_model.uncertainty = smooth(
+            self.state.self_model.uncertainty,
+            (1.0 - felt.body_ownership).max(1.0 - felt.motor_efficacy),
+            2.5,
+            dt,
+        );
+        if episode.closed {
+            let evidence = felt.agency_match * felt.body_integrity * (1.0 - felt.pain_like);
+            self.state.self_model.body_schema_confidence = smooth(
+                self.state.self_model.body_schema_confidence,
+                evidence,
+                0.08,
+                dt,
+            );
+        }
+        self.state.self_model.calibration_urge = ((1.0
+            - self.state.self_model.body_schema_confidence)
+            * (0.45 + 0.55 * felt.exploration_readiness))
+            .clamp(0.0, 1.0);
+
+        let threat = (0.45 * felt.pain_like
+            + 0.30 * felt.physical_load
+            + 0.25 * (1.0 - felt.body_integrity))
+            .clamp(0.0, 1.0);
+        self.state.appraisal.threat = smooth(self.state.appraisal.threat, threat, 8.0, dt);
+        self.state.appraisal.agency = smooth(
+            self.state.appraisal.agency,
+            self.state.self_model.agency,
+            5.0,
+            dt,
+        );
+        self.state.appraisal.controllability = smooth(
+            self.state.appraisal.controllability,
+            felt.motor_efficacy,
+            4.0,
+            dt,
+        );
+
+        let episode_valence = (episode.reward_positive - episode.reward_negative).clamp(-1.0, 1.0);
+        self.state.mood.baseline_valence = smooth_signed_asymmetric(
+            self.state.mood.baseline_valence,
+            episode_valence,
+            18.0,
+            45.0,
+            dt,
+        );
+        self.state.mood.baseline_arousal = smooth_asymmetric(
+            self.state.mood.baseline_arousal,
+            felt.activation,
+            8.0,
+            28.0,
+            dt,
+        );
+        let openness =
+            (felt.social_safety - 0.6 * felt.restraint - 0.5 * episode.ignored_social_bid)
+                .clamp(0.0, 1.0);
+        self.state.mood.social_openness =
+            smooth_asymmetric(self.state.mood.social_openness, openness, 25.0, 80.0, dt);
+        let confidence =
+            (felt.motor_efficacy - 0.7 * self.state.self_model.prediction_error).clamp(0.0, 1.0);
+        self.state.mood.confidence =
+            smooth_asymmetric(self.state.mood.confidence, confidence, 35.0, 95.0, dt);
+        let fatigue = (felt.sleep_pressure + 0.35 * felt.physical_load
+            - 0.7 * episode.rest_quality)
+            .clamp(0.0, 1.0);
+        self.state.mood.fatigue =
+            smooth_asymmetric(self.state.mood.fatigue, fatigue, 45.0, 180.0, dt);
+    }
+
     pub fn apply_feedback(&mut self, event: &FeedbackEvent) {
         self.state.influence.apply_feedback(event);
     }
@@ -1779,6 +1873,22 @@ fn smooth(current: f32, target: f32, speed: f32, dt: f32) -> f32 {
 
 fn smooth_signed(current: f32, target: f32, speed: f32, dt: f32) -> f32 {
     (current + (target - current) * (1.0 - (-speed * dt).exp())).clamp(-1.0, 1.0)
+}
+
+fn smooth_asymmetric(current: f32, target: f32, rise_tau: f32, fall_tau: f32, dt: f32) -> f32 {
+    let tau = if target > current { rise_tau } else { fall_tau }.max(1.0e-4);
+    (current + (target - current) * (1.0 - (-dt / tau).exp())).clamp(0.0, 1.0)
+}
+
+fn smooth_signed_asymmetric(
+    current: f32,
+    target: f32,
+    rise_tau: f32,
+    fall_tau: f32,
+    dt: f32,
+) -> f32 {
+    let tau = if target > current { rise_tau } else { fall_tau }.max(1.0e-4);
+    (current + (target - current) * (1.0 - (-dt / tau).exp())).clamp(-1.0, 1.0)
 }
 
 fn finite(value: f32, fallback: f32) -> f32 {

@@ -2,12 +2,14 @@ use glam::Vec2;
 use lifecore::{ActionId, BodyIntent, InteractionTarget, LocomotionMode, PoseIntent};
 
 use crate::{
-    EcologyDecisionTrace, EcologyState, GoalScore, ObjectId, ObjectKind, ObjectLifecycle,
+    DenEdge, EcologyDecisionTrace, EcologyState, GoalScore, ObjectId, ObjectKind, ObjectLifecycle,
     evaluate_food_utility, retarget_path,
 };
 
 pub const MAX_OBJECT_COMMANDS: usize = 8;
 pub const MAX_OUTCOMES: usize = 8;
+const DEN_HANDOFF_DISTANCE: f32 = crate::DEN_LATCH_RADIUS_PX / crate::REFERENCE_DESKTOP_HEIGHT_PX;
+const DEN_EXIT_DISTANCE: f32 = 0.085;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -978,6 +980,7 @@ fn drive_episode(
                             .saturating_add(1);
                     active.goal = EpisodeGoal::CarryOrbHome;
                     active.phase = EpisodePhase::ReturnHome;
+                    active.elapsed_seconds = 0.0;
                     active.phase_elapsed_seconds = 0.0;
                     active.commitment_remaining = commitment_for(EpisodeGoal::CarryOrbHome);
                     active.reason_code = EpisodeReason::TimedOut;
@@ -1161,6 +1164,7 @@ fn drive_episode(
                     } else {
                         active.goal = EpisodeGoal::RetrieveOrb;
                         active.phase = EpisodePhase::Approach;
+                        active.elapsed_seconds = 0.0;
                         active.phase_elapsed_seconds = 0.0;
                         active.reason_code = EpisodeReason::UserEngaged;
                         active.commitment_remaining = commitment_for(EpisodeGoal::RetrieveOrb);
@@ -1174,6 +1178,7 @@ fn drive_episode(
             if active.elapsed_seconds >= 5.0 {
                 active.goal = EpisodeGoal::RetrieveOrb;
                 active.phase = EpisodePhase::Approach;
+                active.elapsed_seconds = 0.0;
                 active.phase_elapsed_seconds = 0.0;
                 active.reason_code = EpisodeReason::TimedOut;
                 active.commitment_remaining = commitment_for(EpisodeGoal::RetrieveOrb);
@@ -1181,6 +1186,14 @@ fn drive_episode(
         }
         EpisodeGoal::CarryOrbHome => {
             let Some(orb_id) = active.object_id else {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            };
+            let Some(orb_position) = state
+                .objects
+                .iter()
+                .find(|object| object.id == orb_id)
+                .map(|object| object.position)
+            else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
             output.body_intent.target_position = state.den.anchor;
@@ -1196,7 +1209,15 @@ fn drive_episode(
                     speed: 4.0,
                 },
             );
-            if frame.pet_position.distance(state.den.anchor) <= 0.04 {
+            if active.elapsed_seconds >= 10.0 {
+                return EpisodeStep::Abort(EpisodeReason::TimedOut);
+            }
+            // Storage is a handoff, never a teleport: both carrier and object
+            // must physically arrive at the den before the slot can close.
+            if desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect) <= 0.04
+                && desktop_distance(orb_position, state.den.anchor, frame.desktop_aspect)
+                    <= DEN_HANDOFF_DISTANCE
+            {
                 let slot = state
                     .den
                     .slots
@@ -1291,22 +1312,74 @@ fn drive_episode(
             let Some(orb_id) = active.object_id else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
-            output.body_intent.target_position = state.den.anchor;
-            output.body_intent.gaze_target = Some(state.den.anchor);
-            output.body_intent.locomotion = LocomotionMode::Arrive;
+            let Some(orb_position) = state
+                .objects
+                .iter()
+                .find(|object| object.id == orb_id)
+                .map(|object| object.position)
+            else {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            };
             output.body_intent.pose = PoseIntent::Curious;
+            output.body_intent.gaze_target = Some(orb_position);
             output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.34);
-            if frame.pet_position.distance(state.den.anchor) <= 0.045 {
-                let direction = (frame.cursor_position - state.den.anchor).normalize_or_zero();
-                let target = (state.den.anchor + direction * 0.055).clamp(Vec2::ZERO, Vec2::ONE);
+            if matches!(active.phase, EpisodePhase::Orient | EpisodePhase::Approach) {
+                output.body_intent.target_position = state.den.anchor;
+                output.body_intent.locomotion = LocomotionMode::Arrive;
+                if desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect)
+                    <= 0.045
+                {
+                    active.target_position = Some(den_exit_target(
+                        state.den.anchor,
+                        state.den.edge,
+                        frame.cursor_position,
+                    ));
+                    set_phase(active, EpisodePhase::Manipulate);
+                    // Taking the orb starts at its current den position. The
+                    // runtime clears the slot but does not move the object.
+                    push_command(
+                        output,
+                        ObjectCommand::MoveToward {
+                            object_id: orb_id,
+                            target: frame.pet_position,
+                            speed: 5.0,
+                        },
+                    );
+                }
+            } else {
+                let target = active.target_position.unwrap_or_else(|| {
+                    den_exit_target(state.den.anchor, state.den.edge, frame.cursor_position)
+                });
+                output.body_intent.target_position = target;
+                output.body_intent.gaze_target = Some(target);
+                output.body_intent.locomotion = LocomotionMode::Arrive;
                 push_command(
                     output,
-                    ObjectCommand::Retrieve {
+                    ObjectCommand::MoveToward {
                         object_id: orb_id,
-                        target,
+                        target: frame.pet_position,
+                        speed: 5.0,
                     },
                 );
-                return EpisodeStep::Complete;
+                let pet_has_exited =
+                    desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect)
+                        >= DEN_EXIT_DISTANCE;
+                let orb_is_in_hand =
+                    desktop_distance(orb_position, frame.pet_position, frame.desktop_aspect)
+                        <= 0.018;
+                if pet_has_exited && orb_is_in_hand {
+                    push_command(
+                        output,
+                        ObjectCommand::Release {
+                            object_id: orb_id,
+                            velocity: frame.pet_velocity * 0.55,
+                        },
+                    );
+                    return EpisodeStep::Complete;
+                }
+            }
+            if active.elapsed_seconds >= 10.0 {
+                return EpisodeStep::Abort(EpisodeReason::TimedOut);
             }
         }
         EpisodeGoal::EscapePressure => {
@@ -1546,7 +1619,15 @@ fn drive_episode(
                     speed: 3.2,
                 },
             );
-            if frame.pet_position.distance(state.den.anchor) <= 0.04 {
+            let morsel_position = state
+                .objects
+                .iter()
+                .find(|object| object.id == morsel_id)
+                .map_or(state.den.anchor + Vec2::ONE, |object| object.position);
+            if desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect) <= 0.04
+                && desktop_distance(morsel_position, state.den.anchor, frame.desktop_aspect)
+                    <= DEN_HANDOFF_DISTANCE
+            {
                 push_command(
                     output,
                     ObjectCommand::Store {
@@ -1739,6 +1820,22 @@ fn commitment_for(goal: EpisodeGoal) -> f32 {
 fn desktop_distance(left: Vec2, right: Vec2, aspect: f32) -> f32 {
     let delta = left - right;
     Vec2::new(delta.x * aspect.clamp(0.25, 8.0), delta.y).length()
+}
+
+fn den_exit_target(anchor: Vec2, edge: DenEdge, cursor: Vec2) -> Vec2 {
+    let inward = match edge {
+        DenEdge::Left => Vec2::X,
+        DenEdge::Right => Vec2::NEG_X,
+        DenEdge::Top => Vec2::Y,
+        DenEdge::Bottom => Vec2::NEG_Y,
+    };
+    let cursor_direction = (cursor - anchor).normalize_or_zero();
+    let direction = if cursor_direction.dot(inward) >= 0.35 {
+        cursor_direction
+    } else {
+        inward
+    };
+    (anchor + direction * 0.11).clamp(Vec2::splat(0.025), Vec2::splat(0.975))
 }
 
 fn expected_outcome_for(goal: EpisodeGoal) -> ExpectedOutcome {
@@ -2093,6 +2190,8 @@ mod tests {
             endogenous_idle_seconds: 0.0,
             endogenous_play_cooldown: 0.0,
         };
+        state.objects[0].position = state.den.anchor;
+        state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
         let mut frame = behavior_frame(ActionId::BringProceduralOrb);
         frame.pet_position = state.den.anchor;
         let output = director.tick(&mut state, frame, representative_intent(), 0.05);
@@ -2182,8 +2281,9 @@ mod tests {
         let output = director.tick(&mut state, frame, representative_intent(), 0.05);
         assert!(output.object_commands[..output.object_command_count]
             .iter()
-            .any(|command| matches!(command, ObjectCommand::Retrieve { object_id, .. } if *object_id == orb_id)));
+            .any(|command| matches!(command, ObjectCommand::MoveToward { object_id, target, .. } if *object_id == orb_id && *target == frame.pet_position)));
         assert_eq!(output.debug.active_goal, Some(EpisodeGoal::RetrieveOrb));
+        assert!(director.active_episode().is_some());
     }
 
     #[test]

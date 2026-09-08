@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ActionId, SensorFrame, TemperamentGenome};
+use crate::{
+    ActionId, DerivedNervousState, EpisodeContextV1, FeltStateV1, SensorFrame, TemperamentGenome,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +149,47 @@ impl Drives {
         *self = self.bounded();
     }
 
+    /// Slow homeostatic evidence from the embodied nervous-system loop.
+    /// Values are deficits; positive deltas mean the need is less satisfied.
+    pub fn integrate_felt_state(
+        &mut self,
+        felt: FeltStateV1,
+        derived: DerivedNervousState,
+        episode: EpisodeContextV1,
+        dt: f32,
+    ) {
+        let dt = dt.clamp(0.0, 0.25);
+        self.sleep += (0.00035 + 0.00055 * felt.activation + 0.00040 * felt.physical_load
+            - 0.0018 * episode.sleeping_or_deep_rest)
+            * dt;
+        self.social += (0.00025 * episode.user_absent + 0.00035 * episode.ignored_social_bid
+            - 0.0016 * episode.safe_social_exchange)
+            * dt;
+        self.play += (0.00018 * (1.0 - felt.play_readiness) + 0.00022 * felt.boredom
+            - 0.0014 * episode.successful_play)
+            * dt;
+        self.curiosity += (0.00020 * derived.habituation
+            + 0.00016 * (1.0 - derived.neural_novelty)
+            - 0.0012 * episode.successful_exploration)
+            * dt;
+        self.comfort +=
+            (0.0012 * felt.pain_like + 0.00055 * felt.restraint + 0.00040 * felt.physical_load
+                - 0.0013 * felt.comfort)
+                * dt;
+        self.safety += (0.0014 * derived.neural_threat
+            + 0.0015 * felt.pain_like
+            + 0.00055 * (1.0 - felt.social_safety)
+            - 0.0015 * episode.safe_predictable_episode)
+            * dt;
+        self.autonomy += (0.0012 * felt.restraint + 0.00065 * (1.0 - felt.agency_match)
+            - 0.0012 * episode.self_initiated_success)
+            * dt;
+        self.novelty += (0.00028 * felt.boredom + 0.00018 * derived.habituation
+            - 0.0013 * episode.novel_goal_congruent_episode)
+            * dt;
+        *self = self.bounded_with_recovery();
+    }
+
     #[must_use]
     pub fn homeostatic_cost(&self) -> f32 {
         const IMPORTANCE: DriveVector = DriveVector {
@@ -223,6 +266,22 @@ impl Drives {
         self.safety = self.safety.clamp(0.0, 1.0);
         self.autonomy = self.autonomy.clamp(0.0, 1.0);
         self.novelty = self.novelty.clamp(0.0, 1.0);
+        self
+    }
+
+    fn bounded_with_recovery(mut self) -> Self {
+        for value in [
+            &mut self.sleep,
+            &mut self.social,
+            &mut self.play,
+            &mut self.curiosity,
+            &mut self.comfort,
+            &mut self.safety,
+            &mut self.autonomy,
+            &mut self.novelty,
+        ] {
+            *value = value.clamp(0.001, 0.999);
+        }
         self
     }
 }

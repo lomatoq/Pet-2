@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "One Day Diagnostic",
+  "preset": "one_day_diagnostic",
+  "simulated_hours": 24.0,
+  "episodes_per_day": 48,
+  "replicate_count": 4,
+  "seed": 573657340241,
+  "outcome_model": "mixed_realistic",
+  "quiet_advance": "exact",
+  "include_saved_gesture_replays": false,
+  "sleep_consolidation": true,
+  "persistent_learning": true,
+  "evolution_policy": "off",
+  "maximum_generations": 0,
+  "checkpoint_interval_hours": 24.0,
+  "persistence": "dry_run"
+}

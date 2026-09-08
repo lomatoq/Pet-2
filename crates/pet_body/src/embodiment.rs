@@ -1,6 +1,7 @@
 use glam::Vec2;
 use lifecore::{
-    AffectState, BodyFeedback, BodyGenome, BodyIntent, InteractionTarget, PoseIntent, SensorFrame,
+    AffectState, BodyFeedback, BodyGenome, BodyIntent, FaceRuntimeActuation, InteractionTarget,
+    PoseIntent, SensorFrame, VisualPhysiologyActuation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,12 +61,18 @@ pub struct EmbodiedPose {
     pub blink_left: f32,
     pub blink_right: f32,
     pub squint: f32,
+    pub eye_aperture: f32,
+    pub eye_scale: f32,
     pub brow_raise: f32,
     pub brow_tension: f32,
     pub brow_asymmetry: f32,
     pub mouth_open: f32,
     pub mouth_curve: f32,
     pub mouth_tension: f32,
+    pub mouth_compression: f32,
+    pub mouth_asymmetry: f32,
+    pub effort: f32,
+    pub relief: f32,
     pub cheek_glow: f32,
     pub squash: Vec2,
     pub tilt: f32,
@@ -126,6 +133,8 @@ pub struct EmbodiedRuntime {
     motion_response_scale: f32,
     motion_acceleration_limit: f32,
     previous_world_position: Option<Vec2>,
+    runtime_face: FaceRuntimeActuation,
+    runtime_visual: VisualPhysiologyActuation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +154,8 @@ impl EmbodiedRuntime {
         Self {
             pose: EmbodiedPose {
                 pupil_size: 0.52,
+                eye_aperture: 1.0,
+                eye_scale: 1.0,
                 squash: Vec2::ONE,
                 breath: 0.5,
                 ..EmbodiedPose::default()
@@ -194,7 +205,18 @@ impl EmbodiedRuntime {
             motion_response_scale: 1.0,
             motion_acceleration_limit: 8.0,
             previous_world_position: None,
+            runtime_face: FaceRuntimeActuation::default(),
+            runtime_visual: VisualPhysiologyActuation::default(),
         }
+    }
+
+    pub fn set_nervous_system_actuation(
+        &mut self,
+        face: FaceRuntimeActuation,
+        visual: VisualPhysiologyActuation,
+    ) {
+        self.runtime_face = face;
+        self.runtime_visual = visual;
     }
 
     pub fn set_world_to_body_scale(&mut self, scale: Vec2) {
@@ -281,11 +303,17 @@ impl EmbodiedRuntime {
         feedback: &BodyFeedback,
         affect: AffectState,
         expression: lifecore::ExpressionState,
-        face_tuning: FaceTuning,
+        mut face_tuning: FaceTuning,
         voice: VoiceVisualState,
         dt: f32,
     ) {
         mind.sanitize();
+        face_tuning.microsaccade_amount = (face_tuning.microsaccade_amount
+            * self.runtime_face.microsaccade_amount_multiplier)
+            .clamp(0.0, 2.0);
+        face_tuning.microsaccade_rate = (face_tuning.microsaccade_rate
+            * self.runtime_face.microsaccade_rate_multiplier)
+            .clamp(0.01, 2.0);
         let dt = dt.clamp(0.0, 0.05);
         self.elapsed += dt;
         self.slow_blink_cooldown = (self.slow_blink_cooldown - dt).max(0.0);
@@ -311,27 +339,46 @@ impl EmbodiedRuntime {
         );
         self.update_attention_face_pose(mode, mind, feedback);
         self.update_blink(mode, intent, affect, expression, dt);
+        self.pose.eye_aperture = smooth(
+            self.pose.eye_aperture,
+            expression.eye_aperture.clamp(0.0, 1.0),
+            16.0,
+            dt,
+        );
+        self.pose.eye_scale = smooth(
+            self.pose.eye_scale,
+            expression.eye_scale.clamp(0.88, 1.18),
+            12.0,
+            dt,
+        );
+        let aperture_closure = 1.0 - self.pose.eye_aperture;
+        self.pose.blink_left = self.pose.blink_left.max(aperture_closure);
+        self.pose.blink_right = self.pose.blink_right.max(aperture_closure);
         self.update_pupil(mode, intent, sensors, mind, expression, face_tuning, dt);
         self.update_soft_body(genome, intent, feedback, affect, dt);
 
-        let voice_mouth = if voice.active {
-            voice.mouth_open.clamp(0.0, 1.0) * voice.envelope.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let voice_mouth = voice_mouth_target(voice);
         // An audible callback is the sole authority for a visibly open cavity.
         // Emotion still controls curve/tension below, but cannot mime failed audio.
         let mouth_target = voice_mouth;
         self.pose.mouth_open = smooth(self.pose.mouth_open, mouth_target, 22.0, dt);
         self.pose.mouth_curve = smooth(
             self.pose.mouth_curve,
-            (expression.mouth_curve + affect.valence * 0.34).clamp(-1.0, 1.0),
+            (expression.mouth_curve
+                + expression.relief * 0.18
+                + expression.mouth_asymmetry * 0.12
+                + affect.valence * 0.34)
+                .clamp(-1.0, 1.0),
             11.0,
             dt,
         );
         self.pose.mouth_tension = smooth(
             self.pose.mouth_tension,
-            (expression.mouth_tension + affect.frustration * 0.35).clamp(0.0, 1.0),
+            (expression.mouth_tension
+                + expression.mouth_compression * 0.62
+                + expression.effort * 0.28
+                + affect.frustration * 0.35)
+                .clamp(0.0, 1.0),
             13.0,
             dt,
         );
@@ -347,13 +394,35 @@ impl EmbodiedRuntime {
             14.0,
             dt,
         );
-        let asymmetry = (self.elapsed * 0.41 + self.seed_phase).sin() * 0.12
+        let procedural_asymmetry = (self.elapsed * 0.41 + self.seed_phase).sin() * 0.12
             + if intent.pose == PoseIntent::Curious {
                 0.18
             } else {
                 0.0
             };
+        let interaction_weight = expression
+            .effort
+            .max(expression.relief)
+            .max(expression.brow_asymmetry.abs())
+            .max(expression.mouth_compression)
+            .clamp(0.0, 1.0);
+        let asymmetry = procedural_asymmetry * (1.0 - interaction_weight)
+            + expression.brow_asymmetry * interaction_weight;
         self.pose.brow_asymmetry = smooth(self.pose.brow_asymmetry, asymmetry, 7.0, dt);
+        self.pose.mouth_compression = smooth(
+            self.pose.mouth_compression,
+            expression.mouth_compression,
+            13.0,
+            dt,
+        );
+        self.pose.mouth_asymmetry = smooth(
+            self.pose.mouth_asymmetry,
+            expression.mouth_asymmetry,
+            10.0,
+            dt,
+        );
+        self.pose.effort = smooth(self.pose.effort, expression.effort, 10.0, dt);
+        self.pose.relief = smooth(self.pose.relief, expression.relief, 8.0, dt);
         self.pose.squint = smooth(
             self.pose.squint,
             (expression.squint + affect.stress * 0.28).clamp(0.0, 1.0),
@@ -369,6 +438,10 @@ impl EmbodiedRuntime {
         self.pose.audio_envelope = smooth(self.pose.audio_envelope, voice.envelope, 28.0, dt);
         self.pose.purr = smooth(self.pose.purr, voice.purr, 18.0, dt);
         self.physiology.update(visual_traits, mind, dt);
+        self.physiology.pose.droplet_energy = self.runtime_visual.droplet_energy.clamp(0.0, 1.0);
+        self.physiology.pose.droplet_spread = self.runtime_visual.droplet_spread.clamp(0.0, 1.0);
+        self.physiology.pose.droplet_cohesion =
+            self.runtime_visual.droplet_cohesion.clamp(0.0, 1.0);
         let normalized_displacement = self
             .previous_world_position
             .map_or(Vec2::ZERO, |previous| feedback.world_position - previous);
@@ -770,7 +843,8 @@ impl EmbodiedRuntime {
                     BlinkKind::WinkRight
                 });
                 self.wink_cooldown = 10.0;
-            } else if self.blink_clock >= self.next_blink
+            } else if self.blink_clock
+                >= self.next_blink / self.runtime_face.blink_rate_multiplier.clamp(0.55, 1.55)
                 || neural_urge
                 || self.saccade_strength > 0.72
             {
@@ -891,6 +965,20 @@ impl EmbodiedRuntime {
         self.modal_dynamics.update(softness, feedback, dt);
         self.pose.morph = self.modal_dynamics.deformation;
     }
+}
+
+fn voice_mouth_target(voice: VoiceVisualState) -> f32 {
+    if !voice.active {
+        return 0.0;
+    }
+    let activity = voice.envelope.clamp(0.0, 1.0).sqrt();
+    let non_purr = 1.0 - voice.purr.clamp(0.0, 1.0) * 0.62;
+    let audible_aperture_floor = (0.16 + voice.noisiness.clamp(0.0, 1.0) * 0.16) * non_purr;
+    let articulated_aperture = voice.mouth_open.clamp(0.0, 1.0).max(audible_aperture_floor);
+    // `voice.envelope` is a normalized physical activity signal. Keep quiet
+    // phonation visibly articulated instead of multiplying the tract aperture
+    // by raw near-zero PCM energy.
+    articulated_aperture * (0.30 + activity * 0.70)
 }
 
 fn gaze_mode(intent: &BodyIntent, affect: AffectState) -> GazeMode {
@@ -1609,5 +1697,29 @@ mod tests {
                 assert!((0.0..=1.0).contains(&value));
             }
         }
+    }
+
+    #[test]
+    fn normalized_voice_activity_keeps_spoken_mouth_visibly_open() {
+        let speaking = voice_mouth_target(VoiceVisualState {
+            active: true,
+            envelope: 0.52,
+            mouth_open: 0.46,
+            noisiness: 0.18,
+            ..VoiceVisualState::default()
+        });
+        let quiet_purr = voice_mouth_target(VoiceVisualState {
+            active: true,
+            envelope: 0.28,
+            mouth_open: 0.08,
+            purr: 1.0,
+            ..VoiceVisualState::default()
+        });
+        assert!(
+            speaking > 0.34,
+            "spoken aperture was visually closed: {speaking}"
+        );
+        assert!(quiet_purr < speaking);
+        assert_eq!(voice_mouth_target(VoiceVisualState::default()), 0.0);
     }
 }

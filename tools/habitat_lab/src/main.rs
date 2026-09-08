@@ -8,7 +8,8 @@ use pet_ecology::{
     ActionSignature, EcologyBehaviorFrame, EcologyOutcome, EcologyState, EmbodiedEnvironmentFrame,
     EpisodeDirector, EpisodeGoal, EpisodePhase, MAX_OBJECT_SPEED, MorselProfile, NormalizedRect,
     ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig, RhythmSignature,
-    WindowAffordance, WindowAffordanceFrame, WindowId, step_object_with_windows,
+    WindowAffordance, WindowAffordanceFrame, WindowId, orb_is_inside_den_latch,
+    step_den_attraction, step_object_with_windows,
 };
 use serde_json::{Value, json};
 
@@ -455,22 +456,34 @@ impl Lab {
                     }
                 }
                 ObjectCommand::Store { object_id, slot } if usize::from(slot) < 3 => {
-                    self.clear_den_slot_references(object_id);
-                    self.state.den.slots[usize::from(slot)] = Some(object_id);
-                    let anchor = self.state.den.anchor;
-                    if let Some(object) = self
+                    let Some(object_index) = self
                         .state
                         .objects
-                        .iter_mut()
-                        .find(|object| object.id == object_id)
+                        .iter()
+                        .position(|object| object.id == object_id)
+                    else {
+                        continue;
+                    };
+                    let object = &self.state.objects[object_index];
+                    let config = ObjectPhysicsConfig {
+                        desktop_aspect: LAB_DESKTOP_ASPECT,
+                        ..ObjectPhysicsConfig::default()
+                    };
+                    if object.lifecycle != ObjectLifecycle::CarriedByPet
+                        || !orb_is_inside_den_latch(object, self.state.den.anchor, config)
                     {
-                        object.lifecycle = ObjectLifecycle::StoredInDen;
-                        object.home_slot = Some(slot);
-                        object.position = anchor;
-                        object.velocity = Vec2::ZERO;
+                        continue;
                     }
+                    self.clear_den_slot_references(object_id);
+                    let object = &mut self.state.objects[object_index];
+                    object.lifecycle = ObjectLifecycle::Free;
+                    object.home_slot = Some(slot);
+                    object.velocity = Vec2::ZERO;
                 }
-                ObjectCommand::Retrieve { object_id, target } => {
+                ObjectCommand::Retrieve {
+                    object_id,
+                    target: _,
+                } => {
                     self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
@@ -478,8 +491,8 @@ impl Lab {
                         .iter_mut()
                         .find(|object| object.id == object_id)
                     {
-                        object.lifecycle = ObjectLifecycle::Free;
-                        object.position = target.clamp(Vec2::ZERO, Vec2::ONE);
+                        object.lifecycle = ObjectLifecycle::CarriedByPet;
+                        object.home_slot = None;
                         object.velocity = Vec2::ZERO;
                     }
                 }
@@ -509,12 +522,41 @@ impl Lab {
     }
 
     fn advance_objects(&mut self, dt: f32) {
-        let config = ObjectPhysicsConfig::default();
+        let config = ObjectPhysicsConfig {
+            desktop_aspect: LAB_DESKTOP_ASPECT,
+            ..ObjectPhysicsConfig::default()
+        };
         let sub_dt = dt / PHYSICS_STEPS as f32;
         for _ in 0..PHYSICS_STEPS {
+            let den_anchor = self.state.den.anchor;
+            let orb_slot = self
+                .state
+                .objects
+                .iter()
+                .find(|object| object.kind == ObjectKind::Orb)
+                .and_then(|orb| {
+                    orb.home_slot
+                        .filter(|slot| self.state.den.slots[usize::from(*slot)].is_none())
+                        .or_else(|| {
+                            self.state
+                                .den
+                                .slots
+                                .iter()
+                                .position(Option::is_none)
+                                .map(|slot| slot as u8)
+                        })
+                });
+            let mut captured = None;
             for object in &mut self.state.objects {
                 let mut environment = EmbodiedEnvironmentFrame::default();
                 step_object_with_windows(object, config, &self.windows, sub_dt, &mut environment);
+                if step_den_attraction(object, den_anchor, config, sub_dt)
+                    && let Some(slot) = orb_slot
+                {
+                    object.lifecycle = ObjectLifecycle::StoredInDen;
+                    object.home_slot = Some(slot);
+                    captured = Some((object.id, slot));
+                }
                 for contact in environment.contacts.iter().take(environment.contact_count) {
                     if self.contacts.len() < 96 {
                         self.contacts.push(json!({
@@ -525,6 +567,10 @@ impl Lab {
                         }));
                     }
                 }
+            }
+            if let Some((object_id, slot)) = captured {
+                self.clear_den_slot_references(object_id);
+                self.state.den.slots[usize::from(slot)] = Some(object_id);
             }
         }
     }

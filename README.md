@@ -89,7 +89,8 @@ replay, and raw diagnostics. The Perception map renders the same privacy-safe `8
 brightness/color/motion approximation consumed by the organism, plus anonymous
 window rectangles. It never exposes window titles, typed text, native window
 identifiers, screenshots, or pixel buffers. The deterministic cross-platform
-scenario runner remains in `tools/HabitatLab`.
+scenario runner remains in `tools/HabitatLab`; offline voice checks use
+`tools/VoiceLab`. Evolution curricula and embodiment references ship in `config/`.
 
 Packaging leaves only the ZIP archive in `dist`; the installed applications are
 therefore not duplicated in Spotlight or Launchpad by an unpacked build tree.
@@ -143,6 +144,13 @@ Static saturated colors and structured monochrome shapes can claim attention on
 their own, causing gaze/travel plus bounded hue, glow, flow, and cohesion changes.
 A smaller visual reflex remains visible while safety motion owns locomotion.
 
+The R12 den attraction field uses a separate process-local background texture.
+On macOS, a bounded asynchronous Quartz worker captures windows below Pet at
+up to 30 Hz, half physical resolution capped proportionally at 1920×1080.
+Every sample excludes Pet at source, allowing live refraction without recursive
+feedback or frozen pixels under the den. Den pixels never enter perception,
+telemetry, or saved state; capture denial uses the shader's fallback appearance.
+
 The overlay is click-through outside the projected procedural silhouette and
 interactive habitat objects. These in-window controls never install global
 keyboard hooks:
@@ -170,6 +178,21 @@ uses `Space`, arrow keys, the timeline slider, and playback-rate buttons to
 replay captured state. This rewinds the observation, not the running organism.
 The console follows attention, decisions, drives, affect, body/object motion,
 Morph/VITA/Fusion state, learning, identity, and bounded mutation checkpoints.
+
+Character now includes Body, Den/Home, Voice/Sounds, and Nervous → Body calibration.
+These edit one versioned profile and use production render and audio paths.
+Nervous-system modulation preserves the authored black pigment identity.
+
+Diagnostics also contains `Accelerated Learning`. It launches the deterministic
+curriculum runner in a separate process with 120 Hz body/pointer, 60 Hz
+perception, 20 Hz LifeCore/VITA/Morph, and 5 Hz summaries. Dry runs never replace
+the living Pet; accepted forks can be promoted only after report validation and
+with a complete rollback backup. The curriculum and pointer fixtures retain their
+R11 interaction-loop semantics; they do not exercise the full live R12
+interoception/phenotype loop and are not evidence of its perceptual parity.
+The legacy `--simulate-hours` option is now an
+explicit approximate calendar-only compatibility path and cannot generate
+synthetic interaction learning.
 
 Telemetry is written to an 8 MiB `telemetry.jsonl` plus one rotated previous
 file. The older semantic `events.jsonl` is not truncated or rotated and no

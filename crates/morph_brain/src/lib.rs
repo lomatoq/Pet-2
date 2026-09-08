@@ -9,7 +9,7 @@
 use std::{collections::HashMap, sync::OnceLock};
 
 use glam::Vec2;
-use lifecore::{BodyFeedback, FeedbackEvent, LifeState, SensorFrame};
+use lifecore::{BodyFeedback, FeedbackEvent, LifeState, MorphSomaticInput, SensorFrame};
 use serde::{Deserialize, Serialize};
 
 pub const UPSTREAM_COMMIT: &str = "6aa4e7c871c11ff2fa1619942611d4fb50457e49";
@@ -55,6 +55,9 @@ const ACTION_CONTROL_NAMES: [&str; MORPH_ACTION_CONTROL_COUNT] = [
     "C_GRASP",
     "C_RELEASE",
 ];
+
+mod sensor_adapter;
+pub use sensor_adapter::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -268,6 +271,7 @@ pub struct MorphBrain {
     slow_accumulator_ms: f32,
     age_ms: f64,
     last_output: MorphOutput,
+    somatic: MorphSomaticInput,
 }
 
 impl MorphBrain {
@@ -300,6 +304,7 @@ impl MorphBrain {
             slow_accumulator_ms: 0.0,
             age_ms: 0.0,
             last_output: MorphOutput::default(),
+            somatic: MorphSomaticInput::default(),
         };
         if let Some(state) = restored.filter(MorphBrainState::is_valid) {
             brain.restore_weights(&state);
@@ -368,6 +373,13 @@ impl MorphBrain {
         self.reward_trace = (self.reward_trace * 0.55 + reward * 0.75).clamp(-1.0, 1.0);
         self.vibration = self.vibration.max(reward.abs() * 0.35);
         self.plasticity.note_feedback(reward);
+    }
+
+    /// Installs the previous body/cognition frame's normalized somatic input.
+    /// It is read on the next Morph tick, preventing same-tick body loops.
+    pub fn set_somatic_input(&mut self, mut input: MorphSomaticInput) {
+        input.sanitize();
+        self.somatic = input;
     }
 
     #[must_use]
@@ -474,29 +486,32 @@ impl MorphBrain {
         let distance = sensors.cursor_distance_to_pet.max(0.0);
         let speed = sensors.cursor_velocity.length().max(0.0);
         let expansion = (sensors.cursor_approach_speed.max(0.0) * 2.4).clamp(0.0, 1.0);
-        let proximity = if present {
+        let proximity = (if present {
             (-distance * 4.8).exp().clamp(0.0, 1.0)
         } else {
             0.0
-        };
-        let motion = if present {
+        })
+        .max(self.somatic.proximity);
+        let motion = (if present {
             (1.0 + speed * 4.5).ln() / 6.0_f32.ln()
         } else {
             0.0
         }
-        .clamp(0.0, 1.0);
-        let calm_touch = if sensors.pet_touched || body.cursor_contact {
+        .clamp(0.0, 1.0))
+        .max(self.somatic.motion);
+        let calm_touch = (if sensors.pet_touched || body.cursor_contact {
             (1.0 - speed * 1.8).clamp(0.0, 1.0)
         } else {
             0.0
-        };
+        })
+        .max(self.somatic.touch);
         if sensors.pointer_pressed {
             self.vibration = self.vibration.max(0.72);
         }
         if let Some(collision) = &body.collision {
             self.vibration = self.vibration.max(collision.intensity.clamp(0.0, 1.0));
         }
-        let vibration = self.vibration;
+        let vibration = self.vibration.max(self.somatic.vibration);
         self.vibration *= (-dt_ms / 30.0).exp();
         let daytime = sensors.time_of_day_01 >= 8.0 / 24.0 && sensors.time_of_day_01 <= 21.0 / 24.0;
         let luminance = sensors
@@ -509,11 +524,18 @@ impl MorphBrain {
             + body.acceleration.length() * 0.20
             + body.pose_error * 0.45)
             .clamp(0.0, 1.0);
-        drive_feature(&mut self.net, "EXP", expansion);
+        drive_feature(
+            &mut self.net,
+            "EXP",
+            expansion.max(self.somatic.exploration),
+        );
         drive_feature(&mut self.net, "PROX", proximity);
         drive_feature(&mut self.net, "MOT", motion);
         drive_feature(&mut self.net, "TCH", calm_touch);
         drive_feature(&mut self.net, "VIB", vibration);
+        drive_feature(&mut self.net, "LOOM", self.somatic.looming);
+        drive_feature(&mut self.net, "HAB", self.somatic.habituation);
+        drive_feature(&mut self.net, "NOV", self.somatic.novelty);
         drive_feature(&mut self.net, "LGT", luminance);
         drive_feature(&mut self.net, "SLF", self_motion);
         drive_feature(
@@ -565,7 +587,9 @@ impl MorphBrain {
         }
 
         self.rest_ou = self.rest_ou * 0.995 + (self.environment_rng.next_f32() * 2.0 - 1.0) * 0.06;
-        let attention = (proximity * 0.85 + motion * 0.5 + calm_touch + vibration).clamp(0.0, 1.0);
+        let attention = (proximity * 0.85 + motion * 0.5 + calm_touch + vibration)
+            .clamp(0.0, 1.0)
+            .max(self.somatic.attention);
         let boredom =
             ((0.34 + life.drives.social * 0.30 + life.drives.curiosity * 0.26 + self.rest_ou)
                 * (1.0 - attention * 0.88))
@@ -580,15 +604,20 @@ impl MorphBrain {
             "REST",
             1.30 + 3.20 * boredom * (0.42 + 0.58 * (1.0 - unmet)),
         );
+        self.net.drive("REST", 2.4 * self.somatic.rest);
         self.net.drive("MBON_A", 0.55);
         self.net.drive("MBON_V", 0.55);
         self.net.drive(
             "VALP",
-            1.62 + life.affect.valence.max(0.0) * 0.8 + calm_touch * 0.45,
+            1.62 + life.affect.valence.max(0.0) * 0.8
+                + calm_touch * 0.45
+                + self.somatic.positive_outcome * 0.90,
         );
         self.net.drive(
             "VALN",
-            1.62 + (-life.affect.valence).max(0.0) * 0.8 + life.drives.safety * 1.1,
+            1.62 + (-life.affect.valence).max(0.0) * 0.8
+                + life.drives.safety * 1.1
+                + self.somatic.negative_outcome * 1.00,
         );
         self.net.drive("CPG_a", 1.50);
         self.net.drive("CPG_b", 1.50 * 0.98);

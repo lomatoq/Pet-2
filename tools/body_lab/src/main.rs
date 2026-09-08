@@ -4,29 +4,36 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use desktop_host::{
-    LAB_CONTROL_SCHEMA_VERSION, LabControlCommand, LabControlEnvelope, LabDrive, StateStore,
+    EVOLUTION_CONFIG_SCHEMA_VERSION, EVOLUTION_REPORT_SCHEMA_VERSION, EvolutionConfig,
+    EvolutionOutcomeModel, EvolutionPersistence, EvolutionPolicy, EvolutionPreset,
+    EvolutionProgress, EvolutionRunReport, LAB_CONTROL_SCHEMA_VERSION, LabControlCommand,
+    LabControlEnvelope, LabDrive, LabGesture, PortablePetState, QuietAdvanceMode,
+    RuntimeLoadAcknowledgement, RuntimeLoadStatus, StateStore,
 };
 use egui::{CollapsingHeader, Context, DragValue, Sense, Slider};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor, wgpu};
 use egui_winit::State as EguiWinitState;
 use glam::Vec2;
 use lifecore::{
-    AffectState, BodyIntent, EmotionKind, ExpressionState, Genome, InteractionTarget,
-    LocomotionMode, PoseIntent, SensorFrame, VocalRequest, apply_emotion_to_expression,
-    generate_initial_motifs,
+    AffectState, BodyIntent, EmotionKind, ExpressionState, FastPhenotypeActuation, Genome,
+    InteractionTarget, LocomotionMode, PoseIntent, SensorFrame, VocalRequest,
+    apply_emotion_to_expression, generate_initial_motifs,
 };
+use morph_brain::MorphBrainState;
 use pet_audio::AudioEngine;
 use pet_body::{
-    BodyRenderMode, DebugView, LiquidDiagnostics, LiquidTuningAcknowledgement, LiquidTuningProfile,
-    MaterialVariant, ProceduralBody, RenderOutcome, Renderer, ReviewBackground, VisualMindInput,
-    VoiceVisualState,
+    BodyMaterialSnapshot, BodyRenderMode, DebugView, DenVisualTuning, EcologyRenderer,
+    LiquidDiagnostics, LiquidTuningAcknowledgement, LiquidTuningProfile, MaterialVariant,
+    NervousReadabilityTuning, ProceduralBody, RenderOutcome, Renderer, ReviewBackground,
+    TopologyConstraintMode, VisualMindInput, VoiceVisualState,
 };
+use pet_ecology::{EcologyState, ObjectLifecycle};
 use serde_json::Value;
 use winit::{
     application::ApplicationHandler,
@@ -60,6 +67,7 @@ const BACKGROUNDS: [ReviewBackground; 6] = [
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut live_pet = false;
     let mut data_dir = None;
+    let mut promote_report = None;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -69,9 +77,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     arguments.next().ok_or("--data-dir requires a path")?,
                 ));
             }
+            "--promote-report" => {
+                promote_report = Some(PathBuf::from(
+                    arguments.next().ok_or("--promote-report requires a path")?,
+                ));
+            }
             "--help" | "-h" => {
                 println!(
-                    "Pet2 Dev Console\n\n  --live-pet       Start on Perception with live telemetry\n  --data-dir PATH  Use the same overridden Pet 2 data directory\n\n  F1–F4 switch Character, Perception, Behavior, and Diagnostics"
+                    "Pet2 Dev Console\n\n  --live-pet       Start on Perception with live telemetry\n  --data-dir PATH  Use the same overridden Pet 2 data directory\n  --promote-report PATH  Promote a validated fork with loaded-state acknowledgement\n\n  F1–F4 switch Character, Perception, Behavior, and Diagnostics"
                 );
                 return Ok(());
             }
@@ -83,6 +96,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_deref()
         .map(StateStore::at)
         .or_else(|| StateStore::discover().ok());
+    if let Some(report_path) = promote_report {
+        let store = store.ok_or("Pet 2 data directory is unavailable")?;
+        return promote_report_cli(&store, &report_path).map_err(Into::into);
+    }
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut BodyLab::new(SEED, store, live_pet))?;
     Ok(())
@@ -101,6 +118,15 @@ enum DevPanel {
     Perception,
     Behavior,
     Diagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LabSection {
+    #[default]
+    Body,
+    Den,
+    Voice,
+    Nervous,
 }
 
 impl DevPanel {
@@ -137,7 +163,12 @@ impl DevPanel {
 struct LabRuntime {
     window: Arc<Window>,
     renderer: Renderer,
-    body: ProceduralBody,
+    ecology_renderer: EcologyRenderer,
+    ecology_state: EcologyState,
+    // Keep the particle body off winit's comparatively small Windows event-loop
+    // stack. The startup callback already owns the GPU/profile locals and a
+    // second inline 80 KiB body return can overflow before the first frame.
+    body: Box<ProceduralBody>,
     egui_context: Context,
     egui_state: EguiWinitState,
     egui_renderer: EguiRenderer,
@@ -192,11 +223,72 @@ struct LivePetMonitor {
     control_status: String,
     evolution_scrub: EvolutionScrubState,
     canonical_evolution: CanonicalEvolutionCache,
+    accelerated_learning: AcceleratedLearningState,
     last_state_poll: Instant,
     state_file_signature: Option<(SystemTime, u64)>,
     status: String,
     last_poll: Instant,
     last_received: Option<Instant>,
+}
+
+struct AcceleratedLearningState {
+    preset: EvolutionPreset,
+    simulated_hours: f64,
+    episodes_per_day: u32,
+    replicate_count: u32,
+    seed: u64,
+    outcome_model: EvolutionOutcomeModel,
+    include_saved_replays: bool,
+    sleep_consolidation: bool,
+    evolution_policy: EvolutionPolicy,
+    maximum_generations: u32,
+    checkpoint_interval_hours: f64,
+    persistence: EvolutionPersistence,
+    child: Option<Child>,
+    started_at: Option<Instant>,
+    report_path: Option<PathBuf>,
+    progress_path: Option<PathBuf>,
+    log_path: Option<PathBuf>,
+    report: Option<EvolutionRunReport>,
+    progress: Option<EvolutionProgress>,
+    executable: Option<PathBuf>,
+    executable_sha256: Option<String>,
+    child_pid: Option<u32>,
+    error_tail: String,
+    last_promotion_backup: Option<PathBuf>,
+    status: String,
+}
+
+impl Default for AcceleratedLearningState {
+    fn default() -> Self {
+        Self {
+            preset: EvolutionPreset::OneDayDiagnostic,
+            simulated_hours: 24.0,
+            episodes_per_day: 48,
+            replicate_count: 4,
+            seed: 573_657_340_241,
+            outcome_model: EvolutionOutcomeModel::MixedRealistic,
+            include_saved_replays: false,
+            sleep_consolidation: true,
+            evolution_policy: EvolutionPolicy::Off,
+            maximum_generations: 0,
+            checkpoint_interval_hours: 24.0,
+            persistence: EvolutionPersistence::DryRun,
+            child: None,
+            started_at: None,
+            report_path: None,
+            progress_path: None,
+            log_path: None,
+            report: None,
+            progress: None,
+            executable: None,
+            executable_sha256: None,
+            child_pid: None,
+            error_tail: String::new(),
+            last_promotion_backup: None,
+            status: "No accelerated run started from this Body Lab session.".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -250,7 +342,96 @@ enum PreviewScenario {
     WindowPressure,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NervousStimulusRig {
+    enabled: bool,
+    pulse: bool,
+    intensity: f32,
+    threat: bool,
+    pain: bool,
+    contact: bool,
+    safety: bool,
+    restraint: bool,
+    fatigue: bool,
+    novelty: bool,
+    startle: bool,
+    agency_success: bool,
+    relief: bool,
+    play: bool,
+}
+
+impl Default for NervousStimulusRig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pulse: true,
+            intensity: 0.82,
+            threat: false,
+            pain: false,
+            contact: false,
+            safety: false,
+            restraint: false,
+            fatigue: false,
+            novelty: true,
+            startle: false,
+            agency_success: false,
+            relief: false,
+            play: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NervousStimulusLevels {
+    threat: f32,
+    pain: f32,
+    contact: f32,
+    safety: f32,
+    restraint: f32,
+    fatigue: f32,
+    novelty: f32,
+    startle: f32,
+    agency: f32,
+    relief: f32,
+    play: f32,
+}
+
+impl NervousStimulusRig {
+    fn levels(self, tuning: NervousReadabilityTuning, elapsed: f32) -> NervousStimulusLevels {
+        if !self.enabled {
+            return NervousStimulusLevels::default();
+        }
+        let pulse = if self.pulse {
+            0.62 + 0.38 * (elapsed * 2.4).sin().max(-0.35)
+        } else {
+            1.0
+        };
+        let strength = self.intensity.clamp(0.0, 1.0) * pulse;
+        let active = |enabled: bool, sensitivity: f32| {
+            if enabled {
+                (strength * sensitivity).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        NervousStimulusLevels {
+            threat: active(self.threat, tuning.threat_sensitivity),
+            pain: active(self.pain, tuning.pain_sensitivity),
+            contact: active(self.contact, tuning.contact_sensitivity),
+            safety: active(self.safety, tuning.safety_sensitivity),
+            restraint: active(self.restraint, tuning.restraint_sensitivity),
+            fatigue: active(self.fatigue, tuning.fatigue_sensitivity),
+            novelty: active(self.novelty, tuning.novelty_sensitivity),
+            startle: active(self.startle, tuning.startle_sensitivity),
+            agency: active(self.agency_success, tuning.agency_sensitivity),
+            relief: active(self.relief, tuning.safety_sensitivity),
+            play: active(self.play, tuning.novelty_sensitivity),
+        }
+    }
+}
+
 struct LabUi {
+    section: LabSection,
     profile: LiquidTuningProfile,
     authored_profile: LiquidTuningProfile,
     store: Option<StateStore>,
@@ -282,9 +463,17 @@ struct LabUi {
     pending_revision: Option<u64>,
     next_ack_poll: Instant,
     test_voice_requested: bool,
+    audio_output_devices: Vec<String>,
+    audio_output_device: String,
+    pending_audio_output_device: Option<String>,
     audio_status: String,
     audio_rms: f32,
     audio_peak: f32,
+    den_preview_activity: f32,
+    live_den_apply: bool,
+    den_live_dirty: bool,
+    next_den_live_apply: Instant,
+    nervous_stimulus: NervousStimulusRig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,7 +545,7 @@ impl ApplicationHandler for BodyLab {
                 return;
             }
         };
-        let mut body = match ProceduralBody::generate(&self.genome) {
+        let mut body = match generate_lab_body(&self.genome) {
             Ok(body) => body,
             Err(error) => {
                 eprintln!("could not generate liquid body: {error}");
@@ -436,7 +625,29 @@ impl ApplicationHandler for BodyLab {
             }
         };
         renderer.set_review_background(BACKGROUNDS[DEFAULT_BACKGROUND]);
+        let mut ecology_renderer = EcologyRenderer::new(
+            renderer.device(),
+            renderer.surface_format(),
+            renderer.premultiplied_output(),
+        );
+        let (background_width, background_height, background_stride, background_pixels) =
+            pet_lab_reference_background(window.inner_size());
+        let _ = ecology_renderer.update_background(
+            renderer.device(),
+            renderer.queue(),
+            background_width,
+            background_height,
+            background_stride,
+            &background_pixels,
+        );
+        ecology_renderer.set_background_freshness(1.0);
+        ecology_renderer.set_den_tuning(profile.den);
+        let mut ecology_state = EcologyState::new(self.genome.identity_seed);
+        ecology_state.den.anchor = Vec2::new(0.335, 0.52);
+        ecology_state.den.size_scale = 1.42;
+        ecology_state.den.familiarity = 0.72;
         let egui_context = Context::default();
+        egui_context.set_theme(egui::ThemePreference::Dark);
         egui_context.set_visuals(egui::Visuals::dark());
         let egui_state = EguiWinitState::new(
             egui_context.clone(),
@@ -456,12 +667,18 @@ impl ApplicationHandler for BodyLab {
             |store| store.paths.liquid_tuning.display().to_string(),
         );
         let now = Instant::now();
+        let audio_output_devices = AudioEngine::output_device_names().unwrap_or_default();
         let (audio, audio_error) = match AudioEngine::try_start() {
             Ok(engine) => (Some(engine), None),
             Err(error) => (None, Some(error.to_string())),
         };
+        let audio_output_device = audio.as_ref().map_or_else(
+            || "Default output".to_owned(),
+            |engine| engine.device_name().to_owned(),
+        );
         let live_monitor = store.as_ref().map(LivePetMonitor::new);
         let ui = LabUi {
+            section: LabSection::Body,
             json_buffer: serde_json::to_string_pretty(&profile).unwrap_or_default(),
             preset_name_buffer: format!("{} copy", profile.name),
             profile,
@@ -496,6 +713,9 @@ impl ApplicationHandler for BodyLab {
             pending_revision: None,
             next_ack_poll: now,
             test_voice_requested: false,
+            audio_output_devices,
+            audio_output_device,
+            pending_audio_output_device: None,
             audio_status: audio.as_ref().map_or_else(
                 || "Failed".to_owned(),
                 |engine| {
@@ -508,10 +728,17 @@ impl ApplicationHandler for BodyLab {
             ),
             audio_rms: 0.0,
             audio_peak: 0.0,
+            den_preview_activity: 0.82,
+            live_den_apply: false,
+            den_live_dirty: false,
+            next_den_live_apply: now,
+            nervous_stimulus: NervousStimulusRig::default(),
         };
         self.runtime = Some(LabRuntime {
             window,
             renderer,
+            ecology_renderer,
+            ecology_state,
             body,
             egui_context,
             egui_state,
@@ -566,6 +793,21 @@ impl ApplicationHandler for BodyLab {
             event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
             return;
         }
+        runtime
+            .ecology_renderer
+            .set_den_tuning(runtime.ui.profile.den);
+        let size = runtime.window.inner_size();
+        let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+        let distance_px = 182.0 - runtime.ui.den_preview_activity.clamp(0.0, 1.0) * 152.0;
+        if let Some(orb) = runtime.ecology_state.objects.first_mut() {
+            orb.lifecycle = ObjectLifecycle::Free;
+            orb.position = runtime.ecology_state.den.anchor
+                + Vec2::new(
+                    distance_px / (pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * aspect),
+                    0.0,
+                );
+            orb.velocity = Vec2::ZERO;
+        }
         let fixed_dt = 1.0 / runtime.ui.profile.pbf.fixed_hz.clamp(30.0, 120.0);
         if runtime.ui.playing || runtime.ui.drag.active {
             runtime.simulation_accumulator = (runtime.simulation_accumulator
@@ -587,11 +829,44 @@ impl ApplicationHandler for BodyLab {
             runtime.ui.reset_requested = false;
             reset_preview_bodies(runtime, &self.genome);
         }
+        if let Some(device_name) = runtime.ui.pending_audio_output_device.take() {
+            match AudioEngine::try_start_on_device_name(&device_name) {
+                Ok(engine) => {
+                    runtime.ui.audio_output_device = device_name.clone();
+                    runtime.ui.audio_status = format!(
+                        "Ready · {} · {:?}",
+                        engine.device_name(),
+                        engine.selected_config()
+                    );
+                    runtime.audio = Some(engine);
+                    runtime.audio_error = None;
+                    runtime.ui.status = format!(
+                        "Pet Lab output changed to {device_name}. This choice is session-only."
+                    );
+                }
+                Err(error) => {
+                    runtime.audio_error = Some(error.to_string());
+                    runtime.ui.status = format!(
+                        "Could not switch to {device_name}; the previous output stays active."
+                    );
+                }
+            }
+        }
         if runtime.ui.test_voice_requested {
             runtime.ui.test_voice_requested = false;
             if runtime.audio.is_none() {
-                match AudioEngine::try_start() {
+                let start = if runtime
+                    .ui
+                    .audio_output_devices
+                    .contains(&runtime.ui.audio_output_device)
+                {
+                    AudioEngine::try_start_on_device_name(&runtime.ui.audio_output_device)
+                } else {
+                    AudioEngine::try_start()
+                };
+                match start {
                     Ok(engine) => {
+                        runtime.ui.audio_output_device = engine.device_name().to_owned();
                         runtime.audio = Some(engine);
                         runtime.audio_error = None;
                     }
@@ -613,7 +888,7 @@ impl ApplicationHandler for BodyLab {
                     let duration_shape = preview_seeded_unit(performance_seed ^ 0x9FB2_1C65);
                     let pitch_shape = preview_seeded_unit(performance_seed ^ 0xC13F_A9A9);
                     let duration_scale = 0.72 + duration_shape * (1.45 - 0.72);
-                    let request = VocalRequest {
+                    let mut request = VocalRequest {
                         motif_id: motif.id,
                         performance_seed,
                         gain: self.genome.voice.maximum_loudness
@@ -623,8 +898,22 @@ impl ApplicationHandler for BodyLab {
                         tempo_scale: duration_scale.recip(),
                         stress: 0.15,
                         purr: false,
+                        gesture: lifecore::VoiceGesture::WarmChuff,
+                        priority: 128,
+                        style: lifecore::VocalStyle::SocialContact,
+                        valence: 0.2,
+                        arousal: 0.3,
+                        fatigue: 0.0,
+                        confidence: 0.8,
+                        attachment: 0.4,
                         rhythm_intervals: [0.0; 8],
+                        phenotype: runtime.body.fast_phenotype_actuation().voice,
                     };
+                    runtime
+                        .ui
+                        .profile
+                        .voice
+                        .apply_to_request(&mut request, &self.genome.voice);
                     if let Err(error) = audio.enqueue(&self.genome.voice, motif, &request) {
                         runtime.audio_error = Some(error.to_string());
                     } else {
@@ -666,7 +955,11 @@ impl ApplicationHandler for BodyLab {
         }
         runtime
             .renderer
-            .set_review_background(BACKGROUNDS[runtime.ui.background]);
+            .set_review_background(if runtime.ui.section == LabSection::Den {
+                ReviewBackground::BusyChecker
+            } else {
+                BACKGROUNDS[runtime.ui.background]
+            });
         runtime.window.request_redraw();
         event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
     }
@@ -688,6 +981,17 @@ impl ApplicationHandler for BodyLab {
                 WindowEvent::CloseRequested => event_loop.exit(),
                 WindowEvent::Resized(size) => {
                     runtime.renderer.resize(size);
+                    let (background_width, background_height, background_stride, pixels) =
+                        pet_lab_reference_background(size);
+                    let _ = runtime.ecology_renderer.update_background(
+                        runtime.renderer.device(),
+                        runtime.renderer.queue(),
+                        background_width,
+                        background_height,
+                        background_stride,
+                        &pixels,
+                    );
+                    runtime.ecology_renderer.set_background_freshness(1.0);
                     sync_preview_viewport(
                         &mut runtime.body,
                         size,
@@ -748,6 +1052,12 @@ fn sync_preview_space(body: &mut ProceduralBody, size: PhysicalSize<u32>) {
     body.set_desktop_motion_space(Vec2::new(width, height), height);
 }
 
+fn generate_lab_body(genome: &Genome) -> Result<Box<ProceduralBody>, String> {
+    ProceduralBody::generate(genome)
+        .map(Box::new)
+        .map_err(|error| error.to_string())
+}
+
 fn sync_preview_viewport(
     body: &mut ProceduralBody,
     size: PhysicalSize<u32>,
@@ -764,7 +1074,7 @@ fn sync_preview_viewport(
 }
 
 fn reset_preview_bodies(runtime: &mut LabRuntime, genome: &Genome) {
-    match ProceduralBody::generate(genome) {
+    match generate_lab_body(genome) {
         Ok(mut body) => {
             runtime.ui.profile.render_mode = BodyRenderMode::ParticlePbf;
             let _ = body.apply_tuning_profile(runtime.ui.profile.clone());
@@ -826,6 +1136,151 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
     if runtime.ui.focus_lock {
         expression.pupil_focus = 1.0;
     }
+    let mut fast = FastPhenotypeActuation {
+        expression,
+        ..FastPhenotypeActuation::default()
+    };
+    if runtime.ui.section == LabSection::Nervous {
+        let levels = runtime
+            .ui
+            .nervous_stimulus
+            .levels(runtime.ui.profile.nervous, runtime.elapsed);
+        let negative = levels
+            .threat
+            .max(levels.pain)
+            .max(levels.restraint)
+            .max(levels.startle);
+        let positive = levels
+            .contact
+            .max(levels.safety)
+            .max(levels.relief)
+            .max(levels.play);
+        let arousal = runtime
+            .ui
+            .emotional_arousal
+            .max(0.78 * negative + 0.42 * levels.play + 0.34 * levels.novelty)
+            .clamp(0.0, 1.0);
+        let interest = runtime
+            .ui
+            .interest
+            .max(levels.novelty)
+            .max(levels.play * 0.85)
+            .clamp(0.0, 1.0);
+        if levels.threat > 0.01 || levels.pain > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Fear,
+                levels.threat.max(levels.pain),
+            );
+        }
+        if levels.startle > 0.01 {
+            apply_emotion_to_expression(&mut fast.expression, EmotionKind::Alarm, levels.startle);
+        }
+        if levels.restraint > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Frustration,
+                levels.restraint,
+            );
+        }
+        if levels.novelty > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Curiosity,
+                levels.novelty,
+            );
+        }
+        if levels.play > 0.01 {
+            apply_emotion_to_expression(&mut fast.expression, EmotionKind::Delight, levels.play);
+        }
+        if levels.contact > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Affection,
+                levels.contact,
+            );
+        }
+        if levels.safety > 0.01 || levels.relief > 0.01 {
+            apply_emotion_to_expression(
+                &mut fast.expression,
+                EmotionKind::Contentment,
+                levels.safety.max(levels.relief),
+            );
+        }
+        if levels.fatigue > 0.01 {
+            apply_emotion_to_expression(&mut fast.expression, EmotionKind::Boredom, levels.fatigue);
+        }
+        fast.analytic.body_length_scale =
+            1.0 + arousal * 0.030 + interest * 0.018 - levels.fatigue * 0.035;
+        fast.analytic.body_width_scale = (1.0 / fast.analytic.body_length_scale).clamp(0.95, 1.06);
+        fast.analytic.roundness_bias = positive * 0.08 - negative * 0.07;
+        fast.analytic.softness_bias = positive * 0.10 - levels.restraint * 0.12;
+        fast.pbf.idle_breath_amplitude_multiplier =
+            0.82 + arousal * 0.46 - levels.pain * 0.18 + levels.relief * 0.20;
+        fast.pbf.idle_breath_speed_multiplier =
+            0.72 + arousal * 0.70 + levels.startle * 0.24 - levels.fatigue * 0.25;
+        fast.pbf.density_compliance_multiplier =
+            1.0 + 0.16 * (levels.play + levels.fatigue) - 0.12 * negative;
+        fast.pbf.viscosity_multiplier =
+            1.0 + 0.24 * levels.fatigue + 0.12 * levels.safety - 0.18 * arousal;
+        fast.pbf.surface_tension_multiplier =
+            1.0 + 0.18 * (levels.safety + levels.contact + levels.pain) - 0.14 * levels.play;
+        fast.pbf.flight_inertia_multiplier = 1.0 + 0.16 * levels.fatigue - 0.10 * levels.startle;
+        fast.pbf.flight_stretch_multiplier =
+            1.0 + 0.24 * levels.play + 0.18 * levels.novelty + 0.14 * levels.startle
+                - 0.12 * levels.restraint;
+        fast.pbf.flight_damping_multiplier =
+            1.0 + 0.22 * levels.fatigue + 0.12 * levels.safety - 0.16 * levels.startle;
+        fast.pbf.flight_max_lag_multiplier =
+            1.0 + 0.20 * levels.startle + 0.14 * levels.play - 0.12 * levels.restraint;
+        fast.pbf.motor_gain_multiplier = 1.0 + 0.14 * levels.agency + 0.10 * levels.play
+            - 0.18 * levels.fatigue
+            - 0.12 * levels.restraint;
+        fast.pbf.shape_recovery_delta =
+            0.16 * negative + 0.10 * levels.agency + 0.08 * levels.relief;
+        fast.pbf.upright_stabilization_delta =
+            0.14 * levels.agency + 0.12 * levels.safety - 0.10 * levels.startle;
+        fast.material.emission_multiplier =
+            0.78 + arousal * 0.34 + interest * 0.10 + positive * 0.12;
+        fast.material.soul_glow_strength_multiplier =
+            0.80 + arousal * 0.20 + interest * 0.16 + positive * 0.22;
+        fast.material.soul_glow_pulse_multiplier = 0.76 + arousal * 0.38 + levels.startle * 0.18;
+        fast.material.internal_flow_multiplier =
+            0.72 + arousal * 0.36 + interest * 0.24 + levels.play * 0.18;
+        fast.material.internal_orb_speed_multiplier =
+            0.70 + arousal * 0.34 + levels.novelty * 0.28 + levels.startle * 0.20;
+        fast.visual_physiology.pulse_amplitude = 0.14 + arousal * 0.48 + levels.startle * 0.18;
+        fast.visual_physiology.flow_strength_multiplier = fast.material.internal_flow_multiplier;
+        fast.visual_physiology.flow_speed_multiplier = 0.75 + arousal * 0.42 + interest * 0.18;
+        fast.visual_physiology.droplet_energy =
+            0.16 + arousal * 0.38 + levels.play * 0.26 + levels.startle * 0.18;
+        fast.visual_physiology.droplet_spread = 0.12 + levels.play * 0.42 + levels.startle * 0.22;
+        fast.visual_physiology.droplet_cohesion =
+            0.50 + levels.safety * 0.22 + levels.contact * 0.16 - levels.play * 0.14;
+        fast.action.approach =
+            (levels.contact + levels.safety + levels.novelty * 0.55).clamp(0.0, 1.0);
+        fast.action.avoid = (levels.threat + levels.pain + levels.restraint * 0.65).clamp(0.0, 1.0);
+        fast.action.speed = (0.22 + arousal * 0.66 - levels.fatigue * 0.32).clamp(0.0, 1.0);
+        fast.action.play = levels.play;
+        fast.action.settle = (levels.safety + levels.relief + levels.fatigue * 0.4).clamp(0.0, 1.0);
+        fast.action.protect = negative;
+        fast.action.explore = levels.novelty;
+        fast.interaction.recoil = levels.startle.max(levels.pain).max(levels.threat);
+        fast.interaction.resistance = levels.restraint.max(levels.pain);
+        fast.interaction.cooperation = levels.safety.max(levels.contact).max(levels.agency);
+        fast.interaction.local_pulse = levels.contact.max(levels.startle);
+        fast.voice.pitch_multiplier = 0.96 + arousal * 0.10;
+        fast.voice.phrase_speed_multiplier = 0.88 + arousal * 0.24;
+        fast.voice.release_multiplier = 0.96 + (1.0 - arousal) * 0.24;
+        fast.voice.breathiness_delta =
+            (arousal - 0.5) * 0.12 + levels.fatigue * 0.10 + levels.pain * 0.08;
+        fast.voice.roughness_delta = levels.pain * 0.16 + levels.restraint * 0.12;
+        fast.voice.brightness_delta = levels.play * 0.12 + levels.novelty * 0.08;
+        fast.apparent_scale = 0.98 + arousal * 0.045 - levels.fatigue * 0.035;
+        runtime.ui.profile.nervous.apply(&mut fast);
+        expression = fast.expression;
+    }
+    body.set_fast_phenotype_actuation(fast);
     let interaction_target = if runtime.ui.focus_distance < -0.25 {
         Some(InteractionTarget::Cursor)
     } else if runtime.ui.focus_distance > 0.25 {
@@ -833,7 +1288,7 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
     } else {
         None
     };
-    let intent = BodyIntent {
+    let mut intent = BodyIntent {
         locomotion: LocomotionMode::Hover,
         target_position: body_position,
         target_surface: None,
@@ -866,6 +1321,10 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
         mean_luminance: Some(runtime.ui.scene_luminance),
         ..SensorFrame::default()
     };
+    if runtime.ui.section == LabSection::Nervous {
+        body.fast_phenotype_actuation()
+            .apply_to_intent(&mut intent, &sensors, body_position);
+    }
     let mind = VisualMindInput {
         curiosity: runtime.ui.interest,
         attachment: 0.55,
@@ -1085,6 +1544,12 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
         }
     });
     runtime.panel = selected_panel;
+    if runtime.ui.section != LabSection::Nervous {
+        // Switching sections must clear synthetic stimuli even while paused.
+        runtime
+            .body
+            .set_fast_phenotype_actuation(FastPhenotypeActuation::default());
+    }
     runtime
         .egui_state
         .handle_platform_output(runtime.window.as_ref(), output.platform_output);
@@ -1116,9 +1581,46 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     let mut parameters = runtime.body.render_parameters(genome, 0.35);
     parameters.render_mode = BodyRenderMode::ParticlePbf;
     parameters.debug_view = runtime.ui.debug_view;
+    let show_den = runtime.ui.section == LabSection::Den;
+    if show_den {
+        // Keep the physical liquid advancing unchanged, but move only its
+        // presentation outside the surface while reviewing the den. A zero
+        // scale is not a visibility switch: the production renderer clamps it
+        // to 0.5 and used to leave collapsed PBF fragments at the window edge.
+        parameters.presentation_offset = Vec2::splat(8.0);
+    }
+    let desktop_aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+    runtime.ecology_state.den.anchor =
+        (runtime.ui.preview_bounds_min + runtime.ui.preview_bounds_max) * 0.5;
+    if let Some(orb) = runtime.ecology_state.objects.first_mut() {
+        let distance = 182.0 - runtime.ui.den_preview_activity.clamp(0.0, 1.0) * 152.0;
+        orb.position = runtime.ecology_state.den.anchor
+            + Vec2::new(
+                distance / (pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * desktop_aspect),
+                0.0,
+            );
+    }
+    let ecology_time = runtime.elapsed;
+    let ecology_state = &runtime.ecology_state;
+    let ecology_renderer = &mut runtime.ecology_renderer;
     let renderer = &mut runtime.renderer;
     let egui_renderer = &mut runtime.egui_renderer;
     let outcome = renderer.render_with_overlay(parameters, |device, queue, encoder, view| {
+        if show_den {
+            // Review exactly the same pixels sampled by the optics shader. This
+            // makes refraction falsifiable: displaced and undistorted regions
+            // originate from one texture instead of two similar-looking but
+            // spatially unrelated checker implementations.
+            ecology_renderer.render_reference_background(encoder, view);
+            ecology_renderer.render(
+                queue,
+                encoder,
+                view,
+                ecology_state,
+                desktop_aspect,
+                ecology_time,
+            );
+        }
         let callbacks = egui_renderer.update_buffers(device, queue, encoder, &paint_jobs, &screen);
         debug_assert!(callbacks.is_empty());
         let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1202,6 +1704,7 @@ impl LivePetMonitor {
             control_status: "No intervention sent from this Dev Console session.".into(),
             evolution_scrub: EvolutionScrubState::default(),
             canonical_evolution: CanonicalEvolutionCache::default(),
+            accelerated_learning: AcceleratedLearningState::default(),
             last_state_poll: Instant::now() - Duration::from_secs(2),
             state_file_signature: None,
             status: format!("Waiting for {}", store.paths.telemetry.display()),
@@ -1214,6 +1717,7 @@ impl LivePetMonitor {
         self.advance_playback();
         self.expire_pending_control();
         self.poll_canonical_evolution();
+        self.accelerated_learning.poll();
         if self.last_poll.elapsed() < Duration::from_millis(80) {
             return;
         }
@@ -1242,7 +1746,7 @@ impl LivePetMonitor {
         }
 
         if self.using_legacy && !self.legacy_path.exists() {
-            self.status = "No telemetry yet. Start Pet2.exe with --dev-mode.".into();
+            self.status = "No telemetry yet. Start Pet 2 with --dev-mode.".into();
             return;
         }
 
@@ -1555,6 +2059,539 @@ impl LivePetMonitor {
     }
 }
 
+impl AcceleratedLearningState {
+    fn apply_preset(&mut self, preset: EvolutionPreset) {
+        self.preset = preset;
+        match preset {
+            EvolutionPreset::OneDayDiagnostic => {
+                self.simulated_hours = 24.0;
+                self.episodes_per_day = 48;
+                self.replicate_count = 4;
+                self.outcome_model = EvolutionOutcomeModel::MixedRealistic;
+                self.sleep_consolidation = true;
+                self.evolution_policy = EvolutionPolicy::Off;
+                self.maximum_generations = 0;
+                self.checkpoint_interval_hours = 24.0;
+                self.persistence = EvolutionPersistence::DryRun;
+            }
+            EvolutionPreset::SevenDaySocialization => {
+                self.simulated_hours = 168.0;
+                self.episodes_per_day = 36;
+                self.replicate_count = 4;
+                self.outcome_model = EvolutionOutcomeModel::RespectfulSupportive;
+                self.sleep_consolidation = true;
+                self.evolution_policy = EvolutionPolicy::EligibleMaxOne;
+                self.maximum_generations = 1;
+                self.checkpoint_interval_hours = 24.0;
+                self.persistence = EvolutionPersistence::Fork;
+            }
+            EvolutionPreset::BoundarySafety => {
+                self.simulated_hours = 6.0;
+                self.episodes_per_day = 0;
+                self.replicate_count = 1;
+                self.outcome_model = EvolutionOutcomeModel::BoundaryValidation;
+                self.sleep_consolidation = false;
+                self.evolution_policy = EvolutionPolicy::Off;
+                self.maximum_generations = 0;
+                self.checkpoint_interval_hours = 6.0;
+                self.persistence = EvolutionPersistence::DryRun;
+            }
+            EvolutionPreset::ThirtyDayPersonality => {
+                self.simulated_hours = 720.0;
+                self.episodes_per_day = 30;
+                self.replicate_count = 8;
+                self.outcome_model = EvolutionOutcomeModel::MixedRealistic;
+                self.sleep_consolidation = true;
+                // Standard Body Lab automation remains max-one. A second
+                // generation requires a newly validated run and explicit
+                // promotion instead of chained mutations.
+                self.evolution_policy = EvolutionPolicy::EligibleMaxOne;
+                self.maximum_generations = 1;
+                self.checkpoint_interval_hours = 24.0;
+                self.persistence = EvolutionPersistence::Fork;
+            }
+            EvolutionPreset::Custom => {}
+        }
+    }
+
+    fn config(&self) -> EvolutionConfig {
+        EvolutionConfig {
+            schema_version: EVOLUTION_CONFIG_SCHEMA_VERSION,
+            name: evolution_preset_label(self.preset).to_owned(),
+            preset: self.preset,
+            simulated_hours: self.simulated_hours,
+            episodes_per_day: self.episodes_per_day,
+            total_episodes: (self.preset == EvolutionPreset::BoundarySafety).then_some(100),
+            replicate_count: self.replicate_count,
+            seed: self.seed,
+            outcome_model: self.outcome_model,
+            quiet_advance: QuietAdvanceMode::Exact,
+            include_saved_gesture_replays: self.include_saved_replays,
+            sleep_consolidation: self.sleep_consolidation,
+            persistent_learning: self.preset != EvolutionPreset::BoundarySafety,
+            evolution_policy: self.evolution_policy,
+            maximum_generations: self.maximum_generations,
+            checkpoint_interval_hours: self.checkpoint_interval_hours,
+            persistence: self.persistence,
+        }
+    }
+
+    fn start(&mut self, store: &StateStore) {
+        if self.child.is_some() {
+            self.status = "An accelerated runner process is already active.".to_owned();
+            return;
+        }
+        let config = self.config();
+        if let Err(error) = config.validate() {
+            self.status = format!("Evolution config rejected: {error}");
+            return;
+        }
+        let run_id = format!("body-lab-{}-{}", unix_time_ms(), config.seed);
+        let run_directory = store.paths.evolution_runs.join(run_id);
+        let config_path = run_directory.join("config.json");
+        let report_path = run_directory.join("report.json");
+        let progress_path = run_directory.join("progress.json");
+        let log_path = run_directory.join("runner.log");
+        if let Err(error) = fs::create_dir_all(&run_directory) {
+            self.status = format!("Cannot create evolution run directory: {error}");
+            return;
+        }
+        if let Err(error) = write_pretty_json(&config_path, &config) {
+            self.status = error;
+            return;
+        }
+        let current_exe = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Cannot locate Body Lab executable: {error}");
+                return;
+            }
+        };
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let executable = match resolve_pet_executable(&current_exe, &workspace_root) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let log = match File::create(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.status = format!("Cannot create runner log: {error}");
+                return;
+            }
+        };
+        let stderr = match log.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                self.status = format!("Cannot duplicate runner log handle: {error}");
+                return;
+            }
+        };
+        let mut command = Command::new(&executable);
+        command
+            .arg("--headless")
+            .arg("--evolution-config")
+            .arg(&config_path)
+            .arg("--evolution-report")
+            .arg(&report_path)
+            .arg("--evolution-progress")
+            .arg(&progress_path)
+            .arg("--evolution-persist")
+            .arg(evolution_persistence_cli(config.persistence))
+            .arg("--evolution-max-generations")
+            .arg(config.maximum_generations.to_string())
+            .arg("--no-audio-output")
+            .arg("--data-dir")
+            .arg(&store.paths.root)
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr));
+        if let Some(parent) = executable.parent() {
+            command.current_dir(parent);
+        }
+        match command.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                self.child = Some(child);
+                self.started_at = Some(Instant::now());
+                self.report_path = Some(report_path.clone());
+                self.progress_path = Some(progress_path);
+                self.log_path = Some(log_path);
+                self.report = None;
+                self.progress = None;
+                self.executable_sha256 = executable_sha256(&executable).ok();
+                self.executable = Some(executable.clone());
+                self.child_pid = Some(pid);
+                self.error_tail.clear();
+                self.status = format!(
+                    "Runner started · Pet 2 v{} · PID {} · report {}",
+                    env!("CARGO_PKG_VERSION"),
+                    pid,
+                    report_path.display(),
+                );
+            }
+            Err(error) => self.status = format!("Cannot start evolution runner: {error}"),
+        }
+    }
+
+    fn poll(&mut self) {
+        if let Some(path) = &self.progress_path
+            && let Ok(file) = File::open(path)
+            && let Ok(progress) = serde_json::from_reader::<_, EvolutionProgress>(file)
+        {
+            self.progress = Some(progress);
+        }
+        let exit = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(exit) => exit,
+                Err(error) => {
+                    self.status = format!("Runner status check failed: {error}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let Some(exit) = exit else {
+            return;
+        };
+        self.child = None;
+        self.child_pid = None;
+        let elapsed = self
+            .started_at
+            .take()
+            .map_or(0.0, |at| at.elapsed().as_secs_f32());
+        let report = self
+            .report_path
+            .as_deref()
+            .and_then(|path| File::open(path).ok())
+            .and_then(|file| serde_json::from_reader::<_, EvolutionRunReport>(file).ok());
+        self.report = report;
+        self.error_tail = self
+            .log_path
+            .as_deref()
+            .and_then(|path| read_log_tail(path, 24).ok())
+            .unwrap_or_default();
+        self.status = match &self.report {
+            Some(report) => format!(
+                "Runner exited {} after {:.1} s · {} · {} episode(s)",
+                exit, elapsed, report.status, report.completed_episodes
+            ),
+            None => format!(
+                "Runner exited {} after {:.1} s without a readable report. The error tail is shown below.",
+                exit, elapsed,
+            ),
+        };
+    }
+
+    fn cancel(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            self.status = "No active accelerated runner to cancel.".to_owned();
+            return;
+        };
+        match child.kill().and_then(|_| child.wait()) {
+            Ok(exit) => self.status = format!("Runner cancelled; process exited {exit}."),
+            Err(error) => self.status = format!("Could not cancel runner: {error}"),
+        }
+        self.child_pid = None;
+        self.started_at = None;
+    }
+
+    fn open_report(&mut self) {
+        let Some(path) = self.report_path.as_ref().filter(|path| path.is_file()) else {
+            self.status = "No evolution report is available to open.".to_owned();
+            return;
+        };
+        match Command::new(if cfg!(windows) {
+            "explorer.exe"
+        } else if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        })
+        .arg(path)
+        .spawn()
+        {
+            Ok(_) => self.status = format!("Opened {}", path.display()),
+            Err(error) => self.status = format!("Could not open report: {error}"),
+        }
+    }
+
+    fn promote(&mut self, store: &StateStore) {
+        let Some(report) = self.report.as_ref() else {
+            self.status = "Promotion blocked: no parsed report.".to_owned();
+            return;
+        };
+        if !report.invariants.passed || !report.status.starts_with("completed") {
+            self.status =
+                "Promotion blocked: report did not pass acceptance invariants.".to_owned();
+            return;
+        }
+        let Some(path) = report.persisted_state.as_deref().map(PathBuf::from) else {
+            self.status = "Promotion blocked: this run did not create a fork.".to_owned();
+            return;
+        };
+        let expected_hash = report.final_life_state_hash;
+        let old_pid = match stop_live_runtime_for_promotion(store) {
+            Ok(pid) => pid,
+            Err(error) => {
+                self.status = format!("Promotion blocked before writing live state: {error}");
+                return;
+            }
+        };
+        match promote_validated_fork(store, &path, report.final_life_state_hash) {
+            Ok(backup) => {
+                match launch_desktop_pet_at(store).and_then(|(executable, pid)| {
+                    wait_for_loaded_hash(store, expected_hash, old_pid, Duration::from_secs(12))?;
+                    Ok((executable, pid))
+                }) {
+                    Ok((executable, pid)) => {
+                        self.last_promotion_backup = Some(backup.clone());
+                        self.status = format!(
+                            "Validated fork promoted and acknowledged live · state {expected_hash:016x} · PID {pid} · {} · recovery {}",
+                            executable.display(),
+                            backup.display(),
+                        );
+                    }
+                    Err(error) => {
+                        let rollback = restore_bundle(store, &StateStore::at(&backup), true);
+                        let _ = launch_desktop_pet_at(store);
+                        self.status = format!(
+                            "Promotion acknowledgement failed and was rolled back: {error}; rollback={rollback:?}"
+                        );
+                    }
+                }
+            }
+            Err(error) => self.status = format!("Promotion failed without accepting fork: {error}"),
+        }
+    }
+
+    fn rollback(&mut self, store: &StateStore) {
+        let Some(backup) = self.last_promotion_backup.clone() else {
+            self.status = "No promotion backup from this Body Lab session.".to_owned();
+            return;
+        };
+        match restore_bundle(store, &StateStore::at(&backup), true) {
+            Ok(()) => self.status = format!("Rolled back from {}", backup.display()),
+            Err(error) => self.status = format!("Rollback failed: {error}"),
+        }
+    }
+}
+
+fn evolution_preset_label(preset: EvolutionPreset) -> &'static str {
+    match preset {
+        EvolutionPreset::OneDayDiagnostic => "One Day Diagnostic",
+        EvolutionPreset::SevenDaySocialization => "Seven Day Socialization",
+        EvolutionPreset::ThirtyDayPersonality => "Thirty Day Personality",
+        EvolutionPreset::BoundarySafety => "Boundary Safety",
+        EvolutionPreset::Custom => "Custom",
+    }
+}
+
+fn evolution_outcome_label(model: EvolutionOutcomeModel) -> &'static str {
+    match model {
+        EvolutionOutcomeModel::RespectfulSupportive => "Respectful supportive",
+        EvolutionOutcomeModel::MixedRealistic => "Mixed realistic",
+        EvolutionOutcomeModel::QuietUser => "Quiet user",
+        EvolutionOutcomeModel::BoundaryValidation => "Boundary validation",
+    }
+}
+
+fn evolution_persistence_cli(persistence: EvolutionPersistence) -> &'static str {
+    match persistence {
+        EvolutionPersistence::DryRun => "dry-run",
+        EvolutionPersistence::Fork => "fork",
+        EvolutionPersistence::SaveFinal => "save-final",
+    }
+}
+
+fn write_pretty_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let mut file =
+        File::create(path).map_err(|error| format!("Cannot create {}: {error}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, value)
+        .map_err(|error| format!("Cannot serialize {}: {error}", path.display()))?;
+    file.write_all(b"\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("Cannot finish {}: {error}", path.display()))
+}
+
+struct PromotionBundle {
+    portable: PortablePetState,
+    tuning: LiquidTuningProfile,
+    morph: MorphBrainState,
+    ecology: EcologyState,
+    body: BodyMaterialSnapshot,
+}
+
+fn promote_report_cli(store: &StateStore, report_path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(report_path)
+        .map_err(|error| format!("cannot inspect {}: {error}", report_path.display()))?;
+    if metadata.len() > 32 * 1024 * 1024 {
+        return Err("evolution report exceeds the 32 MiB promotion cap".to_owned());
+    }
+    let report: EvolutionRunReport = serde_json::from_reader(
+        File::open(report_path)
+            .map_err(|error| format!("cannot open {}: {error}", report_path.display()))?,
+    )
+    .map_err(|error| format!("cannot parse {}: {error}", report_path.display()))?;
+    if report.schema_version != EVOLUTION_REPORT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported evolution report schema {}; expected {}",
+            report.schema_version, EVOLUTION_REPORT_SCHEMA_VERSION
+        ));
+    }
+    report
+        .config
+        .validate()
+        .map_err(|error| error.to_string())?;
+    if !report.invariants.passed || !report.status.starts_with("completed") {
+        return Err("promotion requires a completed report with passing invariants".to_owned());
+    }
+    let fork = report
+        .persisted_state
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or("promotion report has no persisted fork")?;
+    let expected_hash = report.final_life_state_hash;
+    let old_pid = stop_live_runtime_for_promotion(store)?;
+    let backup = promote_validated_fork(store, &fork, expected_hash)?;
+    match launch_desktop_pet_at(store).and_then(|(executable, pid)| {
+        let acknowledgement =
+            wait_for_loaded_hash(store, expected_hash, old_pid, Duration::from_secs(12))?;
+        Ok((executable, pid, acknowledgement))
+    }) {
+        Ok((executable, pid, acknowledgement)) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "promoted_and_acknowledged",
+                    "report": report_path,
+                    "fork": fork,
+                    "recovery_backup": backup,
+                    "executable": executable,
+                    "pid": pid,
+                    "active_loaded_life_state_hash": format!("{:016x}", acknowledgement.loaded_life_state_hash),
+                    "active_loaded_genome_hash": format!("{:016x}", acknowledgement.loaded_genome_hash),
+                    "acknowledged_unix_ms": acknowledgement.updated_unix_ms,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let rollback = restore_bundle(store, &StateStore::at(&backup), true);
+            let _ = launch_desktop_pet_at(store);
+            Err(format!(
+                "promotion acknowledgement failed and live state was rolled back: {error}; rollback={rollback:?}"
+            ))
+        }
+    }
+}
+
+fn load_promotion_bundle(store: &StateStore) -> Result<PromotionBundle, String> {
+    let portable = store
+        .load_state()
+        .map_err(|error| error.to_string())?
+        .ok_or("fork state.json is missing")?;
+    let morph = store
+        .load_morph_brain::<MorphBrainState>()
+        .map_err(|error| error.to_string())?
+        .filter(MorphBrainState::is_valid)
+        .ok_or("fork morph-brain.json is missing or invalid")?;
+    let ecology = store
+        .load_ecology_state()
+        .map_err(|error| error.to_string())?
+        .ok_or("fork ecology-state.json is missing")?;
+    let tuning = store
+        .load_liquid_tuning::<LiquidTuningProfile>()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| LiquidTuningProfile::for_seed(portable.life.state.genome.identity_seed))
+        .sanitized()
+        .map_err(|error| error.to_string())?;
+    let body = store
+        .load_body_state_validated(|snapshot: &BodyMaterialSnapshot| {
+            snapshot
+                .validate(
+                    portable.life.state.genome.identity_seed,
+                    tuning.schema_version,
+                    tuning.pbf,
+                )
+                .is_ok()
+        })
+        .map_err(|error| error.to_string())?
+        .ok_or("fork body-state.json is missing or invalid")?;
+    Ok(PromotionBundle {
+        portable,
+        tuning,
+        morph,
+        ecology,
+        body,
+    })
+}
+
+fn save_promotion_bundle(store: &StateStore, bundle: &PromotionBundle) -> Result<(), String> {
+    store
+        .save_state(&bundle.portable)
+        .and_then(|_| store.save_liquid_tuning(&bundle.tuning))
+        .and_then(|_| store.save_morph_brain(&bundle.morph))
+        .and_then(|_| store.save_ecology_state(&bundle.ecology))
+        .and_then(|_| store.save_body_state(&bundle.body))
+        .map_err(|error| error.to_string())
+}
+
+fn restore_bundle(
+    destination: &StateStore,
+    source: &StateStore,
+    require_complete: bool,
+) -> Result<(), String> {
+    let bundle = load_promotion_bundle(source)?;
+    if require_complete {
+        bundle
+            .portable
+            .validate()
+            .map_err(|error| error.to_string())?;
+    }
+    save_promotion_bundle(destination, &bundle)
+}
+
+fn promote_validated_fork(
+    live: &StateStore,
+    fork_path: &Path,
+    report_hash: u64,
+) -> Result<PathBuf, String> {
+    let runs_root = fs::canonicalize(&live.paths.evolution_runs)
+        .map_err(|error| format!("cannot resolve evolution-runs root: {error}"))?;
+    let fork_path =
+        fs::canonicalize(fork_path).map_err(|error| format!("cannot resolve fork: {error}"))?;
+    if !fork_path.starts_with(&runs_root) {
+        return Err("fork is outside this Pet's bounded evolution-runs directory".to_owned());
+    }
+    let fork = StateStore::at(&fork_path);
+    let incoming = load_promotion_bundle(&fork)?;
+    let incoming_hash = lifecore::persisted_life_snapshot_hash(&incoming.portable.life)
+        .map_err(|error| error.to_string())?;
+    if incoming_hash != report_hash {
+        return Err(format!(
+            "fork Life snapshot hash does not match the validated report: fork={incoming_hash:016x}, report={report_hash:016x}"
+        ));
+    }
+    let current = load_promotion_bundle(live)?;
+    let backup_path = live
+        .paths
+        .evolution_runs
+        .join("promotion-backups")
+        .join(format!("{}-{report_hash:016x}", unix_time_ms()));
+    let backup = StateStore::at(&backup_path);
+    save_promotion_bundle(&backup, &current)?;
+    if let Err(error) = save_promotion_bundle(live, &incoming) {
+        let _ = save_promotion_bundle(live, &current);
+        return Err(format!(
+            "commit failed and recovery backup was restored: {error}"
+        ));
+    }
+    Ok(backup_path)
+}
+
 fn telemetry_read_is_live(stream_was_bootstrapped: bool, received: usize) -> bool {
     stream_was_bootstrapped && received > 0
 }
@@ -1589,7 +2626,16 @@ fn build_lab_control_envelope(
         } => ((*duration_seconds * 1_000.0).ceil() as u32).saturating_add(2_000),
         LabControlCommand::Reward { .. }
         | LabControlCommand::FocusMode { .. }
-        | LabControlCommand::ClearDrivePulses => 5_000,
+        | LabControlCommand::ClearDrivePulses
+        | LabControlCommand::DeleteGestureConvention { .. }
+        | LabControlCommand::RollbackGestureConventions { .. }
+        | LabControlCommand::ClearGestureConventions => 5_000,
+        LabControlCommand::ShutdownForPromotion => 15_000,
+        LabControlCommand::StimulatePointerGesture {
+            duration_seconds, ..
+        } => ((*duration_seconds * 1_000.0) as u32)
+            .saturating_add(2_000)
+            .clamp(2_100, 30_000),
     }
     .clamp(1_000, 30_000);
     LabControlEnvelope {
@@ -1614,6 +2660,19 @@ fn lab_control_description(command: &LabControlCommand) -> String {
             format!("focus mode {}", if *enabled { "on" } else { "off" })
         }
         LabControlCommand::ClearDrivePulses => "clear temporary drive pulses".into(),
+        LabControlCommand::StimulatePointerGesture {
+            gesture,
+            intensity,
+            duration_seconds,
+        } => format!("fixture {gesture:?}, intensity {intensity:.2}, {duration_seconds:.2} s"),
+        LabControlCommand::DeleteGestureConvention { convention_id } => {
+            format!("delete gesture convention {convention_id}")
+        }
+        LabControlCommand::RollbackGestureConventions { version } => {
+            format!("rollback gesture conventions to version {version}")
+        }
+        LabControlCommand::ClearGestureConventions => "clear gesture conventions".into(),
+        LabControlCommand::ShutdownForPromotion => "graceful shutdown for promotion".into(),
     }
 }
 
@@ -1806,6 +2865,10 @@ fn show_live_panel(context: &Context, monitor: &mut LivePetMonitor, panel: DevPa
                             live_morph_and_activity(&mut columns[0], &latest);
                             live_vita_and_fusion(&mut columns[1], &latest);
                         });
+                        ui.separator();
+                        live_nervous_system(ui, &latest);
+                        ui.separator();
+                        accelerated_learning_panel(ui, monitor);
                         ui.separator();
                         live_raw_json(ui, &latest);
                     }
@@ -2060,6 +3123,281 @@ fn live_behavior_controls(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
     live_controlled_intervention(ui, monitor);
 }
 
+fn accelerated_learning_panel(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
+    let store = monitor.control_store.clone();
+    let state = &mut monitor.accelerated_learning;
+    CollapsingHeader::new("Accelerated Learning")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.small(
+                "Deterministic interaction curriculum · separate process · synthetic experience never writes user conventions. Full live R12 phenotype feedback is not simulated.",
+            );
+            if state.persistence == EvolutionPersistence::DryRun {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 196, 92),
+                    "DRY RUN · results are measured and reported, but learned state will not be saved or promoted",
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Preset:");
+                for preset in [
+                    EvolutionPreset::OneDayDiagnostic,
+                    EvolutionPreset::SevenDaySocialization,
+                    EvolutionPreset::BoundarySafety,
+                    EvolutionPreset::ThirtyDayPersonality,
+                    EvolutionPreset::Custom,
+                ] {
+                    if ui
+                        .selectable_label(state.preset == preset, evolution_preset_label(preset))
+                        .clicked()
+                    {
+                        state.apply_preset(preset);
+                    }
+                }
+            });
+            egui::Grid::new("accelerated_learning_fields")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Simulated hours / days");
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(DragValue::new(&mut state.simulated_hours).range(0.01..=720.0))
+                            .changed()
+                        {
+                            state.preset = EvolutionPreset::Custom;
+                        }
+                        ui.small(format!("{:.2} d", state.simulated_hours / 24.0));
+                    });
+                    ui.end_row();
+                    ui.label("Episodes per day");
+                    if ui
+                        .add(DragValue::new(&mut state.episodes_per_day).range(0..=100))
+                        .changed()
+                    {
+                        state.preset = EvolutionPreset::Custom;
+                    }
+                    ui.end_row();
+                    ui.label("Seed count / replicates");
+                    ui.add(DragValue::new(&mut state.replicate_count).range(1..=8));
+                    ui.end_row();
+                    ui.label("Base seed");
+                    ui.add(DragValue::new(&mut state.seed).speed(1.0));
+                    ui.end_row();
+                    ui.label("Outcome model");
+                    egui::ComboBox::from_id_salt("evolution_outcome_model")
+                        .selected_text(evolution_outcome_label(state.outcome_model))
+                        .show_ui(ui, |ui| {
+                            for model in [
+                                EvolutionOutcomeModel::RespectfulSupportive,
+                                EvolutionOutcomeModel::MixedRealistic,
+                                EvolutionOutcomeModel::QuietUser,
+                                EvolutionOutcomeModel::BoundaryValidation,
+                            ] {
+                                ui.selectable_value(
+                                    &mut state.outcome_model,
+                                    model,
+                                    evolution_outcome_label(model),
+                                );
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Saved gesture replays");
+                    ui.checkbox(&mut state.include_saved_replays, "Include explicit captures");
+                    ui.end_row();
+                    ui.label("Sleep consolidation");
+                    ui.checkbox(&mut state.sleep_consolidation, "Enabled");
+                    ui.end_row();
+                    ui.label("Evolution policy");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut state.evolution_policy, EvolutionPolicy::Off, "Off");
+                        ui.selectable_value(
+                            &mut state.evolution_policy,
+                            EvolutionPolicy::EligibleMaxOne,
+                            "Eligible, max 1",
+                        );
+                    });
+                    ui.end_row();
+                    ui.label("Max generations");
+                    ui.add(DragValue::new(&mut state.maximum_generations).range(0..=1));
+                    ui.end_row();
+                    ui.label("Checkpoint interval (h)");
+                    ui.add(
+                        DragValue::new(&mut state.checkpoint_interval_hours).range(1.0..=168.0),
+                    );
+                    ui.end_row();
+                    ui.label("Persistence");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut state.persistence,
+                            EvolutionPersistence::DryRun,
+                            "Dry run",
+                        );
+                        ui.selectable_value(
+                            &mut state.persistence,
+                            EvolutionPersistence::Fork,
+                            "Fork",
+                        );
+                        ui.selectable_value(
+                            &mut state.persistence,
+                            EvolutionPersistence::SaveFinal,
+                            "Save final",
+                        );
+                    });
+                    ui.end_row();
+                });
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(state.child.is_none(), egui::Button::new("Start"))
+                    .clicked()
+                {
+                    state.start(&store);
+                }
+                if ui
+                    .add_enabled(state.child.is_some(), egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    state.cancel();
+                }
+                if ui
+                    .add_enabled(
+                        state.report_path.as_ref().is_some_and(|path| path.is_file()),
+                        egui::Button::new("Open report"),
+                    )
+                    .clicked()
+                {
+                    state.open_report();
+                }
+                let promotable = state.report.as_ref().is_some_and(|report| {
+                    report.invariants.passed
+                        && report.status.starts_with("completed")
+                        && report.persisted_state.is_some()
+                });
+                if ui
+                    .add_enabled(promotable, egui::Button::new("Promote validated fork"))
+                    .clicked()
+                {
+                    state.promote(&store);
+                }
+                if ui
+                    .add_enabled(
+                        state.last_promotion_backup.is_some(),
+                        egui::Button::new("Rollback"),
+                    )
+                    .clicked()
+                {
+                    state.rollback(&store);
+                }
+            });
+            if let Some(started) = state.started_at {
+                ui.label(format!(
+                    "RUNNING · {:.1} s wall time · target {:.2} simulated h · live progress is committed after every episode",
+                    started.elapsed().as_secs_f32(),
+                    state.simulated_hours
+                ));
+            }
+            if let Some(executable) = &state.executable {
+                ui.monospace(format!(
+                    "exe {} · version {} · SHA-256 {} · PID {}",
+                    executable.display(),
+                    env!("CARGO_PKG_VERSION"),
+                    state.executable_sha256.as_deref().unwrap_or("unavailable"),
+                    state
+                        .child_pid
+                        .map_or_else(|| "exited".to_owned(), |pid| pid.to_string()),
+                ));
+            }
+            if let Some(progress) = &state.progress {
+                ui.add(
+                    egui::ProgressBar::new(progress.fraction())
+                        .show_percentage()
+                        .text(format!(
+                            "{:?} · replicate {}/{} · episode {}/{}",
+                            progress.stage,
+                            progress.replicate_index.saturating_add(1).min(progress.replicate_count),
+                            progress.replicate_count,
+                            progress.episode_index,
+                            progress.episode_count,
+                        )),
+                );
+                ui.small(format!(
+                    "sim {:.2} h · PCM renders {} · learning updates {} · wall {:.1} s · ETA {}",
+                    progress.simulated_seconds / 3_600.0,
+                    progress.audio_render_count,
+                    progress.learning_update_count,
+                    progress.elapsed_wall_seconds,
+                    progress
+                        .eta_seconds
+                        .map_or_else(|| "—".to_owned(), |eta| format!("{eta:.1} s")),
+                ));
+                if let Some(error) = &progress.last_error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 105, 96), error);
+                }
+            }
+            ui.small(&state.status);
+            if !state.error_tail.is_empty() && state.report.is_none() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 105, 96),
+                    "Runner error tail:",
+                );
+                ui.monospace(&state.error_tail);
+            }
+            if let Some(report) = &state.report {
+                let invariant_color = if report.invariants.passed {
+                    egui::Color32::from_rgb(105, 232, 172)
+                } else {
+                    egui::Color32::from_rgb(255, 105, 96)
+                };
+                ui.colored_label(
+                    invariant_color,
+                    format!(
+                        "{} · clock {:?}{} · {:.2} h · {}/{} episodes · generation {} → {}",
+                        report.status,
+                        report.clock_mode,
+                        if report.approximate_calendar_advance {
+                            " (approximate)"
+                        } else {
+                            " (exact)"
+                        },
+                        report.simulated_seconds / 3_600.0,
+                        report.completed_episodes,
+                        report.config.scheduled_episode_count(),
+                        report.initial_generation,
+                        report.final_generation,
+                    ),
+                );
+                ui.small(format!(
+                    "learning updates {} · PCM renders {} ({} WAV) · convention updates {} · consolidations {} · eligible {} · state {:016x} · genome {:016x}",
+                    report.lexicon_updates,
+                    report.audio.rendered_count,
+                    report.audio.exported_wav_count,
+                    report.convention_updates,
+                    report.sleep_consolidations,
+                    report.eligibility.eligible,
+                    report.final_life_state_hash,
+                    report.final_genome_hash,
+                ));
+                ui.small(format!(
+                    "body p50/p95/max {:.1}/{:.1}/{:.1} µs · {:.2} episodes/s · invariant failures: {}",
+                    report.performance.body_step_p50_microseconds,
+                    report.performance.body_step_p95_microseconds,
+                    report.performance.body_step_max_microseconds,
+                    report.performance.episodes_per_wall_second,
+                    report.invariants.failures.len(),
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Gestures:");
+                    for (gesture, count) in &report.gesture_distribution {
+                        ui.monospace(format!("{gesture}={count}"));
+                    }
+                });
+                for failure in &report.invariants.failures {
+                    ui.colored_label(egui::Color32::from_rgb(255, 140, 110), failure);
+                }
+            }
+        });
+}
+
 fn live_timeline(ui: &mut egui::Ui, monitor: &mut LivePetMonitor) {
     let count = monitor.frames.len();
     ui.horizontal_wrapped(|ui| {
@@ -2265,6 +3603,104 @@ fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor)
                 }
             });
 
+            ui.separator();
+            ui.strong("Body Communication fixtures");
+            ui.small(
+                "Each button runs a predefined fixed-seed pointer fixture through real body physics; no classifier label is injected.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                for (gesture, duration) in [
+                    (LabGesture::SoftTouch, 0.7),
+                    (LabGesture::SlowStretch, 1.5),
+                    (LabGesture::Tickle, 1.2),
+                    (LabGesture::ThreeBeatRhythm, 1.8),
+                    (LabGesture::CircularTwist, 1.5),
+                    (LabGesture::SharpFlick, 0.45),
+                    (LabGesture::Hold, 1.4),
+                    (LabGesture::PullRelease, 1.2),
+                    (LabGesture::RealSplitRemerge, 3.6),
+                    (LabGesture::FragmentHelp, 3.6),
+                    (LabGesture::OverstrainBoundary, 1.2),
+                    (LabGesture::SleepQuietInteraction, 0.8),
+                ] {
+                    if ui
+                        .add_enabled(enabled, egui::Button::new(lab_gesture_label(gesture)))
+                        .clicked()
+                    {
+                        pending_command = Some(LabControlCommand::StimulatePointerGesture {
+                            gesture,
+                            intensity: 0.72,
+                            duration_seconds: duration,
+                        });
+                    }
+                }
+            });
+
+            if let Some(conventions) = monitor
+                .selected_frame()
+                .and_then(|frame| frame.pointer("/details/body_interaction/learned_conventions"))
+            {
+                ui.separator();
+                ui.strong("Learned gesture conventions");
+                if let Some(items) = conventions.get("items").and_then(Value::as_array) {
+                    for item in items {
+                        let id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
+                        let meaning = item
+                            .get("meaning")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        let confidence = item
+                            .get("confidence")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0);
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("#{id} {meaning} · {confidence:.2}"));
+                            if ui
+                                .add_enabled(
+                                    enabled && id > 0,
+                                    egui::Button::new("Delete by ID"),
+                                )
+                                .clicked()
+                            {
+                                pending_command = Some(
+                                    LabControlCommand::DeleteGestureConvention {
+                                        convention_id: id,
+                                    },
+                                );
+                            }
+                        });
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(versions) = conventions
+                        .get("rollback_versions")
+                        .and_then(Value::as_array)
+                    {
+                        for version in versions.iter().filter_map(Value::as_u64).rev().take(8) {
+                            if ui
+                                .add_enabled(
+                                    enabled && version <= u64::from(u32::MAX),
+                                    egui::Button::new(format!("Rollback v{version}")),
+                                )
+                                .clicked()
+                            {
+                                pending_command = Some(
+                                    LabControlCommand::RollbackGestureConventions {
+                                        version: version as u32,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Clear all conventions"))
+                        .clicked()
+                    {
+                        pending_command = Some(LabControlCommand::ClearGestureConventions);
+                    }
+                });
+            }
+
             if let Some(command) = pending_command {
                 monitor.send_control(command);
             }
@@ -2277,6 +3713,23 @@ fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor)
                 scalar_table(ui, "live_lab_intervention_status", status, 32);
             }
         });
+}
+
+const fn lab_gesture_label(gesture: LabGesture) -> &'static str {
+    match gesture {
+        LabGesture::SoftTouch => "Soft touch",
+        LabGesture::SlowStretch => "Slow stretch",
+        LabGesture::Tickle => "Tickle",
+        LabGesture::ThreeBeatRhythm => "Three-beat rhythm",
+        LabGesture::CircularTwist => "Circular twist",
+        LabGesture::SharpFlick => "Sharp flick",
+        LabGesture::Hold => "Hold",
+        LabGesture::PullRelease => "Pull/release",
+        LabGesture::RealSplitRemerge => "Real split/remerge",
+        LabGesture::FragmentHelp => "Fragment help",
+        LabGesture::OverstrainBoundary => "Overstrain boundary",
+        LabGesture::SleepQuietInteraction => "Sleep/quiet interaction",
+    }
 }
 
 fn live_blockers(latest: &Value, stale_seconds: Option<f32>) -> Vec<(u8, String)> {
@@ -3733,6 +5186,107 @@ fn live_learning_memory_social(ui: &mut egui::Ui, latest: &Value) {
         });
 }
 
+fn live_nervous_system(ui: &mut egui::Ui, latest: &Value) {
+    let Some(nervous) = latest.pointer("/details/nervous_system") else {
+        ui.small("R12 nervous-system telemetry is unavailable in this frame.");
+        return;
+    };
+    CollapsingHeader::new("Brain ↔ body nervous system (R12)")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.small(
+                "authoritative BodyFeedbackV2 → felt/appraisal/emotion → bounded actuation → next body tick",
+            );
+            ui.columns(2, |columns| {
+                if let Some(felt) = nervous.get("felt_state_v1") {
+                    columns[0].strong("FeltStateV1");
+                    scalar_table(&mut columns[0], "live_r12_felt", felt, 40);
+                }
+                if let Some(emotions) = nervous.get("emotional_readouts") {
+                    columns[1].strong("Continuous emotional readouts");
+                    scalar_table(&mut columns[1], "live_r12_emotions", emotions, 40);
+                }
+            });
+            if let Some(derived) = nervous.get("derived") {
+                CollapsingHeader::new("Derived axes + Morph somatic input")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        scalar_table(ui, "live_r12_derived", derived, 40);
+                        if let Some(morph) = nervous.get("morph_somatic_input") {
+                            scalar_table(ui, "live_r12_morph_input", morph, 32);
+                        }
+                    });
+            }
+            let trace = nervous
+                .pointer("/fast_actuation/trace")
+                .and_then(Value::as_array);
+            CollapsingHeader::new(format!(
+                "Per-target causal trace ({})",
+                trace.map_or(0, Vec::len)
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                let Some(trace) = trace else {
+                    ui.small("No actuation trace in this frame.");
+                    return;
+                };
+                for (index, record) in trace.iter().enumerate() {
+                    let target = record
+                        .get("target_path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown target");
+                    let coupling = record
+                        .get("coupling_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown coupling");
+                    let raw = record.get("raw_target").and_then(Value::as_f64).unwrap_or(0.0);
+                    let filtered = record
+                        .get("filtered_value")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let effective = record
+                        .get("effective_value")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    CollapsingHeader::new(format!(
+                        "{target}  {raw:.3} → {filtered:.3} → {effective:.3}"
+                    ))
+                    .id_salt(("r12_trace", index, target))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.monospace(format!("coupling: {coupling}"));
+                        ui.monospace(format!(
+                            "clamp: [{}, {}] · τ rise/fall: {} / {} s · reason: {}",
+                            record.get("clamp_min").map_or("—".into(), Value::to_string),
+                            record.get("clamp_max").map_or("—".into(), Value::to_string),
+                            record.get("rise_tau_seconds").map_or("—".into(), Value::to_string),
+                            record.get("fall_tau_seconds").map_or("—".into(), Value::to_string),
+                            record
+                                .get("clamp_reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("—")
+                        ));
+                        if let Some(component) = record
+                            .get("component_id_if_local")
+                            .filter(|value| !value.is_null())
+                        {
+                            ui.monospace(format!("localized component: {component}"));
+                        }
+                        ui.label(
+                            record
+                                .get("formula")
+                                .and_then(Value::as_str)
+                                .unwrap_or("compiled formula unavailable"),
+                        );
+                        if let Some(sources) = record.get("source_terms") {
+                            scalar_table(ui, "live_r12_trace_sources", sources, 32);
+                        }
+                    });
+                }
+            });
+        });
+}
+
 fn live_raw_json(ui: &mut egui::Ui, latest: &Value) {
     CollapsingHeader::new("Raw telemetry JSON")
         .default_open(false)
@@ -4025,6 +5579,42 @@ fn format_number(value: &Value, pointer: &str, decimals: usize) -> String {
     number(value, pointer).map_or_else(|| "—".into(), |value| format!("{value:.decimals$}"))
 }
 
+fn pet_lab_reference_background(size: PhysicalSize<u32>) -> (u32, u32, u32, Vec<u8>) {
+    let width = size.width.max(1);
+    let height = size.height.max(1);
+    let bytes_per_row = width.saturating_mul(4).div_ceil(256) * 256;
+    let mut pixels = vec![0_u8; bytes_per_row as usize * height as usize];
+    for y in 0..height {
+        for x in 0..width {
+            // Match `liquid_surface.wgsl::background_for_mode(..., 4.0)`
+            // exactly. The den then samples a displaced copy of the same
+            // pixels visible under it; a mismatched decorative reference can
+            // look animated while proving no optical refraction at all.
+            let checker_x = x as f32 / 64.0;
+            let checker_y = y as f32 / 64.0;
+            let alternating = ((checker_x.floor() as i32 + checker_y.floor() as i32) & 1) == 0;
+            let value = if alternating { 0.72_f32 } else { 0.18_f32 };
+            let accent = 0.04 * (checker_x * 2.17 + checker_y * 1.83).sin();
+            let srgb = linear_to_srgb_byte((value + accent).clamp(0.0, 1.0));
+            let index = (y * bytes_per_row + x * 4) as usize;
+            pixels[index] = srgb;
+            pixels[index + 1] = srgb;
+            pixels[index + 2] = srgb;
+            pixels[index + 3] = 255;
+        }
+    }
+    (width, height, bytes_per_row, pixels)
+}
+
+fn linear_to_srgb_byte(value: f32) -> u8 {
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 fn array_number(value: &Value, pointer: &str, index: usize, decimals: usize) -> String {
     value
         .pointer(pointer)
@@ -4084,26 +5674,55 @@ impl LabUi {
             .resizable(true)
             .show(context, |ui| {
                 ui.heading("Character editor");
-                ui.label("Appearance, liquid motion, face, voice, and preview scenarios");
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.section, LabSection::Body, "Body");
+                    ui.selectable_value(&mut self.section, LabSection::Den, "Den / home");
+                    ui.selectable_value(&mut self.section, LabSection::Voice, "Voice + sounds");
+                    ui.selectable_value(&mut self.section, LabSection::Nervous, "Nervous / body");
+                });
+                ui.small(match self.section {
+                    LabSection::Body => "PBF body, material, face, contact and compositor.",
+                    LabSection::Den => "The exact production den shader over a captured-style reference backdrop.",
+                    LabSection::Voice => "The production procedural voice path with the immutable genome loudness cap.",
+                    LabSection::Nervous => "Readable downstream calibration plus live causal telemetry in Diagnostics.",
+                });
                 ui.separator();
                 self.transport(ui);
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.preset_controls(ui);
-                        self.physics_controls(ui);
-                        self.material_controls(ui);
-                        self.face_controls(ui);
-                        self.compositor_controls(ui);
-                        self.diagnostics(
-                            ui,
-                            diagnostics,
-                            pupil_size,
-                            pupil_asymmetry,
-                            fps,
-                            p95_frame_ms,
-                        );
+                        match self.section {
+                            LabSection::Body => {
+                                self.preset_controls(ui);
+                                self.body_communication_controls(ui);
+                                self.physics_controls(ui);
+                                self.material_controls(ui);
+                                self.face_controls(ui);
+                                self.compositor_controls(ui);
+                                self.diagnostics(
+                                    ui,
+                                    diagnostics,
+                                    pupil_size,
+                                    pupil_asymmetry,
+                                    fps,
+                                    p95_frame_ms,
+                                );
+                            }
+                            LabSection::Den => self.den_controls(ui),
+                            LabSection::Voice => self.voice_controls(ui),
+                            LabSection::Nervous => {
+                                self.nervous_controls(ui);
+                                self.diagnostics(
+                                    ui,
+                                    diagnostics,
+                                    pupil_size,
+                                    pupil_asymmetry,
+                                    fps,
+                                    p95_frame_ms,
+                                );
+                            }
+                        }
                         self.persistence_controls(ui);
                     });
             });
@@ -4117,7 +5736,6 @@ impl LabUi {
             .frame(egui::Frame::NONE)
             .show(context, |ui| {
                 let canvas = ui.max_rect();
-                let response = ui.allocate_rect(canvas, Sense::drag());
                 let content = context.content_rect();
                 let size = content.size().max(egui::Vec2::splat(1.0));
                 // The right-side controls are not part of the visible simulation
@@ -4135,6 +5753,27 @@ impl LabUi {
                     ((padded_canvas.max.x - content.min.x) / size.x).clamp(0.0, 1.0),
                     ((padded_canvas.max.y - content.min.y) / size.y).clamp(0.0, 1.0),
                 );
+
+                if self.section != LabSection::Body {
+                    self.drag.active = false;
+                    self.drag.velocity_normalized *= 0.72;
+                    ui.allocate_rect(canvas, Sense::hover());
+                    let label = match self.section {
+                        LabSection::Den => "Den refraction · production shader",
+                        LabSection::Voice => "Voice · live mouth feedback",
+                        LabSection::Nervous => "Nervous response · F4 for live trace",
+                        LabSection::Body => unreachable!(),
+                    };
+                    ui.painter().text(
+                        canvas.left_top() + egui::vec2(14.0, 14.0),
+                        egui::Align2::LEFT_TOP,
+                        label,
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::from_white_alpha(205),
+                    );
+                    return;
+                }
+                let response = ui.allocate_rect(canvas, Sense::drag());
                 if let Some(pointer) = response.interact_pointer_pos() {
                     self.drag.pointer_normalized = Vec2::new(
                         ((pointer.x - content.min.x) / size.x).clamp(0.0, 1.0),
@@ -4181,6 +5820,52 @@ impl LabUi {
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
+        match self.section {
+            LabSection::Den => {
+                ui.add(
+                    Slider::new(&mut self.den_preview_activity, 0.0..=1.0)
+                        .text("Orb proximity / den activity"),
+                );
+                ui.small("The orb drives the same activity response used by the desktop Pet.");
+                return;
+            }
+            LabSection::Voice => {
+                ui.horizontal(|ui| {
+                    if ui.button("🔊 Test next voice").clicked() {
+                        self.test_voice_requested = true;
+                    }
+                    ui.label(format!(
+                        "{} · RMS {:.3} · peak {:.3}",
+                        self.audio_status, self.audio_rms, self.audio_peak
+                    ));
+                });
+                ui.add(Slider::new(&mut self.emotional_arousal, 0.0..=1.0).text("Voice arousal"));
+                ui.add(Slider::new(&mut self.interest, 0.0..=1.0).text("Voice interest"));
+                return;
+            }
+            LabSection::Nervous => {
+                egui::ComboBox::from_label("Demonstration emotion")
+                    .selected_text(emotion_name(self.preview_emotion))
+                    .show_ui(ui, |ui| {
+                        for emotion in all_preview_emotions() {
+                            ui.selectable_value(
+                                &mut self.preview_emotion,
+                                emotion,
+                                emotion_name(emotion),
+                            );
+                        }
+                    });
+                ui.add(
+                    Slider::new(&mut self.preview_emotion_intensity, 0.0..=1.0)
+                        .text("Emotion intensity"),
+                );
+                ui.add(Slider::new(&mut self.emotional_arousal, 0.0..=1.0).text("Arousal"));
+                ui.add(Slider::new(&mut self.interest, 0.0..=1.0).text("Interest"));
+                ui.checkbox(&mut self.focus_lock, "Attention lock");
+                return;
+            }
+            LabSection::Body => {}
+        }
         ui.horizontal(|ui| {
             if ui
                 .button(if self.playing { "Pause" } else { "Play" })
@@ -4341,7 +6026,7 @@ impl LabUi {
                     .to_owned()
             }
             PresetSelection::MoonlitGlass => {
-                "Cool translucent glass, warm inner light, softer low-viscosity motion, and the same stable v16 solver lane."
+                "Cool translucent glass, warm inner light, softer low-viscosity motion, and the same stable v17 solver lane."
                     .to_owned()
             }
             PresetSelection::User(id) => self
@@ -4486,6 +6171,548 @@ impl LabUi {
             }
             Err(error) => self.status = format!("Preset delete failed: {error}"),
         }
+    }
+
+    fn den_controls(&mut self, ui: &mut egui::Ui) {
+        let previous_tuning = self.profile.den;
+        CollapsingHeader::new("Den distortion / energy field")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.checkbox(
+                    &mut self.live_den_apply,
+                    "LIVE → running desktop Pet (auto-apply sliders)",
+                );
+                ui.small("These sliders feed the exact production WGSL shader. LIVE writes a debounced shared profile while you drag; den physics and orb storage stay unchanged.");
+                let tuning = &mut self.profile.den;
+                ui.label("Converging energy noise");
+                ui.add(Slider::new(&mut tuning.noise_size, 0.60..=5.0).text("Noise packet size"));
+                ui.add(Slider::new(&mut tuning.noise_strength, 0.0..=2.0).text("Noise height / warp"));
+                ui.add(Slider::new(&mut tuning.inward_speed, 0.0..=1.0).text("Noise speed to centre"));
+                ui.add(Slider::new(&mut tuning.noise_detail_scale, 1.0..=4.0).text("Detail scale"));
+                ui.add(Slider::new(&mut tuning.noise_detail_mix, 0.0..=1.0).text("Fine detail mix"));
+                ui.add(Slider::new(&mut tuning.noise_warp, 0.0..=1.0).text("Radial warp"));
+                ui.add(
+                    Slider::new(&mut tuning.noise_band_width, 0.0..=100.0)
+                        .step_by(1.0)
+                        .text("Noise width"),
+                );
+                ui.separator();
+                ui.label("Concentric ripple");
+                ui.add(Slider::new(&mut tuning.ripple_strength, 0.0..=1.5).text("Concentric ripple height"));
+                ui.add(Slider::new(&mut tuning.ripple_inward_speed, 0.0..=1.0).text("Wave speed to centre"));
+                ui.add(Slider::new(&mut tuning.ripple_opacity, 0.0..=1.0).text("Blue-violet ripple opacity"));
+                ui.add(
+                    Slider::new(&mut tuning.orb_speedup_fraction, 0.0..=0.50)
+                        .text("Orb speed-up fraction"),
+                );
+                ui.add(
+                    Slider::new(&mut tuning.orb_attack_seconds, 0.08..=3.0)
+                        .text("Orb acceleration smoothing (s)"),
+                );
+                ui.add(
+                    Slider::new(&mut tuning.orb_release_seconds, 0.08..=5.0)
+                        .text("Orb slowdown smoothing (s)"),
+                );
+                ui.separator();
+                ui.label("Displacement + refraction");
+                ui.add(Slider::new(&mut tuning.displacement_strength, 0.0..=2.5).text("Background displacement"));
+                ui.add(Slider::new(&mut tuning.displacement_blur, 0.012..=0.14).text("Displacement sampling width"));
+                ui.add(Slider::new(&mut tuning.displacement_noise_mix, 0.0..=1.0).text("Noise in displacement"));
+                ui.add(Slider::new(&mut tuning.displacement_radius, 0.45..=1.30).text("Displacement radius"));
+                ui.add(Slider::new(&mut tuning.refraction_strength, 0.0..=1.5).text("Refraction coverage"));
+                ui.add(Slider::new(&mut tuning.refraction_opacity, 0.0..=1.5).text("Displacement visibility / opacity"));
+                ui.add(Slider::new(&mut tuning.dispersion_strength, 0.0..=1.5).text("RGB dispersion"));
+                ui.separator();
+                ui.label("Centre exclusion mask");
+                ui.add(Slider::new(&mut tuning.center_mask_radius, 0.0..=0.72).text("Hidden centre radius"));
+                ui.add(Slider::new(&mut tuning.center_mask_feather, 0.01..=0.80).text("Large feather"));
+                ui.add(Slider::new(&mut tuning.center_mask_opacity, 0.0..=1.0).text("Mask strength"));
+                ui.separator();
+                ui.label("Material + light");
+                ui.add(Slider::new(&mut tuning.tint_strength, 0.0..=2.0).text("Blue-violet tint"));
+                ui.add(Slider::new(&mut tuning.caustic_strength, 0.0..=2.0).text("Fake dispersion caustic"));
+                ui.add(Slider::new(&mut tuning.glow_strength, 0.0..=1.0).text("Energy glow"));
+                ui.add(Slider::new(&mut tuning.particle_count, 0..=24).text("Particles to centre"));
+                ui.add(Slider::new(&mut tuning.particle_brightness, 0.0..=2.0).text("Particle brightness"));
+                ui.horizontal(|ui| {
+                    if ui.button("Strong noisy lens").clicked() {
+                        *tuning = Default::default();
+                    }
+                    if ui.button("Refraction A/B").clicked() {
+                        tuning.noise_size = 3.4;
+                        tuning.noise_strength = 1.45;
+                        tuning.inward_speed = 0.62;
+                        tuning.ripple_inward_speed = 0.52;
+                        tuning.noise_detail_mix = 0.10;
+                        tuning.noise_band_width = 1.10;
+                        tuning.ripple_strength = 0.0;
+                        tuning.ripple_opacity = 0.0;
+                        tuning.displacement_strength = 2.15;
+                        tuning.displacement_noise_mix = 1.0;
+                        tuning.displacement_radius = 1.12;
+                        tuning.refraction_strength = 1.35;
+                        tuning.refraction_opacity = 0.82;
+                        tuning.dispersion_strength = 0.42;
+                        tuning.tint_strength = 0.0;
+                        tuning.caustic_strength = 0.0;
+                        tuning.glow_strength = 0.0;
+                        tuning.particle_brightness = 0.0;
+                        tuning.particle_count = 0;
+                        tuning.center_mask_radius = 0.10;
+                        tuning.center_mask_feather = 0.28;
+                        tuning.center_mask_opacity = 0.88;
+                    }
+                    if ui.button("Quiet lens").clicked() {
+                        tuning.noise_size = 3.0;
+                        tuning.noise_strength = 0.82;
+                        tuning.inward_speed = 0.34;
+                        tuning.ripple_inward_speed = 0.30;
+                        tuning.noise_detail_mix = 0.08;
+                        tuning.noise_band_width = 1.10;
+                        tuning.ripple_strength = 0.18;
+                        tuning.ripple_opacity = 0.12;
+                        tuning.displacement_strength = 1.05;
+                        tuning.displacement_noise_mix = 0.90;
+                        tuning.refraction_strength = 0.86;
+                        tuning.refraction_opacity = 0.78;
+                        tuning.dispersion_strength = 0.45;
+                        tuning.tint_strength = 0.34;
+                        tuning.caustic_strength = 0.45;
+                        tuning.glow_strength = 0.12;
+                        tuning.particle_brightness = 0.82;
+                        tuning.particle_count = 14;
+                        tuning.center_mask_radius = 0.18;
+                        tuning.center_mask_feather = 0.42;
+                        tuning.center_mask_opacity = 0.96;
+                    }
+                });
+                ui.small("Default is noise-dominant: broad inward packets, weak blue-violet ripple, low glow, and a feathered transparent centre.");
+            });
+        if self.profile.den != previous_tuning {
+            self.den_live_dirty = true;
+        }
+        self.flush_live_den_apply();
+    }
+
+    fn flush_live_den_apply(&mut self) {
+        if !self.live_den_apply || !self.den_live_dirty {
+            return;
+        }
+        let now = Instant::now();
+        if now < self.next_den_live_apply {
+            return;
+        }
+        // The runtime polls at a coarser cadence; writing ten complete JSON
+        // profiles per second only stalls the preview and cannot update the Pet
+        // any faster. Keep the control interactive without I/O thrash.
+        self.next_den_live_apply = now + Duration::from_millis(250);
+        match self.save_active_den() {
+            Ok(revision) => {
+                self.den_live_dirty = false;
+                self.status = format!(
+                    "LIVE den revision {revision} saved · desktop Pet updates within 250 ms"
+                );
+            }
+            Err(error) => self.status = format!("LIVE den apply failed: {error}"),
+        }
+    }
+
+    fn voice_controls(&mut self, ui: &mut egui::Ui) {
+        CollapsingHeader::new("Procedural voice calibration")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("Pet Lab audio output");
+                let selected_device = self.audio_output_device.clone();
+                let devices = self.audio_output_devices.clone();
+                egui::ComboBox::from_id_salt("pet_lab_audio_output")
+                    .selected_text(&selected_device)
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for device in devices {
+                            if ui
+                                .selectable_label(device == selected_device, &device)
+                                .clicked()
+                            {
+                                self.pending_audio_output_device = Some(device);
+                            }
+                        }
+                    });
+                ui.small("Session only: this output is never written to the Pet profile or genome.");
+                ui.separator();
+                ui.small("These trims are applied after emotional prosody. The genome voice identity and maximum_loudness remain authoritative.");
+                let tuning = &mut self.profile.voice;
+                ui.add(Slider::new(&mut tuning.pitch_multiplier, 0.75..=1.30).text("Pitch"));
+                ui.add(Slider::new(&mut tuning.formant_multiplier, 0.94..=1.06).text("Body / formant size"));
+                ui.add(Slider::new(&mut tuning.tempo_multiplier, 0.65..=1.35).text("Phrase speed"));
+                ui.add(Slider::new(&mut tuning.loudness_multiplier, 0.30..=1.25).text("Relative loudness"));
+                ui.add(Slider::new(&mut tuning.attack_multiplier, 0.72..=1.28).text("Attack softness"));
+                ui.add(Slider::new(&mut tuning.release_multiplier, 0.75..=1.40).text("Physical release / tail"));
+                ui.add(Slider::new(&mut tuning.breathiness_delta, -0.35..=0.35).text("Breathiness"));
+                ui.add(Slider::new(&mut tuning.roughness_delta, -0.35..=0.35).text("Roughness"));
+                ui.add(Slider::new(&mut tuning.brightness_delta, -0.35..=0.35).text("Brightness"));
+                ui.horizontal(|ui| {
+                    if ui.button("Reset embodied voice").clicked() {
+                        *tuning = Default::default();
+                    }
+                    if ui.button("Long soft tail").clicked() {
+                        tuning.attack_multiplier = 1.10;
+                        tuning.release_multiplier = 1.34;
+                        tuning.tempo_multiplier = 0.90;
+                        tuning.breathiness_delta = 0.06;
+                    }
+                });
+                ui.small("RMS/peak above come from the real callback, not an estimated envelope.");
+            });
+    }
+
+    fn nervous_controls(&mut self, ui: &mut egui::Ui) {
+        CollapsingHeader::new("Stimulus rig · immediate A/B test")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("Turn on any stimulus to drive the preview immediately. Multiple stimuli may be combined; Pulse makes the response breathe so a frozen visual cannot hide it.");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.nervous_stimulus.enabled, "Stimulate");
+                    ui.checkbox(&mut self.nervous_stimulus.pulse, "Pulse");
+                });
+                ui.add(
+                    Slider::new(&mut self.nervous_stimulus.intensity, 0.0..=1.0)
+                        .text("Stimulus intensity"),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.nervous_stimulus.threat, "Threat");
+                    ui.checkbox(&mut self.nervous_stimulus.pain, "Pain");
+                    ui.checkbox(&mut self.nervous_stimulus.restraint, "Restraint");
+                    ui.checkbox(&mut self.nervous_stimulus.startle, "Startle");
+                    ui.checkbox(&mut self.nervous_stimulus.fatigue, "Fatigue");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.nervous_stimulus.contact, "Warm contact");
+                    ui.checkbox(&mut self.nervous_stimulus.safety, "Safety");
+                    ui.checkbox(&mut self.nervous_stimulus.relief, "Relief");
+                    ui.checkbox(&mut self.nervous_stimulus.novelty, "Novelty");
+                    ui.checkbox(&mut self.nervous_stimulus.play, "Play");
+                    ui.checkbox(&mut self.nervous_stimulus.agency_success, "Agency success");
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Clear all").clicked() {
+                        let enabled = self.nervous_stimulus.enabled;
+                        let pulse = self.nervous_stimulus.pulse;
+                        let intensity = self.nervous_stimulus.intensity;
+                        self.nervous_stimulus = NervousStimulusRig {
+                            enabled,
+                            pulse,
+                            intensity,
+                            ..NervousStimulusRig::default()
+                        };
+                        self.nervous_stimulus.novelty = false;
+                    }
+                    if ui.button("Threat test").clicked() {
+                        self.nervous_stimulus = NervousStimulusRig {
+                            threat: true,
+                            startle: true,
+                            ..NervousStimulusRig::default()
+                        };
+                        self.nervous_stimulus.novelty = false;
+                    }
+                    if ui.button("Safe contact test").clicked() {
+                        self.nervous_stimulus = NervousStimulusRig {
+                            contact: true,
+                            safety: true,
+                            agency_success: true,
+                            ..NervousStimulusRig::default()
+                        };
+                        self.nervous_stimulus.novelty = false;
+                    }
+                });
+                let now = ui.input(|input| input.time as f32);
+                let levels = self
+                    .nervous_stimulus
+                    .levels(self.profile.nervous, now);
+                ui.separator();
+                ui.label("Weighted felt-state inputs");
+                stimulus_meter(ui, "threat", levels.threat.max(levels.startle));
+                stimulus_meter(ui, "pain / restraint", levels.pain.max(levels.restraint));
+                stimulus_meter(ui, "contact / safety", levels.contact.max(levels.safety));
+                stimulus_meter(ui, "novelty / play", levels.novelty.max(levels.play));
+                stimulus_meter(ui, "fatigue", levels.fatigue);
+                stimulus_meter(ui, "agency / relief", levels.agency.max(levels.relief));
+                ui.small("The body preview is the output monitor: silhouette, parcel motion, dynamic parcel separation, glow/flow, face, approach/recoil, breathing and voice all receive the same packet.");
+            });
+
+        CollapsingHeader::new("Input sensitivity")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("Sensitivity changes how strongly evidence enters the Lab stimulus chain. 1.0 is neutral; 0 disables that channel.");
+                let tuning = &mut self.profile.nervous;
+                ui.add(Slider::new(&mut tuning.threat_sensitivity, 0.0..=3.0).text("Threat sensitivity"));
+                ui.add(Slider::new(&mut tuning.pain_sensitivity, 0.0..=3.0).text("Pain sensitivity"));
+                ui.add(Slider::new(&mut tuning.contact_sensitivity, 0.0..=3.0).text("Contact sensitivity"));
+                ui.add(Slider::new(&mut tuning.safety_sensitivity, 0.0..=3.0).text("Safety / relief sensitivity"));
+                ui.add(Slider::new(&mut tuning.restraint_sensitivity, 0.0..=3.0).text("Restraint sensitivity"));
+                ui.add(Slider::new(&mut tuning.fatigue_sensitivity, 0.0..=3.0).text("Fatigue sensitivity"));
+                ui.add(Slider::new(&mut tuning.novelty_sensitivity, 0.0..=3.0).text("Novelty / play sensitivity"));
+                ui.add(Slider::new(&mut tuning.startle_sensitivity, 0.0..=3.0).text("Startle sensitivity"));
+                ui.add(Slider::new(&mut tuning.agency_sensitivity, 0.0..=3.0).text("Agency sensitivity"));
+            });
+
+        CollapsingHeader::new("Nervous / body response gains")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("The 36 closed loops already run. These bounded gains make each physical output legible without changing particle_count, fixed_hz, solver iterations, identity, or learning rate.");
+                let tuning = &mut self.profile.nervous;
+                ui.label("Body / metaballs");
+                ui.add(Slider::new(&mut tuning.shape_gain, 0.0..=3.0).text("Silhouette / apparent scale"));
+                ui.add(Slider::new(&mut tuning.breathing_gain, 0.0..=3.0).text("Breathing amplitude + rate"));
+                ui.add(Slider::new(&mut tuning.particle_motion_gain, 0.0..=3.0).text("Metaball motion / slosh / lag"));
+                ui.add(Slider::new(&mut tuning.particle_spacing_response_gain, 0.0..=3.0).text("Dynamic metaball separation"));
+                ui.add(Slider::new(&mut tuning.viscosity_response_gain, 0.0..=3.0).text("Viscosity response"));
+                ui.add(Slider::new(&mut tuning.cohesion_response_gain, 0.0..=3.0).text("Cohesion response"));
+                ui.add(Slider::new(&mut tuning.recovery_response_gain, 0.0..=3.0).text("Shape recovery / upright"));
+                ui.small("Dynamic separation uses bounded density compliance. Structural rest spacing remains authored and is never emotion-coupled.");
+                ui.separator();
+                ui.label("Material / expression / action");
+                ui.add(Slider::new(&mut tuning.material_gain, 0.0..=3.0).text("Material hue / emission"));
+                ui.add(Slider::new(&mut tuning.soul_glow_gain, 0.0..=3.0).text("Soul glow strength + pulse"));
+                ui.add(Slider::new(&mut tuning.internal_flow_gain, 0.0..=3.0).text("Internal flow speed + strength"));
+                ui.add(Slider::new(&mut tuning.pulse_gain, 0.0..=3.0).text("Metabolic pulse"));
+                ui.add(Slider::new(&mut tuning.expression_gain, 0.0..=2.5).text("Face expression"));
+                ui.add(Slider::new(&mut tuning.motion_gain, 0.0..=2.5).text("Approach / recoil / gesture"));
+                ui.add(Slider::new(&mut tuning.voice_gain, 0.0..=2.5).text("Emotional prosody"));
+                ui.horizontal(|ui| {
+                    if ui.button("Readable").clicked() {
+                        *tuning = Default::default();
+                    }
+                    if ui.button("Subtle").clicked() {
+                        tuning.shape_gain = 1.0;
+                        tuning.breathing_gain = 1.0;
+                        tuning.particle_motion_gain = 1.0;
+                        tuning.particle_spacing_response_gain = 1.0;
+                        tuning.viscosity_response_gain = 1.0;
+                        tuning.cohesion_response_gain = 1.0;
+                        tuning.recovery_response_gain = 1.0;
+                        tuning.material_gain = 1.0;
+                        tuning.soul_glow_gain = 1.0;
+                        tuning.internal_flow_gain = 1.0;
+                        tuning.pulse_gain = 1.0;
+                        tuning.expression_gain = 1.0;
+                        tuning.motion_gain = 1.0;
+                        tuning.voice_gain = 1.0;
+                    }
+                    if ui.button("Diagnostic preview").clicked() {
+                        tuning.shape_gain = 2.8;
+                        tuning.breathing_gain = 2.6;
+                        tuning.particle_motion_gain = 2.5;
+                        tuning.particle_spacing_response_gain = 2.5;
+                        tuning.viscosity_response_gain = 2.2;
+                        tuning.cohesion_response_gain = 2.2;
+                        tuning.recovery_response_gain = 2.4;
+                        tuning.material_gain = 2.8;
+                        tuning.soul_glow_gain = 2.6;
+                        tuning.internal_flow_gain = 2.6;
+                        tuning.pulse_gain = 2.5;
+                        tuning.expression_gain = 2.1;
+                        tuning.motion_gain = 2.0;
+                        tuning.voice_gain = 1.8;
+                    }
+                });
+                ui.small("Diagnostic preview stays fully visible in Lab. The desktop Pet applies live-safe caps to continuous motion, startle, fatigue and face gain, so background evidence cannot become permanent flight or closed eyes.");
+                ui.separator();
+                ui.label("Visible outputs");
+                ui.small("• silhouette/scale and area-preserving breath\n• metaball motion and dynamic separation, viscosity, cohesion, stretch, recovery and slosh\n• soul/rim hue, metabolic pulse, flow, droplets and opacity\n• gaze, pupils, brows, mouth, asymmetry and fatigue\n• approach/avoid/recoil/lean and voice prosody");
+                ui.colored_label(
+                    egui::Color32::from_rgb(126, 209, 255),
+                    "Base body pigment stays authored black; mood changes the soul/rim glow.",
+                );
+                ui.small("Open F4 Diagnostics for live FeltStateV1, 22 emotional readouts, fast_actuation, reason traces, actual BodyFeedbackV2 and efference-copy error.");
+            });
+    }
+
+    fn body_communication_controls(&mut self, ui: &mut egui::Ui) {
+        CollapsingHeader::new("Body Communication")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("Eight semantic controls map to bounded physical sensing, topology, response, turn-taking, recovery, and confidence updates.");
+                let mut touch_sensitivity =
+                    ((1.60 - self.profile.interaction.pressure_reference) / 1.15)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(Slider::new(&mut touch_sensitivity, 0.0..=1.0).text("Touch sensitivity"))
+                    .changed()
+                {
+                    self.profile.interaction.pressure_reference =
+                        1.60 - touch_sensitivity * 1.15;
+                    self.profile.interaction.contact_weight_floor =
+                        0.02 + touch_sensitivity * 0.10;
+                    self.profile.interaction.soft_touch_pressure_max =
+                        0.16 + touch_sensitivity * 0.19;
+                    self.profile.interaction.signal_smoothing_hz =
+                        8.0 + touch_sensitivity * 16.0;
+                }
+
+                let mut stretch_compliance = ((self.profile.interaction.stretch_strain_max - 0.42)
+                    / 0.43)
+                    .clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut stretch_compliance, 0.0..=1.0)
+                            .text("Stretch compliance"),
+                    )
+                    .changed()
+                {
+                    self.profile.interaction.stretch_strain_min =
+                        0.08 + stretch_compliance * 0.16;
+                    self.profile.interaction.stretch_strain_max =
+                        0.42 + stretch_compliance * 0.43;
+                    self.profile.interaction.boundary_strain =
+                        0.52 + stretch_compliance * 0.43;
+                    self.profile.pbf.density_compliance =
+                        1.0e-7 * (1_500.0_f32).powf(stretch_compliance);
+                }
+
+                let mut playful_separation =
+                    ((self.profile.interaction.maximum_detached_mass_fraction - 0.05) / 0.20)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut playful_separation, 0.0..=1.0)
+                            .text("Playful separation"),
+                    )
+                    .changed()
+                {
+                    self.profile.interaction.maximum_detached_components =
+                        (1.0 + playful_separation * 2.0).round() as u8;
+                    self.profile.interaction.maximum_detached_mass_fraction =
+                        0.05 + playful_separation * 0.20;
+                    self.profile.interaction.minimum_fragment_particles =
+                        (12.0 - playful_separation * 9.0).round() as u8;
+                    self.profile.interaction.split_hold_seconds =
+                        0.30 - playful_separation * 0.25;
+                }
+
+                let mut cohesion_under_stress =
+                    ((self.profile.pbf.surface_tension - 0.60) / 1.60).clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut cohesion_under_stress, 0.0..=1.0)
+                            .text("Cohesion under stress"),
+                    )
+                    .changed()
+                {
+                    self.profile.pbf.surface_tension = 0.60 + cohesion_under_stress * 1.60;
+                    self.profile.pbf.bond_yield_strain =
+                        0.15 + cohesion_under_stress * 0.45;
+                    self.profile.pbf.bond_break_strain =
+                        0.38 + cohesion_under_stress * 0.82;
+                    self.profile.interaction.boundary_hold_seconds =
+                        0.15 + cohesion_under_stress * 0.90;
+                }
+
+                let mut reaction_amplitude =
+                    ((self.profile.interaction.response_amplitude - 0.25) / 1.0)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut reaction_amplitude, 0.0..=1.0)
+                            .text("Reaction amplitude"),
+                    )
+                    .changed()
+                {
+                    self.profile.interaction.response_amplitude =
+                        0.25 + reaction_amplitude;
+                }
+
+                let mut turn_patience =
+                    ((self.profile.interaction.turn_wait_seconds - 0.45) / 2.05)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(Slider::new(&mut turn_patience, 0.0..=1.0).text("Turn patience"))
+                    .changed()
+                {
+                    self.profile.interaction.turn_wait_seconds = 0.45 + turn_patience * 2.05;
+                    self.profile.interaction.turn_cooldown_seconds =
+                        0.40 + turn_patience * 2.10;
+                    self.profile.interaction.gesture_window_seconds =
+                        1.0 + turn_patience * 2.0;
+                }
+
+                let mut recovery_speed =
+                    ((self.profile.interaction.recovery_field_boost - 1.0) / 1.0)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(Slider::new(&mut recovery_speed, 0.0..=1.0).text("Recovery speed"))
+                    .changed()
+                {
+                    self.profile.interaction.fragment_lifetime_seconds =
+                        15.0 - recovery_speed * 12.0;
+                    self.profile.interaction.offscreen_recovery_delay_seconds =
+                        5.0 - recovery_speed * 4.75;
+                    self.profile.interaction.recovery_field_boost = 1.0 + recovery_speed;
+                    self.profile.pbf.return_strength = 0.45 + recovery_speed * 0.55;
+                }
+
+                let mut learning_openness =
+                    ((self.profile.interaction.learning_openness - 0.50) / 0.75)
+                        .clamp(0.0, 1.0);
+                if ui
+                    .add(
+                        Slider::new(&mut learning_openness, 0.0..=1.0)
+                            .text("Learning openness"),
+                    )
+                    .changed()
+                {
+                    self.profile.interaction.learning_openness =
+                        0.50 + learning_openness * 0.75;
+                }
+
+                CollapsingHeader::new("Advanced interaction fields").show(ui, |ui| {
+                    let tuning = &mut self.profile.interaction;
+                    ui.checkbox(&mut tuning.enabled, "Interaction enabled");
+                    egui::ComboBox::from_label("Topology constraint")
+                        .selected_text(format!("{:?}", tuning.topology_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut tuning.topology_mode,
+                                TopologyConstraintMode::ObserveOnly,
+                                "Observe only",
+                            );
+                            ui.selectable_value(
+                                &mut tuning.topology_mode,
+                                TopologyConstraintMode::GuardedNecks,
+                                "Guarded necks",
+                            );
+                            ui.selectable_value(
+                                &mut tuning.topology_mode,
+                                TopologyConstraintMode::Viscoelastic,
+                                "Viscoelastic",
+                            );
+                        });
+                    ui.add(Slider::new(&mut tuning.contact_weight_floor, 0.0..=0.25).text("Contact weight floor"));
+                    ui.add(Slider::new(&mut tuning.pressure_reference, 0.05..=8.0).logarithmic(true).text("Pressure reference"));
+                    ui.add(Slider::new(&mut tuning.signal_smoothing_hz, 1.0..=60.0).text("Signal smoothing Hz"));
+                    ui.add(Slider::new(&mut tuning.gesture_window_seconds, 0.5..=4.0).text("Gesture window"));
+                    ui.add(Slider::new(&mut tuning.gesture_commit_confidence, 0.50..=0.85).text("Commit confidence"));
+                    ui.add(Slider::new(&mut tuning.gesture_ambiguity_margin, 0.05..=0.35).text("Ambiguity margin"));
+                    ui.add(Slider::new(&mut tuning.soft_touch_pressure_max, 0.05..=0.50).text("Soft-touch pressure max"));
+                    ui.add(Slider::new(&mut tuning.stretch_strain_min, 0.05..=0.45).text("Stretch strain min"));
+                    ui.add(Slider::new(&mut tuning.stretch_strain_max, 0.10..=1.20).text("Stretch strain max"));
+                    ui.add(Slider::new(&mut tuning.flick_speed_min, 0.5..=8.0).text("Flick speed min"));
+                    ui.add(Slider::new(&mut tuning.rhythm_interval_cv_max, 0.05..=0.50).text("Rhythm CV max"));
+                    ui.add(Slider::new(&mut tuning.rhythm_min_impulses, 3..=8).text("Rhythm impulses"));
+                    ui.add(Slider::new(&mut tuning.maximum_detached_components, 1..=3).text("Detached component max"));
+                    ui.add(Slider::new(&mut tuning.maximum_detached_mass_fraction, 0.05..=0.25).text("Detached mass max"));
+                    ui.add(Slider::new(&mut tuning.minimum_fragment_particles, 3..=12).text("Fragment particle min"));
+                    ui.add(Slider::new(&mut tuning.split_hold_seconds, 0.025..=0.50).text("Split hold"));
+                    ui.add(Slider::new(&mut tuning.boundary_strain, 0.45..=1.20).text("Boundary strain"));
+                    ui.add(Slider::new(&mut tuning.boundary_hold_seconds, 0.10..=2.0).text("Boundary hold"));
+                    ui.add(Slider::new(&mut tuning.fragment_lifetime_seconds, 3.0..=15.0).text("Fragment lifetime"));
+                    ui.add(Slider::new(&mut tuning.offscreen_recovery_delay_seconds, 0.25..=5.0).text("Offscreen recovery delay"));
+                    ui.add(Slider::new(&mut tuning.recovery_field_boost, 1.0..=2.0).text("Recovery field boost"));
+                    ui.add(Slider::new(&mut tuning.turn_wait_seconds, 0.45..=2.50).text("Turn wait"));
+                    ui.add(Slider::new(&mut tuning.turn_cooldown_seconds, 0.25..=5.0).text("Turn cooldown"));
+                    ui.add(Slider::new(&mut tuning.response_amplitude, 0.25..=1.25).text("Response amplitude"));
+                    ui.add(Slider::new(&mut tuning.learning_openness, 0.50..=1.25).text("Confidence update multiplier"));
+                });
+            });
     }
 
     fn physics_controls(&mut self, ui: &mut egui::Ui) {
@@ -5035,6 +7262,37 @@ impl LabUi {
         Ok(self.profile.profile_revision)
     }
 
+    fn save_active_den(&mut self) -> Result<u64, String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "Pet data directory is unavailable".to_owned())?;
+        let active = store
+            .load_liquid_tuning::<LiquidTuningProfile>()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "active Pet profile is unavailable".to_owned())?;
+        let profile =
+            merge_live_den_profile(active, self.profile.den, self.profile.profile_revision)?;
+        store
+            .save_liquid_tuning(&profile)
+            .map_err(|error| error.to_string())?;
+        let saved = store
+            .load_liquid_tuning::<LiquidTuningProfile>()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "saved profile could not be reread".to_owned())?;
+        if saved.profile_revision != profile.profile_revision
+            || saved.schema_version != profile.schema_version
+            || saved.den != profile.den
+        {
+            return Err("saved den profile verification mismatch".to_owned());
+        }
+        self.profile.profile_revision = profile.profile_revision;
+        self.profile.schema_version = profile.schema_version;
+        self.pending_revision = Some(profile.profile_revision);
+        self.next_ack_poll = Instant::now();
+        Ok(profile.profile_revision)
+    }
+
     fn poll_pet_acknowledgement(&mut self) {
         let Some(expected_revision) = self.pending_revision else {
             return;
@@ -5331,49 +7589,88 @@ fn delete_user_preset(directory: &Path, id: &str) -> Result<(), String> {
 }
 
 fn canonical_pet_executable_name() -> &'static str {
-    if cfg!(windows) { "Pet 2.exe" } else { "Pet 2" }
+    if cfg!(windows) { "Pet2.exe" } else { "Pet2" }
 }
 
 fn development_pet_executable_name() -> &'static str {
     if cfg!(windows) { "pet2.exe" } else { "pet2" }
 }
 
-fn pet_executable_candidates(current_exe: &Path, workspace_root: &Path) -> Vec<PathBuf> {
+fn legacy_pet_executable_name() -> &'static str {
+    if cfg!(windows) { "Pet 2.exe" } else { "Pet 2" }
+}
+
+fn pet_executable_candidates(
+    current_exe: &Path,
+    workspace_root: &Path,
+    include_builds_current_fallback: bool,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut push_unique = |candidate: PathBuf| {
         if !candidates.contains(&candidate) {
             candidates.push(candidate);
         }
     };
+    // The console executable lives in .app/Contents/Resources. Resolve the
+    // sibling signed Pet bundle before developer fallbacks on packaged macOS.
+    for ancestor in current_exe.ancestors() {
+        if ancestor
+            .extension()
+            .is_some_and(|extension| extension == "app")
+        {
+            if let Some(directory) = ancestor.parent() {
+                push_unique(directory.join("Pet2.app/Contents/MacOS/Pet2"));
+            }
+            break;
+        }
+    }
     if let Some(parent) = current_exe.parent() {
         push_unique(parent.join(canonical_pet_executable_name()));
+        push_unique(parent.join(development_pet_executable_name()));
+        push_unique(parent.join(legacy_pet_executable_name()));
     }
-    push_unique(
-        workspace_root
-            .join("builds")
-            .join("current")
-            .join(canonical_pet_executable_name()),
-    );
     push_unique(
         workspace_root
             .join("target")
             .join("release")
             .join(development_pet_executable_name()),
     );
-    if let Some(parent) = current_exe.parent() {
-        push_unique(parent.join(development_pet_executable_name()));
-    }
     push_unique(
         workspace_root
             .join("target")
             .join("debug")
             .join(development_pet_executable_name()),
     );
+    if include_builds_current_fallback {
+        push_unique(
+            workspace_root
+                .join("builds")
+                .join("current")
+                .join(canonical_pet_executable_name()),
+        );
+        push_unique(
+            workspace_root
+                .join("builds")
+                .join("current")
+                .join(legacy_pet_executable_name()),
+        );
+    }
     candidates
 }
 
 fn resolve_pet_executable(current_exe: &Path, workspace_root: &Path) -> Result<PathBuf, String> {
-    let candidates = pet_executable_candidates(current_exe, workspace_root);
+    let launched_from_builds_current = current_exe
+        .components()
+        .any(|part| part.as_os_str() == "builds")
+        && current_exe
+            .components()
+            .any(|part| part.as_os_str() == "current");
+    let explicit_fallback = env::var("PET2_BUILDS_CURRENT_FALLBACK").as_deref() == Ok("1");
+    let candidates = pet_executable_candidates(
+        current_exe,
+        workspace_root,
+        launched_from_builds_current || explicit_fallback,
+    );
     candidates
         .iter()
         .find(|candidate| candidate.is_file())
@@ -5386,8 +7683,48 @@ fn resolve_pet_executable(current_exe: &Path, workspace_root: &Path) -> Result<P
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+                    + "; set PET2_BUILDS_CURRENT_FALLBACK=1 only to opt into builds/current"
             )
         })
+}
+
+fn executable_sha256(path: &Path) -> Result<String, String> {
+    let output = if cfg!(windows) {
+        Command::new("certutil.exe")
+            .arg("-hashfile")
+            .arg(path)
+            .arg("SHA256")
+            .output()
+    } else if cfg!(target_os = "macos") {
+        Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+    } else {
+        Command::new("sha256sum").arg(path).output()
+    }
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|word| word.trim().to_ascii_lowercase())
+        .find(|word| word.len() == 64 && word.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "SHA-256 utility returned no 64-digit digest".to_owned())
+}
+
+fn read_log_tail(path: &Path, line_count: usize) -> Result<String, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut lines = VecDeque::with_capacity(line_count);
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        if lines.len() == line_count {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+    Ok(lines.into_iter().collect::<Vec<_>>().join("\n"))
 }
 
 fn launch_desktop_pet() -> Result<PathBuf, String> {
@@ -5400,6 +7737,151 @@ fn launch_desktop_pet() -> Result<PathBuf, String> {
     }
     command.spawn().map_err(|error| error.to_string())?;
     Ok(executable)
+}
+
+fn launch_desktop_pet_at(store: &StateStore) -> Result<(PathBuf, u32), String> {
+    let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let executable = resolve_pet_executable(&current_exe, &workspace_root)?;
+    let data_root = fs::canonicalize(&store.paths.root).map_err(|error| {
+        format!(
+            "cannot resolve promoted data directory {}: {error}",
+            store.paths.root.display()
+        )
+    })?;
+    let mut command = Command::new(&executable);
+    command.arg("--data-dir").arg(data_root);
+    if let Some(parent) = executable.parent() {
+        command.current_dir(parent);
+    }
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    Ok((executable, child.id()))
+}
+
+fn stop_live_runtime_for_promotion(store: &StateStore) -> Result<Option<u32>, String> {
+    let now = unix_time_ms();
+    let acknowledgement = store
+        .load_runtime_ack::<RuntimeLoadAcknowledgement>()
+        .map_err(|error| error.to_string())?;
+    let Some(running) = acknowledgement.filter(|ack| {
+        ack.status == RuntimeLoadStatus::Running && now.saturating_sub(ack.updated_unix_ms) <= 3_000
+    }) else {
+        return Ok(None);
+    };
+    let command = LabControlEnvelope {
+        schema_version: LAB_CONTROL_SCHEMA_VERSION,
+        command_id: now.max(1),
+        issued_unix_ms: now,
+        expires_after_ms: 15_000,
+        command: LabControlCommand::ShutdownForPromotion,
+    };
+    store
+        .save_lab_control(&command)
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(ack) = store
+            .load_runtime_ack::<RuntimeLoadAcknowledgement>()
+            .map_err(|error| error.to_string())?
+            && ack.pid == running.pid
+            && ack.status == RuntimeLoadStatus::Stopped
+        {
+            let exit_deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < exit_deadline {
+                if process_has_exited(running.pid)? {
+                    return Ok(Some(running.pid));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return Err(format!(
+                "live Pet PID {} acknowledged stop but did not release the process within 3 s",
+                running.pid
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "live Pet PID {} did not acknowledge a graceful stop within 10 s",
+        running.pid
+    ))
+}
+
+#[cfg(windows)]
+fn process_has_exited(pid: u32) -> Result<bool, String> {
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    // SAFETY: the handle is opened only for synchronization, checked for null,
+    // observed without mutation, and closed on every successful open path.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(true);
+        }
+        return Err(format!("cannot query Pet process {pid}: {error}"));
+    }
+    // SAFETY: `handle` is a live synchronization handle owned by this function.
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    // SAFETY: `handle` was returned by OpenProcess and is closed exactly once.
+    let close_result = unsafe { CloseHandle(handle) };
+    if close_result == 0 {
+        return Err(format!(
+            "cannot close synchronization handle for Pet process {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    match wait {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(format!(
+            "cannot wait on Pet process {pid}: {}",
+            std::io::Error::last_os_error()
+        )),
+        other => Err(format!(
+            "unexpected wait status {other:#x} for Pet process {pid}"
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn process_has_exited(pid: u32) -> Result<bool, String> {
+    Ok(!Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map_err(|error| format!("cannot query Pet process {pid}: {error}"))?
+        .success())
+}
+
+fn wait_for_loaded_hash(
+    store: &StateStore,
+    expected_hash: u64,
+    old_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<RuntimeLoadAcknowledgement, String> {
+    let started_unix_ms = unix_time_ms();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(ack) = store
+            .load_runtime_ack::<RuntimeLoadAcknowledgement>()
+            .map_err(|error| error.to_string())?
+            && ack.status == RuntimeLoadStatus::Running
+            && ack.loaded_life_state_hash == expected_hash
+            && old_pid != Some(ack.pid)
+            && ack.updated_unix_ms >= started_unix_ms
+        {
+            return Ok(ack);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "new live Pet did not acknowledge loaded state {expected_hash:016x} within {:.1} s",
+        timeout.as_secs_f32()
+    ))
 }
 
 fn save_profile_file(path: &Path, profile: &LiquidTuningProfile) -> Result<(), String> {
@@ -5418,6 +7900,19 @@ fn save_profile_file(path: &Path, profile: &LiquidTuningProfile) -> Result<(), S
     file.write_all(b"\n").map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn merge_live_den_profile(
+    mut active: LiquidTuningProfile,
+    den: DenVisualTuning,
+    source_revision: u64,
+) -> Result<LiquidTuningProfile, String> {
+    active.den = den;
+    active.profile_revision = active
+        .profile_revision
+        .max(source_revision)
+        .saturating_add(1);
+    active.sanitized().map_err(|error| error.to_string())
 }
 
 fn load_profile_file(path: &Path) -> Result<LiquidTuningProfile, String> {
@@ -5472,6 +7967,17 @@ fn scenario_name(scenario: PreviewScenario) -> &'static str {
         PreviewScenario::DetachAndRemerge => "Detach / re-merge",
         PreviewScenario::WindowPressure => "Window pressure",
     }
+}
+
+fn stimulus_meter(ui: &mut egui::Ui, label: &str, value: f32) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label:>18}"));
+        ui.add(
+            egui::ProgressBar::new(value.clamp(0.0, 1.0))
+                .desired_width(150.0)
+                .show_percentage(),
+        );
+    });
 }
 
 fn all_preview_emotions() -> [Option<EmotionKind>; 12] {
@@ -5553,6 +8059,142 @@ fn preview_seeded_unit(mut value: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lifecore::LifeCore;
+
+    #[test]
+    fn packaged_macos_console_resolves_sibling_pet_before_development_builds() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let console = root.join("Pet2 Dev Console.app/Contents/Resources/DevConsole");
+        let pet = root.join("Pet2.app/Contents/MacOS/Pet2");
+        let stale = root
+            .join("target/release")
+            .join(development_pet_executable_name());
+        for path in [&pet, &stale] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"fixture").unwrap();
+        }
+        assert_eq!(resolve_pet_executable(&console, root).unwrap(), pet);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_hash_uses_the_system_shasum_utility() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), b"abc").unwrap();
+        assert_eq!(
+            executable_sha256(file.path()).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn lab_runtime_keeps_large_simulation_state_off_the_event_loop_stack() {
+        assert!(std::mem::size_of::<LabRuntime>() < 32 * 1_024);
+        assert!(std::mem::size_of::<ProceduralBody>() > 64 * 1_024);
+    }
+
+    #[test]
+    fn live_den_merge_cannot_replace_the_active_character_profile() {
+        let mut active = LiquidTuningProfile::for_seed(42);
+        active.name = "current production character".to_owned();
+        active.profile_revision = 12;
+        active.pbf.viscosity = 0.015;
+        active.material.opacity = 0.60;
+        active.nervous.shape_gain = 2.50;
+        let mut den = active.den;
+        den.noise_band_width = 2.0;
+
+        let merged = merge_live_den_profile(active.clone(), den, 20).unwrap();
+
+        assert_eq!(merged.profile_revision, 21);
+        assert_eq!(merged.den, den);
+        assert_eq!(merged.name, active.name);
+        assert_eq!(merged.pbf, active.pbf);
+        assert_eq!(merged.material, active.material);
+        assert_eq!(merged.nervous, active.nervous);
+    }
+
+    fn write_test_promotion_bundle(root: &Path, seed: u64) -> (StateStore, u64) {
+        let store = StateStore::at(root);
+        let genome = Genome::from_seed(seed);
+        let life = LifeCore::new(genome.clone(), seed ^ 0xA11F_EC0A);
+        let portable = PortablePetState {
+            schema_version: desktop_host::PORTABLE_STATE_SCHEMA_VERSION,
+            life: life.snapshot(),
+            vita: None,
+            position: desktop_host::PersistedPetPosition::default(),
+        };
+        let tuning = LiquidTuningProfile::for_seed(genome.identity_seed)
+            .sanitized()
+            .unwrap();
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.apply_tuning_profile(tuning.clone()).unwrap();
+        let morph = morph_brain::MorphBrain::new(genome.identity_seed, None).unwrap();
+        store.save_state(&portable).unwrap();
+        store.save_liquid_tuning(&tuning).unwrap();
+        store.save_morph_brain(&morph.snapshot()).unwrap();
+        store
+            .save_ecology_state(&EcologyState::new(genome.identity_seed))
+            .unwrap();
+        store
+            .save_body_state(&body.body_material_snapshot())
+            .unwrap();
+        let hash = lifecore::persisted_life_snapshot_hash(&portable.life).unwrap();
+        (store, hash)
+    }
+
+    #[test]
+    fn validated_fork_can_be_promoted_atomically() {
+        let temporary = tempfile::tempdir().unwrap();
+        let live_root = temporary.path().join("live");
+        let (live, _) = write_test_promotion_bundle(&live_root, 101);
+        let fork_root = live.paths.evolution_runs.join("accepted-fork");
+        let (_, fork_hash) = write_test_promotion_bundle(&fork_root, 202);
+
+        let backup = promote_validated_fork(&live, &fork_root, fork_hash).unwrap();
+        assert_eq!(
+            live.load_state()
+                .unwrap()
+                .unwrap()
+                .life
+                .state
+                .genome
+                .identity_seed,
+            Genome::from_seed(202).identity_seed
+        );
+        restore_bundle(&live, &StateStore::at(&backup), true).unwrap();
+        assert_eq!(
+            live.load_state()
+                .unwrap()
+                .unwrap()
+                .life
+                .state
+                .genome
+                .identity_seed,
+            Genome::from_seed(101).identity_seed
+        );
+    }
+
+    #[test]
+    fn failed_run_never_promotes_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let live_root = temporary.path().join("live");
+        let (live, _) = write_test_promotion_bundle(&live_root, 303);
+        let fork_root = live.paths.evolution_runs.join("rejected-fork");
+        let (_, fork_hash) = write_test_promotion_bundle(&fork_root, 404);
+        assert!(promote_validated_fork(&live, &fork_root, fork_hash ^ 1).is_err());
+        assert_eq!(
+            live.load_state()
+                .unwrap()
+                .unwrap()
+                .life
+                .state
+                .genome
+                .identity_seed,
+            Genome::from_seed(303).identity_seed
+        );
+    }
 
     #[test]
     fn built_in_presets_are_visually_and_dynamically_distinct_but_solver_safe() {
@@ -5641,7 +8283,7 @@ mod tests {
     }
 
     #[test]
-    fn pet_executable_resolution_prefers_canonical_then_release_then_debug() {
+    fn pet_executable_resolution_prefers_packaged_sibling_then_matching_targets() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path();
         let current_directory = workspace.join("builds").join("current");
@@ -5681,6 +8323,31 @@ mod tests {
             resolve_pet_executable(&current_exe, workspace).unwrap(),
             debug
         );
+    }
+
+    #[test]
+    fn stale_builds_current_cannot_override_the_body_lab_sibling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path();
+        let target = workspace.join("target").join("debug");
+        let stale_directory = workspace.join("builds").join("current");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&stale_directory).unwrap();
+        let body_lab = target.join(if cfg!(windows) {
+            "BodyLab.exe"
+        } else {
+            "BodyLab"
+        });
+        let matching_pet = target.join(canonical_pet_executable_name());
+        let stale_pet = stale_directory.join(canonical_pet_executable_name());
+        File::create(&matching_pet).unwrap();
+        File::create(&stale_pet).unwrap();
+
+        assert_eq!(
+            resolve_pet_executable(&body_lab, workspace).unwrap(),
+            matching_pet
+        );
+        assert!(!pet_executable_candidates(&body_lab, workspace, false).contains(&stale_pet));
     }
 
     #[test]
@@ -5859,7 +8526,7 @@ mod tests {
     }
 
     #[test]
-    fn physics_panel_exposes_only_the_schema_sixteen_authoring_controls() {
+    fn physics_panel_exposes_only_the_schema_seventeen_authoring_controls() {
         let source = include_str!("main.rs");
         let panel = source
             .split_once("fn physics_controls")

@@ -2,15 +2,18 @@ use std::{fmt, str::FromStr};
 
 use glam::Vec2;
 use lifecore::{
-    ActionId, BodyFeedback, BodyIntent, FeedbackEvent, LifeState, LocomotionMode, PoseIntent,
+    ActionId, BodyFeedback, BodyIntent, EmbodiedGestureEvent, EpisodeContextV1, FeedbackEvent,
+    FeltStateV1, InteractionBodyActuation, InteractionGazeTarget, InteractionResponsePlan,
+    InteractionTurnRuntime, InteractionTurnState, LifeState, LocomotionMode, PoseIntent,
     SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame, VitaState, apply_emotion_to_expression,
 };
 #[cfg(test)]
 use morph_brain::MORPH_COMMAND_COUNT;
 use morph_brain::{MorphAttention, MorphCommand, MorphOutput};
-use pet_ecology::{RhythmSignature, WindowAffordanceFrame};
+use pet_ecology::{GestureSignature, RhythmSignature, WindowAffordanceFrame};
 use pet_perception::{
-    PerceptionRuntime, SpatialVisualFrame, VisualAttentionTarget, VisualFeatureFrame,
+    EmbodiedGestureClassifierTuning, PerceptionRuntime, SpatialVisualFrame, VisualAttentionTarget,
+    VisualFeatureFrame,
 };
 
 /// Selects the single high-level behavior policy. Physics, rendering and audio
@@ -266,9 +269,24 @@ pub struct VitaRuntime {
     active_mode: BrainMode,
     fusion: FusionArbiter,
     last_fusion: Option<FusionDiagnostics>,
+    interaction_turn: InteractionTurnRuntime,
+    queued_embodied_gesture: Option<EmbodiedGestureEvent>,
+    queued_embodied_signature: Option<GestureSignature>,
+    active_interaction_plan: Option<InteractionResponsePlan>,
 }
 
 impl VitaRuntime {
+    /// Integrates the previous authoritative body's somatic evidence before
+    /// the next appraisal/intent resolution. Keeping this call on the app's
+    /// single simulation thread preserves the N -> N+1 feedback invariant.
+    pub fn integrate_felt_state(&mut self, felt: FeltStateV1, episode: EpisodeContextV1, dt: f32) {
+        self.mind.integrate_felt_state(felt, episode, dt);
+    }
+
+    pub fn set_embodied_gesture_tuning(&mut self, tuning: EmbodiedGestureClassifierTuning) {
+        self.perception.set_embodied_gesture_tuning(tuning);
+    }
+
     pub fn set_visual_features(
         &mut self,
         summary: VisualFeatureFrame,
@@ -312,6 +330,10 @@ impl VitaRuntime {
             active_mode: BrainMode::Classic,
             fusion: FusionArbiter::default(),
             last_fusion: None,
+            interaction_turn: InteractionTurnRuntime::default(),
+            queued_embodied_gesture: None,
+            queued_embodied_signature: None,
+            active_interaction_plan: None,
         }
     }
 
@@ -321,6 +343,92 @@ impl VitaRuntime {
 
     pub fn observe(&mut self, sensors: &SensorFrame, body: &BodyFeedback, dt: f32) {
         self.percept = self.perception.update(sensors, body, dt);
+        if let Some(event) = self.perception.take_embodied_gesture() {
+            self.queued_embodied_signature = self.perception.take_embodied_gesture_signature();
+            if self
+                .interaction_turn
+                .begin_episode(event.classification.episode_id)
+            {
+                self.interaction_turn.state = InteractionTurnState::AwaitingClassification;
+            } else if self.interaction_turn.episode_id == event.classification.episode_id {
+                self.interaction_turn.mark_fresh_input();
+            }
+            self.queued_embodied_gesture = Some(event);
+        }
+    }
+
+    pub fn take_embodied_gesture(&mut self) -> Option<EmbodiedGestureEvent> {
+        let event = self.queued_embodied_gesture.take()?;
+        self.queued_embodied_signature = None;
+        // Release/detach edges may update the same physical episode after its
+        // one response has already been emitted. Consuming that observation
+        // must not strand the turn in Appraising when LifeCore correctly
+        // refuses a duplicate response.
+        if !self.interaction_turn.response_emitted {
+            self.interaction_turn.state = InteractionTurnState::Appraising;
+        }
+        Some(event)
+    }
+
+    pub fn take_embodied_gesture_observation(
+        &mut self,
+    ) -> Option<(EmbodiedGestureEvent, Option<GestureSignature>)> {
+        let event = self.queued_embodied_gesture.take()?;
+        let signature = self.queued_embodied_signature.take();
+        if !self.interaction_turn.response_emitted {
+            self.interaction_turn.state = InteractionTurnState::Appraising;
+        }
+        Some((event, signature))
+    }
+
+    pub fn accept_interaction_response(&mut self, plan: InteractionResponsePlan) -> bool {
+        if !self
+            .interaction_turn
+            .emit_response(plan.episode_id, plan.response_id)
+        {
+            return false;
+        }
+        self.active_interaction_plan = Some(plan);
+        true
+    }
+
+    /// Closes a transient appraisal that LifeCore intentionally did not turn
+    /// into a response (for example an ambiguous release edge). This owns no
+    /// policy: LifeCore has already made the decision, and VITA only prevents
+    /// its turn-state machine from remaining open indefinitely.
+    pub fn finish_interaction_appraisal_without_response(&mut self, episode_id: u64) {
+        if episode_id == self.interaction_turn.episode_id
+            && self.interaction_turn.state == InteractionTurnState::Appraising
+            && !self.interaction_turn.response_emitted
+        {
+            self.interaction_turn.state = InteractionTurnState::Disengaging;
+            self.interaction_turn.elapsed_seconds = 0.0;
+        }
+    }
+
+    #[must_use]
+    pub const fn interaction_turn(&self) -> InteractionTurnRuntime {
+        self.interaction_turn
+    }
+
+    #[must_use]
+    pub const fn active_interaction_plan(&self) -> Option<InteractionResponsePlan> {
+        self.active_interaction_plan
+    }
+
+    #[must_use]
+    pub fn latest_embodied_gesture(&self) -> lifecore::GestureClassification {
+        self.perception.latest_embodied_gesture()
+    }
+
+    #[must_use]
+    pub fn interaction_actuation(&self) -> InteractionBodyActuation {
+        if self.interaction_turn.state == InteractionTurnState::Responding {
+            self.active_interaction_plan
+                .map_or_else(InteractionBodyActuation::default, |plan| plan.body)
+        } else {
+            InteractionBodyActuation::default()
+        }
     }
 
     #[must_use]
@@ -383,7 +491,7 @@ impl VitaRuntime {
             }
             self.active_mode = mode;
         }
-        match mode {
+        let result = match mode {
             BrainMode::Classic => {
                 self.last_fusion = None;
                 (base_intent, None)
@@ -411,6 +519,111 @@ impl VitaRuntime {
                 self.last_fusion = Some(diagnostics);
                 (intent, Some(output))
             }
+        };
+        let (mut intent, output) = result;
+        self.apply_interaction_response(&mut intent, sensors, body, dt);
+        (intent, output)
+    }
+
+    fn apply_interaction_response(
+        &mut self,
+        intent: &mut BodyIntent,
+        sensors: &SensorFrame,
+        body: &BodyFeedback,
+        dt: f32,
+    ) {
+        self.interaction_turn.tick(self.active_interaction_plan, dt);
+        let Some(plan) = self.active_interaction_plan else {
+            return;
+        };
+        if self.interaction_turn.state != InteractionTurnState::Responding {
+            if self.interaction_turn.state == InteractionTurnState::Idle {
+                self.active_interaction_plan = None;
+            }
+            return;
+        }
+        let elapsed = self.interaction_turn.elapsed_seconds;
+        let weight = if elapsed < plan.onset_seconds {
+            elapsed / plan.onset_seconds.max(1.0e-4)
+        } else if elapsed < plan.onset_seconds + plan.hold_seconds {
+            1.0
+        } else {
+            1.0 - (elapsed - plan.onset_seconds - plan.hold_seconds)
+                / plan.release_seconds.max(1.0e-4)
+        }
+        .clamp(0.0, 1.0)
+            * plan.expression.amplitude;
+        let gaze = match plan.gaze {
+            InteractionGazeTarget::ContactPoint => Some(
+                sensors
+                    .embodied_interaction
+                    .contact
+                    .point_world
+                    .clamp(Vec2::ZERO, Vec2::ONE),
+            ),
+            InteractionGazeTarget::Cursor => Some(sensors.cursor_position),
+            InteractionGazeTarget::Viewer => Some(Vec2::splat(0.5)),
+            InteractionGazeTarget::MainComponent | InteractionGazeTarget::MergePoint => {
+                Some(body.world_position)
+            }
+            InteractionGazeTarget::DetachedComponent(id) => sensors.embodied_interaction.components
+                [..usize::from(sensors.embodied_interaction.component_observation_count)]
+                .iter()
+                .find(|component| component.component_id == id)
+                .map(|component| component.center_world),
+            target @ InteractionGazeTarget::WorldEntity { .. } => target.world_position(),
+            InteractionGazeTarget::Away => Some(
+                (body.world_position
+                    + (body.world_position - sensors.cursor_position).normalize_or_zero() * 0.18)
+                    .clamp(Vec2::ZERO, Vec2::ONE),
+            ),
+        };
+        if let Some(gaze) = gaze.filter(|gaze| gaze.is_finite()) {
+            intent.gaze_target = Some(gaze.clamp(Vec2::ZERO, Vec2::ONE));
+        }
+        let target = plan.expression;
+        blend(
+            &mut intent.expression.eye_aperture,
+            target.eye_aperture,
+            weight,
+        );
+        blend(&mut intent.expression.eye_scale, target.eye_scale, weight);
+        blend(
+            &mut intent.expression.brow_asymmetry,
+            target.brow_asymmetry,
+            weight,
+        );
+        blend(
+            &mut intent.expression.mouth_curve,
+            target.mouth_curve,
+            weight,
+        );
+        blend(
+            &mut intent.expression.mouth_compression,
+            target.mouth_compression,
+            weight,
+        );
+        blend(
+            &mut intent.expression.mouth_asymmetry,
+            target.mouth_asymmetry,
+            weight,
+        );
+        blend(&mut intent.expression.effort, target.effort, weight);
+        blend(&mut intent.expression.relief, target.relief, weight);
+        intent.expression.brow_tension = intent
+            .expression
+            .brow_tension
+            .max(target.effort * weight * 0.65);
+        intent.expression.mouth_tension = intent
+            .expression
+            .mouth_tension
+            .max(target.mouth_compression * weight);
+        if plan.body.recoil > 0.0 || plan.body.resistance > 0.45 {
+            intent.pose = PoseIntent::Compact;
+        } else if plan.body.cooperation > 0.55 {
+            intent.pose = PoseIntent::Playful;
+        } else {
+            intent.pose = PoseIntent::Curious;
         }
     }
 
@@ -603,6 +816,10 @@ fn blend_scalar(local: f32, candidate: f32, authority: f32) -> f32 {
     local + (candidate - local) * authority.clamp(0.0, 0.30)
 }
 
+fn blend(value: &mut f32, target: f32, weight: f32) {
+    *value += (target - *value) * weight.clamp(0.0, 1.0);
+}
+
 fn local_kernel_protected(
     life: &LifeState,
     sensors: &SensorFrame,
@@ -648,6 +865,42 @@ mod tests {
         let restored = VitaRuntime::new(core.state.genome.identity_seed, Some(runtime.snapshot()));
         assert_eq!(runtime.state(), restored.state());
         assert_eq!(restored.percept(), &VitaPerceptFrame::default());
+    }
+
+    #[test]
+    fn same_episode_release_observation_does_not_strand_an_emitted_turn() {
+        let core = LifeCore::new(Genome::from_seed(21), 23);
+        let mut runtime = VitaRuntime::new(core.state.genome.identity_seed, None);
+        runtime.interaction_turn = InteractionTurnRuntime {
+            episode_id: 7,
+            response_id: Some(9),
+            state: InteractionTurnState::AwaitingUser,
+            response_emitted: true,
+            ..InteractionTurnRuntime::default()
+        };
+        runtime.queued_embodied_gesture = Some(EmbodiedGestureEvent::default());
+        let _ = runtime.take_embodied_gesture_observation();
+        assert_eq!(
+            runtime.interaction_turn.state,
+            InteractionTurnState::AwaitingUser
+        );
+    }
+
+    #[test]
+    fn declined_ambiguous_appraisal_disengages_without_emitting_a_response() {
+        let core = LifeCore::new(Genome::from_seed(25), 27);
+        let mut runtime = VitaRuntime::new(core.state.genome.identity_seed, None);
+        runtime.interaction_turn = InteractionTurnRuntime {
+            episode_id: 11,
+            state: InteractionTurnState::Appraising,
+            ..InteractionTurnRuntime::default()
+        };
+        runtime.finish_interaction_appraisal_without_response(11);
+        assert_eq!(
+            runtime.interaction_turn.state,
+            InteractionTurnState::Disengaging
+        );
+        assert!(!runtime.interaction_turn.response_emitted);
     }
 
     #[test]

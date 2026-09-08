@@ -2,7 +2,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Genome,
+    DevelopmentalEvidence, EmbodiedGestureKind, EpisodeContextV1, Genome, GestureBoundaryEvent,
+    InteroceptionSnapshot, LIFECORE_HZ,
     genome::{range, signed_unit},
 };
 
@@ -54,6 +55,24 @@ pub struct DevelopmentState {
     pub lifetime: LifetimeStatistics,
     pub mutation_history: Vec<MutationRecord>,
     pub metamorphosis_count: u32,
+    #[serde(default)]
+    pub nervous_evidence: DevelopmentalEvidence,
+    #[serde(default)]
+    pub evidence_seconds: f64,
+    #[serde(default)]
+    pub completed_interaction_episodes: u32,
+    #[serde(default)]
+    pub observed_gesture_class_mask: u16,
+    #[serde(default)]
+    pub sleep_consolidations: u32,
+    #[serde(default)]
+    pub quiet_episodes: u32,
+    #[serde(default)]
+    pub safe_boundary_episodes: u32,
+    #[serde(default)]
+    pub last_completed_episode_id: u64,
+    #[serde(default)]
+    pub last_observed_gesture_episode_id: u64,
 }
 
 impl Default for DevelopmentState {
@@ -63,6 +82,15 @@ impl Default for DevelopmentState {
             lifetime: LifetimeStatistics::default(),
             mutation_history: Vec::new(),
             metamorphosis_count: 0,
+            nervous_evidence: DevelopmentalEvidence::default(),
+            evidence_seconds: 0.0,
+            completed_interaction_episodes: 0,
+            observed_gesture_class_mask: 0,
+            sleep_consolidations: 0,
+            quiet_episodes: 0,
+            safe_boundary_episodes: 0,
+            last_completed_episode_id: 0,
+            last_observed_gesture_episode_id: 0,
         }
     }
 }
@@ -95,6 +123,134 @@ impl MutationRecord {
 }
 
 impl DevelopmentState {
+    /// Integrates the six R12 developmental evidence channels at a multi-hour
+    /// timescale. Closed-episode counters are edge-triggered by episode id so a
+    /// scheduler retry cannot double count experience.
+    pub fn integrate_nervous_evidence(
+        &mut self,
+        snapshot: InteroceptionSnapshot,
+        episode: EpisodeContextV1,
+        dt: f32,
+    ) {
+        let dt = if dt.is_finite() {
+            dt.clamp(0.0, 60.0)
+        } else {
+            0.0
+        };
+        self.evidence_seconds = (self.evidence_seconds + f64::from(dt)).max(0.0);
+        let f = snapshot.felt;
+        let d = snapshot.derived;
+        let e = snapshot.emotions;
+        let target = DevelopmentalEvidence {
+            flight_mastery: unit(
+                0.38 * f.agency_match
+                    + 0.30 * f.motor_efficacy
+                    + 0.20 * d.confidence
+                    + 0.12 * episode.goal_congruent_motor_success,
+            ),
+            social_security: unit(
+                0.40 * f.social_safety
+                    + 0.25 * f.contact_pleasantness
+                    + 0.20 * episode.safe_social_exchange
+                    + 0.15 * (1.0 - e.frustration),
+            ),
+            exploration_mastery: unit(
+                0.40 * f.exploration_readiness
+                    + 0.25 * d.curiosity
+                    + 0.20 * d.neural_novelty
+                    + 0.15 * episode.successful_exploration,
+            ),
+            rest_adaptation: unit(
+                0.48 * episode.rest_quality + 0.28 * f.relief + 0.24 * (1.0 - e.exhaustion),
+            ),
+            physical_resilience: unit(
+                0.42 * f.body_integrity
+                    + 0.28 * f.relief
+                    + 0.18 * episode.goal_congruent_motor_success
+                    + 0.12 * (1.0 - episode.boundary_violation),
+            ),
+            communication_mastery: unit(
+                0.42 * episode.rhythmic_synchrony
+                    + 0.28 * episode.safe_social_exchange
+                    + 0.20 * episode.reward_positive
+                    + 0.10 * (1.0 - episode.ignored_social_bid),
+            ),
+        };
+        // Six hours: experience changes phenotype evidence, never fast mood or
+        // per-frame appearance. Promotion still requires the eligibility gate.
+        let alpha = 1.0 - (-dt / (6.0 * 60.0 * 60.0)).exp();
+        self.nervous_evidence.flight_mastery +=
+            (target.flight_mastery - self.nervous_evidence.flight_mastery) * alpha;
+        self.nervous_evidence.social_security +=
+            (target.social_security - self.nervous_evidence.social_security) * alpha;
+        self.nervous_evidence.exploration_mastery +=
+            (target.exploration_mastery - self.nervous_evidence.exploration_mastery) * alpha;
+        self.nervous_evidence.rest_adaptation +=
+            (target.rest_adaptation - self.nervous_evidence.rest_adaptation) * alpha;
+        self.nervous_evidence.physical_resilience +=
+            (target.physical_resilience - self.nervous_evidence.physical_resilience) * alpha;
+        self.nervous_evidence.communication_mastery +=
+            (target.communication_mastery - self.nervous_evidence.communication_mastery) * alpha;
+        self.nervous_evidence.sanitize();
+
+        if episode.closed
+            && episode.episode_id != 0
+            && episode.episode_id != self.last_completed_episode_id
+        {
+            self.completed_interaction_episodes =
+                self.completed_interaction_episodes.saturating_add(1);
+            if episode.sleeping_or_deep_rest > 0.5 {
+                self.quiet_episodes = self.quiet_episodes.saturating_add(1);
+            }
+            if episode.boundary_violation <= 0.05 {
+                self.safe_boundary_episodes = self.safe_boundary_episodes.saturating_add(1);
+            }
+            self.last_completed_episode_id = episode.episode_id;
+        }
+    }
+
+    pub fn note_embodied_gesture(
+        &mut self,
+        episode_id: u64,
+        kind: EmbodiedGestureKind,
+        boundary: GestureBoundaryEvent,
+        ended: bool,
+    ) {
+        if episode_id == 0 || episode_id == self.last_observed_gesture_episode_id {
+            return;
+        }
+        self.last_observed_gesture_episode_id = episode_id;
+        if let Some(bit) = gesture_bit(kind) {
+            self.observed_gesture_class_mask |= 1_u16 << bit;
+        }
+        if ended && boundary == GestureBoundaryEvent::QuietOrSleep {
+            self.quiet_episodes = self.quiet_episodes.saturating_add(1);
+        }
+        if ended && boundary == GestureBoundaryEvent::None {
+            self.safe_boundary_episodes = self.safe_boundary_episodes.saturating_add(1);
+        }
+    }
+
+    pub fn note_sleep_consolidation(&mut self) {
+        self.sleep_consolidations = self.sleep_consolidations.saturating_add(1);
+    }
+
+    #[must_use]
+    pub fn nervous_system_eligible(
+        &self,
+        interaction_turn_closed: bool,
+        body_invariants_pass: bool,
+    ) -> bool {
+        self.lifetime.ticks_alive >= u64::from(LIFECORE_HZ as u32) * 24 * 60 * 60
+            && self.completed_interaction_episodes >= 120
+            && self.observed_gesture_class_mask.count_ones() >= 8
+            && self.sleep_consolidations >= 5
+            && self.quiet_episodes >= 12
+            && self.safe_boundary_episodes >= 8
+            && interaction_turn_closed
+            && body_invariants_pass
+    }
+
     /// Bounds checkpoint-less v1 history, then enriches only the one checkpoint
     /// that legacy v1 can identify exactly: the final mutation record when it
     /// names the currently persisted genome. Parent genomes and missing
@@ -131,6 +287,9 @@ impl DevelopmentState {
                 .iter()
                 .all(MutationRecord::is_fully_legacy);
         if !self.lifetime.is_valid()
+            || !self.nervous_evidence.is_valid()
+            || !self.evidence_seconds.is_finite()
+            || self.evidence_seconds < 0.0
             || (self.mutation_history.len() > MAX_MUTATION_HISTORY && !oversized_legacy_history)
             || self.metamorphosis_count != current.generation
             || self.stage != stage_for_count(self.metamorphosis_count)
@@ -232,6 +391,31 @@ impl DevelopmentState {
     }
 }
 
+fn gesture_bit(kind: EmbodiedGestureKind) -> Option<u32> {
+    Some(match kind {
+        EmbodiedGestureKind::Unknown => return None,
+        EmbodiedGestureKind::SoftTouch => 0,
+        EmbodiedGestureKind::SlowStretch => 1,
+        EmbodiedGestureKind::Tickle => 2,
+        EmbodiedGestureKind::RhythmicTouch => 3,
+        EmbodiedGestureKind::CircularTwist => 4,
+        EmbodiedGestureKind::SharpFlick => 5,
+        EmbodiedGestureKind::Hold => 6,
+        EmbodiedGestureKind::PullAndRelease => 7,
+        EmbodiedGestureKind::FragmentSeparationAttempt => 8,
+        EmbodiedGestureKind::SharedPlayInvitation => 9,
+        EmbodiedGestureKind::FragmentHelp => 10,
+    })
+}
+
+fn unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DevelopmentResult {
     pub previous_generation: u32,
@@ -295,6 +479,12 @@ pub fn metamorphose(
         changed_traits.push("pattern_voice_brain_subtle_shift".to_owned());
     }
 
+    if development.nervous_system_eligible(true, true) {
+        apply_nervous_system_development(genome, &before_genome, development.nervous_evidence);
+        changed_traits.push("embodied_nervous_system_evidence".to_owned());
+    }
+    enforce_r12_generation_caps(genome, &before_genome);
+
     genome.generation = genome.generation.saturating_add(1);
     genome.clamp_all();
     development.metamorphosis_count = development.metamorphosis_count.saturating_add(1);
@@ -325,6 +515,113 @@ fn chance(rng: &mut impl RngCore, probability: f32) -> bool {
 
 fn signed_bias(rng: &mut impl RngCore, pressure: f32) -> f32 {
     signed_unit(rng) * 0.45 + pressure * 0.55
+}
+
+fn apply_nervous_system_development(
+    genome: &mut Genome,
+    before: &Genome,
+    evidence: DevelopmentalEvidence,
+) {
+    let gain = genome.developmental_plasticity * genome.mutation_rate;
+    let centered = |value: f32| (2.0 * value.clamp(0.0, 1.0) - 1.0) * gain;
+    let flight = centered(evidence.flight_mastery);
+    let social_resilience =
+        centered(0.55 * evidence.social_security + 0.45 * evidence.physical_resilience);
+    let exploration = centered(evidence.exploration_mastery);
+    let rest = centered(evidence.rest_adaptation);
+    let communication = centered(evidence.communication_mastery);
+
+    genome.body.wing_span += before.body.wing_span * 0.03 * flight;
+    genome.body.wing_aspect += 0.03 * flight;
+    genome.body.inertia -= 0.04 * flight;
+
+    genome.body.softness += 0.04 * social_resilience;
+    genome.body.body_roundness += 0.03 * social_resilience;
+    genome.body.glow_color_hsv.z += 0.035 * social_resilience;
+    genome.body.pattern_contrast -= 0.025 * social_resilience.max(0.0);
+
+    genome.body.eye_size += 0.01 * exploration;
+    genome.body.ear_fin_size += 0.015 * exploration + 0.010 * communication;
+    genome.body.pattern_scale *= 1.0 + 0.03 * exploration;
+    genome.body.bioluminescence += 0.025 * exploration + 0.025 * rest;
+    genome.body.glow_color_hsv.x =
+        (genome.body.glow_color_hsv.x + rest * (2.0 / 360.0)).rem_euclid(1.0);
+
+    genome.voice.formant_scale *= 1.0 + 0.02 * communication;
+    // Communication changes resonance, never the hard loudness ceiling.
+    genome.voice.maximum_loudness = before.voice.maximum_loudness;
+}
+
+fn enforce_r12_generation_caps(genome: &mut Genome, before: &Genome) {
+    macro_rules! rel {
+        ($field:ident, $cap:expr) => {
+            genome.body.$field = cap_relative(before.body.$field, genome.body.$field, $cap)
+        };
+    }
+    macro_rules! abs {
+        ($field:ident, $cap:expr) => {
+            genome.body.$field = cap_absolute(before.body.$field, genome.body.$field, $cap)
+        };
+    }
+    rel!(body_length, 0.02);
+    rel!(body_width, 0.02);
+    abs!(body_roundness, 0.03);
+    abs!(head_ratio, 0.015);
+    abs!(eye_size, 0.01);
+    rel!(wing_span, 0.03);
+    rel!(tail_length, 0.03);
+    rel!(limb_length, 0.025);
+    abs!(softness, 0.04);
+    abs!(visual_mass, 0.035);
+    abs!(inertia, 0.04);
+    genome.body.primary_color_hsv.x = cap_hue(
+        before.body.primary_color_hsv.x,
+        genome.body.primary_color_hsv.x,
+        2.0 / 360.0,
+    );
+    genome.body.secondary_color_hsv.x = cap_hue(
+        before.body.secondary_color_hsv.x,
+        genome.body.secondary_color_hsv.x,
+        3.0 / 360.0,
+    );
+    genome.body.primary_color_hsv.y = cap_absolute(
+        before.body.primary_color_hsv.y,
+        genome.body.primary_color_hsv.y,
+        0.03,
+    );
+    genome.body.secondary_color_hsv.y = cap_absolute(
+        before.body.secondary_color_hsv.y,
+        genome.body.secondary_color_hsv.y,
+        0.03,
+    );
+    rel!(pattern_scale, 0.03);
+    abs!(pattern_contrast, 0.025);
+    abs!(bioluminescence, 0.04);
+    genome.voice.base_pitch_hz =
+        cap_relative(before.voice.base_pitch_hz, genome.voice.base_pitch_hz, 0.02);
+    genome.voice.formant_scale =
+        cap_relative(before.voice.formant_scale, genome.voice.formant_scale, 0.02);
+    genome.voice.maximum_loudness = before.voice.maximum_loudness;
+    genome.identity_seed = before.identity_seed;
+    genome.lineage_id = before.lineage_id;
+    genome.body.pattern_seed = before.body.pattern_seed;
+    genome.voice.voice_seed = before.voice.voice_seed;
+    genome.brain.network_seed = before.brain.network_seed;
+    genome.brain.learning_rate = before.brain.learning_rate;
+}
+
+fn cap_relative(base: f32, value: f32, fraction: f32) -> f32 {
+    let cap = base.abs().max(f32::EPSILON) * fraction;
+    base + (value - base).clamp(-cap, cap)
+}
+
+fn cap_absolute(base: f32, value: f32, cap: f32) -> f32 {
+    base + (value - base).clamp(-cap, cap)
+}
+
+fn cap_hue(base: f32, value: f32, cap_turns: f32) -> f32 {
+    let delta = (value - base + 0.5).rem_euclid(1.0) - 0.5;
+    (base + delta.clamp(-cap_turns, cap_turns)).rem_euclid(1.0)
 }
 
 const fn stage_for_count(metamorphosis_count: u32) -> DevelopmentStage {
@@ -419,6 +716,7 @@ mod tests {
                 })
                 .collect(),
             metamorphosis_count: 67,
+            ..DevelopmentState::default()
         };
 
         // Validation admits this one legacy shape so restore can migrate it.
@@ -468,5 +766,114 @@ mod tests {
                 .stable_hash(),
         );
         assert!(!foreign.is_valid_for_genome(&genome));
+    }
+
+    #[test]
+    fn closed_episode_evidence_is_edge_triggered_and_bounded() {
+        let mut development = DevelopmentState::default();
+        let snapshot = InteroceptionSnapshot {
+            felt: crate::FeltStateV1 {
+                agency_match: 0.9,
+                motor_efficacy: 0.8,
+                social_safety: 0.85,
+                contact_pleasantness: 0.75,
+                body_integrity: 0.95,
+                relief: 0.7,
+                exploration_readiness: 0.8,
+                ..crate::FeltStateV1::default()
+            },
+            derived: crate::DerivedNervousState {
+                confidence: 0.8,
+                curiosity: 0.8,
+                neural_novelty: 0.7,
+                ..crate::DerivedNervousState::default()
+            },
+            ..InteroceptionSnapshot::default()
+        };
+        let episode = EpisodeContextV1 {
+            episode_id: 41,
+            closed: true,
+            reward_positive: 0.8,
+            successful_exploration: 0.8,
+            goal_congruent_motor_success: 0.9,
+            safe_social_exchange: 0.9,
+            safe_predictable_episode: 0.9,
+            rest_quality: 0.7,
+            ..EpisodeContextV1::default()
+        };
+
+        development.integrate_nervous_evidence(snapshot, episode, 60.0);
+        development.integrate_nervous_evidence(snapshot, episode, 60.0);
+
+        assert_eq!(development.completed_interaction_episodes, 1);
+        assert_eq!(development.safe_boundary_episodes, 1);
+        assert!(development.nervous_evidence.is_valid());
+        assert!(development.nervous_evidence.flight_mastery > 0.0);
+    }
+
+    #[test]
+    fn nervous_development_preserves_locks_and_generation_caps() {
+        let mut genome = Genome::from_seed(2026);
+        let before = genome.clone();
+        let mut development = DevelopmentState::default();
+        development.lifetime.ticks_alive = u64::from(LIFECORE_HZ as u32) * 24 * 60 * 60;
+        development.completed_interaction_episodes = 120;
+        development.observed_gesture_class_mask = 0xff;
+        development.sleep_consolidations = 5;
+        development.quiet_episodes = 12;
+        development.safe_boundary_episodes = 8;
+        development.nervous_evidence = DevelopmentalEvidence {
+            flight_mastery: 1.0,
+            social_security: 1.0,
+            exploration_mastery: 1.0,
+            rest_adaptation: 1.0,
+            physical_resilience: 1.0,
+            communication_mastery: 1.0,
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(77);
+
+        metamorphose(&mut genome, &mut development, &mut rng);
+
+        assert_eq!(genome.identity_seed, before.identity_seed);
+        assert_eq!(genome.lineage_id, before.lineage_id);
+        assert_eq!(genome.body.pattern_seed, before.body.pattern_seed);
+        assert_eq!(genome.voice.voice_seed, before.voice.voice_seed);
+        assert_eq!(genome.brain.network_seed, before.brain.network_seed);
+        assert_eq!(genome.brain.learning_rate, before.brain.learning_rate);
+        assert_eq!(genome.voice.maximum_loudness, before.voice.maximum_loudness);
+        assert!((genome.body.body_length / before.body.body_length - 1.0).abs() <= 0.020_01);
+        assert!((genome.body.wing_span / before.body.wing_span - 1.0).abs() <= 0.030_01);
+        assert!((genome.body.softness - before.body.softness).abs() <= 0.040_01);
+        assert!((genome.voice.formant_scale / before.voice.formant_scale - 1.0).abs() <= 0.020_01);
+    }
+
+    #[test]
+    fn identical_evidence_and_seed_produce_identical_development_trace() {
+        let mut left_genome = Genome::from_seed(88);
+        let mut right_genome = left_genome.clone();
+        let mut left = DevelopmentState::default();
+        left.lifetime.ticks_alive = u64::from(LIFECORE_HZ as u32) * 10 * 24 * 60 * 60;
+        left.completed_interaction_episodes = 300;
+        left.observed_gesture_class_mask = 0x7ff;
+        left.sleep_consolidations = 20;
+        left.quiet_episodes = 30;
+        left.safe_boundary_episodes = 25;
+        left.nervous_evidence = DevelopmentalEvidence {
+            flight_mastery: 0.8,
+            social_security: 0.7,
+            exploration_mastery: 0.9,
+            rest_adaptation: 0.65,
+            physical_resilience: 0.75,
+            communication_mastery: 0.82,
+        };
+        let mut right = left.clone();
+        let mut left_rng = ChaCha8Rng::seed_from_u64(123);
+        let mut right_rng = ChaCha8Rng::seed_from_u64(123);
+
+        metamorphose(&mut left_genome, &mut left, &mut left_rng);
+        metamorphose(&mut right_genome, &mut right, &mut right_rng);
+
+        assert_eq!(left_genome.stable_hash(), right_genome.stable_hash());
+        assert_eq!(left, right);
     }
 }

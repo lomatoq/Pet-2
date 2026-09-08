@@ -10,9 +10,14 @@ mod bandit;
 mod development;
 mod drives;
 mod genome;
+mod interaction;
+mod interoception;
+mod language;
 mod memory;
 mod microbrain;
 mod persistence;
+mod phenotype;
+mod phenotype_director;
 mod vita;
 
 use std::{array, collections::VecDeque};
@@ -28,9 +33,14 @@ pub use bandit::*;
 pub use development::*;
 pub use drives::*;
 pub use genome::*;
+pub use interaction::*;
+pub use interoception::*;
+pub use language::*;
 pub use memory::*;
 pub use microbrain::*;
 pub use persistence::*;
+pub use phenotype::*;
+pub use phenotype_director::*;
 pub use vita::*;
 
 pub const LIFECORE_HZ: f32 = 20.0;
@@ -107,6 +117,56 @@ pub struct LifeCore {
 }
 
 impl LifeCore {
+    /// Applies the previous immutable body's felt-state evidence before the
+    /// normal LifeCore tick. Renderers never receive mutable access to drives.
+    pub fn integrate_felt_state(
+        &mut self,
+        snapshot: InteroceptionSnapshot,
+        episode: EpisodeContextV1,
+        dt: f32,
+    ) {
+        self.state
+            .development
+            .integrate_nervous_evidence(snapshot, episode, dt);
+        self.state
+            .drives
+            .integrate_felt_state(snapshot.felt, snapshot.derived, episode, dt);
+        self.state.affect.integrate_felt_state(snapshot.felt, dt);
+    }
+
+    /// Advances only calendar/homeostatic opportunity during an explicitly
+    /// approximate quiet interval. It never ticks the brain, contextual
+    /// bandits, interaction variants, user models, success counters, or
+    /// response credit.
+    pub fn advance_calendar_only(&mut self, seconds: f64) {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return;
+        }
+        let seconds = seconds.min(30.0 * 86_400.0);
+        self.state.elapsed_seconds += seconds;
+        let logical_ticks = (seconds * f64::from(LIFECORE_HZ)).round() as u64;
+        self.state.tick_count = self.state.tick_count.saturating_add(logical_ticks);
+        self.state.development.lifetime.ticks_alive = self
+            .state
+            .development
+            .lifetime
+            .ticks_alive
+            .saturating_add(logical_ticks);
+        let seconds_f32 = seconds as f32;
+        self.state.action_elapsed_seconds = (self.state.action_elapsed_seconds + seconds_f32)
+            .min(self.state.current_action.definition().maximum_duration);
+        for cooldown in &mut self.state.action_cooldowns {
+            *cooldown = (*cooldown - seconds_f32).max(0.0);
+        }
+        self.state.attention_budget.recover(seconds_f32);
+        // The average of the circadian sleep term over a full cycle is 0.5.
+        // Calendar-only deliberately models opportunity, not a synthetic sleep
+        // action or consolidation reward.
+        self.state.drives.sleep =
+            (self.state.drives.sleep + seconds_f32 * (0.0025 + 0.5 * 0.006)).clamp(0.0, 1.0);
+        self.state.recent_reward *= (-seconds_f32 * 0.05).exp();
+    }
+
     #[must_use]
     pub fn new(genome: Genome, seed: u64) -> Self {
         let mut seed_rng = ChaCha8Rng::seed_from_u64(seed);
@@ -134,6 +194,12 @@ impl LifeCore {
         self.state.tick_count = self.state.tick_count.saturating_add(1);
         self.state.elapsed_seconds += f64::from(dt);
         self.state.action_elapsed_seconds += dt;
+        if let Some(credit) = &mut self.state.interactions.pending_credit {
+            credit.elapsed_seconds = (credit.elapsed_seconds + dt).min(3_600.0);
+            if credit.elapsed_seconds > 30.0 {
+                self.state.interactions.pending_credit = None;
+            }
+        }
         self.state.last_body_feedback = body.clone();
         self.state.attention_budget.recover(dt);
         for cooldown in &mut self.state.action_cooldowns {
@@ -209,6 +275,32 @@ impl LifeCore {
     }
 
     pub fn apply_feedback(&mut self, event: FeedbackEvent) {
+        let interaction_outcome = self.state.interactions.pending_credit.map(|credit| {
+            let kind = match &event {
+                FeedbackEvent::PettingStarted
+                | FeedbackEvent::PlayStarted
+                | FeedbackEvent::CursorApproached
+                | FeedbackEvent::RespondedAfterSound => {
+                    InteractionOutcomeKind::VoluntaryContinuation
+                }
+                FeedbackEvent::Observed | FeedbackEvent::Reward(_) => {
+                    InteractionOutcomeKind::ExplicitPositive
+                }
+                FeedbackEvent::Ignored => InteractionOutcomeKind::NoResponse,
+                FeedbackEvent::PushedAway => InteractionOutcomeKind::ExplicitNegative,
+                FeedbackEvent::MuteOrHide | FeedbackEvent::FocusModeEnabled => {
+                    InteractionOutcomeKind::Refusal
+                }
+                FeedbackEvent::FocusModeDisabled => InteractionOutcomeKind::NoResponse,
+            };
+            InteractionOutcome {
+                episode_id: credit.episode_id,
+                response_id: Some(credit.response_id),
+                kind,
+                confidence: 1.0,
+                elapsed_seconds: credit.elapsed_seconds,
+            }
+        });
         match event {
             FeedbackEvent::FocusModeEnabled => self.state.focus_mode = true,
             FeedbackEvent::FocusModeDisabled => self.state.focus_mode = false,
@@ -257,9 +349,188 @@ impl LifeCore {
                 1.0,
             );
         }
+        if let Some(outcome) = interaction_outcome {
+            self.resolve_interaction_outcome(outcome);
+        }
+    }
+
+    pub fn observe_embodied_gesture(
+        &mut self,
+        event: EmbodiedGestureEvent,
+    ) -> Option<InteractionResponsePlan> {
+        self.observe_embodied_gesture_with_tuning(event, 1.0, 1.15, 1.25, 1.0)
+    }
+
+    pub fn observe_embodied_gesture_with_tuning(
+        &mut self,
+        mut event: EmbodiedGestureEvent,
+        response_amplitude: f32,
+        turn_wait_seconds: f32,
+        turn_cooldown_seconds: f32,
+        learning_openness: f32,
+    ) -> Option<InteractionResponsePlan> {
+        event.sanitize();
+        self.state.development.note_embodied_gesture(
+            event.classification.episode_id,
+            event.classification.kind,
+            event.boundary,
+            event.classification.ended,
+        );
+        let boundary = event.boundary != GestureBoundaryEvent::None;
+        if (!event.classification.committed && !boundary)
+            || event.classification.episode_id == 0
+            || self.state.interactions.last_responded_episode == event.classification.episode_id
+        {
+            return None;
+        }
+        if let Some(pending) = self.state.interactions.pending_credit
+            && pending.episode_id != event.classification.episode_id
+        {
+            self.resolve_interaction_outcome(InteractionOutcome {
+                episode_id: pending.episode_id,
+                response_id: Some(pending.response_id),
+                kind: InteractionOutcomeKind::NoResponse,
+                confidence: 1.0,
+                elapsed_seconds: pending.elapsed_seconds,
+            });
+        }
+        let appraisal = appraise_embodied_gesture(
+            event,
+            self.state.drives,
+            self.state.affect,
+            &self.state.genome.temperament,
+            self.state.successful_interactions,
+            self.state.interactions.recent_boundary_events,
+        );
+        // Schema-2 kept a four-arm ± expression scaler. The living-language
+        // path uses one semantically directed plan and learns its lexicon
+        // timing instead of making the face microscopically larger/smaller.
+        let variant = 1;
+        let response_id = self.state.interactions.next_response_id;
+        self.state.interactions.next_response_id = response_id.saturating_add(1).max(1);
+        let mut plan = interaction_response_plan(
+            event,
+            appraisal,
+            response_id,
+            variant,
+            response_amplitude,
+            turn_wait_seconds,
+            turn_cooldown_seconds,
+        );
+        if self.state.drives.sleep >= 0.72 {
+            // Sleep is an upstream behavioral state, not an audio-host policy.
+            // Preserve the causal acknowledgement while bounding every startle
+            // channel and suppressing interaction vocalization at the source.
+            plan.voice_trigger = None;
+            plan.expression.amplitude = plan.expression.amplitude.min(0.28);
+            plan.body.local_pulse = plan.body.local_pulse.min(0.008);
+            plan.body.recoil = plan.body.recoil.min(0.012);
+            plan.body.cooperation = plan.body.cooperation.min(0.30);
+            plan.sanitize();
+        }
+        debug_assert!(validate_interaction_expression_consistency(appraisal, plan).is_ok());
+        self.state.interactions.last_responded_episode = event.classification.episode_id;
+        self.state.interactions.last_appraisal = Some(appraisal);
+        self.state.interactions.last_response_plan = Some(plan);
+        self.state.interactions.affect_before = Some(self.state.affect);
+        self.state.interactions.pending_credit = Some(PendingInteractionCredit {
+            episode_id: event.classification.episode_id,
+            response_id,
+            variant,
+            expected_effect: plan.expected_receiver_effect,
+            elapsed_seconds: 0.0,
+            learning_openness: learning_openness.clamp(0.50, 1.25),
+        });
+        if boundary {
+            self.state.interactions.recent_boundary_events = self
+                .state
+                .interactions
+                .recent_boundary_events
+                .saturating_add(1)
+                .min(32);
+        } else {
+            self.state.interactions.recent_boundary_events = self
+                .state
+                .interactions
+                .recent_boundary_events
+                .saturating_sub(1);
+        }
+        self.state.affect.valence =
+            (self.state.affect.valence + appraisal.valence * 0.05).clamp(-1.0, 1.0);
+        self.state.affect.arousal = self
+            .state
+            .affect
+            .arousal
+            .max(appraisal.arousal * 0.65)
+            .clamp(0.0, 1.0);
+        self.state.affect.stress = (self.state.affect.stress + appraisal.boundary_need * 0.08
+            - appraisal.cooperation * 0.025)
+            .clamp(0.0, 1.0);
+        self.state.interactions.affect_after = Some(self.state.affect);
+        Some(plan)
+    }
+
+    pub fn resolve_interaction_outcome(&mut self, mut outcome: InteractionOutcome) {
+        outcome.confidence = if outcome.confidence.is_finite() {
+            outcome.confidence.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let Some(credit) = self.state.interactions.pending_credit else {
+            return;
+        };
+        if outcome.episode_id != credit.episode_id
+            || outcome
+                .response_id
+                .is_some_and(|id| id != credit.response_id)
+        {
+            return;
+        }
+        let reward = match outcome.kind {
+            InteractionOutcomeKind::NoResponse | InteractionOutcomeKind::InterruptedByRestart => {
+                0.0
+            }
+            InteractionOutcomeKind::VoluntaryContinuation => 0.35,
+            InteractionOutcomeKind::ExplicitPositive => 0.90,
+            InteractionOutcomeKind::ExplicitNegative => -0.60,
+            InteractionOutcomeKind::Refusal => -1.0,
+            InteractionOutcomeKind::FragmentRemerged => 0.75,
+        } * outcome.confidence;
+        if reward != 0.0 {
+            let intent = self
+                .state
+                .interactions
+                .last_response_plan
+                .map(|plan| social_intent(plan.reason))
+                .unwrap_or_default();
+            self.state
+                .vocal_lexicon
+                .update_social_timing(intent, credit.episode_id, reward);
+        }
+        if matches!(
+            outcome.kind,
+            InteractionOutcomeKind::VoluntaryContinuation
+                | InteractionOutcomeKind::ExplicitPositive
+                | InteractionOutcomeKind::FragmentRemerged
+        ) {
+            self.state.interactions.successful_voluntary_outcomes = self
+                .state
+                .interactions
+                .successful_voluntary_outcomes
+                .saturating_add(1);
+        }
+        if outcome.kind == InteractionOutcomeKind::InterruptedByRestart {
+            self.state.interactions.interrupted_outcomes = self
+                .state
+                .interactions
+                .interrupted_outcomes
+                .saturating_add(1);
+        }
+        self.state.interactions.pending_credit = None;
     }
 
     pub fn consolidate_sleep(&mut self) {
+        self.state.development.note_sleep_consolidation();
         self.memories.consolidate();
         self.brain.consolidate();
         self.repair_vocal_repertoire();
@@ -325,13 +596,18 @@ impl LifeCore {
     }
 
     pub fn restore(mut snapshot: LifeSnapshot) -> Result<Self, LifeError> {
-        // Validate the on-disk shape before applying the narrow v1 lineage
-        // migration, then validate the normalized state again.
+        // Voice anatomy and motor gestures are additive schema fields. Repair
+        // them deterministically before strict validation so old identities
+        // load without accepting arbitrary invalid data.
+        snapshot.repair_additive_voice_schema();
+        // Validate the normalized on-disk shape before applying the narrow v1
+        // lineage migration, then validate the state again.
         snapshot.validate()?;
         snapshot
             .state
             .development
             .repair_legacy_current_generation(&snapshot.state.genome);
+        snapshot.schema_version = LIFE_SNAPSHOT_SCHEMA_VERSION;
         snapshot.validate()?;
         let mut rng = ChaCha8Rng::from_seed(snapshot.rng.seed);
         rng.set_stream(snapshot.rng.stream);
@@ -344,6 +620,13 @@ impl LifeCore {
             rng,
             rng_seed: snapshot.rng.seed,
         };
+        if restored.state.interactions.pending_credit.take().is_some() {
+            restored.state.interactions.interrupted_outcomes = restored
+                .state
+                .interactions
+                .interrupted_outcomes
+                .saturating_add(1);
+        }
         restored.repair_vocal_repertoire();
         Ok(restored)
     }
@@ -363,10 +646,12 @@ impl LifeCore {
         self.state.successful_interactions = 0;
         self.state.recent_reward = 0.0;
         self.state.vocal_motifs = generate_initial_motifs(&self.state.genome.voice);
+        self.state.vocal_lexicon = VocalLexiconState::default();
         self.state.selected_motif_id = None;
         self.state.recent_vocalizations.clear();
         self.state.pending_vocal_credit = None;
         self.state.pending_vocal_delivery = None;
+        self.state.interactions = PersistentInteractionState::default();
     }
 
     /// Ask the mind for an interaction sound without bypassing its learned
@@ -436,7 +721,25 @@ impl LifeCore {
             elapsed_seconds: 0.0,
             response_window_seconds: delivery.response_window_seconds,
             penalize_if_ignored: delivery.penalize_if_ignored,
+            social_intent: delivery.social_intent,
+            episode_id: delivery.episode_id,
         });
+        true
+    }
+
+    /// Confirm that a headless/offline host really synthesized this request.
+    /// This clears the process-owned delivery slot, but intentionally does not
+    /// create recency, social credit, or a claim that anybody heard the sound.
+    pub fn confirm_vocal_request_rendered_offline(&mut self, request_id: u64) -> bool {
+        if self
+            .state
+            .pending_vocal_delivery
+            .as_ref()
+            .is_none_or(|pending| pending.request_id != request_id)
+        {
+            return false;
+        }
+        self.state.pending_vocal_delivery = None;
         true
     }
 
@@ -715,27 +1018,67 @@ impl LifeCore {
             context: *context,
             response_window_seconds,
             penalize_if_ignored: trigger.expects_response(),
+            social_intent: SocialIntent::for_trigger(trigger),
+            episode_id: self.state.interactions.last_responded_episode,
         });
         let affect = self.state.affect;
         let fatigue = self.state.drives.sleep;
-        let (style_pitch, style_tempo, style_gain, purr) = match trigger {
-            VocalTrigger::Action(ActionId::Purr) => (0.86, 0.82, 0.74, true),
-            VocalTrigger::Action(ActionId::MimicClickRhythm) => (1.02, 1.12, 0.90, false),
-            VocalTrigger::Action(ActionId::Chirp) => (1.08, 1.06, 1.0, false),
-            VocalTrigger::Action(_) => (1.0, 1.0, 0.88, false),
-            VocalTrigger::Touch => (0.98, 1.02, 0.90, false),
-            VocalTrigger::ToyOffer => (1.05, 0.96, 0.85, false),
-            VocalTrigger::CatchSuccess => (1.12, 1.18, 0.94, false),
-            VocalTrigger::MissAndRetry => (0.94, 0.92, 0.78, false),
-            VocalTrigger::NeedHelp => (1.08, 0.88, 0.88, false),
-            VocalTrigger::FoodInspect => (0.98, 0.92, 0.74, false),
-            VocalTrigger::FoodAccepted => (1.06, 1.05, 0.82, false),
-            VocalTrigger::FoodRefused => (0.90, 0.86, 0.68, false),
-            VocalTrigger::HomeReturn => (0.88, 0.78, 0.65, true),
-            VocalTrigger::SkillMastered => (1.15, 1.14, 0.92, false),
-            VocalTrigger::RhythmEcho => (1.02, 1.0, 0.90, false),
-            VocalTrigger::VisualNotice => (1.10, 0.84, 0.80, false),
+        let (style, style_pitch, style_tempo, style_gain, purr) = match trigger {
+            VocalTrigger::Action(ActionId::Purr) => (VocalStyle::Purr, 0.86, 0.82, 0.74, true),
+            VocalTrigger::Action(ActionId::MimicClickRhythm) => {
+                (VocalStyle::RhythmMimic, 1.02, 1.12, 0.90, false)
+            }
+            VocalTrigger::Action(ActionId::Chirp) => {
+                (VocalStyle::SocialContact, 1.08, 1.06, 1.0, false)
+            }
+            VocalTrigger::Action(_) => (VocalStyle::SocialContact, 1.0, 1.0, 0.88, false),
+            VocalTrigger::ToyOffer | VocalTrigger::CatchSuccess | VocalTrigger::PlayfulRelease => {
+                (VocalStyle::PlayInvite, 1.08, 1.08, 0.86, false)
+            }
+            VocalTrigger::MissAndRetry | VocalTrigger::FoodRefused | VocalTrigger::CalmBoundary => {
+                (VocalStyle::Frustrated, 0.91, 0.86, 0.68, false)
+            }
+            VocalTrigger::NeedHelp | VocalTrigger::VisualNotice => {
+                (VocalStyle::AttentionCall, 1.09, 0.86, 0.84, false)
+            }
+            VocalTrigger::FoodInspect => (VocalStyle::SocialContact, 0.98, 0.92, 0.74, false),
+            VocalTrigger::FoodAccepted | VocalTrigger::HomeReturn => {
+                (VocalStyle::ContentMurmur, 0.92, 0.82, 0.70, true)
+            }
+            VocalTrigger::SkillMastered => (VocalStyle::PlayInvite, 1.15, 1.14, 0.92, false),
+            VocalTrigger::RhythmEcho => (VocalStyle::RhythmMimic, 1.02, 1.0, 0.90, false),
+            VocalTrigger::SoftTouch => (VocalStyle::TouchResponse, 0.98, 0.82, 0.55, true),
+            VocalTrigger::PhysicalStartle | VocalTrigger::ComponentDetached => {
+                (VocalStyle::Startle, 1.10, 1.15, 0.65, false)
+            }
+            VocalTrigger::ComponentRemerged | VocalTrigger::FragmentHelped => {
+                (VocalStyle::ContentMurmur, 0.98, 0.90, 0.62, true)
+            }
         };
+        let physical = sensors.embodied_interaction;
+        let radial = physical.contact.point_local.normalize_or_zero();
+        let tangential_speed = physical
+            .contact
+            .relative_velocity_local
+            .perp_dot(radial)
+            .abs()
+            .clamp(0.0, 1.0);
+        let resolving_interval = if matches!(
+            trigger,
+            VocalTrigger::ComponentRemerged | VocalTrigger::FragmentHelped
+        ) {
+            0.94
+        } else {
+            1.0
+        };
+        let physical_stress = (physical.material.maximum_strain * 0.32
+            + physical.material.slosh_energy * 0.24
+            + (1.0 - physical.material.topology_budget_remaining) * 0.18)
+            .clamp(0.0, 0.55);
+        let lexeme = self
+            .state
+            .vocal_lexicon
+            .entry(SocialIntent::for_trigger(trigger));
         Some(VocalRequest {
             motif_id,
             performance_seed,
@@ -747,14 +1090,25 @@ impl LifeCore {
             pan: (sensors.cursor_position.x * 2.0 - 1.0).clamp(-0.8, 0.8),
             pitch_scale: (style_pitch
                 * (1.0 + affect.arousal * 0.12 - fatigue * 0.10)
+                * resolving_interval
                 * performance_pitch)
                 .clamp(0.70, 1.38),
             tempo_scale: (style_tempo
                 * (1.0 + affect.arousal * 0.18 - fatigue * 0.20)
-                * performance_tempo)
+                * (1.0 + tangential_speed * 0.16)
+                * performance_tempo
+                * lexeme.timing_scale)
                 .clamp(0.62, 1.48),
-            stress: affect.stress,
+            stress: affect.stress.max(physical_stress).clamp(0.0, 1.0),
             purr,
+            gesture: lexeme.gesture,
+            priority: trigger.priority(),
+            style,
+            valence: affect.valence.clamp(-1.0, 1.0),
+            arousal: affect.arousal.clamp(0.0, 1.0),
+            fatigue: fatigue.clamp(0.0, 1.0),
+            confidence: (1.0 - affect.stress * 0.55).clamp(0.0, 1.0),
+            attachment: affect.attachment.clamp(0.0, 1.0),
             rhythm_intervals: if trigger == VocalTrigger::RhythmEcho {
                 sensors.recent_click_rhythm.map(|interval| {
                     if interval.is_finite() && interval > 0.0 {
@@ -766,6 +1120,7 @@ impl LifeCore {
             } else {
                 [0.0; 8]
             },
+            phenotype: VoicePhenotypeActuation::default(),
         })
     }
 
@@ -827,6 +1182,11 @@ impl LifeCore {
     }
 
     fn update_vocal_motif_from_credit(&mut self, credit: &PendingVocalCredit, reward: f32) {
+        self.state.vocal_lexicon.update_social_timing(
+            credit.social_intent,
+            credit.episode_id,
+            reward,
+        );
         if let Some(motif) = self
             .state
             .vocal_motifs
@@ -1369,7 +1729,6 @@ fn motif_style_score(motif: &VocalMotif, trigger: VocalTrigger, affect: AffectSt
         }
         VocalTrigger::Action(ActionId::Chirp) => [0.72, 0.28, 0.20, 0.20, 0.24, 0.38, 0.74],
         VocalTrigger::Action(_) => [0.50; 7],
-        VocalTrigger::Touch => [0.44, 0.34, 0.16, 0.12, 0.18, 0.34, 0.62],
         VocalTrigger::ToyOffer => [0.64, 0.34, 0.30, 0.18, 0.18, 0.52, 0.68],
         VocalTrigger::CatchSuccess => [0.78, 0.24, 0.18, 0.22, 0.18, 0.42, 0.78],
         VocalTrigger::MissAndRetry => [0.46, 0.42, 0.34, 0.16, 0.28, 0.46, 0.42],
@@ -1381,6 +1740,13 @@ fn motif_style_score(motif: &VocalMotif, trigger: VocalTrigger, affect: AffectSt
         VocalTrigger::SkillMastered => [0.82, 0.26, 0.20, 0.24, 0.18, 0.56, 0.82],
         VocalTrigger::RhythmEcho => [0.55, 0.30, 0.56, 0.82, 0.30, 0.68, 0.50],
         VocalTrigger::VisualNotice => [0.74, 0.22, 0.16, 0.32, 0.20, 0.42, 0.76],
+        VocalTrigger::SoftTouch => [0.38, 0.72, 0.12, 0.10, 0.12, 0.76, 0.52],
+        VocalTrigger::PhysicalStartle => [0.76, 0.16, 0.32, 0.18, 0.24, 0.28, 0.82],
+        VocalTrigger::PlayfulRelease => [0.70, 0.24, 0.30, 0.30, 0.18, 0.48, 0.74],
+        VocalTrigger::CalmBoundary => [0.20, 0.66, 0.16, 0.08, 0.18, 0.62, 0.34],
+        VocalTrigger::ComponentDetached => [0.62, 0.30, 0.28, 0.16, 0.22, 0.42, 0.68],
+        VocalTrigger::ComponentRemerged => [0.46, 0.64, 0.18, 0.12, 0.12, 0.72, 0.58],
+        VocalTrigger::FragmentHelped => [0.58, 0.42, 0.22, 0.20, 0.16, 0.62, 0.64],
     };
     target[0] = (target[0] + affect.arousal * 0.10).clamp(0.0, 1.0);
     target[4] = (target[4] + affect.stress * 0.28).clamp(0.0, 1.0);
@@ -1393,7 +1759,67 @@ fn motif_style_score(motif: &VocalMotif, trigger: VocalTrigger, affect: AffectSt
         .map(|((value, target), weight)| (value - target).powi(2) * weight)
         .sum::<f32>()
         / weights.iter().sum::<f32>();
-    (1.0 - weighted_distance.sqrt() * 1.55).clamp(-1.0, 1.0)
+    let gesture_signature = [
+        mean(|syllable| syllable.gesture.pressure_peak),
+        mean(|syllable| syllable.gesture.adduction),
+        mean(|syllable| syllable.gesture.nasality),
+        mean(|syllable| syllable.gesture.constriction),
+        mean(|syllable| syllable.gesture.instability),
+    ];
+    let gesture_target = match trigger {
+        VocalTrigger::Action(ActionId::Purr)
+        | VocalTrigger::HomeReturn
+        | VocalTrigger::SoftTouch
+        | VocalTrigger::ComponentRemerged => [0.34, 0.48, 0.62, 0.28, 0.08],
+        VocalTrigger::PhysicalStartle | VocalTrigger::ComponentDetached => {
+            [0.90, 0.76, 0.05, 0.32, 0.58]
+        }
+        VocalTrigger::FoodRefused | VocalTrigger::CalmBoundary => [0.72, 0.76, 0.22, 0.64, 0.34],
+        VocalTrigger::Action(ActionId::MimicClickRhythm) | VocalTrigger::RhythmEcho => {
+            [0.62, 0.64, 0.10, 0.32, 0.12]
+        }
+        _ => [0.58, 0.54, 0.18, 0.18, 0.10],
+    };
+    let gesture_error = gesture_signature
+        .iter()
+        .zip(gesture_target)
+        .map(|(value, target)| (value - target).powi(2))
+        .sum::<f32>()
+        / gesture_signature.len() as f32;
+    let family_match = match trigger {
+        VocalTrigger::Action(ActionId::Purr) => motif.family == VocalFamily::Purr,
+        VocalTrigger::Action(ActionId::MimicClickRhythm) | VocalTrigger::RhythmEcho => {
+            motif.family == VocalFamily::RhythmMimic
+        }
+        VocalTrigger::PhysicalStartle | VocalTrigger::ComponentDetached => {
+            motif.family == VocalFamily::StartleSqueak
+        }
+        VocalTrigger::FoodRefused | VocalTrigger::CalmBoundary => {
+            motif.family == VocalFamily::FrustratedGrunt
+        }
+        VocalTrigger::SoftTouch | VocalTrigger::HomeReturn | VocalTrigger::ComponentRemerged => {
+            matches!(motif.family, VocalFamily::ContentMurmur | VocalFamily::Purr)
+        }
+        VocalTrigger::ToyOffer | VocalTrigger::CatchSuccess | VocalTrigger::PlayfulRelease => {
+            matches!(
+                motif.family,
+                VocalFamily::PlayYip | VocalFamily::PlayfulTrill
+            )
+        }
+        VocalTrigger::NeedHelp | VocalTrigger::VisualNotice => {
+            matches!(
+                motif.family,
+                VocalFamily::QuestionWhine | VocalFamily::AttentionCall
+            )
+        }
+        _ => matches!(
+            motif.family,
+            VocalFamily::SoftContact | VocalFamily::QuestionWhine
+        ),
+    };
+    (1.0 - weighted_distance.sqrt() * 1.15 - gesture_error.sqrt() * 0.75
+        + if family_match { 0.22 } else { 0.0 })
+    .clamp(-1.0, 1.0)
 }
 
 fn motif_value(motif: &VocalMotif) -> f32 {
@@ -1402,7 +1828,7 @@ fn motif_value(motif: &VocalMotif) -> f32 {
 }
 
 fn motif_distance(left: &VocalMotif, right: &VocalMotif) -> f32 {
-    if left.syllables.len() != right.syllables.len() {
+    if left.family != right.family || left.syllables.len() != right.syllables.len() {
         return 1.0;
     }
     let total = left
@@ -1413,6 +1839,7 @@ fn motif_distance(left: &VocalMotif, right: &VocalMotif) -> f32 {
             (a.duration_ms - b.duration_ms).abs() / 500.0
                 + (a.pitch_peak - b.pitch_peak).abs()
                 + (a.gap_after_ms - b.gap_after_ms).abs() / 300.0
+                + gesture_distance(a.gesture, b.gesture)
         })
         .sum::<f32>();
     total / left.syllables.len().max(1) as f32
@@ -1441,6 +1868,204 @@ fn smooth(current: f32, target: f32, speed: f32, dt: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embodied_event(
+        episode_id: u64,
+        kind: EmbodiedGestureKind,
+        strain: f32,
+        pressure: f32,
+        boundary: GestureBoundaryEvent,
+    ) -> EmbodiedGestureEvent {
+        EmbodiedGestureEvent {
+            classification: GestureClassification {
+                episode_id,
+                kind,
+                confidence: 0.92,
+                second_best_confidence: 0.18,
+                intensity: strain.max(pressure),
+                committed: true,
+                ended: true,
+                ..GestureClassification::default()
+            },
+            frame: EmbodiedInteractionFrame {
+                contact: PointerMaterialContact {
+                    active: true,
+                    point_world: Vec2::splat(0.5),
+                    point_local: Vec2::new(0.18, 0.02),
+                    area_fraction: 0.12,
+                    effective_pressure: pressure,
+                    pressure_impulse: pressure * 0.8,
+                    contact_seconds: 0.8,
+                    ..PointerMaterialContact::default()
+                },
+                material: BodyMaterialState {
+                    deformation_energy: strain * 0.7,
+                    maximum_strain: strain,
+                    neck_tension: strain.min(1.0),
+                    neck_thickness: (1.0 - strain * 0.7).clamp(0.0, 1.0),
+                    component_count: 1,
+                    topology_budget_remaining: 1.0,
+                    ..BodyMaterialState::default()
+                },
+                ..EmbodiedInteractionFrame::default()
+            },
+            boundary,
+            observation_quality: 1.0,
+        }
+    }
+
+    #[test]
+    fn same_gesture_changes_response_coherently_with_affect() {
+        let genome = Genome::from_seed(0x00AF_FEC7);
+        let mut calm = LifeCore::new(genome.clone(), 1);
+        calm.state.drives.sleep = 0.10;
+        calm.state.drives.play = 0.15;
+        let mut playful = LifeCore::new(genome.clone(), 1);
+        playful.state.drives.sleep = 0.05;
+        playful.state.drives.play = 1.0;
+        playful.state.affect.attachment = 1.0;
+        playful.state.affect.confidence = 1.0;
+        let mut fatigued = LifeCore::new(genome, 1);
+        fatigued.state.drives.sleep = 0.95;
+        fatigued.state.drives.play = 0.05;
+        let event = embodied_event(
+            7,
+            EmbodiedGestureKind::SlowStretch,
+            0.34,
+            0.30,
+            GestureBoundaryEvent::None,
+        );
+
+        let calm_plan = calm.observe_embodied_gesture(event).unwrap();
+        let playful_plan = playful.observe_embodied_gesture(event).unwrap();
+        let fatigued_plan = fatigued.observe_embodied_gesture(event).unwrap();
+
+        assert!(playful_plan.body.cooperation > calm_plan.body.cooperation);
+        assert!(fatigued_plan.expression.amplitude <= 0.28);
+        assert_eq!(fatigued_plan.voice_trigger, None);
+        for core in [&calm, &playful, &fatigued] {
+            validate_interaction_expression_consistency(
+                core.state.interactions.last_appraisal.unwrap(),
+                core.state.interactions.last_response_plan.unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn sleep_bounds_visual_and_vocal_response() {
+        let mut core = LifeCore::new(Genome::from_seed(0x0005_1EE9), 2);
+        core.state.drives.sleep = 1.0;
+        let plan = core
+            .observe_embodied_gesture(embodied_event(
+                9,
+                EmbodiedGestureKind::SharpFlick,
+                0.24,
+                0.38,
+                GestureBoundaryEvent::None,
+            ))
+            .unwrap();
+        assert_eq!(plan.voice_trigger, None);
+        assert!(plan.expression.amplitude <= 0.28);
+        assert!(plan.body.recoil <= 0.012);
+        assert!(plan.body.local_pulse <= 0.008);
+    }
+
+    #[test]
+    fn strong_sustained_input_selects_calm_boundary() {
+        let mut core = LifeCore::new(Genome::from_seed(0xB0A_DA7), 3);
+        let plan = core
+            .observe_embodied_gesture(embodied_event(
+                11,
+                EmbodiedGestureKind::SlowStretch,
+                0.96,
+                0.88,
+                GestureBoundaryEvent::Overstrain,
+            ))
+            .unwrap();
+        assert_eq!(plan.reason, InteractionReasonCode::CalmBoundary);
+        assert_eq!(
+            plan.communicative_intent,
+            CommunicativeIntent::SetCalmBoundary
+        );
+        assert_eq!(
+            plan.expected_receiver_effect,
+            ReceiverEffect::ReducePressure
+        );
+    }
+
+    #[test]
+    fn boundary_never_escalates_loudness_or_distress() {
+        let mut core = LifeCore::new(Genome::from_seed(0xB0AD), 4);
+        core.state.affect.stress = 1.0;
+        let event = embodied_event(
+            13,
+            EmbodiedGestureKind::FragmentSeparationAttempt,
+            1.0,
+            1.0,
+            GestureBoundaryEvent::TopologyBudgetExhausted,
+        );
+        let plan = core.observe_embodied_gesture(event).unwrap();
+        assert_eq!(plan.reason, InteractionReasonCode::CalmBoundary);
+        assert!(plan.expression.amplitude <= 0.55);
+        assert!(plan.body.recoil <= 0.025);
+        assert_eq!(plan.body.cooperation, 0.0);
+        assert_eq!(plan.expression.relief, 0.0);
+        for _ in 0..100 {
+            assert!(core.observe_embodied_gesture(event).is_none());
+        }
+    }
+
+    #[test]
+    fn fresh_input_after_await_can_open_a_new_turn() {
+        let mut turn = InteractionTurnRuntime::default();
+        assert!(turn.begin_episode(1));
+        assert!(turn.emit_response(1, 1));
+        turn.state = InteractionTurnState::AwaitingUser;
+        turn.mark_fresh_input();
+        turn.tick(None, 0.0);
+        assert_eq!(turn.state, InteractionTurnState::Disengaging);
+        turn.state = InteractionTurnState::Cooldown;
+        for _ in 0..6 {
+            turn.tick(None, 0.25);
+        }
+        assert_eq!(turn.state, InteractionTurnState::Idle);
+        assert!(turn.begin_episode(2));
+    }
+
+    #[test]
+    fn gaze_expression_body_and_voice_share_one_reason_code() {
+        let mut event = embodied_event(
+            15,
+            EmbodiedGestureKind::FragmentHelp,
+            0.28,
+            0.20,
+            GestureBoundaryEvent::None,
+        );
+        event.frame.components[0] = BodyComponentObservation {
+            component_id: 4,
+            lifecycle: ComponentLifecycle::Returning,
+            particle_count: 8,
+            mass_fraction: 0.08,
+            center_world: Vec2::splat(0.5),
+            ..BodyComponentObservation::default()
+        };
+        event.frame.component_observation_count = 1;
+        event.frame.remerge_event = Some(4);
+        let mut core = LifeCore::new(Genome::from_seed(0x000C_A05E), 5);
+        let plan = core.observe_embodied_gesture(event).unwrap();
+
+        assert_eq!(plan.reason, InteractionReasonCode::SuccessfulReunion);
+        assert_eq!(plan.gaze, InteractionGazeTarget::MergePoint);
+        assert_eq!(plan.body.target_component, Some(4));
+        assert_eq!(plan.voice_trigger, Some(VocalTrigger::ComponentRemerged));
+        assert!(plan.expression.relief > 0.0);
+        validate_interaction_expression_consistency(
+            core.state.interactions.last_appraisal.unwrap(),
+            plan,
+        )
+        .unwrap();
+    }
 
     fn run_ticks(core: &mut LifeCore, count: usize, sensors: &SensorFrame) -> Vec<ActionId> {
         let body = BodyFeedback::default();
@@ -1730,7 +2355,7 @@ mod tests {
         let mut heard = Vec::<(u64, u64)>::new();
         for _ in 0..32 {
             let request = core
-                .request_vocalization(VocalTrigger::Touch, &sensors)
+                .request_vocalization(VocalTrigger::SoftTouch, &sensors)
                 .expect("touch has a voice");
             assert!(core.confirm_vocal_request_heard(request.performance_seed));
             let family = motif_family_id(&core.state.vocal_motifs, request.motif_id);
@@ -1767,7 +2392,7 @@ mod tests {
             ..SensorFrame::default()
         };
         let request = core
-            .request_vocalization(VocalTrigger::Touch, &sensors)
+            .request_vocalization(VocalTrigger::SoftTouch, &sensors)
             .expect("touch has a voice");
         assert!(core.confirm_vocal_request_heard(request.performance_seed));
         let credit = core
@@ -1844,7 +2469,7 @@ mod tests {
     fn failed_audio_delivery_cannot_train_a_motif() {
         let mut core = LifeCore::new(Genome::from_seed(54), 94);
         let request = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .expect("touch has a voice");
         let before = core
             .state
@@ -1873,14 +2498,14 @@ mod tests {
         let before_motifs = core.state.vocal_motifs.clone();
         let before_recent = core.state.recent_vocalizations.clone();
         let request = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .expect("touch selects a queued performance");
 
         assert_eq!(core.state.vocal_motifs, before_motifs);
         assert_eq!(core.state.recent_vocalizations, before_recent);
         assert!(core.state.pending_vocal_credit.is_none());
         assert!(
-            core.request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            core.request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
                 .is_none()
         );
         assert!(!core.confirm_vocal_request_heard(request.performance_seed ^ 1));
@@ -1892,7 +2517,7 @@ mod tests {
         assert_eq!(core.state.vocal_motifs, before_motifs);
         assert_eq!(core.state.recent_vocalizations, before_recent);
         assert!(
-            core.request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            core.request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
                 .is_some()
         );
     }
@@ -1902,13 +2527,13 @@ mod tests {
         let mut core = LifeCore::new(Genome::from_seed(541), 941);
         for _ in 0..RECENT_VOCAL_CAPACITY {
             let request = core
-                .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+                .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
                 .unwrap();
             assert!(core.confirm_vocal_request_heard(request.performance_seed));
         }
         let before = core.state.recent_vocalizations.clone();
         let rejected = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .unwrap();
         core.cancel_vocal_request(rejected.performance_seed);
         assert_eq!(core.state.recent_vocalizations, before);
@@ -1918,12 +2543,12 @@ mod tests {
     fn new_audio_session_drops_only_process_owned_vocal_state() {
         let mut core = LifeCore::new(Genome::from_seed(542), 942);
         let heard = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .unwrap();
         assert!(core.confirm_vocal_request_heard(heard.performance_seed));
         let history = core.state.recent_vocalizations.clone();
         let queued = core
-            .request_vocalization(VocalTrigger::Touch, &SensorFrame::default())
+            .request_vocalization(VocalTrigger::SoftTouch, &SensorFrame::default())
             .unwrap();
         assert_eq!(
             core.state
@@ -1983,12 +2608,27 @@ mod tests {
         let snapshot = core.snapshot();
         let current_json = serde_json::to_string(&snapshot.state).unwrap();
         let legacy_json = current_json
+            .replace(
+                &format!(
+                    "\"vocal_lexicon\":{},",
+                    serde_json::to_string(&snapshot.state.vocal_lexicon).unwrap()
+                ),
+                "",
+            )
             .replace("\"recent_vocalizations\":[],", "")
             .replace("\"pending_vocal_credit\":null,", "")
-            .replace("\"pending_vocal_delivery\":null,", "");
+            .replace("\"pending_vocal_delivery\":null,", "")
+            .replace(
+                &format!(
+                    "\"interactions\":{},",
+                    serde_json::to_string(&snapshot.state.interactions).unwrap()
+                ),
+                "",
+            );
         assert_ne!(legacy_json, current_json);
         let legacy_state = serde_json::from_str(&legacy_json).unwrap();
         let legacy = LifeSnapshot {
+            schema_version: 1,
             state: legacy_state,
             ..snapshot
         };
@@ -1996,7 +2636,8 @@ mod tests {
         assert!(restored.state.recent_vocalizations.is_empty());
         assert!(restored.state.pending_vocal_credit.is_none());
         assert!(restored.state.pending_vocal_delivery.is_none());
-        assert_eq!(restored.snapshot().schema_version, 1);
+        assert_eq!(restored.snapshot().schema_version, 3);
+        assert_eq!(restored.state.vocal_lexicon, VocalLexiconState::default());
     }
 
     #[test]
@@ -2060,7 +2701,7 @@ mod tests {
         let mut seeds = std::collections::HashSet::new();
         for _ in 0..96 {
             let request = core
-                .request_vocalization(VocalTrigger::Touch, &sensors)
+                .request_vocalization(VocalTrigger::SoftTouch, &sensors)
                 .expect("touch has a voice");
             assert!(request.gain.is_finite() && (0.01..=0.5).contains(&request.gain));
             assert!(request.tempo_scale.is_finite() && (0.5..=1.6).contains(&request.tempo_scale));
@@ -2177,6 +2818,35 @@ mod tests {
         snapshot.state.development.mutation_history[0].child_genome_hash = Some(0);
 
         assert!(LifeCore::restore(snapshot).is_err());
+    }
+
+    #[test]
+    fn offline_render_receipt_never_claims_a_heard_social_event() {
+        let mut core = LifeCore::new(Genome::from_seed(0x000F_F11E), 91);
+        let sensors = SensorFrame::default();
+        let uses_before = core
+            .state
+            .vocal_motifs
+            .iter()
+            .map(|motif| motif.use_count)
+            .collect::<Vec<_>>();
+        let recent_before = core.state.recent_vocalizations.clone();
+        let request = core
+            .request_vocalization(VocalTrigger::SoftTouch, &sensors)
+            .unwrap();
+
+        assert!(core.confirm_vocal_request_rendered_offline(request.performance_seed));
+        assert!(core.state.pending_vocal_delivery.is_none());
+        assert!(core.state.pending_vocal_credit.is_none());
+        assert_eq!(core.state.recent_vocalizations, recent_before);
+        assert_eq!(
+            core.state
+                .vocal_motifs
+                .iter()
+                .map(|motif| motif.use_count)
+                .collect::<Vec<_>>(),
+            uses_before
+        );
     }
 
     #[test]

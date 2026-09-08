@@ -33,7 +33,7 @@ cargo build \
   --manifest-path "$workspace/Cargo.toml" \
   --release \
   --target "$target" \
-  -p pet2 -p body_lab -p habitat_lab
+  -p pet2 -p body_lab -p habitat_lab -p voice_lab
 
 mkdir -p \
   "$pet_app/Contents/MacOS" "$pet_app/Contents/Resources" \
@@ -54,6 +54,10 @@ if [[ -f "$workspace/assets/macos/AppIcon.icns" ]]; then
   cp "$workspace/assets/macos/AppIcon.icns" "$console_app/Contents/Resources/AppIcon.icns"
 fi
 
+cp -R "$workspace/config/evolution" "$payload/config/evolution"
+cp -R "$workspace/config/embodiment" "$payload/config/embodiment"
+cp "$workspace/target/$target/release/voice_lab" "$payload/tools/VoiceLab"
+cp "$workspace/PET2_ORGANIC_VOICE_IMPLEMENTATION.md" "$payload/ORGANIC_VOICE.md"
 cp "$workspace/target/$target/release/habitat_lab" "$payload/tools/HabitatLab"
 cp "$workspace/assets/macos/Pet2-Dev.command" "$payload/Pet2-Dev.command"
 cp "$workspace/README.md" "$payload/README.txt"
@@ -63,7 +67,7 @@ chmod +x \
   "$pet_app/Contents/MacOS/Pet2" \
   "$console_app/Contents/MacOS/Pet2DevConsole" \
   "$console_app/Contents/Resources/DevConsole" \
-  "$payload/tools/HabitatLab" \
+  "$payload/tools/HabitatLab" "$payload/tools/VoiceLab" \
   "$payload/Pet2-Dev.command"
 
 if [[ "$codesign_identity" == "-" ]]; then

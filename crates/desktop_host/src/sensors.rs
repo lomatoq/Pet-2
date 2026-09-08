@@ -223,6 +223,8 @@ impl SensorNormalizer {
             .collect();
         let time_of_day_01 = local_time_01.rem_euclid(1.0);
         SensorFrame {
+            embodied_interaction: Default::default(),
+            interaction_actuation: Default::default(),
             timestamp: snapshot.timestamp,
             screen_size: Vec2::ONE,
             cursor_position: cursor,
