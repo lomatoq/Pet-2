@@ -237,9 +237,16 @@ impl BodyPhenotypeDirector {
         self.output.interaction.sanitize();
 
         macro_rules! expression {
-            ($name:ident, $r:expr, $f:expr) => {
-                f!(expression.$name, $r, $f)
-            };
+            ($name:ident, $r:expr, $f:expr) => {{
+                let neutral = crate::ExpressionState::default().$name;
+                let current = self.output.expression.$name;
+                let target = t.expression.$name;
+                let attack = (target - neutral).abs() > (current - neutral).abs()
+                    || (target - neutral) * (current - neutral) < 0.0;
+                let tau: f32 = if attack { $r } else { $f };
+                self.output.expression.$name =
+                    current + (target - current) * (1.0 - (-dt / tau).exp());
+            }};
         }
         expression!(squint, 0.08, 0.85);
         expression!(pupil_size, 0.12, 0.50);
@@ -464,6 +471,75 @@ fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> Fast
             + 0.16 * f.startle
             + 0.16 * f.physical_load,
     );
+    // A categorical geometry carrier plus a bounded secondary modifier.
+    // These are readouts of existing felt state, never another emotion owner.
+    let scores = [
+        e.interest,
+        e.playfulness,
+        e.affection,
+        d.fatigue,
+        e.confusion,
+        e.fear.max(f.startle).max(f.pain_like),
+        e.protest,
+    ];
+    let dominant_expression = if scores[5] > 0.35 {
+        5
+    } else {
+        scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(i, _)| i)
+    };
+    let secondary_modifier = scores
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != dominant_expression)
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map_or(0.0, |(_, s)| *s * 0.25);
+    if scores[dominant_expression] > 0.25 {
+        match dominant_expression {
+            0 => {
+                expression.eye_aperture = 1.0;
+                expression.eye_scale = 1.10;
+                expression.pupil_focus = 0.90;
+                expression.brow_tension = 0.08 + secondary_modifier * 0.2;
+            }
+            1 => {
+                expression.eye_aperture = 1.0;
+                expression.mouth_curve = 0.45;
+                expression.brow_tension = 0.10;
+            }
+            2 => {
+                expression.eye_aperture = 0.82;
+                expression.squint = 0.12;
+                expression.mouth_curve = 0.35;
+                expression.cheek_glow = 0.65;
+            }
+            3 => {
+                expression.eye_aperture = (0.70 - 0.30 * d.fatigue).clamp(0.28, 0.65);
+                expression.brow_tension = 0.10;
+            }
+            4 => {
+                expression.brow_asymmetry = 0.32;
+                expression.mouth_asymmetry = 0.18;
+                expression.mouth_curve = 0.0;
+            }
+            5 => {
+                expression.eye_aperture = 1.0;
+                expression.pupil_focus = 1.0;
+                expression.mouth_curve = -0.18;
+                expression.cheek_glow = 0.0;
+                expression.brow_tension = 0.65;
+            }
+            _ => {
+                expression.mouth_curve = -0.22;
+                expression.brow_tension = 0.45;
+                expression.brow_asymmetry = 0.18;
+                expression.cheek_glow = 0.0;
+            }
+        }
+    }
     out.expression = expression;
 
     out.visual_physiology = VisualPhysiologyActuation {
@@ -492,11 +568,8 @@ fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> Fast
     };
 
     out.face = FaceRuntimeActuation {
-        gaze_target: if source.perception.selected_salience > 0.05 {
-            Some(source.body.contact.point_world)
-        } else {
-            None
-        },
+        gaze_target: source.perception.attention_target_position,
+
         microsaccade_amount_multiplier: (1.0 + 0.20 * d.curiosity - 0.35 * d.attention_commitment)
             .clamp(0.55, 1.20),
         microsaccade_rate_multiplier: (0.90 + 0.25 * d.curiosity + 0.20 * e.anxiety

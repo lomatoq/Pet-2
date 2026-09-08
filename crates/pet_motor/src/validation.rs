@@ -383,22 +383,23 @@ fn activation_fixture(
         }
         P::HomeFoodInspectSample => {
             goal.drives.comfort = 0.60;
-            context.orb_position = Some(Vec2::new(0.66, 0.62));
-            "idle, proxy_morsel present, comfort_need=0.60 (>0.52)"
+            context.edible_position = Some(Vec2::new(0.66, 0.62));
+            "idle, edible_morsel present, comfort_need=0.60 (>0.52)"
         }
         P::HomeFoodAcceptTransport => {
             goal.drives.comfort = 0.72;
             goal.affect.valence = 0.30;
-            context.orb_position = Some(Vec2::new(0.66, 0.62));
+            context.edible_position = Some(Vec2::new(0.66, 0.62));
             "morsel present, comfort_need=0.72 (>0.64), valence=0.30 (>0.20)"
         }
         P::HomeFoodRefusePushAway => {
             goal.drives.comfort = 0.72;
             goal.affect.valence = -0.30;
-            context.orb_position = Some(Vec2::new(0.66, 0.62));
+            context.edible_position = Some(Vec2::new(0.66, 0.62));
             "morsel present, comfort_need=0.72, valence=-0.30 (<-0.16)"
         }
         P::HomeDigestionSatiation => {
+            context.world_event = crate::MotorWorldEvent::FoodConsumed;
             goal.drives.comfort = 0.20;
             goal.felt.relief = 0.70;
             "idle, comfort_need=0.20 (<0.28), relief=0.70 (>0.54)"

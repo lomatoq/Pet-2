@@ -13,11 +13,30 @@ pub enum PhaseAdvance {
 /// `pet_body::embodiment` and therefore is deliberately not accelerated here.
 pub const BODY_ACTION_TEMPO: f32 = 2.0;
 
-/// Keeps sleep holding time physiological while making every performed body
-/// action twice as fast and the whole pre-sleep landing chain four times faster.
+/// Physical preparation can accelerate; social and perceptual holds use seconds.
 #[must_use]
 pub fn phase_clock_scale(program: BehaviorProgramId, phase_name: &str) -> f32 {
     use BehaviorProgramId as P;
+    if program == P::MoveInspectPauseScan
+        || response_phase(phase_name)
+        || matches!(
+            phase_name,
+            "ack_or_withdraw"
+                | "accept_or_withdraw"
+                | "inspect"
+                | "listen"
+                | "appraise"
+                | "decide"
+                | "recheck"
+                | "hold_boundary"
+                | "release_gradually"
+                | "hold"
+                | "recovery_or_hold"
+                | "release_recover"
+        )
+    {
+        return 1.0;
+    }
     match program {
         P::RestSurfaceRoostSearch
         | P::RestLandingSoftTouchdown
@@ -43,18 +62,72 @@ pub fn advance_phase(
     } else {
         0.0
     };
+    let waiting = response_phase(spec.name);
+    if waiting {
+        let bid = active.social_bid.get_or_insert_with(|| crate::SocialBid {
+            bid_id: active.bout_id,
+            target: active.locked_target.clone(),
+            expected_response: match active.program {
+                BehaviorProgramId::PlayOrbCarryOffer => crate::ExpectedResponse::ToyMove,
+                BehaviorProgramId::SocialAttentionBidWait => crate::ExpectedResponse::Attention,
+                _ => crate::ExpectedResponse::Touch,
+            },
+            started_at: context.timestamp_seconds,
+            started_frame: context.frame_id,
+            response_received: false,
+            previous_touch: context.pet_touched,
+            previous_toy_held: context.orb_user_held,
+        });
+        let fresh =
+            context.frame_id > bid.started_frame && context.timestamp_seconds > bid.started_at;
+        let response = match bid.expected_response {
+            crate::ExpectedResponse::Touch => context.pet_touched && !bid.previous_touch,
+            crate::ExpectedResponse::ToyMove => context.orb_user_held && !bid.previous_toy_held,
+            crate::ExpectedResponse::Help => {
+                context.locomotion_completed && context.somatic.motor_error < 0.08
+            }
+            crate::ExpectedResponse::Attention => {
+                context.cursor_velocity.length() > 0.02
+                    && context
+                        .cursor_position
+                        .distance(context.body.motion.world_position)
+                        < 0.12
+            }
+        };
+        bid.previous_touch = context.pet_touched;
+        bid.previous_toy_held = context.orb_user_held;
+        bid.response_received |= fresh && response && context.boundary_violation < 0.18;
+        if context.focus_mode || context.boundary_violation >= 0.18 {
+            return PhaseAdvance::Finished(CompletionReason::GracefulWithdrawal);
+        }
+        if bid.expected_response == crate::ExpectedResponse::ToyMove
+            && context.orb_position.is_none()
+        {
+            return PhaseAdvance::Finished(CompletionReason::Invalidated);
+        }
+    }
     let performed_dt = dt * phase_clock_scale(active.program, spec.name);
     active.phase_time += performed_dt;
     active.total_time += performed_dt;
     active.minimum_readability_reached |= active.phase_time >= spec.minimum_seconds;
     let evidence_complete = phase_evidence_complete(active, spec.name, context);
-    if active.phase_time < spec.minimum_seconds
+    if (!waiting && active.phase_time < spec.minimum_seconds)
         || (!evidence_complete && active.phase_time < spec.maximum_seconds)
     {
         return PhaseAdvance::Hold;
     }
     if usize::from(active.phase.index) + 1 >= definition.phases.len() {
-        return PhaseAdvance::Finished(super::completion_from_context(active.program, context));
+        let reason = active.social_bid.as_ref().map_or_else(
+            || super::completion_from_context(active.program, context),
+            |bid| {
+                if bid.response_received {
+                    CompletionReason::UserResponded
+                } else {
+                    CompletionReason::GracefulWithdrawal
+                }
+            },
+        );
+        return PhaseAdvance::Finished(reason);
     }
     active.phase.index = active.phase.index.saturating_add(1);
     active.phase_time = 0.0;
@@ -74,7 +147,16 @@ fn phase_evidence_complete(
     context: &BehaviorContextFrame,
 ) -> bool {
     use BehaviorProgramId as P;
+    if response_phase(phase_name) {
+        return active
+            .social_bid
+            .as_ref()
+            .is_some_and(|bid| bid.response_received);
+    }
     let program = active.program;
+    if phase_name == "hold" && program.family() == crate::ProgramFamily::TouchManipulation {
+        return !context.pointer_down || context.gesture_ended;
+    }
     match (program, phase_name) {
         (P::MovePunctuatedTravel, "coast") => {
             context
@@ -135,5 +217,14 @@ fn bottom_screen_edge(active: &ActivePerformance) -> bool {
         active.locked_target.as_ref(),
         Some(crate::BehaviorTarget::Surface(surface))
             if surface.surface_id.0 == "screen:bottom_edge"
+    )
+}
+
+/// Human-dependent holds must never inherit physical performance tempo.
+#[must_use]
+pub fn response_phase(name: &str) -> bool {
+    matches!(
+        name,
+        "look_wait" | "wait" | "user_turn" | "listen" | "ambiguity_wait"
     )
 }

@@ -524,6 +524,9 @@ impl EpisodeDirector {
         match step {
             EpisodeStep::Continue => self.active = Some(active),
             EpisodeStep::Complete => {
+                if active.goal == EpisodeGoal::OfferOrb {
+                    self.orb_bid_cooldown = 20.0;
+                }
                 if active.goal == EpisodeGoal::CarryOrbHome
                     && active.reason_code == EpisodeReason::TimedOut
                 {
@@ -967,7 +970,12 @@ fn drive_episode(
             else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
-            if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
+            if orb.lifecycle == ObjectLifecycle::GrabbedByUser
+                && active.phase == EpisodePhase::WaitForUser
+                && active.phase_elapsed_seconds > 0.0
+                && orb.last_interaction_seconds
+                    > frame.timestamp - f64::from(active.phase_elapsed_seconds)
+            {
                 active.phase = EpisodePhase::Celebrate;
                 output.body_intent.pose = PoseIntent::Display;
                 output.vocal_trigger = Some(EcologyVocalTrigger::ToyOffer);
@@ -984,7 +992,7 @@ fn drive_episode(
                     set_phase(active, EpisodePhase::WaitForUser);
                     output.vocal_trigger = Some(EcologyVocalTrigger::ToyOffer);
                 }
-                EpisodePhase::WaitForUser if active.phase_elapsed_seconds >= 5.5 => {
+                EpisodePhase::WaitForUser if active.phase_elapsed_seconds >= 3.5 => {
                     state.episode_stats.started[EpisodeGoal::CarryOrbHome.index()] =
                         state.episode_stats.started[EpisodeGoal::CarryOrbHome.index()]
                             .saturating_add(1);
@@ -1010,17 +1018,27 @@ fn drive_episode(
                 let toward_user = (frame.cursor_position - frame.pet_position).normalize_or_zero();
                 let offer_target =
                     (frame.pet_position + toward_user * 0.045).clamp(Vec2::ZERO, Vec2::ONE);
-                push_command(
-                    output,
-                    ObjectCommand::MoveToward {
-                        object_id: orb.id,
-                        target: offer_target,
-                        speed: 0.9,
-                    },
-                );
+                if active.phase == EpisodePhase::Manipulate {
+                    push_command(
+                        output,
+                        ObjectCommand::MoveToward {
+                            object_id: orb.id,
+                            target: offer_target,
+                            speed: 0.9,
+                        },
+                    );
+                }
                 output.body_intent.target_position = frame.pet_position;
                 output.body_intent.locomotion = LocomotionMode::Hover;
-                output.body_intent.gaze_target = Some(frame.cursor_position);
+                output.body_intent.desired_speed = 0.0;
+                output.body_intent.gaze_target =
+                    Some(if active.phase_elapsed_seconds % 1.5 < 0.5 {
+                        orb.position
+                    } else if active.phase_elapsed_seconds % 1.5 < 1.0 {
+                        frame.cursor_position
+                    } else {
+                        orb.position
+                    });
             }
         }
         EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay => {
@@ -1184,7 +1202,7 @@ fn drive_episode(
                         active.target_position.unwrap_or(orb_position);
                 }
             }
-            if active.elapsed_seconds >= 5.0 {
+            if active.elapsed_seconds >= 5.0 && active.phase != EpisodePhase::AskForHelp {
                 active.goal = EpisodeGoal::RetrieveOrb;
                 active.phase = EpisodePhase::Approach;
                 active.elapsed_seconds = 0.0;
@@ -1253,6 +1271,15 @@ fn drive_episode(
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
             if !frame.orb_trapped && active.elapsed_seconds > 0.10 {
+                // Resolved constraint resumes the original retrieval goal.
+                if active.phase == EpisodePhase::AskForHelp {
+                    output.vocal_trigger = Some(EcologyVocalTrigger::HomeReturn);
+                    output.body_intent.gaze_target = Some(orb.position);
+                    active.reason_code = EpisodeReason::UserEngaged;
+                    set_phase(active, EpisodePhase::Approach);
+                    active.elapsed_seconds = 0.0;
+                    return EpisodeStep::Continue;
+                }
                 return EpisodeStep::Complete;
             }
             output.body_intent.target_position = orb.position;
@@ -1287,18 +1314,28 @@ fn drive_episode(
                             impulse: alternating * 0.16,
                         },
                     );
+                    active.target_position = Some(orb.position);
                     active.attempts = active.attempts.saturating_add(1);
                     set_phase(active, EpisodePhase::Retry);
                 }
                 EpisodePhase::Retry if active.phase_elapsed_seconds >= 0.60 => {
                     if active.attempts < 2 {
                         set_phase(active, EpisodePhase::Manipulate);
-                    } else if frame.user_activity > 0.02 {
+                    } else if frame.user_activity > 0.02
+                        && active
+                            .target_position
+                            .is_some_and(|before| before.distance(orb.position) < 0.01)
+                    {
+                        // Two real impulses, same object, negligible displacement.
                         set_phase(active, EpisodePhase::AskForHelp);
                         output.vocal_trigger = Some(EcologyVocalTrigger::NeedHelp);
                     }
                 }
                 EpisodePhase::AskForHelp => {
+                    output.body_intent.desired_speed = 0.0;
+                    if active.phase_elapsed_seconds >= 3.5 {
+                        return EpisodeStep::Abort(EpisodeReason::TimedOut);
+                    }
                     output.body_intent.gaze_target = if active.phase_elapsed_seconds % 0.9 < 0.45 {
                         Some(orb.position)
                     } else {
@@ -1313,7 +1350,7 @@ fn drive_episode(
                 } else {
                     LocomotionMode::Hover
                 };
-            if active.elapsed_seconds >= 5.0 {
+            if active.elapsed_seconds >= 5.0 && active.phase != EpisodePhase::AskForHelp {
                 return EpisodeStep::Abort(EpisodeReason::TimedOut);
             }
         }
@@ -2386,6 +2423,13 @@ mod tests {
         assert!(help_seen);
         assert_eq!(state.objects.len(), 1);
         assert_eq!(state.objects[0].id, orb_id);
+        frame.orb_trapped = false;
+        let resumed = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(
+            director.active_episode().map(|e| e.goal),
+            Some(EpisodeGoal::RetrieveOrb)
+        );
+        assert_eq!(resumed.vocal_trigger, Some(EcologyVocalTrigger::HomeReturn));
     }
 
     #[test]

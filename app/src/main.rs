@@ -2767,8 +2767,41 @@ impl PetApplication {
                 ecology_target: ecology_gaze,
                 source: gaze_source,
             };
-            let motor_context = build_motor_context(runtime);
+            let mut motor_context = build_motor_context(runtime);
+            if let Some(episode) = runtime.ecology.active_episode()
+                && episode.phase == EpisodePhase::AskForHelp
+                && episode.attempts >= 2
+            {
+                runtime
+                    .nervous_system
+                    .observe_repeated_motor_failure(episode.id, episode.attempts);
+            }
+            if ecology_output.outcomes[..ecology_output.outcome_count]
+                .iter()
+                .any(|o| {
+                    matches!(
+                        o,
+                        EcologyOutcome::EpisodeCompleted(
+                            EpisodeGoal::ChaseOrb
+                                | EpisodeGoal::InterceptOrb
+                                | EpisodeGoal::SoloOrbPlay
+                                | EpisodeGoal::OfferOrb
+                        )
+                    )
+                })
+            {
+                runtime.motor.note_play_success();
+            }
+            if ecology_output.outcomes[..ecology_output.outcome_count]
+                .iter()
+                .any(|o| matches!(o, EcologyOutcome::MorselConsumed(_)))
+            {
+                motor_context.world_event = MotorWorldEvent::FoodConsumed;
+            }
             let nervous_snapshot = runtime.nervous_system.snapshot();
+            runtime
+                .nervous_system
+                .observe_outcomes(&ecology_output.outcomes[..ecology_output.outcome_count]);
             let recent_outcome = ecology_output.outcomes[..ecology_output.outcome_count]
                 .last()
                 .map(|outcome| stable_hash_bytes(format!("{outcome:?}").as_bytes()));
@@ -2782,7 +2815,7 @@ impl PetApplication {
                 attachment: runtime.life.state.affect.attachment,
                 recent_outcome,
             };
-            let motor_packet = if let Some(program) = runtime.lab_motor_program {
+            let mut motor_packet = if let Some(program) = runtime.lab_motor_program {
                 if runtime.lab_motor_restart {
                     runtime
                         .motor
@@ -2799,6 +2832,55 @@ impl PetApplication {
             } else {
                 runtime.motor.tick(&motor_goal, &motor_context, LIFE_DT)
             };
+            let danger = motor_goal.felt.startle > 0.4 || motor_goal.felt.pain_like > 0.2;
+            let (attention, kind) = if danger {
+                (
+                    Some(if motor_context.body.contact.contact_count > 0 {
+                        motor_context.body.contact.point_world
+                    } else {
+                        runtime.sensors.cursor_position
+                    }),
+                    lifecore::AttentionTargetKind::Danger,
+                )
+            } else if runtime.sensors.pet_touched {
+                (
+                    Some(runtime.sensors.cursor_position),
+                    lifecore::AttentionTargetKind::Interaction,
+                )
+            } else if motor_packet.expression.gaze_target.is_some() {
+                (
+                    motor_packet.expression.gaze_target,
+                    if runtime.motor.active().is_some_and(|a| {
+                        matches!(a.locked_target, Some(pet_motor::BehaviorTarget::Cursor(_)))
+                    }) {
+                        lifecore::AttentionTargetKind::Social
+                    } else {
+                        lifecore::AttentionTargetKind::ObjectGoal
+                    },
+                )
+            } else if ecology_output.body_intent.gaze_target.is_some() {
+                (
+                    ecology_output.body_intent.gaze_target,
+                    lifecore::AttentionTargetKind::ObjectGoal,
+                )
+            } else if let Some(target) = runtime.vita.visual_attention_target() {
+                (Some(target.position), lifecore::AttentionTargetKind::Visual)
+            } else {
+                (None, lifecore::AttentionTargetKind::Free)
+            };
+            if danger {
+                motor_packet.expression.gaze_target = attention;
+            }
+            runtime.nervous_system.set_attention(
+                attention,
+                kind,
+                if kind == lifecore::AttentionTargetKind::ObjectGoal {
+                    runtime.ecology.active_episode().and_then(|e| e.object_id)
+                } else {
+                    None
+                },
+                f32::from(attention.is_some()),
+            );
             output.body_intent = ecology_output.body_intent;
             let ecology_vocal_trigger = ecology_output.vocal_trigger;
             preserve_navigation_during_material_drag(
@@ -4057,6 +4139,13 @@ fn apply_shared_feedback(runtime: &mut PetRuntime, event: FeedbackEvent) {
             .ecology
             .observe_explicit_refusal(runtime.sensors.timestamp);
     }
+    if matches!(
+        event,
+        FeedbackEvent::FocusModeEnabled | FeedbackEvent::FocusModeDisabled
+    ) {
+        runtime.life.apply_feedback(event);
+        return;
+    }
     apply_gesture_convention_feedback(runtime, &event);
     runtime.vita.apply_feedback(&event);
     runtime.morph.apply_feedback(&event);
@@ -4089,6 +4178,30 @@ fn stage_gesture_convention(
         return;
     };
     if let Some(matched) = recognized {
+        runtime
+            .motor
+            .acknowledge_recognition(runtime.sensors.cursor_position, matched.confidence);
+        let repeated = runtime
+            .pending_gesture_convention
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.existing_id == Some(matched.id)
+                    && pending.episode_id != event.classification.episode_id
+                    && runtime.sensors.timestamp - pending.observed_at <= 3.5
+            });
+        if matched.confidence < 0.75 && !repeated {
+            event.classification.committed = false;
+            event.classification.confidence = event.classification.confidence.min(0.35);
+            runtime.motor.await_gesture_repetition();
+            runtime.pending_gesture_convention = Some(PendingGestureConvention {
+                episode_id: event.classification.episode_id,
+                meaning,
+                signature,
+                existing_id: Some(matched.id),
+                observed_at: runtime.sensors.timestamp.max(0.0),
+            });
+            return;
+        }
         event.classification.kind = gesture_for_convention_meaning(matched.meaning);
         event.classification.confidence = event.classification.confidence.max(matched.confidence);
         event.classification.committed = true;
@@ -4852,6 +4965,7 @@ fn motor_world_goal(goal: Option<EpisodeGoal>) -> MotorWorldGoal {
         Some(EpisodeGoal::InspectWindow) => MotorWorldGoal::InspectWindow,
         Some(EpisodeGoal::RideWindow) => MotorWorldGoal::RideWindow,
         Some(EpisodeGoal::SharedAttention) => MotorWorldGoal::SharedAttention,
+        Some(EpisodeGoal::OfferOrb) => MotorWorldGoal::OfferOrb,
         _ => MotorWorldGoal::None,
     }
 }
@@ -4941,6 +5055,34 @@ fn build_motor_context(runtime: &mut PetRuntime) -> BehaviorContextFrame {
         surfaces,
         den_anchor: Some(state.den.anchor),
         den_familiarity: state.den.familiarity,
+        edible_position: state
+            .objects
+            .iter()
+            .find(|o| {
+                o.kind == ObjectKind::Morsel
+                    && !matches!(
+                        o.lifecycle,
+                        ObjectLifecycle::Consumed | ObjectLifecycle::StoredInDen
+                    )
+            })
+            .map(|o| o.position),
+        object_affordance: if orb.is_some() {
+            pet_motor::ObjectAffordance::Toy
+        } else {
+            pet_motor::ObjectAffordance::Unknown
+        },
+        orb_user_held: orb.is_some_and(|o| o.lifecycle == ObjectLifecycle::GrabbedByUser),
+        focus_mode: runtime.life.state.focus_mode,
+        world_social_hold: runtime.ecology.active_episode().is_some_and(|e| {
+            matches!(
+                e.phase,
+                EpisodePhase::WaitForUser | EpisodePhase::AskForHelp
+            )
+        }),
+        world_help_wait: runtime
+            .ecology
+            .active_episode()
+            .is_some_and(|e| e.phase == EpisodePhase::AskForHelp),
         orb_position: orb.map(|object| object.position),
         orb_stored: orb.is_some_and(|object| object.lifecycle == ObjectLifecycle::StoredInDen),
         world_goal,
@@ -5683,6 +5825,13 @@ fn load_restore_body_state(store: &StateStore, body: &mut ProceduralBody) -> Res
 /// material remain available inside Body Lab for diagnostics, but a stale user
 /// profile must not silently switch the desktop organism back to either lane.
 fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningProfile {
+    // Migrate only the exact previous stock pair; retain authored overrides.
+    if (profile.nervous.expression_gain - 1.28).abs() < 0.0001
+        && (profile.nervous.motion_gain - 1.20).abs() < 0.0001
+    {
+        profile.nervous.expression_gain = 1.40;
+        profile.nervous.motion_gain = 1.30;
+    }
     let reference = approved_production_liquid_tuning(profile.seed);
     let stale_body = profile.render_mode != BodyRenderMode::ParticlePbf;
     let stale_material = profile.material.variant != MaterialVariant::CinematicJelly;

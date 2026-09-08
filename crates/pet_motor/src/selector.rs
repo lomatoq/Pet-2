@@ -23,7 +23,8 @@ pub fn choose_program(
 ) -> Option<ProgramDecision> {
     use BehaviorProgramId as P;
     let eligible = |program: P| {
-        cooldowns[program.index()] <= 0.0
+        (!context.focus_mode || program.family() != crate::ProgramFamily::AffiliationSocial)
+            && cooldowns[program.index()] <= 0.0
             || active_program == Some(program)
             // Support acquisition is one continuous behavior.  A completed
             // readable approach/landing bout may be repeated immediately
@@ -170,6 +171,7 @@ pub fn choose_program(
     }
 
     let world_program = match (context.world_event, context.world_goal) {
+        (_, MotorWorldGoal::OfferOrb) => Some(P::PlayOrbCarryOffer),
         (
             MotorWorldEvent::DenFieldEntered
             | MotorWorldEvent::OrbCaptureStarted
@@ -290,24 +292,24 @@ pub fn choose_program(
             Some(P::HomeDenNestRest)
         }
         ActionId::IdleHover
-            if context.orb_position.is_some()
+            if context.edible_position.is_some()
                 && goal.drives.comfort > 0.64
                 && goal.affect.valence > 0.20 =>
         {
             Some(P::HomeFoodAcceptTransport)
         }
         ActionId::IdleHover
-            if context.orb_position.is_some()
+            if context.edible_position.is_some()
                 && goal.drives.comfort > 0.64
                 && goal.affect.valence < -0.16 =>
         {
             Some(P::HomeFoodRefusePushAway)
         }
-        ActionId::IdleHover if context.orb_position.is_some() && goal.drives.comfort > 0.52 => {
+        ActionId::IdleHover if context.edible_position.is_some() && goal.drives.comfort > 0.52 => {
             Some(P::HomeFoodInspectSample)
         }
         ActionId::IdleHover
-            if context.orb_position.is_none()
+            if context.world_event == MotorWorldEvent::FoodConsumed
                 && goal.drives.comfort < 0.28
                 && goal.felt.relief > 0.54 =>
         {
@@ -470,10 +472,11 @@ pub fn lock_target(
             }
         }
         P::SocialPettingSolicitation => {
-            let away =
-                (context.body.motion.world_position - context.cursor_position).normalize_or_zero();
+            let offset = context.cursor_position - context.body.motion.world_position;
             Some(BehaviorTarget::Point(
-                (context.cursor_position + away * 0.075).clamp(Vec2::ZERO, Vec2::ONE),
+                (context.body.motion.world_position
+                    + offset.normalize_or_zero() * (offset.length() - 0.035).clamp(0.0, 0.03))
+                .clamp(Vec2::ZERO, Vec2::ONE),
             ))
         }
         P::SocialRubNuzzleCursor | P::TouchSoftTouchYield | P::TouchSustainedHoldRelaxOrResist => {
@@ -531,12 +534,10 @@ pub fn lock_target(
             .or(Some(BehaviorTarget::Point(
                 goal.body_intent.target_position,
             ))),
-        P::HomeHungerSearchBid
-        | P::HomeFoodInspectSample
-        | P::HomeFoodAcceptTransport
-        | P::HomeFoodRefusePushAway
-        | P::HomeDigestionSatiation
-        | P::HomeDenNestRest => context
+        P::HomeFoodInspectSample | P::HomeFoodAcceptTransport | P::HomeFoodRefusePushAway => {
+            context.edible_position.map(BehaviorTarget::Point)
+        }
+        P::HomeHungerSearchBid | P::HomeDigestionSatiation | P::HomeDenNestRest => context
             .orb_position
             .map(BehaviorTarget::Orb)
             .or_else(|| context.den_anchor.map(BehaviorTarget::Den))
@@ -574,7 +575,7 @@ pub fn completion_from_context(
         P::RestLandingSoftTouchdown | P::RestSitSettle if context.support_confirmed() => {
             CompletionReason::SupportConfirmed
         }
-        P::SocialPettingSolicitation if context.pet_touched => CompletionReason::UserResponded,
+        // Social completion is owned by the fresh contextual bid in advance_phase.
         P::HomeDenReturnEscort if context.world_event == MotorWorldEvent::OrbStored => {
             CompletionReason::GoalReached
         }

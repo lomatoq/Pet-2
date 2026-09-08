@@ -525,6 +525,21 @@ pub struct EpisodeContextV1 {
 pub struct PerceptionSelectionV1 {
     pub selected_salience: f32,
     pub selected_object_slot: Option<u8>,
+    pub attention_target_id: Option<u64>,
+    pub attention_target_position: Option<glam::Vec2>,
+    pub attention_target_kind: AttentionTargetKind,
+    pub attention_confidence: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttentionTargetKind {
+    Danger,
+    Interaction,
+    ObjectGoal,
+    Social,
+    Visual,
+    #[default]
+    Free,
 }
 
 /// Slow, bounded evidence accumulated from closed embodied episodes. These

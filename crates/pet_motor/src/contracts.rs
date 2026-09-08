@@ -404,11 +404,13 @@ pub enum MotorWorldGoal {
     InspectWindow,
     RideWindow,
     SharedAttention,
+    OfferOrb,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MotorWorldEvent {
+    FoodConsumed,
     None,
     DenFieldEntered,
     OrbCaptureStarted,
@@ -485,8 +487,41 @@ impl BehaviorTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpectedResponse {
+    Touch,
+    ToyMove,
+    Help,
+    Attention,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SocialBid {
+    pub bid_id: u64,
+    pub target: Option<BehaviorTarget>,
+    pub expected_response: ExpectedResponse,
+    pub started_at: f64,
+    pub started_frame: u64,
+    pub response_received: bool,
+    pub previous_touch: bool,
+    pub previous_toy_held: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectAffordance {
+    Toy,
+    Edible,
+    Home,
+    Obstacle,
+    Support,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivePerformance {
+    #[serde(default)]
+    pub social_bid: Option<SocialBid>,
     pub bout_id: u64,
     pub program: BehaviorProgramId,
     pub phase: PhaseId,
@@ -554,6 +589,18 @@ pub struct BehaviorContextFrame {
     pub den_familiarity: f32,
     pub orb_position: Option<Vec2>,
     pub orb_stored: bool,
+    #[serde(default)]
+    pub edible_position: Option<Vec2>,
+    #[serde(default)]
+    pub object_affordance: ObjectAffordance,
+    #[serde(default)]
+    pub orb_user_held: bool,
+    #[serde(default)]
+    pub focus_mode: bool,
+    #[serde(default)]
+    pub world_social_hold: bool,
+    #[serde(default)]
+    pub world_help_wait: bool,
     pub world_goal: MotorWorldGoal,
     pub world_event: MotorWorldEvent,
 }
@@ -589,6 +636,12 @@ impl Default for BehaviorContextFrame {
             den_familiarity: 0.0,
             orb_position: None,
             orb_stored: false,
+            edible_position: None,
+            object_affordance: ObjectAffordance::Unknown,
+            orb_user_held: false,
+            focus_mode: false,
+            world_social_hold: false,
+            world_help_wait: false,
             world_goal: MotorWorldGoal::None,
             world_event: MotorWorldEvent::None,
         }
@@ -800,6 +853,8 @@ impl Default for InternalPhysiologyActuation {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExpressionIntent {
+    #[serde(default)]
+    pub acknowledgement: f32,
     pub gaze_target: Option<Vec2>,
     pub eye_aperture_delta: f32,
     pub squint_delta: f32,
@@ -987,6 +1042,7 @@ impl SomaticActuationPacket {
         self.expression.blink = unit(self.expression.blink);
         self.expression.relief = unit(self.expression.relief);
         self.expression.effort = unit(self.expression.effort);
+        self.expression.acknowledgement = unit(self.expression.acknowledgement);
         self.voice.intensity = unit(self.voice.intensity);
     }
 

@@ -13,6 +13,17 @@ const TRACE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct BehaviorPerformanceRuntime {
+    previous_touch: bool,
+    contact_side: f32,
+    pleasant_touch_seconds: f32,
+    acknowledgement_seconds: f32,
+    ambiguity_seconds: f32,
+    acknowledgement_target: glam::Vec2,
+    previous_gesture: lifecore::EmbodiedGestureKind,
+    previous_salience: f32,
+    previous_orb_user_held: bool,
+    afterglow_seconds: f32,
+    play_afterglow_seconds: f32,
     identity_seed: u64,
     next_bout_id: u64,
     active: Option<ActivePerformance>,
@@ -32,6 +43,17 @@ impl BehaviorPerformanceRuntime {
     #[must_use]
     pub fn new(identity_seed: u64) -> Self {
         Self {
+            previous_touch: false,
+            contact_side: 1.0,
+            pleasant_touch_seconds: 0.0,
+            acknowledgement_seconds: 0.0,
+            ambiguity_seconds: 0.0,
+            acknowledgement_target: glam::Vec2::ZERO,
+            previous_gesture: lifecore::EmbodiedGestureKind::Unknown,
+            previous_salience: 0.0,
+            previous_orb_user_held: false,
+            afterglow_seconds: 0.0,
+            play_afterglow_seconds: 0.0,
             identity_seed,
             next_bout_id: 1,
             active: None,
@@ -46,6 +68,21 @@ impl BehaviorPerformanceRuntime {
             last_completion: CompletionReason::None,
             last_packet: SomaticActuationPacket::default(),
         }
+    }
+
+    pub fn acknowledge_recognition(&mut self, target: glam::Vec2, confidence: f32) {
+        self.ambiguity_seconds = 0.0;
+        self.acknowledgement_target = target;
+        self.acknowledgement_seconds = if confidence >= 0.75 { 0.10 } else { 0.18 };
+    }
+
+    pub fn await_gesture_repetition(&mut self) {
+        self.ambiguity_seconds = 3.5;
+    }
+
+    /// Called only after the ecology director reports a completed play outcome.
+    pub fn note_play_success(&mut self) {
+        self.play_afterglow_seconds = 10.0;
     }
 
     pub fn set_tuning(&mut self, tuning: MotorReadabilityTuning) {
@@ -115,20 +152,117 @@ impl BehaviorPerformanceRuntime {
             *cooldown = (*cooldown - dt).max(0.0);
         }
         self.update_regime(goal, dt);
+        self.acknowledgement_seconds = (self.acknowledgement_seconds - dt).max(0.0);
+        self.ambiguity_seconds = (self.ambiguity_seconds - dt).max(0.0);
+        self.afterglow_seconds = (self.afterglow_seconds - dt).max(0.0);
+        self.play_afterglow_seconds = (self.play_afterglow_seconds - dt).max(0.0);
+        if (context.pet_touched && !self.previous_touch)
+            || (context.gesture != self.previous_gesture && context.gesture_confidence > 0.4)
+        {
+            self.acknowledgement_seconds = 0.14;
+            self.acknowledgement_target = context.cursor_position;
+        }
+        self.previous_gesture = context.gesture;
+        if (context.selected_salience > 0.55
+            && context.selected_salience > self.previous_salience + 0.2)
+            || (context.orb_user_held && !self.previous_orb_user_held)
+        {
+            self.acknowledgement_seconds = 0.14;
+            self.acknowledgement_target = if context.orb_user_held {
+                context.orb_position.unwrap_or(context.cursor_position)
+            } else {
+                goal.body_intent
+                    .gaze_target
+                    .unwrap_or(context.cursor_position)
+            };
+        }
+        self.previous_salience = context.selected_salience;
+        self.previous_orb_user_held = context.orb_user_held;
+        if context.pet_touched
+            && goal.felt.contact_pleasantness > 0.42
+            && context.boundary_violation < 0.18
+        {
+            self.pleasant_touch_seconds += dt;
+            let side = (context.cursor_position.x - context.body.motion.world_position.x).signum();
+            if side != 0.0 {
+                self.contact_side = side;
+            }
+            self.afterglow_seconds = 8.0;
+        }
+        let touch_stopped = self.previous_touch && !context.pet_touched;
+        self.previous_touch = context.pet_touched;
+        if allow_selection
+            && touch_stopped
+            && self.pleasant_touch_seconds >= 0.35
+            && goal.drives.social + goal.attachment * 0.35 > goal.drives.autonomy
+            && !context.focus_mode
+            && context.boundary_violation < 0.18
+            && self.cooldowns[BehaviorProgramId::SocialPettingSolicitation.index()] <= 0.0
+        {
+            self.finish_active(CompletionReason::ContactConfirmed);
+            self.start(
+                BehaviorProgramId::SocialPettingSolicitation,
+                crate::MotorCause::UserGesture,
+                goal,
+                context,
+            );
+            if let Some(active) = &mut self.active {
+                active.sampled_style.arc_sign = self.contact_side;
+            }
+            self.pleasant_touch_seconds = 0.0;
+        }
+        if touch_stopped {
+            self.pleasant_touch_seconds = 0.0;
+        }
 
         if let Some(active) = &mut self.active {
             match advance_phase(active, context, dt) {
                 PhaseAdvance::Hold | PhaseAdvance::Advanced => {}
-                PhaseAdvance::Finished(reason) => self.finish_active(reason),
+                PhaseAdvance::Finished(reason) => {
+                    let touch_bid = self.active.as_ref().is_some_and(|a| {
+                        a.social_bid
+                            .as_ref()
+                            .is_some_and(|b| b.expected_response == crate::ExpectedResponse::Touch)
+                    });
+                    self.finish_active(reason);
+                    if reason == CompletionReason::GracefulWithdrawal && !context.focus_mode {
+                        let next = if goal.felt.sleep_pressure > 0.5 {
+                            BehaviorProgramId::HomeLowEnergyRecharge
+                        } else if context.orb_position.is_some() && goal.drives.play > 0.4 {
+                            BehaviorProgramId::PlaySelfPlayDroplet
+                        } else if goal.drives.curiosity > 0.4 {
+                            BehaviorProgramId::MoveInspectPauseScan
+                        } else {
+                            BehaviorProgramId::StateSelfGroomRealign
+                        };
+                        self.start(
+                            next,
+                            crate::MotorCause::PhysiologicalTransition,
+                            goal,
+                            context,
+                        );
+                    }
+                    if reason == CompletionReason::UserResponded && touch_bid {
+                        self.afterglow_seconds = 8.0;
+                        self.start(
+                            BehaviorProgramId::SocialRubNuzzleCursor,
+                            crate::MotorCause::UserGesture,
+                            goal,
+                            context,
+                        );
+                    }
+                }
             }
         }
 
         if allow_selection {
             let current_program = self.active.as_ref().map(|active| active.program);
-            let current_readable = self
-                .active
-                .as_ref()
-                .is_none_or(|active| active.minimum_readability_reached);
+            let current_readable = self.active.as_ref().is_none_or(|active| {
+                active.minimum_readability_reached
+                    && !crate::response_phase(phase_name(active.program, active.phase.index))
+                    && active.social_bid.is_none()
+                    && active.program != BehaviorProgramId::SocialPettingSolicitation
+            });
             if let Some(decision) = choose_program(
                 goal,
                 context,
@@ -139,9 +273,12 @@ impl BehaviorPerformanceRuntime {
                 let should_start = match self.active.as_ref() {
                     None => true,
                     Some(active) if active.program == decision.program => false,
+                    Some(active) if active.social_bid.is_some() && decision.priority.rank() < 3 => {
+                        false
+                    }
                     Some(active) => {
                         decision.priority.rank() > definition(active.program).priority.rank()
-                            || active.minimum_readability_reached
+                            || current_readable
                     }
                 };
                 if should_start {
@@ -199,6 +336,58 @@ impl BehaviorPerformanceRuntime {
         } else {
             packet.sanitize();
         }
+        if self.afterglow_seconds > 0.0 && goal.felt.pain_like < 0.2 && goal.felt.startle < 0.35 {
+            let residual = (self.afterglow_seconds / 8.0).min(1.0);
+            packet.material.density_compliance_multiplier *= 1.0 + residual * 0.06;
+            packet.material.viscosity_multiplier *= 1.0 - residual * 0.05;
+            packet.expression.relief = packet.expression.relief.max(residual * 0.18);
+        }
+        if self.play_afterglow_seconds > 0.0
+            && goal.felt.pain_like < 0.2
+            && goal.felt.startle < 0.35
+        {
+            packet.internal.flow_speed_multiplier *=
+                1.0 + 0.12 * self.play_afterglow_seconds / 10.0;
+        }
+        if self.acknowledgement_seconds > 0.0 {
+            packet.expression.acknowledgement = (self.acknowledgement_seconds / 0.14).min(1.0);
+            packet.expression.gaze_target = Some(self.acknowledgement_target);
+            packet.locomotion.gaze_lead = 1.0;
+            packet.internal.pulse_amplitude = packet.internal.pulse_amplitude.max(0.14);
+            packet.expression.eye_aperture_delta = 0.10;
+            if self.acknowledgement_seconds > 0.06
+                && goal.felt.startle < 0.35
+                && goal.felt.pain_like < 0.2
+            {
+                packet.locomotion.speed_multiplier = 0.0;
+            }
+        }
+        if context.world_goal == crate::MotorWorldGoal::OfferOrb {
+            packet.locomotion.target_position = Some(goal.body_intent.target_position);
+            packet.locomotion.speed_multiplier = f32::from(goal.body_intent.desired_speed > 0.001);
+            packet.expression.gaze_target = goal.body_intent.gaze_target;
+        }
+        if self.ambiguity_seconds > 0.0
+            && !context.focus_mode
+            && context.boundary_violation < 0.18
+            && goal.felt.startle < 0.35
+        {
+            packet.phase_name = "ambiguity_wait".to_owned();
+            packet.locomotion.speed_multiplier = 0.0;
+            packet.expression.gaze_target = Some(context.cursor_position);
+        }
+        if context.world_social_hold && goal.felt.pain_like < 0.2 && goal.felt.startle < 0.4 {
+            packet.locomotion.target_position = Some(goal.body_intent.target_position);
+            packet.locomotion.speed_multiplier = 0.0;
+            packet.locomotion.arrival_pause = 1.0;
+            packet.expression.gaze_target = goal.body_intent.gaze_target;
+            packet.phase_name = "wait".to_owned();
+            packet.voice.emit_once = false; // ecology emits its one query/invitation
+            if context.world_help_wait {
+                packet.expression.effort = 0.20;
+            }
+        }
+        packet.sanitize();
         self.last_packet = packet.clone();
         packet
     }
@@ -228,6 +417,7 @@ impl BehaviorPerformanceRuntime {
         self.recent_motion_signatures
             .push_back(motion_signature(sampled_style));
         self.active = Some(ActivePerformance {
+            social_bid: None,
             bout_id,
             program,
             phase: PhaseId { program, index: 0 },
@@ -246,6 +436,19 @@ impl BehaviorPerformanceRuntime {
     fn finish_active(&mut self, reason: CompletionReason) {
         if let Some(active) = self.active.take() {
             self.cooldowns[active.program.index()] = definition(active.program).cooldown_seconds;
+            if active.social_bid.is_some()
+                || active.program == BehaviorProgramId::SocialPettingSolicitation
+            {
+                let cooldown = 12.0 + (self.identity_seed % 24) as f32;
+                for p in [
+                    BehaviorProgramId::SocialPettingSolicitation,
+                    BehaviorProgramId::SocialPresentTouchSide,
+                    BehaviorProgramId::SocialAttentionBidWait,
+                    BehaviorProgramId::PlayOrbCarryOffer,
+                ] {
+                    self.cooldowns[p.index()] = cooldown;
+                }
+            }
             self.last_completion = reason;
             if reason == CompletionReason::Invalidated
                 && matches!(active.locked_target, Some(BehaviorTarget::Surface(_)))

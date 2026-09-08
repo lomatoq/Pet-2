@@ -96,6 +96,25 @@ impl SomaticActuationBus {
                 .max(1.0 - packet.locomotion.lift_fraction),
         );
 
+        if packet.expression.acknowledgement > 0.0 {
+            phenotype.expression.pupil_focus = phenotype.expression.pupil_focus.max(0.90);
+            phenotype.face.semantic_roll += 0.045 * packet.expression.acknowledgement;
+        }
+        let meaningful = packet.expression.acknowledgement > 0.0
+            || crate::response_phase(&packet.phase_name)
+            || matches!(
+                packet.phase_name.as_str(),
+                "signal" | "present_side" | "inspect" | "hold_boundary"
+            )
+            || matches!(
+                packet.program,
+                Some(crate::BehaviorProgramId::MoveInspectPauseScan)
+            );
+        if meaningful {
+            phenotype.face.microsaccade_amount_multiplier *= 0.55;
+            phenotype.pbf.idle_lean_angle_multiplier *= 0.5;
+            phenotype.visual_physiology.droplet_energy *= 0.6;
+        }
         let protective = packet
             .program
             .is_some_and(|program| program.family() == crate::ProgramFamily::DefenseIntegrity)
@@ -104,6 +123,14 @@ impl SomaticActuationBus {
             phenotype.interaction.allow_intentional_bud = false;
             phenotype.interaction.cooperation = 0.0;
             phenotype.action.play = 0.0;
+            phenotype.action.social_approach = 0.0;
+            phenotype.expression.mouth_curve = phenotype.expression.mouth_curve.min(0.0);
+            phenotype.expression.cheek_glow = 0.0;
+            phenotype.material.soul_glow_strength_multiplier =
+                phenotype.material.soul_glow_strength_multiplier.min(1.0);
+            if packet.regime.primary == SomaticRegime::Threatened {
+                phenotype.expression.squint = phenotype.expression.squint.max(0.28);
+            }
             phenotype.voice.purr_amount = 0.0;
             phenotype.voice.trill_amount = 0.0;
         }

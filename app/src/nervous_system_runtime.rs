@@ -31,6 +31,7 @@ pub struct NervousSystemRuntime {
     episode: EpisodeContextV1,
     perception: PerceptionSelectionV1,
     next_body_frame_id: u64,
+    last_failed_attempt: Option<(u64, u8)>,
 }
 
 impl Default for NervousSystemRuntime {
@@ -47,6 +48,7 @@ impl Default for NervousSystemRuntime {
             episode: EpisodeContextV1::default(),
             perception: PerceptionSelectionV1::default(),
             next_body_frame_id: 1,
+            last_failed_attempt: None,
         }
     }
 }
@@ -112,15 +114,12 @@ impl NervousSystemRuntime {
             EmbodiedGestureKind::SoftTouch
                 | EmbodiedGestureKind::Tickle
                 | EmbodiedGestureKind::RhythmicTouch
-                | EmbodiedGestureKind::SharedPlayInvitation
-                | EmbodiedGestureKind::FragmentHelp
         );
         let successful_play = matches!(
             classification.kind,
-            EmbodiedGestureKind::Tickle
-                | EmbodiedGestureKind::RhythmicTouch
-                | EmbodiedGestureKind::SharedPlayInvitation
-        );
+            EmbodiedGestureKind::Tickle | EmbodiedGestureKind::RhythmicTouch
+        ) && classification.ended
+            && boundary_violation == 0.0;
         self.gesture = GestureFrameV1 {
             episode_id: classification.episode_id,
             confidence: classification.confidence,
@@ -145,7 +144,7 @@ impl NervousSystemRuntime {
             episode_id: classification.episode_id,
             open: !classification.ended,
             closed: classification.ended,
-            reward_positive: if positive_social {
+            reward_positive: if positive_social && classification.ended {
                 classification.confidence * (1.0 - boundary_violation)
             } else {
                 0.0
@@ -156,13 +155,9 @@ impl NervousSystemRuntime {
             } else {
                 0.0
             },
-            goal_congruent_motor_success: if classification.committed {
-                classification.confidence * (1.0 - classification.prediction_error)
-            } else {
-                0.0
-            },
+            goal_congruent_motor_success: 0.0, // supplied only by measured motor outcomes
             rhythmic_synchrony: self.gesture.rhythm_strength,
-            safe_social_exchange: if positive_social {
+            safe_social_exchange: if positive_social && classification.ended {
                 classification.confidence * (1.0 - boundary_violation)
             } else {
                 0.0
@@ -171,11 +166,7 @@ impl NervousSystemRuntime {
                 * (1.0 - boundary_violation),
             ignored_social_bid: 0.0,
             boundary_violation,
-            repeated_intentional_failure: if classification.prediction_error > 0.65 {
-                classification.prediction_error
-            } else {
-                0.0
-            },
+            repeated_intentional_failure: 0.0, // novelty is not failed goal pursuit
             novel_goal_congruent_episode: classification.prediction_error
                 * classification.confidence
                 * (1.0 - boundary_violation),
@@ -183,6 +174,44 @@ impl NervousSystemRuntime {
             rest_quality: f32::from(event.boundary == GestureBoundaryEvent::QuietOrSleep),
             ..EpisodeContextV1::default()
         };
+    }
+
+    /// Called after two measured failed impulses against the same object goal.
+    pub fn observe_repeated_motor_failure(&mut self, goal_id: u64, attempts: u8) {
+        if attempts >= 2 && self.last_failed_attempt != Some((goal_id, attempts)) {
+            self.last_failed_attempt = Some((goal_id, attempts));
+            self.episode.repeated_intentional_failure = 0.5;
+        }
+    }
+
+    pub fn observe_outcomes(&mut self, outcomes: &[pet_ecology::EcologyOutcome]) {
+        for outcome in outcomes {
+            if let pet_ecology::EcologyOutcome::EpisodeCompleted(goal) = outcome {
+                self.episode.goal_congruent_motor_success = 1.0;
+                if matches!(
+                    goal,
+                    pet_ecology::EpisodeGoal::ChaseOrb
+                        | pet_ecology::EpisodeGoal::InterceptOrb
+                        | pet_ecology::EpisodeGoal::SoloOrbPlay
+                        | pet_ecology::EpisodeGoal::OfferOrb
+                ) {
+                    self.episode.successful_play = 1.0;
+                }
+            }
+        }
+    }
+
+    pub fn set_attention(
+        &mut self,
+        position: Option<glam::Vec2>,
+        kind: lifecore::AttentionTargetKind,
+        id: Option<u64>,
+        confidence: f32,
+    ) {
+        self.perception.attention_target_position = position.filter(|p| p.is_finite());
+        self.perception.attention_target_kind = kind;
+        self.perception.attention_target_id = id;
+        self.perception.attention_confidence = confidence.clamp(0.0, 1.0);
     }
 
     pub fn set_selected_salience(&mut self, salience: f32) {
@@ -232,6 +261,10 @@ impl NervousSystemRuntime {
         vita.integrate_felt_state(self.snapshot.felt, episode, dt);
         morph.set_somatic_input(self.snapshot.morph_sensors);
         self.episode = episode;
+        // Outcome impulses are consumed once; LifeCore owns their inertia.
+        self.episode.goal_congruent_motor_success = 0.0;
+        self.episode.successful_play = 0.0;
+        self.episode.repeated_intentional_failure = 0.0;
         if episode.closed {
             self.episode = EpisodeContextV1 {
                 episode_id: episode.episode_id,

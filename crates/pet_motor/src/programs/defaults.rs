@@ -210,8 +210,25 @@ pub(crate) fn apply(
             );
         }
         ProgramFamily::DefenseIntegrity => {
+            let away =
+                (context.body.motion.world_position - context.cursor_position).normalize_or_zero();
+            packet.expression.gaze_target = Some(context.cursor_position);
+            if active.program == P::DefenseOverpressureBoundary {
+                packet.expression.gaze_target = Some(
+                    (context.body.motion.world_position + away * 0.1).clamp(Vec2::ZERO, Vec2::ONE),
+                );
+                if phase == "protect" {
+                    packet.locomotion.target_position = Some(
+                        (context.body.motion.world_position + away * 0.05)
+                            .clamp(Vec2::ZERO, Vec2::ONE),
+                    );
+                }
+            }
             packet.locomotion.pose = MotorPoseIntent::Threat;
             packet.locomotion.speed_multiplier = 0.0;
+            if active.program == P::DefenseOverpressureBoundary && phase == "protect" {
+                packet.locomotion.speed_multiplier = 0.30;
+            }
             packet.material.density_compliance_multiplier = 0.78;
             packet.material.viscosity_multiplier = 1.30;
             packet.material.surface_tension_multiplier = 1.20;
@@ -275,7 +292,12 @@ pub(crate) fn apply(
                     progress,
                 ),
             );
-            if phase_started && active.program == P::StateSocialPurrCoregulation {
+            if phase_started
+                && active.program == P::StateSocialPurrCoregulation
+                && goal.felt.pain_like < 0.2
+                && goal.felt.startle < 0.35
+                && goal.drives.safety < 0.65
+            {
                 packet.voice.semantic = VoiceSemanticIntent::Purr;
                 packet.voice.emit_once = true;
                 packet.voice.intensity = goal.attachment.clamp(0.25, 0.55);

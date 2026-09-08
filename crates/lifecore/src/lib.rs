@@ -78,7 +78,7 @@ impl FeedbackEvent {
             Self::Ignored => -0.25,
             Self::PushedAway => -0.60,
             Self::MuteOrHide => -0.80,
-            Self::FocusModeEnabled => -1.00,
+            Self::FocusModeEnabled => 0.0,
             Self::FocusModeDisabled => 0.0,
             Self::Reward(value) => value.clamp(-1.0, 1.0),
         }
@@ -312,6 +312,16 @@ impl LifeCore {
     }
 
     pub fn apply_feedback(&mut self, event: FeedbackEvent) {
+        // Availability is not a reward or a relationship outcome.
+        if matches!(
+            event,
+            FeedbackEvent::FocusModeEnabled | FeedbackEvent::FocusModeDisabled
+        ) {
+            self.state.focus_mode = matches!(event, FeedbackEvent::FocusModeEnabled);
+            self.state.pending_attention = None;
+            self.state.interactions.pending_credit = None;
+            return;
+        }
         let interaction_outcome = self.state.interactions.pending_credit.map(|credit| {
             let kind = match &event {
                 FeedbackEvent::PettingStarted

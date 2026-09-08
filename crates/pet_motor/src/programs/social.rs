@@ -83,9 +83,34 @@ pub(crate) fn apply(
                     }
                 }
                 "accept_or_withdraw" => {
-                    packet.locomotion.speed_multiplier =
-                        if context.pet_touched { 0.0 } else { 0.24 };
-                    packet.expression.relief = f32::from(context.pet_touched) * 0.45;
+                    if !active
+                        .social_bid
+                        .as_ref()
+                        .is_some_and(|bid| bid.response_received)
+                    {
+                        let away = (context.body.motion.world_position - context.cursor_position)
+                            .normalize_or_zero();
+                        packet.locomotion.target_position = Some(
+                            (context.body.motion.world_position + away * 0.04)
+                                .clamp(Vec2::ZERO, Vec2::ONE),
+                        );
+                        packet.expression.gaze_target = packet.locomotion.target_position;
+                    }
+                    packet.locomotion.speed_multiplier = if active
+                        .social_bid
+                        .as_ref()
+                        .is_some_and(|bid| bid.response_received)
+                    {
+                        0.0
+                    } else {
+                        0.24
+                    };
+                    packet.expression.relief = f32::from(
+                        active
+                            .social_bid
+                            .as_ref()
+                            .is_some_and(|bid| bid.response_received),
+                    ) * 0.45;
                 }
                 _ => {}
             }

@@ -18,7 +18,7 @@ impl ExpressionRuntime {
             target.blink_right.max(procedural_blink),
             response,
         );
-        for (current, target) in [
+        for (index, (current, target)) in [
             (&mut self.current.squint, target.squint),
             (&mut self.current.pupil_size, target.pupil_size),
             (&mut self.current.pupil_focus, target.pupil_focus),
@@ -39,8 +39,17 @@ impl ExpressionRuntime {
             (&mut self.current.mouth_asymmetry, target.mouth_asymmetry),
             (&mut self.current.effort, target.effort),
             (&mut self.current.relief, target.relief),
-        ] {
-            *current = smooth(*current, target, response);
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let neutral = if index == 10 || index == 11 { 1.0 } else { 0.0 };
+            let tau = if (target - neutral).abs() > (*current - neutral).abs() {
+                0.06
+            } else {
+                0.35
+            };
+            *current = smooth(*current, target, 1.0 - (-dt.clamp(0.0, 0.1) / tau).exp());
         }
     }
 }

@@ -2718,14 +2718,7 @@ impl LiquidMorphRuntime {
             mass_conservation_error: interaction.material.mass_conservation_error.clamp(0.0, 1.0),
             completion_reason,
             motor_error,
-            user_response_credit: if interaction.contact.active
-                && interaction.material.maximum_strain < 0.55
-            {
-                (interaction.contact.area_fraction * (1.0 - interaction.material.maximum_strain))
-                    .clamp(0.0, 1.0)
-            } else {
-                0.0
-            },
+            user_response_credit: 0.0, // physics cannot attribute a social bid
         };
         self.somatic_feedback.sanitize();
     }

@@ -431,7 +431,7 @@ impl EmbodiedRuntime {
         );
         self.pose.cheek_glow = smooth(
             self.pose.cheek_glow,
-            (expression.cheek_glow * 0.7 + affect.attachment * 0.38).clamp(0.0, 1.0),
+            (expression.cheek_glow * (0.7 + affect.attachment * 0.38)).clamp(0.0, 1.0),
             5.0,
             dt,
         );

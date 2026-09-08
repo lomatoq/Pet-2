@@ -92,7 +92,7 @@ const SOLICIT: [PhaseSpec; 6] = [
     PhaseSpec::new("approach", 0.25, 2.0),
     PhaseSpec::new("stop_short", 0.16, 0.45),
     PhaseSpec::new("present_side", 0.22, 0.65),
-    PhaseSpec::new("look_wait", 3.0, 8.0),
+    PhaseSpec::new("look_wait", 2.5, 3.5),
     PhaseSpec::new("accept_or_withdraw", 0.25, 1.0),
 ];
 const RUB: [PhaseSpec; 5] = [
@@ -183,7 +183,7 @@ const FAMILY_SOCIAL: [PhaseSpec; 5] = [
     PhaseSpec::new("orient_other", 0.08, 0.25),
     PhaseSpec::new("approach_or_present", 0.16, 1.4),
     PhaseSpec::new("signal", 0.16, 0.75),
-    PhaseSpec::new("wait", 0.35, 3.0),
+    PhaseSpec::new("wait", 2.5, 3.5),
     PhaseSpec::new("ack_or_withdraw", 0.16, 0.70),
 ];
 const FAMILY_TOUCH: [PhaseSpec; 5] = [
