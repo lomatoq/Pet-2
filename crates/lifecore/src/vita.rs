@@ -879,6 +879,8 @@ pub struct FavoritePlace {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VitaState {
+    #[serde(default)]
+    pub next_gesture_episode_id: u64,
     pub schema_version: u32,
     pub attention: AttentionState,
     pub appraisal: AppraisalState,
@@ -896,6 +898,7 @@ pub struct VitaState {
 impl Default for VitaState {
     fn default() -> Self {
         Self {
+            next_gesture_episode_id: 1,
             schema_version: VITA_STATE_SCHEMA_VERSION,
             attention: AttentionState::default(),
             appraisal: AppraisalState::default(),

@@ -344,8 +344,7 @@ impl ProceduralBody {
             .min(position.y)
             .min(1.0 - position.y);
         let previous_acceleration = previous.map_or(Vec2::ZERO, |frame| frame.motion.acceleration);
-        let intended_velocity = (intent.target_position - position).normalize_or_zero()
-            * intent.desired_speed.clamp(0.0, 1.0);
+        let intended_velocity = self.simulation.motor_velocity;
         let actual_velocity = legacy.velocity.clamp_length_max(1.0);
         let length_ratio = diagnostics.stretch_ratio.clamp(0.5, 1.8);
         let width_ratio = (1.0 / length_ratio.max(0.01)).clamp(0.5, 1.8);
@@ -1441,7 +1440,10 @@ mod tests {
 
         assert_eq!(frame.frame_id, 17);
         assert!(frame.is_valid());
-        assert!(frame.efference_copy.intended_velocity.length() > 0.0);
+        assert_eq!(
+            frame.efference_copy.intended_velocity,
+            body.simulation.motor_velocity
+        );
         assert_eq!(
             frame.motion.world_position,
             body.simulation.feedback.world_position

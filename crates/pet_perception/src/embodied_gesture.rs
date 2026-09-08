@@ -170,6 +170,14 @@ impl Default for EmbodiedGestureClassifier {
 }
 
 impl EmbodiedGestureClassifier {
+    pub fn reserve_episode_ids_before(&mut self, next: u64) {
+        self.next_episode_id = self.next_episode_id.max(next).max(1);
+    }
+
+    pub const fn next_episode_id(&self) -> u64 {
+        self.next_episode_id
+    }
+
     pub fn set_tuning(&mut self, tuning: EmbodiedGestureClassifierTuning) {
         self.tuning = tuning.sanitized();
     }

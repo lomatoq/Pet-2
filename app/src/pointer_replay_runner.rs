@@ -90,6 +90,8 @@ fn execute_replay(
     tuning: LiquidTuningProfile,
 ) -> Result<ReplayOutcome, Box<dyn Error>> {
     replay.validate(tuning.pbf)?;
+    let mut nervous = crate::NervousSystemRuntime::default();
+    let mut expression = lifecore::ExpressionDirector::default();
     let mut body = ProceduralBody::generate(&life.state.genome)?;
     body.apply_tuning_profile(tuning.clone())?;
     body.restore_body_material_snapshot(&replay.initial_body_snapshot)?;
@@ -165,6 +167,8 @@ fn execute_replay(
             vita.observe(&sensors, &body.simulation.feedback, 1.0 / 60.0);
         }
         if tick.is_multiple_of(LIFE_DIVISOR) {
+            nervous.prepare(&mut life, &mut vita, &mut morph, &body, 1.0 / 20.0);
+            expression.tick(1.0 / 20.0);
             let morph_output = morph.tick_with_world(
                 &sensors,
                 &body.simulation.feedback,
@@ -174,6 +178,7 @@ fn execute_replay(
             );
             let mut output = life.tick(&sensors, &body.simulation.feedback, 1.0 / 20.0);
             if let Some(event) = vita.take_embodied_gesture() {
+                nervous.observe_gesture(&event);
                 let episode_id = event.classification.episode_id;
                 if selected_gesture == EmbodiedGestureKind::Unknown
                     && event.classification.kind != EmbodiedGestureKind::Unknown
@@ -187,6 +192,20 @@ fn execute_replay(
                     tuning.interaction.turn_cooldown_seconds,
                     tuning.interaction.learning_openness,
                 ) {
+                    let plan = expression
+                        .direct_world(
+                            plan,
+                            lifecore::LivingStateFrame::from_life(&life.state),
+                            lifecore::PhysicalExpressionContext::from_frames(
+                                &sensors,
+                                &body.simulation.feedback,
+                            ),
+                            lifecore::WorldModelFrame::from_frames(
+                                &sensors,
+                                &body.simulation.feedback,
+                            ),
+                        )
+                        .plan;
                     if vita.accept_interaction_response(plan) {
                         response_count = response_count.saturating_add(1);
                         response_reason = plan.reason;
@@ -212,7 +231,16 @@ fn execute_replay(
                 Some(morph_output),
                 1.0 / 20.0,
             );
-            sensors.interaction_actuation = vita.interaction_actuation();
+            nervous.apply_actuation(
+                &mut life,
+                &vita,
+                &morph,
+                &mut body,
+                &mut sensors,
+                &mut intent,
+                1.0 / 20.0,
+            );
+            nervous.commit_intent(&mut life, &body, &sensors, &intent);
         }
         body.fixed_update(&life.state.genome, &intent, &sensors, BODY_DT);
         body.embodied_update(
@@ -223,6 +251,7 @@ fn execute_replay(
             VoiceVisualState::default(),
             BODY_DT,
         );
+        nervous.observe_body(&body, &intent, &sensors);
         let frame = body.embodied_interaction_frame();
         if !frame.is_valid() || !body.embodiment.liquid.diagnostics().finite {
             return Err(format!("pointer replay body invariant failed at tick {tick}").into());
@@ -247,6 +276,10 @@ fn execute_replay(
     // would reject the genome's full-width u128 lineage identifier.
     let mut state_bytes = serde_json::to_vec(&life.snapshot())?;
     state_bytes.extend_from_slice(&serde_json::to_vec(&final_body)?);
+    state_bytes.extend_from_slice(&serde_json::to_vec(&vita.snapshot())?);
+    state_bytes.extend_from_slice(&serde_json::to_vec(&morph.snapshot())?);
+    state_bytes.extend_from_slice(&serde_json::to_vec(&nervous.snapshot())?);
+    state_bytes.extend_from_slice(&serde_json::to_vec(nervous.actuation())?);
     state_bytes.extend_from_slice(&serde_json::to_vec(&selected_gesture)?);
     state_bytes.extend_from_slice(&serde_json::to_vec(&response_reason)?);
     state_bytes.push(response_variant);

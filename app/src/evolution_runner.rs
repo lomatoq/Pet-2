@@ -620,6 +620,7 @@ fn run_replicate(
     let learning_before = progress.progress.learning_update_count;
     let mut audio = OfflineAudioRecorder::new(audio_directory.to_owned(), replicate_index);
     let mut expression_director = ExpressionDirector::default();
+    let mut nervous = crate::NervousSystemRuntime::default();
 
     for episode in 0..episode_count {
         let scheduled =
@@ -630,7 +631,7 @@ fn run_replicate(
             &mut base_tick,
             quiet_target,
             &mut sensors,
-            &body,
+            &mut body,
             &mut life,
             &mut vita,
             &mut morph,
@@ -638,6 +639,7 @@ fn run_replicate(
             &mut telemetry_samples,
             &mut audio,
             &mut expression_director,
+            &mut nervous,
         );
         capture_checkpoints(
             &life,
@@ -677,6 +679,7 @@ fn run_replicate(
             &mut safe_boundary_episodes,
             &mut audio,
             &mut expression_director,
+            &mut nervous,
         );
         completed_episodes = completed_episodes.saturating_add(1);
         progress.progress.stage = EvolutionProgressStage::Episode;
@@ -701,7 +704,7 @@ fn run_replicate(
         &mut base_tick,
         total_ticks,
         &mut sensors,
-        &body,
+        &mut body,
         &mut life,
         &mut vita,
         &mut morph,
@@ -709,6 +712,7 @@ fn run_replicate(
         &mut telemetry_samples,
         &mut audio,
         &mut expression_director,
+        &mut nervous,
     );
     capture_checkpoints(
         &life,
@@ -822,7 +826,7 @@ fn advance_quiet(
     base_tick: &mut u64,
     target_tick: u64,
     sensors: &mut SensorFrame,
-    body: &ProceduralBody,
+    body: &mut ProceduralBody,
     life: &mut LifeCore,
     vita: &mut VitaRuntime,
     morph: &mut MorphBrain,
@@ -830,6 +834,7 @@ fn advance_quiet(
     telemetry_samples: &mut u64,
     audio: &mut OfflineAudioRecorder,
     expression_director: &mut ExpressionDirector,
+    nervous: &mut crate::NervousSystemRuntime,
 ) {
     if target_tick <= *base_tick {
         return;
@@ -837,25 +842,26 @@ fn advance_quiet(
     if mode == QuietAdvanceMode::CalendarOnly {
         let ticks = target_tick - *base_tick;
         life.advance_calendar_only(ticks as f64 / BASE_HZ as f64);
+        life.learning.body.clear_transients();
+        life.learning.responses.cancel();
+        life.state.interactions.pending_credit = None;
+        *nervous = crate::NervousSystemRuntime::default();
         *telemetry_samples = telemetry_samples.saturating_add(ticks / TELEMETRY_DIVISOR);
         *base_tick = target_tick;
         return;
     }
-    let feedback = body.simulation.feedback.clone();
-    loop {
-        let next_perception_tick = (*base_tick / PERCEPTION_DIVISOR)
-            .saturating_add(1)
-            .saturating_mul(PERCEPTION_DIVISOR);
-        if next_perception_tick > target_tick {
-            break;
+    while *base_tick < target_tick {
+        *base_tick += 1;
+        set_quiet_sensors(sensors, *base_tick, body.simulation.feedback.world_position);
+        sensors.embodied_interaction = body.embodied_interaction_frame();
+        if (*base_tick).is_multiple_of(PERCEPTION_DIVISOR) {
+            vita.observe(sensors, &body.simulation.feedback, PERCEPTION_DT);
         }
-        *base_tick = next_perception_tick;
-        set_quiet_sensors(sensors, *base_tick, feedback.world_position);
-        vita.observe(sensors, &feedback, PERCEPTION_DT);
         if (*base_tick).is_multiple_of(LIFE_DIVISOR) {
+            nervous.prepare(life, vita, morph, body, LIFE_DT);
             expression_director.tick(LIFE_DT);
-            let morph_output = morph.tick(sensors, &feedback, &life.state, LIFE_DT);
-            let mut output = life.tick(sensors, &feedback, LIFE_DT);
+            let morph_output = morph.tick(sensors, &body.simulation.feedback, &life.state, LIFE_DT);
+            let mut output = life.tick(sensors, &body.simulation.feedback, LIFE_DT);
             if let Some(request) = output.vocal_request.take() {
                 audio.render(life, request);
             }
@@ -863,17 +869,28 @@ fn advance_quiet(
                 BrainMode::MorphFusion,
                 &life.state,
                 sensors,
-                &feedback,
+                &body.simulation.feedback,
                 output.body_intent,
                 Some(morph_output),
                 LIFE_DT,
             );
+            nervous.apply_actuation(life, vita, morph, body, sensors, intent, LIFE_DT);
+            nervous.commit_intent(life, body, sensors, intent);
         }
+        body.fixed_update(&life.state.genome, intent, sensors, BODY_DT);
+        body.embodied_update(
+            intent,
+            sensors,
+            life.state.affect,
+            VisualMindInput::default(),
+            VoiceVisualState::default(),
+            BODY_DT,
+        );
+        nervous.observe_body(body, intent, sensors);
         if (*base_tick).is_multiple_of(TELEMETRY_DIVISOR) {
             *telemetry_samples = telemetry_samples.saturating_add(1);
         }
     }
-    *base_tick = target_tick;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,6 +917,7 @@ fn run_episode(
     safe_boundary_episodes: &mut u32,
     audio: &mut OfflineAudioRecorder,
     expression_director: &mut ExpressionDirector,
+    nervous: &mut crate::NervousSystemRuntime,
 ) {
     let mut fixture = FixtureRuntime::new(kind, seed, episode_index);
     let anticipation = 0.25_f32;
@@ -949,6 +967,7 @@ fn run_episode(
             vita.observe(sensors, &body.simulation.feedback, PERCEPTION_DT);
         }
         if (*base_tick).is_multiple_of(LIFE_DIVISOR) {
+            nervous.prepare(life, vita, morph, body, LIFE_DT);
             expression_director.tick(LIFE_DT);
             let morph_output = morph.tick_with_world(
                 sensors,
@@ -959,6 +978,7 @@ fn run_episode(
             );
             let mut output = life.tick(sensors, &body.simulation.feedback, LIFE_DT);
             if let Some((event, _signature)) = vita.take_embodied_gesture_observation() {
+                nervous.observe_gesture(&event);
                 let physical_episode = event.classification.episode_id;
                 if event.boundary != lifecore::GestureBoundaryEvent::None {
                     saw_safe_boundary = true;
@@ -1014,7 +1034,8 @@ fn run_episode(
                 Some(morph_output),
                 LIFE_DT,
             );
-            sensors.interaction_actuation = vita.interaction_actuation();
+            nervous.apply_actuation(life, vita, morph, body, sensors, intent, LIFE_DT);
+            nervous.commit_intent(life, body, sensors, intent);
         }
 
         let fixture_phase = (active_elapsed / fixture.active_seconds).clamp(0.0, 1.0);
@@ -1042,6 +1063,7 @@ fn run_episode(
             VoiceVisualState::default(),
             BODY_DT,
         );
+        nervous.observe_body(body, intent, sensors);
         body_timings_us.push(started.elapsed().as_secs_f64() * 1_000_000.0);
         check_body_invariants(body, interaction_tuning, invariants);
         if (*base_tick).is_multiple_of(TELEMETRY_DIVISOR) {
@@ -1448,7 +1470,7 @@ mod tests {
     #[test]
     fn calendar_only_advances_time_without_learning() {
         let mut life = LifeCore::new(Genome::from_seed(12), 13);
-        let before_variants = life.state.interactions.variants;
+        let before_learning = life.learning.clone();
         let before_successes = life.state.successful_interactions;
         life.advance_calendar_only(3_600.0);
         assert_eq!(life.state.elapsed_seconds, 3_600.0);
@@ -1456,7 +1478,7 @@ mod tests {
             life.state.tick_count,
             (LIFECORE_HZ as u64).saturating_mul(3_600)
         );
-        assert_eq!(life.state.interactions.variants, before_variants);
+        assert_eq!(life.learning, before_learning);
         assert_eq!(life.state.successful_interactions, before_successes);
     }
 
@@ -1484,7 +1506,7 @@ mod tests {
         let mut life = LifeCore::new(Genome::from_seed(0xC10C), 0x71C5);
         let mut vita = VitaRuntime::new(life.state.genome.identity_seed, None);
         let mut morph = MorphBrain::new(life.state.genome.identity_seed, None).unwrap();
-        let body = ProceduralBody::generate(&life.state.genome).unwrap();
+        let mut body = ProceduralBody::generate(&life.state.genome).unwrap();
         let mut sensors = SensorFrame::default();
         let mut intent = stable_body_intent();
         let mut base_tick = 1;
@@ -1492,13 +1514,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut audio = OfflineAudioRecorder::new(directory.path().to_owned(), 0);
         let mut expression_director = ExpressionDirector::default();
+        let mut nervous = crate::NervousSystemRuntime::default();
 
         advance_quiet(
             QuietAdvanceMode::Exact,
             &mut base_tick,
             25,
             &mut sensors,
-            &body,
+            &mut body,
             &mut life,
             &mut vita,
             &mut morph,
@@ -1506,12 +1529,13 @@ mod tests {
             &mut telemetry_samples,
             &mut audio,
             &mut expression_director,
+            &mut nervous,
         );
 
         assert_eq!(base_tick, 25);
         assert_eq!(life.state.tick_count, 4);
         assert_eq!(telemetry_samples, 1);
-        assert_eq!(sensors.timestamp, 24.0 / BASE_HZ as f64);
+        assert_eq!(sensors.timestamp, 25.0 / BASE_HZ as f64);
     }
 
     #[test]

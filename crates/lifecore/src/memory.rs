@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActionId, AppCategory, ContextVector};
+use crate::{ActionId, AppCategory, CONTEXT_SIZE, ContextVector};
 
 const SHORT_TERM_CAPACITY: usize = 512;
 const EPISODIC_CAPACITY: usize = 256;
@@ -107,34 +107,24 @@ impl MemorySystem {
         if event.salience >= 0.32 {
             self.merge_episode(&event);
         }
+        // Accounting belongs to ingestion, never to repeated sleep/replay.
+        update_preference(
+            &mut self.user_model.preferred_attention_strategies,
+            event.action,
+            event.reward,
+        );
+        // The bias marks an observed context. Missing startup context is not midnight.
+        if event.context[CONTEXT_SIZE - 1] > 0.5 {
+            let hour = (event.context[0].clamp(0.0, 0.999_999) * 24.0) as usize;
+            for (index, value) in self.user_model.usual_active_hours.iter_mut().enumerate() {
+                *value = (*value * 0.98 + if index == hour { 0.02 } else { 0.0 }).clamp(0.0, 1.0);
+            }
+        }
         self.short_term.push_back(event);
+        self.discover_habit();
     }
 
     pub fn consolidate(&mut self) {
-        let mut active_hours = [0.0_f32; 24];
-        for event in &self.short_term {
-            let hour = ((event.timestamp / 3600.0).rem_euclid(24.0)) as usize;
-            active_hours[hour] += event.salience.max(0.05);
-            update_preference(
-                &mut self.user_model.preferred_attention_strategies,
-                event.action,
-                event.reward,
-            );
-        }
-        let maximum = active_hours
-            .iter()
-            .copied()
-            .fold(0.0_f32, f32::max)
-            .max(1.0);
-        for (stored, observed) in self
-            .user_model
-            .usual_active_hours
-            .iter_mut()
-            .zip(active_hours)
-        {
-            *stored = (*stored * 0.82 + observed / maximum * 0.18).clamp(0.0, 1.0);
-        }
-        self.discover_habit();
         self.episodic.sort_by(|left, right| {
             right
                 .representative
@@ -193,8 +183,8 @@ impl MemorySystem {
         let successful: Vec<_> = self
             .short_term
             .iter()
-            .filter(|event| event.reward > 0.35)
             .rev()
+            .take_while(|event| event.reward > 0.35)
             .take(4)
             .map(|event| event.action)
             .collect();
@@ -248,4 +238,64 @@ fn context_distance(left: &ContextVector, right: &ContextVector) -> f32 {
         .map(|(a, b)| (a - b).powi(2))
         .sum::<f32>()
         .sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(outcome: Outcome) -> EventRecord {
+        let mut context = [0.5; CONTEXT_SIZE];
+        context[CONTEXT_SIZE - 1] = 1.0;
+        EventRecord {
+            timestamp: 500_000.0,
+            context,
+            action: ActionId::Chirp,
+            outcome,
+            reward: if outcome == Outcome::Success {
+                0.8
+            } else {
+                -0.8
+            },
+            salience: 0.8,
+        }
+    }
+
+    #[test]
+    fn sleep_accounting_is_idempotent_across_restore() {
+        let mut m = MemorySystem::default();
+        for _ in 0..3 {
+            m.record(event(Outcome::Success));
+        }
+        m.consolidate();
+        assert_eq!(
+            m.user_model.preferred_attention_strategies[0].observations,
+            3
+        );
+        assert_eq!(m.habits[0].use_count, 1);
+        let mut restored: MemorySystem =
+            serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        for _ in 0..5 {
+            restored.consolidate();
+        }
+        assert_eq!(restored, m);
+        assert!(m.user_model.usual_active_hours[12] > 0.0);
+    }
+
+    #[test]
+    fn failure_breaks_a_habit_sequence() {
+        let mut m = MemorySystem::default();
+        for outcome in [
+            Outcome::Success,
+            Outcome::Rejected,
+            Outcome::Success,
+            Outcome::Success,
+        ] {
+            m.record(event(outcome));
+        }
+        m.consolidate();
+        assert!(m.habits.is_empty());
+        m.record(event(Outcome::Success));
+        assert_eq!(m.habits.len(), 1);
+    }
 }

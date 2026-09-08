@@ -1,0 +1,10 @@
+{
+  "backup": "/Users/darap/projects/Pet-2/target/install-backups/20260908-175113",
+  "package_sha256": "91563da67e21de40389b172ae5fd074c138e864e78402e2e88c1fbc117a97935",
+  "bundles_verified": [
+    "Pet2.app",
+    "Pet2 Dev Console.app"
+  ],
+  "saved_state_unchanged_before_launch": true,
+  "state_sha256_before_launch": "2cea1fd489058b871914b66bface58a3d3adc8884a7b478b8bf52b65499a5d19"
+}

@@ -6,7 +6,6 @@ use crate::{AffectState, Drives, TemperamentGenome, VocalTrigger};
 pub const MAX_TRACKED_BODY_COMPONENTS: usize = 4;
 pub const MAX_GESTURE_CAUSES: usize = 6;
 pub const MAX_INTERACTION_VARIANTS: usize = 3;
-pub const MAX_INTERACTION_VARIANT_HISTORY: usize = 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -815,82 +814,8 @@ impl InteractionTurnRuntime {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct InteractionVariantValue {
-    pub value: f32,
-    pub confidence: f32,
-    pub updates: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct InteractionVariantBandit {
-    pub variants: [InteractionVariantValue; MAX_INTERACTION_VARIANTS],
-    pub history:
-        [[InteractionVariantValue; MAX_INTERACTION_VARIANTS]; MAX_INTERACTION_VARIANT_HISTORY],
-    pub history_count: u8,
-    pub version: u32,
-    pub last_updated_episode: u64,
-}
-
-impl Default for InteractionVariantBandit {
-    fn default() -> Self {
-        Self {
-            variants: [InteractionVariantValue::default(); MAX_INTERACTION_VARIANTS],
-            history: [[InteractionVariantValue::default(); MAX_INTERACTION_VARIANTS];
-                MAX_INTERACTION_VARIANT_HISTORY],
-            history_count: 0,
-            version: 1,
-            last_updated_episode: 0,
-        }
-    }
-}
-
-impl InteractionVariantBandit {
-    pub fn update(&mut self, episode_id: u64, variant: usize, reward: f32, learning_rate: f32) {
-        if episode_id == 0
-            || episode_id == self.last_updated_episode
-            || variant >= MAX_INTERACTION_VARIANTS
-        {
-            return;
-        }
-        self.checkpoint();
-        // Learning openness may reduce the configured rate, but the social
-        // variant learner itself retains the non-negotiable per-episode cap.
-        let rate = bounded(learning_rate, 0.0, 0.04, 0.0);
-        let reward = finite_signed(reward, 1.0);
-        let selected = &mut self.variants[variant];
-        selected.value = (selected.value + (reward - selected.value) * rate).clamp(-1.0, 1.0);
-        selected.confidence =
-            (selected.confidence + rate * (1.0 - selected.confidence)).clamp(0.0, 1.0);
-        selected.updates = selected.updates.saturating_add(1);
-        self.last_updated_episode = episode_id;
-        self.version = self.version.saturating_add(1);
-    }
-
-    pub fn rollback(&mut self) -> bool {
-        if self.history_count == 0 {
-            return false;
-        }
-        self.history_count -= 1;
-        self.variants = self.history[usize::from(self.history_count)];
-        self.version = self.version.saturating_add(1);
-        self.last_updated_episode = 0;
-        true
-    }
-
-    fn checkpoint(&mut self) {
-        if usize::from(self.history_count) == MAX_INTERACTION_VARIANT_HISTORY {
-            self.history.rotate_left(1);
-            self.history_count -= 1;
-        }
-        self.history[usize::from(self.history_count)] = self.variants;
-        self.history_count += 1;
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct PendingInteractionCredit {
+    pub executed: bool,
     pub episode_id: u64,
     pub response_id: u64,
     pub variant: u8,
@@ -907,7 +832,6 @@ const fn default_learning_openness() -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistentInteractionState {
-    pub variants: InteractionVariantBandit,
     pub pending_credit: Option<PendingInteractionCredit>,
     pub next_response_id: u64,
     pub last_responded_episode: u64,
@@ -923,7 +847,6 @@ pub struct PersistentInteractionState {
 impl Default for PersistentInteractionState {
     fn default() -> Self {
         Self {
-            variants: InteractionVariantBandit::default(),
             pending_credit: None,
             next_response_id: 1,
             last_responded_episode: 0,
@@ -943,19 +866,6 @@ impl PersistentInteractionState {
     pub fn is_valid(self) -> bool {
         self.next_response_id > 0
             && self.recent_boundary_events <= 32
-            && self.variants.history_count as usize <= MAX_INTERACTION_VARIANT_HISTORY
-            && self.variants.last_updated_episode <= self.last_responded_episode
-            && self
-                .variants
-                .variants
-                .iter()
-                .chain(self.variants.history.iter().flatten())
-                .all(|value| {
-                    value.value.is_finite()
-                        && (-1.0..=1.0).contains(&value.value)
-                        && value.confidence.is_finite()
-                        && (0.0..=1.0).contains(&value.confidence)
-                })
             && self.pending_credit.is_none_or(|credit| {
                 credit.episode_id > 0
                     && credit.response_id > 0
@@ -1415,19 +1325,5 @@ mod tests {
         assert!(turn.emit_response(7, 11));
         assert!(!turn.emit_response(7, 12));
         assert_eq!(turn.response_id, Some(11));
-    }
-
-    #[test]
-    fn interaction_variant_update_is_bounded_and_rollbackable() {
-        let mut bandit = InteractionVariantBandit::default();
-        bandit.update(1, 0, 1.0, 1.0);
-        assert!(bandit.variants[0].value <= 0.04);
-        let learned = bandit.variants;
-        bandit.update(1, 0, -1.0, 0.04);
-        assert_eq!(bandit.variants, learned);
-        bandit.update(2, 0, -1.0, 0.04);
-        assert!(bandit.variants[0].value < learned[0].value);
-        assert!(bandit.rollback());
-        assert_eq!(bandit.variants, learned);
     }
 }

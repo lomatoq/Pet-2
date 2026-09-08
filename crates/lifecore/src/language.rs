@@ -557,6 +557,9 @@ impl ExpressionDirector {
         physical: PhysicalExpressionContext,
         world: WorldModelFrame,
     ) -> CreaturePhrase {
+        let quiet_response = plan.reason == InteractionReasonCode::QuietAcknowledgement;
+        let quiet_hold = plan.hold_seconds;
+        let quiet_gaze = plan.gaze;
         let intent = social_intent(plan.reason);
         let priority = intent_priority(intent);
         if let Some(active) = self.active
@@ -628,6 +631,13 @@ impl ExpressionDirector {
             .clamp(0.04, 0.18);
         plan.hold_seconds = (0.80 + living.affect.attachment * 0.45 + load * 0.35).clamp(0.80, 2.0);
         plan.release_seconds = plan.release_seconds.clamp(0.18, 0.60);
+        if quiet_response {
+            plan.body.local_pulse = 0.0;
+            plan.body.lean = 0.0;
+            plan.gaze = quiet_gaze;
+            plan.hold_seconds = quiet_hold;
+            plan.voice_trigger = None;
+        }
         let quiet_suppressed = living.quiet_preferred && priority < 220;
         let voice_gesture = plan.voice_trigger.map(VoiceGesture::for_trigger);
         if quiet_suppressed {
@@ -750,6 +760,35 @@ mod tests {
             expression: InteractionExpressionTarget::default(),
             voice_trigger: Some(trigger),
             ..InteractionResponsePlan::default()
+        }
+    }
+
+    #[test]
+    fn learned_response_semantics_survive_expression_direction() {
+        let life = LifeState::new(crate::Genome::from_seed(8));
+        for strategy in [0, 2] {
+            let mut response = plan(
+                InteractionReasonCode::GentleContact,
+                VocalTrigger::SoftTouch,
+            );
+            crate::ResponseLearning::apply_strategy(&mut response, strategy);
+            let phrase = ExpressionDirector::default().direct(
+                response,
+                LivingStateFrame::from_life(&life),
+                PhysicalExpressionContext::default(),
+            );
+            if strategy == 0 {
+                assert!(phrase.plan.voice_trigger.is_none());
+                assert_eq!(phrase.plan.hold_seconds, response.hold_seconds);
+                assert_eq!(phrase.plan.body.local_pulse, 0.0);
+                assert_eq!(phrase.plan.body.lean, 0.0);
+            } else {
+                assert_eq!(phrase.intent, SocialIntent::Invite);
+                assert_eq!(
+                    phrase.plan.communicative_intent,
+                    crate::CommunicativeIntent::InviteRepeat
+                );
+            }
         }
     }
 

@@ -227,6 +227,8 @@ pub struct LifeSnapshot {
     pub brain: MicroBrain,
     pub habits: ContextualBandit,
     pub memories: MemorySystem,
+    #[serde(default)]
+    pub learning: crate::AdaptiveLearning,
     pub rng: SavedRngState,
 }
 
@@ -278,6 +280,11 @@ impl LifeSnapshot {
         if !self.habits.is_valid() {
             return Err(LifeError::InvalidState(
                 "ContextualBandit structure is invalid",
+            ));
+        }
+        if !self.learning.is_valid() {
+            return Err(LifeError::InvalidState(
+                "Adaptive learning bounds or values are invalid",
             ));
         }
         if !self.memories.is_valid() {

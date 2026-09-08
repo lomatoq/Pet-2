@@ -6,6 +6,7 @@ const BODY_SCREEN_GRAVITY: f32 = 0.16;
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodySimulation {
     pub feedback: BodyFeedback,
+    pub motor_velocity: Vec2,
     wander_phase: f32,
     /// Physical desktop extent used for locomotion math. `BodyFeedback` remains
     /// the normalized persistence/LifeCore mirror, but direction, arrival and
@@ -22,6 +23,7 @@ impl BodySimulation {
     pub fn new(seed: u64) -> Self {
         Self {
             feedback: BodyFeedback::default(),
+            motor_velocity: Vec2::ZERO,
             wander_phase: seed as u32 as f32 / u32::MAX as f32 * std::f32::consts::TAU,
             motion_space_pixels: None,
             embodied_target: None,
@@ -32,6 +34,19 @@ impl BodySimulation {
         if size.is_finite() && size.min_element() > 1.0 {
             self.motion_space_pixels = Some(size);
         }
+    }
+
+    /// The same actuator calculation on a private copy, before the transition.
+    pub fn preview_motor_velocity(
+        &self,
+        genome: &BodyGenome,
+        intent: &BodyIntent,
+        sensors: &SensorFrame,
+        dt: f32,
+    ) -> Vec2 {
+        let mut preview = self.clone();
+        preview.fixed_update(genome, intent, sensors, dt);
+        preview.motor_velocity
     }
 
     pub fn fixed_update(
@@ -180,6 +195,7 @@ impl BodySimulation {
             &sensors.visible_surfaces,
             intent,
         );
+        self.motor_velocity = (desired_velocity / scale).clamp_length_max(1.0);
         let velocity = self.feedback.velocity * scale;
         let purposeful_mode = matches!(
             intent.locomotion,
@@ -326,6 +342,42 @@ mod tests {
     use lifecore::{ExpressionState, Genome, PoseIntent};
 
     use super::*;
+
+    #[test]
+    fn efference_preview_uses_actual_flee_and_orbit_actuator() {
+        let genome = Genome::from_seed(17);
+        for mode in [
+            LocomotionMode::Seek,
+            LocomotionMode::Flee,
+            LocomotionMode::Orbit,
+        ] {
+            let mut body = BodySimulation::new(17);
+            let before = body.clone();
+            let intent = BodyIntent {
+                locomotion: mode,
+                target_position: Vec2::new(0.7, 0.5),
+                target_surface: None,
+                desired_speed: 0.1,
+                facing_direction: 1.0,
+                gaze_target: None,
+                pose: PoseIntent::Neutral,
+                expression: ExpressionState::default(),
+                interaction_target: None,
+            };
+            let sensors = SensorFrame::default();
+            let predicted =
+                body.preview_motor_velocity(&genome.body, &intent, &sensors, 1.0 / 120.0);
+            assert_eq!(body, before, "preview must not mutate the world");
+            body.fixed_update(&genome.body, &intent, &sensors, 1.0 / 120.0);
+            assert_eq!(predicted, body.motor_velocity);
+            match mode {
+                LocomotionMode::Seek => assert!(predicted.x > 0.0),
+                LocomotionMode::Flee => assert!(predicted.x < 0.0),
+                LocomotionMode::Orbit => assert!(predicted.y.abs() > 0.01),
+                _ => unreachable!(),
+            }
+        }
+    }
 
     #[test]
     fn wander_arrives_at_its_waypoint_instead_of_hitting_desktop_edges() {

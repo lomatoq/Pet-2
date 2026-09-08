@@ -27,9 +27,13 @@ pub struct NervousSystemRuntime {
     voice_feedback: VoiceFeedbackV1,
     previous_voice_energy: f32,
     gesture: GestureFrameV1,
+    gesture_age: f32,
     episode: EpisodeContextV1,
     perception: PerceptionSelectionV1,
     next_body_frame_id: u64,
+    consumed_body_frame: u64,
+    body_time: f64,
+    executed_locomotion: lifecore::LocomotionMode,
 }
 
 impl Default for NervousSystemRuntime {
@@ -43,9 +47,13 @@ impl Default for NervousSystemRuntime {
             voice_feedback: VoiceFeedbackV1::default(),
             previous_voice_energy: 0.0,
             gesture: GestureFrameV1::default(),
+            gesture_age: 0.0,
             episode: EpisodeContextV1::default(),
             perception: PerceptionSelectionV1::default(),
             next_body_frame_id: 1,
+            consumed_body_frame: 0,
+            body_time: 0.0,
+            executed_locomotion: lifecore::LocomotionMode::Hover,
         }
     }
 }
@@ -59,6 +67,8 @@ impl NervousSystemRuntime {
         intent: &BodyIntent,
         sensors: &SensorFrame,
     ) {
+        self.body_time = sensors.timestamp;
+        self.executed_locomotion = intent.locomotion;
         let previous = self.body_feedback;
         self.body_feedback =
             body.body_feedback_v2(intent, sensors, Some(&previous), self.next_body_frame_id);
@@ -99,6 +109,7 @@ impl NervousSystemRuntime {
     }
 
     pub fn observe_gesture(&mut self, event: &EmbodiedGestureEvent) {
+        self.gesture_age = 0.0;
         let classification = event.classification;
         let boundary_violation = match event.boundary {
             GestureBoundaryEvent::Overstrain
@@ -113,12 +124,6 @@ impl NervousSystemRuntime {
                 | EmbodiedGestureKind::RhythmicTouch
                 | EmbodiedGestureKind::SharedPlayInvitation
                 | EmbodiedGestureKind::FragmentHelp
-        );
-        let successful_play = matches!(
-            classification.kind,
-            EmbodiedGestureKind::Tickle
-                | EmbodiedGestureKind::RhythmicTouch
-                | EmbodiedGestureKind::SharedPlayInvitation
         );
         self.gesture = GestureFrameV1 {
             episode_id: classification.episode_id,
@@ -150,16 +155,9 @@ impl NervousSystemRuntime {
                 0.0
             },
             reward_negative: boundary_violation,
-            successful_play: if successful_play {
-                classification.confidence
-            } else {
-                0.0
-            },
-            goal_congruent_motor_success: if classification.committed {
-                classification.confidence * (1.0 - classification.prediction_error)
-            } else {
-                0.0
-            },
+            // A recognized invitation is not evidence of successful play or execution.
+            successful_play: 0.0,
+            goal_congruent_motor_success: 0.0,
             rhythmic_synchrony: self.gesture.rhythm_strength,
             safe_social_exchange: if positive_social {
                 classification.confidence * (1.0 - boundary_violation)
@@ -170,11 +168,7 @@ impl NervousSystemRuntime {
                 * (1.0 - boundary_violation),
             ignored_social_bid: 0.0,
             boundary_violation,
-            repeated_intentional_failure: if classification.prediction_error > 0.65 {
-                classification.prediction_error
-            } else {
-                0.0
-            },
+            repeated_intentional_failure: 0.0,
             novel_goal_congruent_episode: classification.prediction_error
                 * classification.confidence
                 * (1.0 - boundary_violation),
@@ -182,6 +176,84 @@ impl NervousSystemRuntime {
             rest_quality: f32::from(event.boundary == GestureBoundaryEvent::QuietOrSleep),
             ..EpisodeContextV1::default()
         };
+    }
+
+    pub fn has_fresh_body(&self) -> bool {
+        self.body_feedback.frame_id > self.consumed_body_frame
+    }
+
+    /// Shared live/headless boundary: body evidence always precedes cognition.
+    pub fn prepare(
+        &mut self,
+        life: &mut LifeCore,
+        vita: &mut VitaRuntime,
+        morph: &mut MorphBrain,
+        body: &ProceduralBody,
+        dt: f32,
+    ) {
+        let tuning = body.tuning_profile();
+        self.prepare_cognition_tick(
+            life,
+            vita,
+            morph,
+            tuning.interaction.soft_touch_pressure_max,
+            tuning.nervous.for_live_runtime(),
+            dt,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_actuation(
+        &mut self,
+        life: &mut LifeCore,
+        vita: &VitaRuntime,
+        morph: &MorphBrain,
+        body: &mut ProceduralBody,
+        sensors: &mut SensorFrame,
+        intent: &mut BodyIntent,
+        dt: f32,
+    ) {
+        let tuning = body.tuning_profile();
+        let calibration = tuning.nervous.for_live_runtime();
+        let mut phenotype = self.resolve_actuation(
+            life,
+            vita,
+            morph,
+            vita.interaction_actuation(),
+            tuning.interaction.soft_touch_pressure_max,
+            calibration,
+            dt,
+        );
+        calibration.apply(&mut phenotype);
+        phenotype.apply_to_intent(intent, sensors, body.simulation.feedback.world_position);
+        life.learning
+            .body
+            .adapt_intent(intent, body.simulation.feedback.cursor_contact);
+        vita.apply_interaction_expression(intent, sensors, &body.simulation.feedback);
+        phenotype.expression = intent.expression;
+        phenotype.face.gaze_target = intent.gaze_target;
+        sensors.interaction_actuation = phenotype.interaction;
+        self.actuation = phenotype.clone();
+        body.set_fast_phenotype_actuation(phenotype);
+    }
+
+    /// Called after the platform's final target/velocity constraints.
+    pub fn commit_intent(
+        &self,
+        life: &mut LifeCore,
+        body: &ProceduralBody,
+        sensors: &SensorFrame,
+        intent: &BodyIntent,
+    ) {
+        let command = body.simulation.preview_motor_velocity(
+            &life.state.genome.body,
+            intent,
+            sensors,
+            1.0 / 120.0,
+        );
+        life.learning
+            .body
+            .begin(self.body_feedback, command, self.body_time);
     }
 
     pub fn set_selected_salience(&mut self, salience: f32) {
@@ -204,6 +276,38 @@ impl NervousSystemRuntime {
         calibration: NervousReadabilityTuning,
         dt: f32,
     ) {
+        if !self.has_fresh_body() {
+            return;
+        }
+        self.consumed_body_frame = self.body_feedback.frame_id;
+        life.learning
+            .body
+            .complete(self.body_feedback, self.body_time);
+        let motion = self.body_feedback.motion.velocity;
+        let commanded = self.body_feedback.efference_copy.intended_velocity;
+        let command = if motion.length() > 0.005 && motion.dot(commanded) > 0.0 {
+            match self.executed_locomotion {
+                lifecore::LocomotionMode::Flee => morph_brain::MorphCommand::Flee,
+                lifecore::LocomotionMode::Seek | lifecore::LocomotionMode::Arrive => {
+                    morph_brain::MorphCommand::Approach
+                }
+                lifecore::LocomotionMode::Orbit => morph_brain::MorphCommand::Play,
+                _ => morph_brain::MorphCommand::Idle,
+            }
+        } else {
+            morph_brain::MorphCommand::Idle
+        };
+        morph.acknowledge_execution(command);
+        if let Some(plan) = vita.active_interaction_plan()
+            && vita.interaction_turn().elapsed_seconds >= plan.onset_seconds
+        {
+            life.acknowledge_interaction_execution(plan.response_id);
+        }
+        self.gesture_age += dt.clamp(0.0, 0.25);
+        if self.gesture_age > 1.0 {
+            self.gesture = GestureFrameV1::default();
+            self.episode = EpisodeContextV1::default();
+        }
         let source = self.source(life, vita, morph, soft_touch_pressure_max, calibration);
         self.snapshot = self.interoception.tick(&source, dt);
         let mut episode = self.episode;
@@ -226,12 +330,13 @@ impl NervousSystemRuntime {
         } else {
             positive
         };
-        episode.reward_negative = episode.reward_negative.max(negative);
+        episode.reward_negative = negative;
         life.integrate_felt_state(self.snapshot, episode, dt);
         vita.integrate_felt_state(self.snapshot.felt, episode, dt);
         morph.set_somatic_input(self.snapshot.morph_sensors);
         self.episode = episode;
         if episode.closed {
+            self.gesture = GestureFrameV1::default();
             self.episode = EpisodeContextV1 {
                 episode_id: episode.episode_id,
                 ..EpisodeContextV1::default()
@@ -427,6 +532,54 @@ fn merge_interaction(phenotype: &mut InteractionBodyActuation, vita: Interaction
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_gesture_and_pain_recover_without_another_gesture() {
+        let mut nervous = NervousSystemRuntime::default();
+        let mut life = LifeCore::new(lifecore::Genome::from_seed(7), 11);
+        let mut vita = VitaRuntime::new(7, None);
+        let mut morph = MorphBrain::new(7, None).unwrap();
+        let event = EmbodiedGestureEvent {
+            classification: lifecore::GestureClassification {
+                episode_id: 1,
+                kind: EmbodiedGestureKind::SoftTouch,
+                committed: true,
+                confidence: 1.0,
+                prediction_error: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        nervous.observe_gesture(&event);
+        for tick in 1..=1400 {
+            nervous.body_feedback.frame_id = tick;
+            nervous.body_feedback.contact.pressure = if tick < 20 { 1.0 } else { 0.0 };
+            nervous.body_feedback.shape.maximum_strain = if tick < 20 { 1.0 } else { 0.0 };
+            nervous.prepare_cognition_tick(
+                &mut life,
+                &mut vita,
+                &mut morph,
+                0.15,
+                NervousReadabilityTuning::default().for_live_runtime(),
+                0.05,
+            );
+        }
+        assert_eq!(nervous.gesture, GestureFrameV1::default());
+        assert!(nervous.episode.reward_negative < 0.001);
+        let before = nervous.snapshot;
+        nervous.prepare_cognition_tick(
+            &mut life,
+            &mut vita,
+            &mut morph,
+            0.15,
+            NervousReadabilityTuning::default().for_live_runtime(),
+            0.05,
+        );
+        assert_eq!(
+            nervous.snapshot, before,
+            "a repeated physical frame must not update interoception"
+        );
+    }
 
     #[test]
     fn voice_feedback_uses_callback_output_and_respects_genome_cap() {

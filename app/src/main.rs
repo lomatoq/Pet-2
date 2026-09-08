@@ -991,6 +991,20 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
     let mut maximum_position = feedback.world_position;
     let feedback_interval = (5.0 / dt).round().max(1.0) as u64;
     let empty_window_affordances = pet_ecology::WindowAffordanceFrame::default();
+    let mut nervous = NervousSystemRuntime::default();
+    let previous_intent = BodyIntent {
+        locomotion: lifecore::LocomotionMode::Hover,
+        target_position: feedback.world_position,
+        target_surface: None,
+        desired_speed: 0.0,
+        facing_direction: 1.0,
+        gaze_target: None,
+        pose: lifecore::PoseIntent::Neutral,
+        expression: ExpressionState::default(),
+        interaction_target: None,
+    };
+    nervous.observe_body(&body, &previous_intent, &sensors);
+    let mut headless_expression = ExpressionDirector::default();
     for tick in 0..tick_count {
         let time = tick as f32 * dt;
         sensors.timestamp = f64::from(time);
@@ -1016,6 +1030,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         }
         vita.observe(&sensors, &feedback, dt);
         sensors.desktop_focus_pressure = vita.desktop_focus_pressure();
+        nervous.prepare(&mut life, &mut vita, &mut morph, &body, dt);
         let morph_started = Instant::now();
         let morph_world = ecology.morph_world_input(feedback.world_position, life.state.drives);
         let morph_output =
@@ -1041,10 +1056,20 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             morph_switches = morph_switches.saturating_add(1);
         }
         previous_morph_command = morph_output.command;
+        headless_expression.tick(dt);
         let mut output = life.tick(&sensors, &feedback, dt);
         if let Some(event) = vita.take_embodied_gesture() {
+            nervous.observe_gesture(&event);
             let episode_id = event.classification.episode_id;
             if let Some(plan) = life.observe_embodied_gesture(event) {
+                let plan = headless_expression
+                    .direct_world(
+                        plan,
+                        LivingStateFrame::from_life(&life.state),
+                        lifecore::PhysicalExpressionContext::from_frames(&sensors, &feedback),
+                        lifecore::WorldModelFrame::from_frames(&sensors, &feedback),
+                    )
+                    .plan;
                 if vita.accept_interaction_response(plan) && output.vocal_request.is_none() {
                     output.vocal_request = plan
                         .voice_trigger
@@ -1098,6 +1123,16 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             }
         }
         output.body_intent = ecology_output.body_intent;
+        nervous.apply_actuation(
+            &mut life,
+            &vita,
+            &morph,
+            &mut body,
+            &mut sensors,
+            &mut output.body_intent,
+            dt,
+        );
+        nervous.commit_intent(&mut life, &body, &sensors, &output.body_intent);
         let visual_mind = visual_mind_input(
             &life,
             &sensors,
@@ -1112,29 +1147,29 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         let goal_distance_before = feedback
             .world_position
             .distance(output.body_intent.target_position);
-        body.fixed_update(
-            &life.state.genome,
-            &output.body_intent,
-            &sensors,
-            dt.min(1.0 / 30.0),
-        );
-        apply_headless_rect_domain(&mut body.simulation.feedback);
-        ecology.fixed_update(
-            16.0 / 9.0,
-            &empty_window_affordances,
-            &body.simulation.feedback,
-            dt.min(1.0 / 30.0),
-        );
-        body.set_embodied_environment(ecology.environment());
-        body.set_ecology_visual_effect(ecology.visual_effect());
-        body.embodied_update(
-            &output.body_intent,
-            &sensors,
-            output.affect,
-            visual_mind,
-            VoiceVisualState::default(),
-            dt.min(0.05),
-        );
+        for substep in 0..6 {
+            body.fixed_update(&life.state.genome, &output.body_intent, &sensors, SENSOR_DT);
+            apply_headless_rect_domain(&mut body.simulation.feedback);
+            ecology.fixed_update(
+                16.0 / 9.0,
+                &empty_window_affordances,
+                &body.simulation.feedback,
+                SENSOR_DT,
+            );
+            body.set_embodied_environment(ecology.environment());
+            body.set_ecology_visual_effect(ecology.visual_effect());
+            body.embodied_update(
+                &output.body_intent,
+                &sensors,
+                output.affect,
+                visual_mind,
+                VoiceVisualState::default(),
+                SENSOR_DT,
+            );
+            let mut completed_sensors = sensors.clone();
+            completed_sensors.timestamp += f64::from(SENSOR_DT) * f64::from(substep + 1);
+            nervous.observe_body(&body, &output.body_intent, &completed_sensors);
+        }
         let next_feedback = body.simulation.feedback.clone();
         let step_distance = next_feedback
             .world_position
@@ -2346,18 +2381,16 @@ impl PetApplication {
         );
         while runtime.life_accumulator >= LIFE_DT {
             let tick_started = Instant::now();
-            let soft_touch_pressure_max = runtime
-                .body
-                .tuning_profile()
-                .interaction
-                .soft_touch_pressure_max;
-            let nervous_calibration = runtime.body.tuning_profile().nervous.for_live_runtime();
-            runtime.nervous_system.prepare_cognition_tick(
+            if !runtime.nervous_system.has_fresh_body() {
+                // A delayed presentation must not train repeatedly on one body sample.
+                runtime.life_accumulator %= LIFE_DT;
+                break;
+            }
+            runtime.nervous_system.prepare(
                 &mut runtime.life,
                 &mut runtime.vita,
                 &mut runtime.morph,
-                soft_touch_pressure_max,
-                nervous_calibration,
+                &runtime.body,
                 LIFE_DT,
             );
             // Lab drive pulses are an observational experiment layer, never a
@@ -2407,6 +2440,7 @@ impl PetApplication {
                             });
                         }
                     } else {
+                        runtime.life.cancel_interaction_response(plan.response_id);
                         runtime
                             .vita
                             .finish_interaction_appraisal_without_response(episode_id);
@@ -2434,7 +2468,6 @@ impl PetApplication {
                 Some(morph_output),
                 LIFE_DT,
             );
-            let vita_interaction = runtime.vita.interaction_actuation();
             let vita_gaze = resolved_intent.gaze_target;
             output.body_intent = resolved_intent;
             let ecology_output = runtime.ecology.resolve_intent(
@@ -2482,32 +2515,23 @@ impl PetApplication {
                 runtime.sensors.pet_dragged,
             );
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
-            let mut phenotype = runtime.nervous_system.resolve_actuation(
-                &runtime.life,
+            runtime.nervous_system.apply_actuation(
+                &mut runtime.life,
                 &runtime.vita,
                 &runtime.morph,
-                vita_interaction,
-                soft_touch_pressure_max,
-                nervous_calibration,
+                &mut runtime.body,
+                &mut runtime.sensors,
+                &mut output.body_intent,
                 LIFE_DT,
             );
-            // The director owns causality and bounded targets. This downstream
-            // calibration only changes perceptual readability around neutral;
-            // it cannot touch identity, solver cadence/counts, learning rates,
-            // topology limits, or the genome loudness ceiling.
-            nervous_calibration.apply(&mut phenotype);
-            phenotype.apply_to_intent(
-                &mut output.body_intent,
-                &runtime.sensors,
-                runtime.body.simulation.feedback.world_position,
-            );
             keep_eyes_available_during_active_locomotion(&mut output.body_intent);
-            // The nervous action blend can move the semantic target after the
-            // ecology projection, so enforce the monitor-union invariant once
-            // more at the final intent boundary.
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
-            runtime.sensors.interaction_actuation = phenotype.interaction;
-            runtime.body.set_fast_phenotype_actuation(phenotype);
+            runtime.nervous_system.commit_intent(
+                &mut runtime.life,
+                &runtime.body,
+                &runtime.sensors,
+                &output.body_intent,
+            );
             runtime.brain_tick_microseconds = tick_started.elapsed().as_secs_f64() * 1_000_000.0;
             runtime.last_debug = Some(output.debug.clone());
             runtime.last_vita = vita_output;
@@ -2809,6 +2833,9 @@ impl PetApplication {
                     "lab_interventions": lab_interventions,
                     "body_interaction": body_interaction,
                     "nervous_system": {
+                        "body_learning": runtime.life.learning.body.diagnostics,
+                        "response_observations": runtime.life.learning.responses.observations,
+                        "last_response_strategy": runtime.life.state.interactions.pending_credit.map(|c| c.variant),
                         "body_feedback_v2": nervous_body_feedback,
                         "derived": nervous_snapshot.derived,
                         "felt_state_v1": nervous_snapshot.felt,

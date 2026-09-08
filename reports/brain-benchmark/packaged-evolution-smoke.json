@@ -1,0 +1,159 @@
+{
+  "schema_version": 2,
+  "config": {
+    "schema_version": 1,
+    "name": "Accelerated Learning Pipeline Smoke",
+    "preset": "custom",
+    "simulated_hours": 0.01,
+    "episodes_per_day": 0,
+    "total_episodes": 2,
+    "replicate_count": 1,
+    "seed": 573657340241,
+    "outcome_model": "mixed_realistic",
+    "quiet_advance": "exact",
+    "include_saved_gesture_replays": false,
+    "sleep_consolidation": false,
+    "persistent_learning": true,
+    "evolution_policy": "off",
+    "maximum_generations": 0,
+    "checkpoint_interval_hours": 1.0,
+    "persistence": "dry_run"
+  },
+  "status": "completed",
+  "clock_mode": "exact",
+  "approximate_calendar_advance": false,
+  "base_hz": 120,
+  "perception_hz": 60,
+  "life_hz": 20,
+  "telemetry_hz": 5,
+  "simulated_seconds": 36.0,
+  "base_ticks": 4320,
+  "completed_episodes": 2,
+  "quiet_or_no_response_episodes": 1,
+  "safe_boundary_episodes": 1,
+  "sleep_consolidations": 0,
+  "gesture_distribution": {
+    "SlowStretch": 1,
+    "Tickle": 1
+  },
+  "lexicon_updates": 1,
+  "convention_updates": 0,
+  "audio": {
+    "rendered_count": 1,
+    "exported_wav_count": 1,
+    "total_rendered_seconds": 0.8447708333333334,
+    "rms_min": 0.019069461,
+    "rms_max": 0.019069461,
+    "peak_max": 0.087938994,
+    "zero_crossing_rate_mean": 0.044390738,
+    "wav_artifacts": [
+      "/tmp/audio/replicate-00-voice-0001-798582b1408de4a1.wav"
+    ]
+  },
+  "telemetry_samples": 180,
+  "eligibility": {
+    "eligible": false,
+    "simulated_hours_met": false,
+    "interaction_episodes_met": false,
+    "gesture_diversity_met": false,
+    "sleep_consolidations_met": false,
+    "quiet_episodes_met": false,
+    "safe_boundary_episodes_met": false,
+    "mass_and_remerge_passed": true,
+    "zero_recovery_failures": true,
+    "interaction_closed": true,
+    "reasons": [
+      "minimum 24 simulated hours not met",
+      "minimum 120 interaction episodes not met",
+      "minimum eight observed gesture classes not met",
+      "minimum five sleep consolidations not met",
+      "minimum twelve quiet/no-response episodes not met",
+      "minimum eight safe boundary episodes not met"
+    ]
+  },
+  "invariants": {
+    "passed": true,
+    "mass_conservation_failures": 0,
+    "non_finite_failures": 0,
+    "emergency_recoveries": 0,
+    "topology_budget_failures": 0,
+    "unremerged_components": 0,
+    "duplicate_response_failures": 0,
+    "maximum_detached_mass_fraction": 0.0,
+    "failures": []
+  },
+  "initial_generation": 0,
+  "final_generation": 0,
+  "initial_genome_hash": 1976742582416502521,
+  "final_genome_hash": 1976742582416502521,
+  "final_life_state_hash": 389302916510269760,
+  "checkpoints": [],
+  "replicates": [
+    {
+      "replicate_index": 0,
+      "seed": 573657340241,
+      "completed_episodes": 2,
+      "final_generation": 0,
+      "final_genome_hash": 1976742582416502521,
+      "final_life_state_hash": 389302916510269760,
+      "lexicon_updates": 1,
+      "audio": {
+        "rendered_count": 1,
+        "exported_wav_count": 1,
+        "total_rendered_seconds": 0.8447708333333334,
+        "rms_min": 0.019069461,
+        "rms_max": 0.019069461,
+        "peak_max": 0.087938994,
+        "zero_crossing_rate_mean": 0.044390738,
+        "wav_artifacts": [
+          "/tmp/audio/replicate-00-voice-0001-798582b1408de4a1.wav"
+        ]
+      },
+      "telemetry_samples": 180,
+      "gesture_distribution": {
+        "SlowStretch": 1,
+        "Tickle": 1
+      },
+      "eligibility": {
+        "eligible": false,
+        "simulated_hours_met": false,
+        "interaction_episodes_met": false,
+        "gesture_diversity_met": false,
+        "sleep_consolidations_met": false,
+        "quiet_episodes_met": false,
+        "safe_boundary_episodes_met": false,
+        "mass_and_remerge_passed": true,
+        "zero_recovery_failures": true,
+        "interaction_closed": true,
+        "reasons": [
+          "minimum 24 simulated hours not met",
+          "minimum 120 interaction episodes not met",
+          "minimum eight observed gesture classes not met",
+          "minimum five sleep consolidations not met",
+          "minimum twelve quiet/no-response episodes not met",
+          "minimum eight safe boundary episodes not met"
+        ]
+      },
+      "invariants": {
+        "passed": true,
+        "mass_conservation_failures": 0,
+        "non_finite_failures": 0,
+        "emergency_recoveries": 0,
+        "topology_budget_failures": 0,
+        "unremerged_components": 0,
+        "duplicate_response_failures": 0,
+        "maximum_detached_mass_fraction": 0.0,
+        "failures": []
+      }
+    }
+  ],
+  "performance": {
+    "wall_seconds": 2.951077291,
+    "active_body_steps": 780,
+    "body_step_p50_microseconds": 533.542,
+    "body_step_p95_microseconds": 597.708,
+    "body_step_max_microseconds": 732.625,
+    "episodes_per_wall_second": 0.677718610115522
+  },
+  "persisted_state": null
+}

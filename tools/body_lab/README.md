@@ -99,5 +99,9 @@ not replace the last valid runtime profile.
 
 R12 integration note: Character keeps the four calibration subsections inside
 F1; F4 Diagnostics adds the live nervous-system readouts and accelerated runner.
-The offline curriculum and pointer fixtures preserve their R11 interaction loop;
-their invariant checks do not certify the full live R12 phenotype response.
+The exact curriculum and pointer fixtures share the live R12 interoception and
+final actuation boundaries, with body feedback published after every physical
+substep. Calendar-only remains approximate. Synthetic runs do not validate native
+screen/audio capture. Diagnostics also shows the adaptive body predictor and
+confirmed counts for quiet/acknowledgement/invitation responses; rest rehearsal
+never adds user approvals.

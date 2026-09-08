@@ -5,6 +5,7 @@
 //! graphics, audio devices, native windows, physical pixels, or operating systems.
 
 mod actions;
+mod adaptive_learning;
 mod affect;
 mod bandit;
 mod development;
@@ -28,6 +29,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
 pub use actions::*;
+pub use adaptive_learning::*;
 pub use affect::*;
 pub use bandit::*;
 pub use development::*;
@@ -112,8 +114,11 @@ pub struct LifeCore {
     brain: MicroBrain,
     habits: ContextualBandit,
     memories: MemorySystem,
+    pub learning: AdaptiveLearning,
     rng: ChaCha8Rng,
     rng_seed: [u8; 32],
+    last_work_pressure: f32,
+    last_context: ContextVector,
 }
 
 impl LifeCore {
@@ -179,13 +184,18 @@ impl LifeCore {
             brain,
             habits,
             memories: MemorySystem::default(),
+            learning: AdaptiveLearning::default(),
             rng: ChaCha8Rng::from_seed(rng_seed),
             rng_seed,
+            last_work_pressure: 0.0,
+            last_context: [0.0; CONTEXT_SIZE],
         }
     }
 
     pub fn tick(&mut self, sensors: &SensorFrame, body: &BodyFeedback, dt: f32) -> LifeOutput {
         let dt = finite_dt(dt);
+        self.learning.body.tick(dt);
+        self.last_work_pressure = sensors.desktop_focus_pressure.clamp(0.0, 1.0);
         // Older snapshots could accumulate hundreds of implicit "ignores" because
         // solitary play was misclassified as a bid for user attention. Treat this
         // value as a bounded recent streak so a repaired companion can recover
@@ -240,6 +250,7 @@ impl LifeCore {
             self.state.successful_interactions,
         );
         let scores = self.score_actions(sensors, body, &context, &readouts.actions);
+        self.last_context = context;
         let sampled = sample_softmax(&scores, action_temperature(&self.state), &mut self.rng);
         let switched = self.maybe_switch_action(sampled, &scores, sensors, body, &context);
         let expression = ExpressionState::from_readouts(readouts.expressions, self.state.affect);
@@ -283,9 +294,14 @@ impl LifeCore {
                 | FeedbackEvent::RespondedAfterSound => {
                     InteractionOutcomeKind::VoluntaryContinuation
                 }
-                FeedbackEvent::Observed | FeedbackEvent::Reward(_) => {
+                FeedbackEvent::Observed => InteractionOutcomeKind::ExplicitPositive,
+                FeedbackEvent::Reward(value) if *value > 0.0 => {
                     InteractionOutcomeKind::ExplicitPositive
                 }
+                FeedbackEvent::Reward(value) if *value < 0.0 => {
+                    InteractionOutcomeKind::ExplicitNegative
+                }
+                FeedbackEvent::Reward(_) => InteractionOutcomeKind::NoResponse,
                 FeedbackEvent::Ignored => InteractionOutcomeKind::NoResponse,
                 FeedbackEvent::PushedAway => InteractionOutcomeKind::ExplicitNegative,
                 FeedbackEvent::MuteOrHide | FeedbackEvent::FocusModeEnabled => {
@@ -310,7 +326,7 @@ impl LifeCore {
         self.state.recent_reward = reward;
         self.brain.apply_reward(reward);
         let (action, context, delay) = self.state.pending_attention.take().map_or(
-            (self.state.current_action, [0.0; CONTEXT_SIZE], 0.0),
+            (self.state.current_action, self.last_context, 0.0),
             |pending| (pending.action, pending.context, pending.elapsed_seconds),
         );
         self.habits.update(action, &context, reward);
@@ -402,10 +418,22 @@ impl LifeCore {
             self.state.successful_interactions,
             self.state.interactions.recent_boundary_events,
         );
-        // Schema-2 kept a four-arm ± expression scaler. The living-language
-        // path uses one semantically directed plan and learns its lexicon
-        // timing instead of making the face microscopically larger/smaller.
-        let variant = 1;
+        let work = if self.state.focus_mode {
+            1.0
+        } else {
+            self.last_work_pressure
+        };
+        let response_context = ResponseLearning::context(&event, &self.state, work);
+        let adaptive = ResponseLearning::supports(&event);
+        let variant = if adaptive {
+            self.learning.responses.choose(
+                response_context,
+                self.state.elapsed_seconds,
+                random_unit(&mut self.rng),
+            ) as u8
+        } else {
+            1
+        };
         let response_id = self.state.interactions.next_response_id;
         self.state.interactions.next_response_id = response_id.saturating_add(1).max(1);
         let mut plan = interaction_response_plan(
@@ -417,6 +445,15 @@ impl LifeCore {
             turn_wait_seconds,
             turn_cooldown_seconds,
         );
+        if adaptive {
+            ResponseLearning::apply_strategy(&mut plan, usize::from(variant));
+            self.learning.responses.propose(
+                response_id,
+                response_context,
+                usize::from(variant),
+                self.state.elapsed_seconds,
+            );
+        }
         if self.state.drives.sleep >= 0.72 {
             // Sleep is an upstream behavioral state, not an audio-host policy.
             // Preserve the causal acknowledgement while bounding every startle
@@ -440,6 +477,7 @@ impl LifeCore {
             expected_effect: plan.expected_receiver_effect,
             elapsed_seconds: 0.0,
             learning_openness: learning_openness.clamp(0.50, 1.25),
+            executed: false,
         });
         if boundary {
             self.state.interactions.recent_boundary_events = self
@@ -470,6 +508,27 @@ impl LifeCore {
         Some(plan)
     }
 
+    pub fn acknowledge_interaction_execution(&mut self, response_id: u64) {
+        if let Some(credit) = &mut self.state.interactions.pending_credit
+            && credit.response_id == response_id
+        {
+            credit.executed = true;
+            self.learning.responses.acknowledge(response_id);
+        }
+    }
+
+    pub fn cancel_interaction_response(&mut self, response_id: u64) {
+        if self
+            .state
+            .interactions
+            .pending_credit
+            .is_some_and(|c| c.response_id == response_id)
+        {
+            self.state.interactions.pending_credit = None;
+            self.learning.responses.cancel();
+        }
+    }
+
     pub fn resolve_interaction_outcome(&mut self, mut outcome: InteractionOutcome) {
         outcome.confidence = if outcome.confidence.is_finite() {
             outcome.confidence.clamp(0.0, 1.0)
@@ -496,7 +555,13 @@ impl LifeCore {
             InteractionOutcomeKind::Refusal => -1.0,
             InteractionOutcomeKind::FragmentRemerged => 0.75,
         } * outcome.confidence;
-        if reward != 0.0 {
+        self.learning.responses.outcome(
+            credit.response_id,
+            (credit.executed && outcome.confidence > 0.0).then_some(reward),
+            credit.learning_openness,
+            self.state.elapsed_seconds,
+        );
+        if reward != 0.0 && credit.executed {
             let intent = self
                 .state
                 .interactions
@@ -507,12 +572,15 @@ impl LifeCore {
                 .vocal_lexicon
                 .update_social_timing(intent, credit.episode_id, reward);
         }
-        if matches!(
-            outcome.kind,
-            InteractionOutcomeKind::VoluntaryContinuation
-                | InteractionOutcomeKind::ExplicitPositive
-                | InteractionOutcomeKind::FragmentRemerged
-        ) {
+        if credit.executed
+            && outcome.confidence > 0.0
+            && matches!(
+                outcome.kind,
+                InteractionOutcomeKind::VoluntaryContinuation
+                    | InteractionOutcomeKind::ExplicitPositive
+                    | InteractionOutcomeKind::FragmentRemerged
+            )
+        {
             self.state.interactions.successful_voluntary_outcomes = self
                 .state
                 .interactions
@@ -532,6 +600,7 @@ impl LifeCore {
     pub fn consolidate_sleep(&mut self) {
         self.state.development.note_sleep_consolidation();
         self.memories.consolidate();
+        self.learning.body.rehearse();
         self.brain.consolidate();
         self.repair_vocal_repertoire();
         let mut created = 0;
@@ -587,6 +656,7 @@ impl LifeCore {
             brain: self.brain.clone(),
             habits: self.habits.clone(),
             memories: self.memories.clone(),
+            learning: self.learning.clone(),
             rng: SavedRngState {
                 seed: self.rng_seed,
                 stream: self.rng.get_stream(),
@@ -617,8 +687,11 @@ impl LifeCore {
             brain: snapshot.brain,
             habits: snapshot.habits,
             memories: snapshot.memories,
+            learning: snapshot.learning,
             rng,
             rng_seed: snapshot.rng.seed,
+            last_work_pressure: 0.0,
+            last_context: [0.0; CONTEXT_SIZE],
         };
         if restored.state.interactions.pending_credit.take().is_some() {
             restored.state.interactions.interrupted_outcomes = restored
@@ -627,6 +700,13 @@ impl LifeCore {
                 .interrupted_outcomes
                 .saturating_add(1);
         }
+        // Session-local receipts cannot survive without their classifier/turn.
+        restored.state.interactions.last_responded_episode = 0;
+        restored.state.interactions.last_response_plan = None;
+        restored.state.development.last_completed_episode_id = 0;
+        restored.state.development.last_observed_gesture_episode_id = 0;
+        restored.learning.responses.cancel();
+        restored.learning.body.clear_transients();
         restored.repair_vocal_repertoire();
         Ok(restored)
     }
@@ -641,6 +721,7 @@ impl LifeCore {
     pub fn reset_learning(&mut self) {
         self.habits = ContextualBandit::new(&self.state.genome.temperament);
         self.memories = MemorySystem::default();
+        self.learning = AdaptiveLearning::default();
         self.brain = MicroBrain::new(self.state.genome.brain.clone());
         self.state.ignored_attempts = 0;
         self.state.successful_interactions = 0;
@@ -839,6 +920,10 @@ impl LifeCore {
                         * (1.0 + self.state.ignored_attempts as f32 * 0.35)
                 };
             brain_priors[index] * 0.62
+                + self.learning.body.curiosity_bonus(
+                    action,
+                    self.state.focus_mode || sensors.desktop_focus_pressure > 0.25,
+                )
                 + expected_relief
                 + learned
                 + exploration
@@ -1868,6 +1953,75 @@ fn smooth(current: f32, target: f32, speed: f32, dt: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsolicited_feedback_uses_observed_clock_and_unknown_time_is_not_midnight() {
+        let mut core = LifeCore::new(Genome::from_seed(911), 911);
+        core.apply_feedback(FeedbackEvent::Observed);
+        assert_eq!(core.memories.user_model.usual_active_hours, [0.0; 24]);
+        let sensors = SensorFrame {
+            time_of_day_01: 0.75,
+            ..SensorFrame::default()
+        };
+        core.tick(&sensors, &BodyFeedback::default(), 0.05);
+        core.state.pending_attention = None;
+        core.apply_feedback(FeedbackEvent::Observed);
+        assert!(core.memories.user_model.usual_active_hours[18] > 0.0);
+        assert_eq!(core.memories.user_model.usual_active_hours[0], 0.0);
+    }
+
+    #[test]
+    fn in_memory_restore_discards_unfinished_body_prediction() {
+        let mut core = LifeCore::new(Genome::from_seed(912), 912);
+        core.learning
+            .body
+            .begin(BodyFeedbackV2::default(), Vec2::X, 0.0);
+        let mut restored = LifeCore::restore(core.snapshot()).unwrap();
+        let frame = BodyFeedbackV2 {
+            frame_id: 1,
+            ..BodyFeedbackV2::default()
+        };
+        restored.learning.body.complete(frame, 0.05);
+        assert_eq!(restored.learning.body.diagnostics.observations, 0);
+    }
+
+    #[test]
+    fn signed_feedback_is_consistent_for_executed_interaction() {
+        for (value, successes) in [(-1.0, 0), (0.0, 0), (1.0, 1)] {
+            let mut core = LifeCore::new(Genome::from_seed(7), 11);
+            core.state.interactions.pending_credit = Some(PendingInteractionCredit {
+                episode_id: 1,
+                response_id: 1,
+                executed: true,
+                learning_openness: 1.0,
+                ..Default::default()
+            });
+            core.apply_feedback(FeedbackEvent::Reward(value));
+            assert_eq!(
+                core.state.interactions.successful_voluntary_outcomes,
+                successes
+            );
+            assert_eq!(core.state.recent_reward, value);
+            assert!(core.state.interactions.pending_credit.is_none());
+        }
+    }
+
+    #[test]
+    fn first_gesture_after_restart_is_not_a_duplicate() {
+        let mut core = LifeCore::new(Genome::from_seed(8), 12);
+        let event = embodied_event(
+            1,
+            EmbodiedGestureKind::SoftTouch,
+            0.0,
+            0.05,
+            GestureBoundaryEvent::None,
+        );
+        assert!(core.observe_embodied_gesture(event).is_some());
+        assert!(core.observe_embodied_gesture(event).is_none());
+        let mut restarted = LifeCore::restore(core.snapshot()).unwrap();
+        assert!(restarted.observe_embodied_gesture(event).is_some());
+        assert!(restarted.observe_embodied_gesture(event).is_none());
+    }
 
     fn embodied_event(
         episode_id: u64,
@@ -2900,6 +3054,7 @@ mod tests {
         assert!(serde_json::to_vec(&core.snapshot()).is_ok());
         assert!(core.memories.is_valid());
         assert!(!core.memories.short_term.is_empty());
-        assert!(!core.memories.habits.is_empty());
+        // Positive outcomes separated by failed attempts are not a successful sequence.
+        assert!(!core.memories.episodic.is_empty());
     }
 }

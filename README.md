@@ -187,9 +187,19 @@ Diagnostics also contains `Accelerated Learning`. It launches the deterministic
 curriculum runner in a separate process with 120 Hz body/pointer, 60 Hz
 perception, 20 Hz LifeCore/VITA/Morph, and 5 Hz summaries. Dry runs never replace
 the living Pet; accepted forks can be promoted only after report validation and
-with a complete rollback backup. The curriculum and pointer fixtures retain their
-R11 interaction-loop semantics; they do not exercise the full live R12
-interoception/phenotype loop and are not evidence of its perceptual parity.
+with a complete rollback backup. The exact curriculum and pointer runner now use
+the live R12 interoception/phenotype boundaries, publish completed body feedback at
+120 Hz, and preserve semantic responses through the final expression packet.
+Their synthetic inputs do not certify native screen/audio capture or perceptual
+parity with every desktop configuration.
+Adaptive learning adds three safe contact responses (quiet, acknowledgement,
+invitation), context-dependent outcome learning, and a bounded recent-experience
+memory. A small body predictor learns confirmed actuator transitions; progress
+adds only a bounded bonus to already allowed self-play/exploration. Rest rehearses
+recorded body transitions without inventing social rewards. Models persist with
+the pet; transient execution credit is cleared on restart. Diagnostics shows real
+observation counts, prediction confidence/error, progress and rehearsal updates.
+
 The legacy `--simulate-hours` option is now an
 explicit approximate calendar-only compatibility path and cannot generate
 synthetic interaction learning.

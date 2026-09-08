@@ -318,12 +318,18 @@ impl VitaRuntime {
 
     #[must_use]
     pub fn new(identity_seed: u64, restored: Option<VitaState>) -> Self {
+        let mut perception = PerceptionRuntime::default();
+        perception.reserve_gesture_ids_before(
+            restored
+                .as_ref()
+                .map_or(1, |state| state.next_gesture_episode_id),
+        );
         Self {
             mind: restored.map_or_else(
                 || VitaMind::new(identity_seed),
                 |state| VitaMind::restore(identity_seed, state),
             ),
-            perception: PerceptionRuntime::default(),
+            perception,
             percept: VitaPerceptFrame::default(),
             // Force the first non-classic resolve through its entry path so
             // the arbiter starts from the actual current body target.
@@ -343,6 +349,7 @@ impl VitaRuntime {
 
     pub fn observe(&mut self, sensors: &SensorFrame, body: &BodyFeedback, dt: f32) {
         self.percept = self.perception.update(sensors, body, dt);
+        self.mind.state.next_gesture_episode_id = self.perception.next_gesture_episode_id();
         if let Some(event) = self.perception.take_embodied_gesture() {
             self.queued_embodied_signature = self.perception.take_embodied_gesture_signature();
             if self
@@ -533,13 +540,23 @@ impl VitaRuntime {
         dt: f32,
     ) {
         self.interaction_turn.tick(self.active_interaction_plan, dt);
+        if self.interaction_turn.state == InteractionTurnState::Idle {
+            self.active_interaction_plan = None;
+        }
+        self.apply_interaction_expression(intent, sensors, body);
+    }
+
+    /// Immutable overlay: the turn clock advances only in resolve_intent.
+    pub fn apply_interaction_expression(
+        &self,
+        intent: &mut BodyIntent,
+        sensors: &SensorFrame,
+        body: &BodyFeedback,
+    ) {
         let Some(plan) = self.active_interaction_plan else {
             return;
         };
         if self.interaction_turn.state != InteractionTurnState::Responding {
-            if self.interaction_turn.state == InteractionTurnState::Idle {
-                self.active_interaction_plan = None;
-            }
             return;
         }
         let elapsed = self.interaction_turn.elapsed_seconds;
@@ -553,6 +570,7 @@ impl VitaRuntime {
         }
         .clamp(0.0, 1.0)
             * plan.expression.amplitude;
+        let weight = weight.min(1.0);
         let gaze = match plan.gaze {
             InteractionGazeTarget::ContactPoint => Some(
                 sensors
@@ -618,6 +636,14 @@ impl VitaRuntime {
             .expression
             .mouth_tension
             .max(target.mouth_compression * weight);
+        if matches!(
+            intent.locomotion,
+            lifecore::LocomotionMode::Sleep
+                | lifecore::LocomotionMode::Cocoon
+                | lifecore::LocomotionMode::Flee
+        ) {
+            return;
+        }
         if plan.body.recoil > 0.0 || plan.body.resistance > 0.45 {
             intent.pose = PoseIntent::Compact;
         } else if plan.body.cooperation > 0.55 {
@@ -628,6 +654,13 @@ impl VitaRuntime {
     }
 
     pub fn apply_feedback(&mut self, event: &FeedbackEvent) {
+        if matches!(
+            event,
+            FeedbackEvent::FocusModeEnabled | FeedbackEvent::MuteOrHide
+        ) {
+            self.active_interaction_plan = None;
+            self.interaction_turn = InteractionTurnRuntime::default();
+        }
         self.mind.apply_feedback(event);
     }
 
@@ -650,7 +683,9 @@ impl VitaRuntime {
 
     #[must_use]
     pub fn snapshot(&self) -> VitaState {
-        self.mind.snapshot()
+        let mut state = self.mind.snapshot();
+        state.next_gesture_episode_id = self.perception.next_gesture_episode_id();
+        state
     }
 
     #[must_use]
@@ -847,6 +882,53 @@ mod tests {
     use lifecore::{ExpressionState, Genome, LifeCore, LocomotionMode, PoseIntent};
 
     use super::*;
+
+    #[test]
+    fn semantic_expression_survives_final_nervous_packet_and_focus_cancels_turn() {
+        let mut life = LifeCore::new(Genome::from_seed(17), 19);
+        let mut vita = VitaRuntime::new(17, None);
+        let morph = morph_brain::MorphBrain::new(17, None).unwrap();
+        let mut body = pet_body::ProceduralBody::generate(&life.state.genome).unwrap();
+        let mut nervous = crate::NervousSystemRuntime::default();
+        let mut sensors = SensorFrame::default();
+        let mut intent = life
+            .tick(&sensors, &body.simulation.feedback, 0.05)
+            .body_intent;
+        let plan = InteractionResponsePlan {
+            response_id: 7,
+            episode_id: 9,
+            onset_seconds: 0.0,
+            expression: lifecore::InteractionExpressionTarget {
+                mouth_curve: 0.8,
+                amplitude: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        vita.interaction_turn.begin_episode(9);
+        assert!(vita.accept_interaction_response(plan));
+        nervous.apply_actuation(
+            &mut life,
+            &vita,
+            &morph,
+            &mut body,
+            &mut sensors,
+            &mut intent,
+            0.05,
+        );
+        assert!((intent.expression.mouth_curve - 0.8).abs() < 1.0e-5);
+        assert_eq!(intent.expression, nervous.actuation().expression);
+        vita.apply_feedback(&FeedbackEvent::FocusModeEnabled);
+        assert!(vita.active_interaction_plan().is_none());
+    }
+
+    #[test]
+    fn gesture_allocator_survives_restart() {
+        let mut vita = VitaRuntime::new(17, None);
+        vita.perception.reserve_gesture_ids_before(42);
+        let restored = VitaRuntime::new(17, Some(vita.snapshot()));
+        assert_eq!(restored.perception.next_gesture_episode_id(), 42);
+    }
 
     #[test]
     fn bridge_restores_persistent_mind_but_not_raw_history() {

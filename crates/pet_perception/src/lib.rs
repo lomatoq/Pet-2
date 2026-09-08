@@ -134,6 +134,14 @@ impl Default for PerceptionRuntime {
 }
 
 impl PerceptionRuntime {
+    pub fn reserve_gesture_ids_before(&mut self, next: u64) {
+        self.embodied_gestures.reserve_episode_ids_before(next);
+    }
+
+    pub fn next_gesture_episode_id(&self) -> u64 {
+        self.embodied_gestures.next_episode_id()
+    }
+
     pub fn set_embodied_gesture_tuning(&mut self, tuning: EmbodiedGestureClassifierTuning) {
         self.embodied_gestures.set_tuning(tuning);
     }

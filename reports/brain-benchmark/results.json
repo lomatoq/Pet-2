@@ -1,0 +1,1 @@
+{"added_step_p95_us":1.375,"added_step_p99_us":1.417,"context_accuracy":[0.966,0.944,0.973,0.977,0.981,0.974,0.98,0.972,0.957,0.965],"fixed_ack_baseline":0.5,"heldout_trials_per_seed":1000,"seeds":10,"serialized_learning_max_bytes":19916,"training_responses_per_seed":2400}

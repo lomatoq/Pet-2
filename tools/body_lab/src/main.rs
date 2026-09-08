@@ -5197,6 +5197,15 @@ fn live_nervous_system(ui: &mut egui::Ui, latest: &Value) {
             ui.small(
                 "authoritative BodyFeedbackV2 → felt/appraisal/emotion → bounded actuation → next body tick",
             );
+            if let Some(learning) = nervous.get("body_learning") {
+                CollapsingHeader::new("Learning from experience").default_open(true).show(ui, |ui| {
+                    scalar_table(ui, "body_learning", learning, 8);
+                    if let Some(counts) = nervous.get("response_observations") {
+                        ui.small(format!("Confirmed responses (quiet / acknowledge / invite): {counts}"));
+                    }
+                    ui.small("Rest rehearses recorded movements; it never adds user approvals.");
+                });
+            }
             ui.columns(2, |columns| {
                 if let Some(felt) = nervous.get("felt_state_v1") {
                     columns[0].strong("FeltStateV1");

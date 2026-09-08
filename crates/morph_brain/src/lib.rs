@@ -308,7 +308,9 @@ impl MorphBrain {
         };
         if let Some(state) = restored.filter(MorphBrainState::is_valid) {
             brain.restore_weights(&state);
-            brain.reward_trace = state.reward_trace.clamp(-1.0, 1.0);
+            // A user save preserves learned weights, not in-flight eligibility.
+            // Never apply a pre-restart reward to a new sensory context.
+            brain.reward_trace = 0.0;
             brain.age_ms = state.age_ms.max(0.0);
         }
         Ok(brain)
@@ -364,15 +366,24 @@ impl MorphBrain {
         self.readout.update(&self.net, dt_ms as f32);
         self.last_output = self.readout.output(&self.net, world);
         self.update_command_habituation(self.last_output.command, dt_ms as f32);
-        self.plasticity.note_controls(&self.last_output, &self.net);
+        self.plasticity.execution_age_ms += dt_ms as f32;
+        if self.plasticity.execution_age_ms > 2_000.0 {
+            self.plasticity.last_command = MorphCommand::Idle;
+        }
         self.last_output
+    }
+
+    /// Called only for a completed physical frame, after all intent overrides.
+    pub fn acknowledge_execution(&mut self, command: MorphCommand) {
+        self.plasticity.last_command = command;
+        self.plasticity.execution_age_ms = 0.0;
     }
 
     pub fn apply_feedback(&mut self, event: &FeedbackEvent) {
         let reward = event.reward().clamp(-1.0, 1.0);
         self.reward_trace = (self.reward_trace * 0.55 + reward * 0.75).clamp(-1.0, 1.0);
         self.vibration = self.vibration.max(reward.abs() * 0.35);
-        self.plasticity.note_feedback(reward);
+        self.plasticity.note_feedback(&mut self.net, reward);
     }
 
     /// Installs the previous body/cognition frame's normalized somatic input.
@@ -1449,7 +1460,7 @@ struct Plasticity {
     bond_edges: Vec<usize>,
     dopamine_edges: Vec<usize>,
     last_command: MorphCommand,
-    pending_feedback: f32,
+    execution_age_ms: f32,
 }
 
 impl Plasticity {
@@ -1485,7 +1496,7 @@ impl Plasticity {
             bond_edges: asset.meta.bond_edges.clone(),
             dopamine_edges: asset.meta.dopamine_edges.clone(),
             last_command: MorphCommand::Idle,
-            pending_feedback: 0.0,
+            execution_age_ms: 0.0,
         }
     }
 
@@ -1497,32 +1508,25 @@ impl Plasticity {
         }
     }
 
-    fn note_controls(&mut self, output: &MorphOutput, _net: &Network) {
-        let strongest = [
-            (output.command, output.winner_rate),
-            (output.manipulation, output.manipulation_rate),
-            (output.perception, output.perception_rate),
-            (output.carry, output.carry_rate),
-        ]
-        .into_iter()
-        .filter(|(command, _)| {
-            self.operant_names
-                .iter()
-                .any(|name| name == command.as_wire())
-        })
-        .max_by(|(_, left), (_, right)| left.total_cmp(right));
-        if let Some((command, rate)) = strongest
-            && command != MorphCommand::Idle
-            && rate > 7.0
+    fn note_feedback(&mut self, net: &mut Network, reward: f32) {
+        // Commit this executed action's outcome immediately on the simulation
+        // thread. Another outcome before the slow tick cannot replace it.
+        let command = std::mem::take(&mut self.last_command);
+        if let Some(command_index) = self
+            .operant_names
+            .iter()
+            .position(|name| name == command.as_wire())
         {
-            self.last_command = command;
-        } else if output.command != MorphCommand::Idle {
-            self.last_command = output.command;
+            for i in 0..self.operant_edges.len() {
+                if self.operant_command[i] as usize == command_index {
+                    let initial = self.operant_initial[i];
+                    self.operant_weights[i] = (self.operant_weights[i]
+                        + 0.0035 * self.kc_trace[self.operant_pre[i]] * reward)
+                        .clamp(initial * 0.25, initial * 2.6);
+                }
+            }
+            self.flush(net);
         }
-    }
-
-    fn note_feedback(&mut self, reward: f32) {
-        self.pending_feedback = (self.pending_feedback + reward).clamp(-1.0, 1.0);
     }
 
     fn update(&mut self, net: &mut Network, reward: f32, dt_ms: f32) {
@@ -1542,28 +1546,6 @@ impl Plasticity {
                     - 0.006 * trace * reward.abs())
                 .clamp(minimum, self.classical_initial[index]);
             }
-        }
-        if self.pending_feedback.abs() > 0.05 {
-            let command_index = self
-                .operant_names
-                .iter()
-                .position(|name| name == self.last_command.as_wire());
-            if let Some(command_index) = command_index {
-                for index in 0..self.operant_edges.len() {
-                    if self.operant_command[index] as usize != command_index {
-                        continue;
-                    }
-                    let trace = self.kc_trace[self.operant_pre[index]];
-                    if trace <= 0.000_1 {
-                        continue;
-                    }
-                    let initial = self.operant_initial[index];
-                    self.operant_weights[index] = (self.operant_weights[index]
-                        + 0.0035 * trace * self.pending_feedback)
-                        .clamp(initial * 0.25, initial * 2.6);
-                }
-            }
-            self.pending_feedback *= 0.35;
         }
         for trace in &mut self.kc_trace {
             *trace *= decay;
@@ -1788,6 +1770,64 @@ mod tests {
         voltage: Vec<f32>,
         adaptation: Vec<f32>,
         std_x: Vec<f32>,
+    }
+
+    #[test]
+    fn close_outcomes_do_not_overwrite_each_other() {
+        let mut brain = MorphBrain::new(17, None).unwrap();
+        brain.plasticity.kc_trace.fill(1.0);
+        brain.acknowledge_execution(MorphCommand::Play);
+        brain.apply_feedback(&FeedbackEvent::Reward(1.0));
+        let first = brain.plasticity.operant_weights.clone();
+        brain.apply_feedback(&FeedbackEvent::Reward(-1.0));
+        assert_eq!(first, brain.plasticity.operant_weights);
+        brain.acknowledge_execution(MorphCommand::Groom);
+        brain.apply_feedback(&FeedbackEvent::Reward(1.0));
+        assert!(first != brain.plasticity.operant_weights);
+        for (i, w) in first.iter().enumerate() {
+            if brain.plasticity.operant_names[brain.plasticity.operant_command[i] as usize]
+                == MorphCommand::Play.as_wire()
+            {
+                assert_eq!(*w, brain.plasticity.operant_weights[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn reward_credit_is_for_executed_command_and_cannot_move_to_later_proposal() {
+        let mut brain = MorphBrain::new(17, None).unwrap();
+        let before = brain.plasticity.operant_weights.clone();
+        brain.plasticity.kc_trace.fill(1.0);
+        brain.apply_feedback(&FeedbackEvent::Reward(1.0));
+        brain.plasticity.update(&mut brain.net, 0.0, 100.0);
+        assert_eq!(
+            brain.plasticity.operant_weights, before,
+            "a proposal alone has no execution credit"
+        );
+        brain.acknowledge_execution(MorphCommand::Play);
+        brain.apply_feedback(&FeedbackEvent::Reward(1.0));
+        brain.acknowledge_execution(MorphCommand::Groom);
+        brain.plasticity.update(&mut brain.net, 0.0, 100.0);
+        for (i, weight) in brain.plasticity.operant_weights.iter().enumerate() {
+            let name =
+                &brain.plasticity.operant_names[brain.plasticity.operant_command[i] as usize];
+            if name != MorphCommand::Play.as_wire() {
+                assert_eq!(*weight, before[i]);
+            }
+        }
+        assert!(
+            brain.plasticity.operant_weights != before,
+            "executed Play must learn"
+        );
+        let weights = brain.plasticity.operant_weights.clone();
+        brain.plasticity.update(&mut brain.net, 0.0, 100.0);
+        assert_eq!(
+            brain.plasticity.operant_weights, weights,
+            "one outcome is consumed once"
+        );
+        let restored = MorphBrain::new(17, Some(brain.snapshot())).unwrap();
+        assert_eq!(restored.reward_trace, 0.0);
+        assert_eq!(restored.plasticity.operant_weights, weights);
     }
 
     #[test]
