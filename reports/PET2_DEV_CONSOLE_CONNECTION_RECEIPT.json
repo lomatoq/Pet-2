@@ -1,0 +1,62 @@
+{
+  "backup": "/Users/darap/projects/Pet-2/target/install-backups/20260909-232442",
+  "package_sha256": "93c0cd4aad68d5d7d9301996d52e8ee940bcebc68c33874c4589f190f98585c0",
+  "bundles_verified": [
+    "Pet2.app",
+    "Pet2 Dev Console.app"
+  ],
+  "saved_state_unchanged_before_launch": true,
+  "state_sha256_before_launch": "55b02dbfe57cb5ec2efab44dfe8c09de1662fe91c710fba51fb9d3efa916fc2a",
+  "developer_id_team": "KKM3M9K749",
+  "verified_signed_items": [
+    "Pet2.app",
+    "Pet2 Dev Console.app",
+    "Pet2 Dev Console.app/Contents/Resources/DevConsole"
+  ],
+  "cold_start": {
+    "first": {
+      "pid": 20816,
+      "age_seconds": 0.14399957656860352,
+      "sequence": 34,
+      "session_id": 1226996502593676678,
+      "session_active": true,
+      "screen_capture": true,
+      "visual_grid_age_ms": 9.630166053771973,
+      "coarse_scene_available": true
+    },
+    "after_lease_renewal": {
+      "pid": 20816,
+      "age_seconds": 0.15591049194335938,
+      "sequence": 89,
+      "session_id": 1226996502593676678,
+      "session_active": true,
+      "screen_capture": true,
+      "visual_grid_age_ms": 9.654707908630371,
+      "coarse_scene_available": true
+    },
+    "checks_passed": true
+  },
+  "reopened_console": {
+    "first": {
+      "pid": 20816,
+      "age_seconds": 0.12268400192260742,
+      "sequence": 1503,
+      "session_id": 184965921099853148,
+      "session_active": true,
+      "screen_capture": true,
+      "visual_grid_age_ms": 10.095041275024414,
+      "coarse_scene_available": true
+    },
+    "after_lease_renewal": {
+      "pid": 20816,
+      "age_seconds": 0.14336705207824707,
+      "sequence": 1558,
+      "session_id": 184965921099853148,
+      "session_active": true,
+      "screen_capture": true,
+      "visual_grid_age_ms": 9.86370849609375,
+      "coarse_scene_available": true
+    },
+    "checks_passed": true
+  }
+}

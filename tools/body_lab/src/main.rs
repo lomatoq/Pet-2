@@ -725,7 +725,9 @@ impl ApplicationHandler for BodyLab {
             || "Default output".to_owned(),
             |engine| engine.device_name().to_owned(),
         );
-        let live_monitor = store.as_ref().map(LivePetMonitor::new);
+        let live_monitor = store
+            .as_ref()
+            .map(|store| LivePetMonitor::new(store, self.start_live));
         let ui = LabUi {
             section: LabSection::Body,
             json_buffer: serde_json::to_string_pretty(&profile).unwrap_or_default(),
@@ -1722,8 +1724,8 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
 }
 
 impl LivePetMonitor {
-    fn new(store: &StateStore) -> Self {
-        Self {
+    fn new(store: &StateStore, connect_on_start: bool) -> Self {
+        let mut monitor = Self {
             control_store: store.clone(),
             telemetry_path: store.paths.telemetry.clone(),
             telemetry_previous_path: store.paths.telemetry_previous.clone(),
@@ -1774,7 +1776,11 @@ impl LivePetMonitor {
             launched_for_connect: false,
             runtime_session_id: None,
             runtime_sequence: None,
+        };
+        if connect_on_start {
+            monitor.connect();
         }
+        monitor
     }
 
     fn connect(&mut self) {
@@ -1899,10 +1905,10 @@ impl LivePetMonitor {
         if !self.launched_for_connect {
             self.launched_for_connect = true;
             match launch_desktop_pet_at(&self.control_store) {
-                Ok((path, pid)) => {
+                Ok(path) => {
                     self.connection = LabConnectionState::Connecting;
                     self.control_status = format!(
-                        "Started sibling Pet PID {pid} from {}; waiting for runtime heartbeat.",
+                        "Started sibling Pet from {}; waiting for runtime heartbeat.",
                         path.display()
                     );
                 }
@@ -2591,9 +2597,14 @@ impl AcceleratedLearningState {
         };
         match promote_validated_fork(store, &path, report.final_life_state_hash) {
             Ok(backup) => {
-                match launch_desktop_pet_at(store).and_then(|(executable, pid)| {
-                    wait_for_loaded_hash(store, expected_hash, old_pid, Duration::from_secs(12))?;
-                    Ok((executable, pid))
+                match launch_desktop_pet_at(store).and_then(|executable| {
+                    let acknowledgement = wait_for_loaded_hash(
+                        store,
+                        expected_hash,
+                        old_pid,
+                        Duration::from_secs(12),
+                    )?;
+                    Ok((executable, acknowledgement.pid))
                 }) {
                     Ok((executable, pid)) => {
                         self.last_promotion_backup = Some(backup.clone());
@@ -2705,12 +2716,12 @@ fn promote_report_cli(store: &StateStore, report_path: &Path) -> Result<(), Stri
     let expected_hash = report.final_life_state_hash;
     let old_pid = stop_live_runtime_for_promotion(store)?;
     let backup = promote_validated_fork(store, &fork, expected_hash)?;
-    match launch_desktop_pet_at(store).and_then(|(executable, pid)| {
+    match launch_desktop_pet_at(store).and_then(|executable| {
         let acknowledgement =
             wait_for_loaded_hash(store, expected_hash, old_pid, Duration::from_secs(12))?;
-        Ok((executable, pid, acknowledgement))
+        Ok((executable, acknowledgement))
     }) {
-        Ok((executable, pid, acknowledgement)) => {
+        Ok((executable, acknowledgement)) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -2719,7 +2730,7 @@ fn promote_report_cli(store: &StateStore, report_path: &Path) -> Result<(), Stri
                     "fork": fork,
                     "recovery_backup": backup,
                     "executable": executable,
-                    "pid": pid,
+                    "pid": acknowledgement.pid,
                     "active_loaded_life_state_hash": format!("{:016x}", acknowledgement.loaded_life_state_hash),
                     "active_loaded_genome_hash": format!("{:016x}", acknowledgement.loaded_genome_hash),
                     "acknowledged_unix_ms": acknowledgement.updated_unix_ms,
@@ -8268,15 +8279,11 @@ fn launch_desktop_pet() -> Result<PathBuf, String> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let executable = resolve_pet_executable(&current_exe, &workspace_root)?;
     verify_packaged_release_pair(&current_exe, &executable)?;
-    let mut command = Command::new(&executable);
-    if let Some(parent) = executable.parent() {
-        command.current_dir(parent);
-    }
-    command.spawn().map_err(|error| error.to_string())?;
+    start_desktop_pet(&executable, None)?;
     Ok(executable)
 }
 
-fn launch_desktop_pet_at(store: &StateStore) -> Result<(PathBuf, u32), String> {
+fn launch_desktop_pet_at(store: &StateStore) -> Result<PathBuf, String> {
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let executable = resolve_pet_executable(&current_exe, &workspace_root)?;
@@ -8287,13 +8294,53 @@ fn launch_desktop_pet_at(store: &StateStore) -> Result<(PathBuf, u32), String> {
             store.paths.root.display()
         )
     })?;
-    let mut command = Command::new(&executable);
-    command.arg("--data-dir").arg(data_root);
+    start_desktop_pet(&executable, Some(&data_root))?;
+    Ok(executable)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pet_launch_command(executable: &Path, data_root: Option<&Path>) -> Option<Command> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    if macos.file_name()? != "MacOS"
+        || contents.file_name()? != "Contents"
+        || bundle.extension()? != "app"
+    {
+        return None;
+    }
+    // LaunchServices gives Pet its own TCC responsibility. Directly spawning
+    // its binary makes screen recording depend on the console's permission.
+    let mut command = Command::new("/usr/bin/open");
+    command.arg("-a").arg(bundle);
+    if let Some(root) = data_root {
+        command.args(["--args", "--data-dir"]).arg(root);
+    }
+    Some(command)
+}
+
+fn start_desktop_pet(executable: &Path, data_root: Option<&Path>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if let Some(mut command) = macos_pet_launch_command(executable, data_root) {
+        let output = command.output().map_err(|error| error.to_string())?;
+        return if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Could not open Pet: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        };
+    }
+    let mut command = Command::new(executable);
+    if let Some(root) = data_root {
+        command.arg("--data-dir").arg(root);
+    }
     if let Some(parent) = executable.parent() {
         command.current_dir(parent);
     }
-    let child = command.spawn().map_err(|error| error.to_string())?;
-    Ok((executable, child.id()))
+    command.spawn().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn stop_live_runtime_for_promotion(store: &StateStore) -> Result<Option<u32>, String> {
@@ -8599,6 +8646,105 @@ fn preview_seeded_unit(mut value: u64) -> f32 {
 mod tests {
     use super::*;
     use lifecore::LifeCore;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn packaged_pet_uses_launchservices_and_preserves_the_data_directory_argument() {
+        let executable = Path::new("/Applications/Pet2.app/Contents/MacOS/Pet2");
+        let root = Path::new("/tmp/Pet state with spaces");
+        let command = macos_pet_launch_command(executable, Some(root)).unwrap();
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-a",
+                "/Applications/Pet2.app",
+                "--args",
+                "--data-dir",
+                "/tmp/Pet state with spaces"
+            ]
+        );
+        assert_eq!(
+            macos_pet_launch_command(executable, None)
+                .unwrap()
+                .get_args()
+                .collect::<Vec<_>>(),
+            ["-a", "/Applications/Pet2.app"]
+        );
+        assert!(
+            macos_pet_launch_command(Path::new("/tmp/target/release/pet2"), Some(root)).is_none()
+        );
+    }
+
+    #[test]
+    fn live_launch_connects_to_running_pet_renews_and_releases_its_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let acknowledgement = RuntimeLoadAcknowledgement {
+            schema_version: 1,
+            status: RuntimeLoadStatus::Running,
+            pid: 123,
+            executable_version: env!("CARGO_PKG_VERSION").into(),
+            loaded_life_state_hash: 42,
+            loaded_genome_hash: 7,
+            updated_unix_ms: unix_time_ms(),
+        };
+        store.save_runtime_ack(&acknowledgement).unwrap();
+        let mut monitor = LivePetMonitor::new(&store, true);
+        assert_eq!(monitor.connection, LabConnectionState::Connecting);
+        let request = store.load_lab_control().unwrap().unwrap();
+        assert!(matches!(
+            request.command,
+            LabControlCommand::OpenSession { .. }
+        ));
+        let session_id = desktop_host::lab_session_id(request.session_token.as_deref().unwrap());
+        assert!(!monitor.launched_for_connect);
+        let frame = |session| desktop_host::EventLogEntry {
+            monotonic_seconds: 1.0,
+            kind: "debug_state".into(),
+            details: serde_json::json!({
+                "lab_session": {"active": true, "session_id": session}
+            }),
+        };
+        // Historical data from another lease must not masquerade as a connection.
+        store
+            .append_telemetry(&frame(session_id.wrapping_add(1)))
+            .unwrap();
+        monitor.poll();
+        assert_eq!(monitor.connection, LabConnectionState::Connecting);
+        assert!(monitor.last_received.is_none());
+        store.append_telemetry(&frame(session_id)).unwrap();
+        monitor.last_poll = Instant::now() - Duration::from_secs(1);
+        monitor.poll();
+        assert_eq!(monitor.connection, LabConnectionState::Connected);
+        assert!(monitor.last_received.is_some());
+        monitor.last_session_command = Some(Instant::now() - Duration::from_secs(4));
+        monitor.maintain_connection();
+        assert!(matches!(
+            store.load_lab_control().unwrap().unwrap().command,
+            LabControlCommand::RenewSession { .. }
+        ));
+        drop(monitor);
+        let closed = store.load_lab_control().unwrap().unwrap();
+        assert_eq!(closed.command, LabControlCommand::CloseSession);
+        assert_eq!(closed.session_token, request.session_token);
+        assert_eq!(
+            store
+                .load_runtime_ack::<RuntimeLoadAcknowledgement>()
+                .unwrap(),
+            Some(acknowledgement)
+        );
+    }
+
+    #[test]
+    fn character_preview_launch_does_not_request_a_live_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let monitor = LivePetMonitor::new(&store, false);
+        assert_eq!(monitor.connection, LabConnectionState::Disconnected);
+        drop(monitor);
+        assert!(store.load_lab_control().unwrap().is_none());
+    }
 
     #[test]
     fn packaged_macos_console_resolves_sibling_pet_before_development_builds() {

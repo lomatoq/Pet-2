@@ -83,6 +83,9 @@ if [[ "$codesign_identity" == "-" ]]; then
   echo "warning: ad-hoc signing does not preserve macOS privacy identity across changed builds" >&2
 fi
 codesign --force --deep --sign "$codesign_identity" "$pet_app"
+# Resources is sealed as data, so --deep does not sign this executable for us.
+codesign --force --sign "$codesign_identity" \
+  --identifier io.lomatoq.pet2.dev-console "$console_app/Contents/Resources/DevConsole"
 codesign --force --deep --sign "$codesign_identity" "$console_app"
 
 # Sign first so the manifest hashes the final executable bytes. Updating the
@@ -103,6 +106,7 @@ PY
 codesign --force --sign "$codesign_identity" "$console_app"
 codesign --verify --deep --strict "$pet_app"
 codesign --verify --deep --strict "$console_app"
+codesign --verify --strict "$console_app/Contents/Resources/DevConsole"
 
 dist_payload="$dist_root/$package_name"
 archive="$dist_root/$package_name.zip"

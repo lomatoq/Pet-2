@@ -58,6 +58,7 @@ jobs:
           test -x "$payload/tools/VoiceLab"
           codesign --verify --deep --strict "$payload/Pet2.app"
           codesign --verify --deep --strict "$payload/Pet2 Dev Console.app"
+          codesign --verify --strict "$payload/Pet2 Dev Console.app/Contents/Resources/DevConsole"
       - uses: actions/upload-artifact@v4
         with:
           name: Pet2-macos-arm64

@@ -81,7 +81,9 @@ bash ./scripts/package_macos.sh
 
 The macOS archive contains `Pet2.app`, one `Pet2 Dev Console.app`, the
 deterministic `tools/HabitatLab` runner, and `Pet2-Dev.command`. Opening Dev
-Console restarts the installed Pet in bounded 5 Hz telemetry mode. Its normal,
+Console automatically connects to the installed Pet with a temporary 5 Hz
+telemetry lease, starting Pet if necessary. Closing or disconnecting the console
+releases that lease. Its normal,
 minimizable window contains four panels: Character, Perception, Behavior, and
 Diagnostics. They expose realtime desktop position, final gaze, visual-saliency
 target, decisions, drives, safe temporary behavior controls, body response,
