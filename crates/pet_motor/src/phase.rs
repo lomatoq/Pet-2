@@ -66,6 +66,8 @@ pub fn advance_phase(
     if waiting {
         let bid = active.social_bid.get_or_insert_with(|| crate::SocialBid {
             bid_id: active.bout_id,
+            object_id: context.orb_id,
+            status: crate::BidStatus::Waiting,
             target: active.locked_target.clone(),
             expected_response: match active.program {
                 BehaviorProgramId::PlayOrbCarryOffer => crate::ExpectedResponse::ToyMove,
@@ -81,8 +83,15 @@ pub fn advance_phase(
         let fresh =
             context.frame_id > bid.started_frame && context.timestamp_seconds > bid.started_at;
         let response = match bid.expected_response {
-            crate::ExpectedResponse::Touch => context.pet_touched && !bid.previous_touch,
-            crate::ExpectedResponse::ToyMove => context.orb_user_held && !bid.previous_toy_held,
+            crate::ExpectedResponse::Touch => {
+                context.pet_touched && !bid.previous_touch && context.boundary_violation < 0.18
+            }
+            crate::ExpectedResponse::ToyMove => {
+                context.orb_user_held
+                    && !bid.previous_toy_held
+                    && bid.object_id.is_some()
+                    && bid.object_id == context.orb_id
+            }
             crate::ExpectedResponse::Help => {
                 context.locomotion_completed && context.somatic.motor_error < 0.08
             }
@@ -97,17 +106,31 @@ pub fn advance_phase(
         bid.previous_touch = context.pet_touched;
         bid.previous_toy_held = context.orb_user_held;
         bid.response_received |= fresh && response && context.boundary_violation < 0.18;
+        if bid.response_received {
+            bid.status = crate::BidStatus::Accepted;
+        }
         if context.focus_mode || context.boundary_violation >= 0.18 {
+            bid.status = crate::BidStatus::Cancelled;
             return PhaseAdvance::Finished(CompletionReason::GracefulWithdrawal);
         }
         if bid.expected_response == crate::ExpectedResponse::ToyMove
-            && context.orb_position.is_none()
+            && (context.orb_position.is_none() || bid.object_id != context.orb_id)
         {
+            bid.status = crate::BidStatus::Invalidated;
             return PhaseAdvance::Finished(CompletionReason::Invalidated);
         }
     }
     let performed_dt = dt * phase_clock_scale(active.program, spec.name);
     active.phase_time += performed_dt;
+    if waiting && let Some(bid) = &mut active.social_bid {
+        let elapsed = (context.timestamp_seconds - bid.started_at) as f32;
+        if elapsed.is_finite() {
+            active.phase_time = active.phase_time.max(elapsed.max(0.0));
+        }
+        if active.phase_time >= spec.maximum_seconds && !bid.response_received {
+            bid.status = crate::BidStatus::TimedOut;
+        }
+    }
     active.total_time += performed_dt;
     active.minimum_readability_reached |= active.phase_time >= spec.minimum_seconds;
     let evidence_complete = phase_evidence_complete(active, spec.name, context);

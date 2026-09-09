@@ -46,6 +46,7 @@ pub struct VoiceVisualState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EmbodiedPose {
+    pub geometry: lifecore::FaceGeometry,
     pub gaze: Vec2,
     pub gaze_mode: GazeMode,
     /// Brain-authorized translation of the complete facial mask toward the
@@ -339,102 +340,31 @@ impl EmbodiedRuntime {
         );
         self.update_attention_face_pose(mode, mind, feedback);
         self.update_blink(mode, intent, affect, expression, dt);
-        self.pose.eye_aperture = smooth(
-            self.pose.eye_aperture,
-            expression.eye_aperture.clamp(0.0, 1.0),
-            16.0,
-            dt,
-        );
-        self.pose.eye_scale = smooth(
-            self.pose.eye_scale,
-            expression.eye_scale.clamp(0.88, 1.18),
-            12.0,
-            dt,
-        );
-        let aperture_closure = 1.0 - self.pose.eye_aperture;
-        self.pose.blink_left = self.pose.blink_left.max(aperture_closure);
-        self.pose.blink_right = self.pose.blink_right.max(aperture_closure);
+        // Explicit physiological closure may be held; it must not become a
+        // repeating blink that briefly exposes the iris between envelopes.
+        self.pose.blink_left = self.pose.blink_left.max(expression.blink_left);
+        self.pose.blink_right = self.pose.blink_right.max(expression.blink_right);
+        self.pose.eye_aperture = expression.eye_aperture.clamp(0.0, 1.0);
+        self.pose.eye_scale = expression.eye_scale.clamp(0.88, 1.18);
         self.update_pupil(mode, intent, sensors, mind, expression, face_tuning, dt);
         self.update_soft_body(genome, intent, feedback, affect, dt);
 
         let voice_mouth = voice_mouth_target(voice);
-        // An audible callback is the sole authority for a visibly open cavity.
-        // Emotion still controls curve/tension below, but cannot mime failed audio.
-        let mouth_target = voice_mouth;
+        // Silent O/smile is semantic geometry. Only actual playback adds articulation.
+        self.pose.geometry = expression.geometry.sanitized();
+        let mouth_target = expression.mouth_open.clamp(0.0, 1.0).max(voice_mouth);
         self.pose.mouth_open = smooth(self.pose.mouth_open, mouth_target, 22.0, dt);
-        self.pose.mouth_curve = smooth(
-            self.pose.mouth_curve,
-            (expression.mouth_curve
-                + expression.relief * 0.18
-                + expression.mouth_asymmetry * 0.12
-                + affect.valence * 0.34)
-                .clamp(-1.0, 1.0),
-            11.0,
-            dt,
-        );
-        self.pose.mouth_tension = smooth(
-            self.pose.mouth_tension,
-            (expression.mouth_tension
-                + expression.mouth_compression * 0.62
-                + expression.effort * 0.28
-                + affect.frustration * 0.35)
-                .clamp(0.0, 1.0),
-            13.0,
-            dt,
-        );
-        self.pose.brow_raise = smooth(
-            self.pose.brow_raise,
-            (expression.brow_raise + affect.arousal * 0.22).clamp(-1.0, 1.0),
-            12.0,
-            dt,
-        );
-        self.pose.brow_tension = smooth(
-            self.pose.brow_tension,
-            (expression.brow_tension + affect.stress * 0.36).clamp(0.0, 1.0),
-            14.0,
-            dt,
-        );
-        let procedural_asymmetry = (self.elapsed * 0.41 + self.seed_phase).sin() * 0.12
-            + if intent.pose == PoseIntent::Curious {
-                0.18
-            } else {
-                0.0
-            };
-        let interaction_weight = expression
-            .effort
-            .max(expression.relief)
-            .max(expression.brow_asymmetry.abs())
-            .max(expression.mouth_compression)
-            .clamp(0.0, 1.0);
-        let asymmetry = procedural_asymmetry * (1.0 - interaction_weight)
-            + expression.brow_asymmetry * interaction_weight;
-        self.pose.brow_asymmetry = smooth(self.pose.brow_asymmetry, asymmetry, 7.0, dt);
-        self.pose.mouth_compression = smooth(
-            self.pose.mouth_compression,
-            expression.mouth_compression,
-            13.0,
-            dt,
-        );
-        self.pose.mouth_asymmetry = smooth(
-            self.pose.mouth_asymmetry,
-            expression.mouth_asymmetry,
-            10.0,
-            dt,
-        );
-        self.pose.effort = smooth(self.pose.effort, expression.effort, 10.0, dt);
-        self.pose.relief = smooth(self.pose.relief, expression.relief, 8.0, dt);
-        self.pose.squint = smooth(
-            self.pose.squint,
-            (expression.squint + affect.stress * 0.28).clamp(0.0, 1.0),
-            13.0,
-            dt,
-        );
-        self.pose.cheek_glow = smooth(
-            self.pose.cheek_glow,
-            (expression.cheek_glow * (0.7 + affect.attachment * 0.38)).clamp(0.0, 1.0),
-            5.0,
-            dt,
-        );
+        self.pose.mouth_curve = expression.mouth_curve.clamp(-1.0, 1.0);
+        self.pose.mouth_tension = expression.mouth_tension.clamp(0.0, 1.0);
+        self.pose.brow_raise = expression.brow_raise.clamp(-1.0, 1.0);
+        self.pose.brow_tension = expression.brow_tension.clamp(0.0, 1.0);
+        self.pose.brow_asymmetry = expression.brow_asymmetry.clamp(-1.0, 1.0);
+        self.pose.mouth_compression = expression.mouth_compression;
+        self.pose.mouth_asymmetry = expression.mouth_asymmetry;
+        self.pose.effort = expression.effort;
+        self.pose.relief = expression.relief;
+        self.pose.squint = expression.squint.clamp(0.0, 1.0);
+        self.pose.cheek_glow = expression.cheek_glow.clamp(0.0, 1.0);
         self.pose.audio_envelope = smooth(self.pose.audio_envelope, voice.envelope, 28.0, dt);
         self.pose.purr = smooth(self.pose.purr, voice.purr, 18.0, dt);
         self.physiology.update(visual_traits, mind, dt);

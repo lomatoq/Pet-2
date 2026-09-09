@@ -14,6 +14,7 @@ const TRACE_CAPACITY: usize = 256;
 #[derive(Debug, Clone)]
 pub struct BehaviorPerformanceRuntime {
     previous_touch: bool,
+    previous_world_goal: crate::MotorWorldGoal,
     contact_side: f32,
     pleasant_touch_seconds: f32,
     acknowledgement_seconds: f32,
@@ -22,8 +23,6 @@ pub struct BehaviorPerformanceRuntime {
     previous_gesture: lifecore::EmbodiedGestureKind,
     previous_salience: f32,
     previous_orb_user_held: bool,
-    afterglow_seconds: f32,
-    play_afterglow_seconds: f32,
     identity_seed: u64,
     next_bout_id: u64,
     active: Option<ActivePerformance>,
@@ -44,6 +43,7 @@ impl BehaviorPerformanceRuntime {
     pub fn new(identity_seed: u64) -> Self {
         Self {
             previous_touch: false,
+            previous_world_goal: crate::MotorWorldGoal::None,
             contact_side: 1.0,
             pleasant_touch_seconds: 0.0,
             acknowledgement_seconds: 0.0,
@@ -52,8 +52,6 @@ impl BehaviorPerformanceRuntime {
             previous_gesture: lifecore::EmbodiedGestureKind::Unknown,
             previous_salience: 0.0,
             previous_orb_user_held: false,
-            afterglow_seconds: 0.0,
-            play_afterglow_seconds: 0.0,
             identity_seed,
             next_bout_id: 1,
             active: None,
@@ -78,11 +76,6 @@ impl BehaviorPerformanceRuntime {
 
     pub fn await_gesture_repetition(&mut self) {
         self.ambiguity_seconds = 3.5;
-    }
-
-    /// Called only after the ecology director reports a completed play outcome.
-    pub fn note_play_success(&mut self) {
-        self.play_afterglow_seconds = 10.0;
     }
 
     pub fn set_tuning(&mut self, tuning: MotorReadabilityTuning) {
@@ -151,11 +144,19 @@ impl BehaviorPerformanceRuntime {
         for cooldown in &mut self.cooldowns {
             *cooldown = (*cooldown - dt).max(0.0);
         }
+        if self.previous_world_goal == crate::MotorWorldGoal::PetMore
+            && context.world_goal != self.previous_world_goal
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|a| a.cause == crate::MotorCause::WorldEvent)
+        {
+            self.finish_active(CompletionReason::GracefulWithdrawal);
+        }
+        self.previous_world_goal = context.world_goal;
         self.update_regime(goal, dt);
         self.acknowledgement_seconds = (self.acknowledgement_seconds - dt).max(0.0);
         self.ambiguity_seconds = (self.ambiguity_seconds - dt).max(0.0);
-        self.afterglow_seconds = (self.afterglow_seconds - dt).max(0.0);
-        self.play_afterglow_seconds = (self.play_afterglow_seconds - dt).max(0.0);
         if (context.pet_touched && !self.previous_touch)
             || (context.gesture != self.previous_gesture && context.gesture_confidence > 0.4)
         {
@@ -187,30 +188,9 @@ impl BehaviorPerformanceRuntime {
             if side != 0.0 {
                 self.contact_side = side;
             }
-            self.afterglow_seconds = 8.0;
         }
         let touch_stopped = self.previous_touch && !context.pet_touched;
         self.previous_touch = context.pet_touched;
-        if allow_selection
-            && touch_stopped
-            && self.pleasant_touch_seconds >= 0.35
-            && goal.drives.social + goal.attachment * 0.35 > goal.drives.autonomy
-            && !context.focus_mode
-            && context.boundary_violation < 0.18
-            && self.cooldowns[BehaviorProgramId::SocialPettingSolicitation.index()] <= 0.0
-        {
-            self.finish_active(CompletionReason::ContactConfirmed);
-            self.start(
-                BehaviorProgramId::SocialPettingSolicitation,
-                crate::MotorCause::UserGesture,
-                goal,
-                context,
-            );
-            if let Some(active) = &mut self.active {
-                active.sampled_style.arc_sign = self.contact_side;
-            }
-            self.pleasant_touch_seconds = 0.0;
-        }
         if touch_stopped {
             self.pleasant_touch_seconds = 0.0;
         }
@@ -225,25 +205,7 @@ impl BehaviorPerformanceRuntime {
                             .is_some_and(|b| b.expected_response == crate::ExpectedResponse::Touch)
                     });
                     self.finish_active(reason);
-                    if reason == CompletionReason::GracefulWithdrawal && !context.focus_mode {
-                        let next = if goal.felt.sleep_pressure > 0.5 {
-                            BehaviorProgramId::HomeLowEnergyRecharge
-                        } else if context.orb_position.is_some() && goal.drives.play > 0.4 {
-                            BehaviorProgramId::PlaySelfPlayDroplet
-                        } else if goal.drives.curiosity > 0.4 {
-                            BehaviorProgramId::MoveInspectPauseScan
-                        } else {
-                            BehaviorProgramId::StateSelfGroomRealign
-                        };
-                        self.start(
-                            next,
-                            crate::MotorCause::PhysiologicalTransition,
-                            goal,
-                            context,
-                        );
-                    }
                     if reason == CompletionReason::UserResponded && touch_bid {
-                        self.afterglow_seconds = 8.0;
                         self.start(
                             BehaviorProgramId::SocialRubNuzzleCursor,
                             crate::MotorCause::UserGesture,
@@ -336,19 +298,6 @@ impl BehaviorPerformanceRuntime {
         } else {
             packet.sanitize();
         }
-        if self.afterglow_seconds > 0.0 && goal.felt.pain_like < 0.2 && goal.felt.startle < 0.35 {
-            let residual = (self.afterglow_seconds / 8.0).min(1.0);
-            packet.material.density_compliance_multiplier *= 1.0 + residual * 0.06;
-            packet.material.viscosity_multiplier *= 1.0 - residual * 0.05;
-            packet.expression.relief = packet.expression.relief.max(residual * 0.18);
-        }
-        if self.play_afterglow_seconds > 0.0
-            && goal.felt.pain_like < 0.2
-            && goal.felt.startle < 0.35
-        {
-            packet.internal.flow_speed_multiplier *=
-                1.0 + 0.12 * self.play_afterglow_seconds / 10.0;
-        }
         if self.acknowledgement_seconds > 0.0 {
             packet.expression.acknowledgement = (self.acknowledgement_seconds / 0.14).min(1.0);
             packet.expression.gaze_target = Some(self.acknowledgement_target);
@@ -362,7 +311,10 @@ impl BehaviorPerformanceRuntime {
                 packet.locomotion.speed_multiplier = 0.0;
             }
         }
-        if context.world_goal == crate::MotorWorldGoal::OfferOrb {
+        if matches!(
+            context.world_goal,
+            crate::MotorWorldGoal::OfferOrb | crate::MotorWorldGoal::PetMore
+        ) {
             packet.locomotion.target_position = Some(goal.body_intent.target_position);
             packet.locomotion.speed_multiplier = f32::from(goal.body_intent.desired_speed > 0.001);
             packet.expression.gaze_target = goal.body_intent.gaze_target;
@@ -388,6 +340,43 @@ impl BehaviorPerformanceRuntime {
             }
         }
         packet.sanitize();
+        let axis = packet
+            .expression
+            .gaze_target
+            .or(goal.body_intent.gaze_target)
+            .map_or(glam::Vec2::ZERO, |p| {
+                (p - context.body.motion.world_position).normalize_or_zero()
+            });
+        let mode = if context.boundary_violation >= 0.18 {
+            crate::ShapeMode::Recoil
+        } else if goal.felt.startle > 0.35 || goal.felt.pain_like > 0.2 {
+            crate::ShapeMode::Guard
+        } else if context.screen_edge_supported && goal.derived.fatigue > 0.55 {
+            crate::ShapeMode::Settle
+        } else if context.pet_touched && goal.felt.contact_pleasantness > 0.42 {
+            crate::ShapeMode::Present
+        } else if goal.derived.curiosity > 0.3 && axis.length_squared() > 0.0 {
+            crate::ShapeMode::Reach
+        } else {
+            crate::ShapeMode::Neutral
+        };
+        let axis = if matches!(mode, crate::ShapeMode::Present | crate::ShapeMode::Recoil)
+            && context.pet_touched
+        {
+            (context.body.contact.point_world - context.body.motion.world_position)
+                .normalize_or_zero()
+        } else {
+            axis
+        };
+        let rise = self
+            .active
+            .as_ref()
+            .map_or(1.0, |a| (a.total_time / 0.25).min(1.0));
+        packet.shape = crate::ShapeIntent {
+            mode,
+            axis,
+            strength: 0.85 * rise,
+        };
         self.last_packet = packet.clone();
         packet
     }
@@ -405,12 +394,17 @@ impl BehaviorPerformanceRuntime {
         if let Some(BehaviorTarget::Surface(surface)) = &target {
             self.remembered_surface = Some(surface.clone());
         }
-        let sampled_style = sample_style_avoiding(
+        let mut sampled_style = sample_style_avoiding(
             self.identity_seed,
             bout_id,
             program,
             &self.recent_motion_signatures,
         );
+        if program == BehaviorProgramId::SocialPresentTouchSide
+            && context.preferred_touch_side != 0.0
+        {
+            sampled_style.arc_sign = context.preferred_touch_side.signum();
+        }
         if self.recent_motion_signatures.len() == 2 {
             self.recent_motion_signatures.pop_front();
         }

@@ -2,6 +2,91 @@ use glam::Vec2;
 
 use super::particles::{LiquidParticle, MAX_LIQUID_PARTICLES};
 
+/// Low-frequency deformation only. Particle masses, translation, contact and
+/// solver constraints remain authoritative; subtract the mass-weighted acceleration.
+pub fn apply_posture_field(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    center: Vec2,
+    pose: pet_motor::ShapeIntent,
+    world_to_body: Vec2,
+    gain: f32,
+) -> f32 {
+    use pet_motor::ShapeMode;
+    let count = count.min(MAX_LIQUID_PARTICLES);
+    if count == 0
+        || pose.mode == ShapeMode::Neutral
+        || !pose.strength.is_finite()
+        || !gain.is_finite()
+    {
+        return 0.0;
+    }
+    let strength = pose.strength.clamp(0.0, 1.0) * gain.clamp(0.0, 1.5);
+    let attention = (pose.axis * world_to_body).normalize_or_zero();
+    if !attention.is_finite() {
+        return 0.0;
+    }
+    let axis = match pose.mode {
+        ShapeMode::Settle | ShapeMode::Guard => Vec2::X,
+        _ if attention.length_squared() > 1.0e-6 => attention,
+        _ => return 0.0,
+    };
+    let across = Vec2::new(-axis.y, axis.x);
+    let stretch = match pose.mode {
+        ShapeMode::Reach => 1.16,
+        ShapeMode::Present => 1.02,
+        ShapeMode::Guard => 1.05,
+        ShapeMode::Settle => 1.16,
+        ShapeMode::Recoil => 0.94,
+        ShapeMode::Neutral => 1.0,
+    };
+    let mut forces = [Vec2::ZERO; MAX_LIQUID_PARTICLES];
+    let mut weighted = Vec2::ZERO;
+    let mut total_mass = 0.0;
+    for (i, p) in particles[..count].iter().enumerate() {
+        if p.inverse_mass <= 0.0 || !p.inverse_mass.is_finite() {
+            continue;
+        }
+        let local = p.position - center;
+        // The reciprocal orthogonal scale preserves affine area exactly.
+        let affine = axis * local.dot(axis) * (stretch - 1.0)
+            + across * local.dot(across) * (1.0 / stretch - 1.0);
+        let front = (local.dot(axis) / 0.43).clamp(0.0, 1.0);
+        let directional = match pose.mode {
+            ShapeMode::Reach => axis * front * front * 0.055,
+            ShapeMode::Present => axis * front * front * 0.085,
+            ShapeMode::Recoil => -axis * (front * front * 0.10 + local.y * 0.25),
+            ShapeMode::Settle => Vec2::new(local.x * (-local.y / 0.43).clamp(0.0, 1.0) * 0.20, 0.0),
+            _ => Vec2::ZERO,
+        };
+        // Compact support keeps detached fragments under their existing return field.
+        let support = (1.0 - (local.length() - 0.45).max(0.0) / 0.25).clamp(0.0, 1.0);
+        forces[i] = ((affine + directional) * 12.0 * strength * support).clamp_length_max(1.2);
+        let mass = p.inverse_mass.recip();
+        weighted += forces[i] * mass;
+        total_mass += mass;
+    }
+    if total_mass <= 0.0 {
+        return 0.0;
+    }
+    let mean = weighted / total_mass;
+    let largest = forces[..count]
+        .iter()
+        .map(|f| (*f - mean).length())
+        .fold(0.0_f32, f32::max);
+    // One shared bound preserves the zero-mean constraint after limiting.
+    let bound = (1.2 / largest.max(1.2)).min(1.0);
+    let mut energy = 0.0;
+    for (p, force) in particles[..count].iter_mut().zip(forces) {
+        if p.inverse_mass > 0.0 {
+            let acceleration = (force - mean) * bound;
+            p.force += acceleration;
+            energy += acceleration.length_squared();
+        }
+    }
+    energy / count as f32
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CharacterFieldParameters {
     /// Elliptical equipotential radii in body-local units.
@@ -123,6 +208,48 @@ pub fn apply_character_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_postures_preserve_mass_and_have_zero_weighted_acceleration() {
+        use pet_motor::{ShapeIntent, ShapeMode};
+        for mode in [
+            ShapeMode::Reach,
+            ShapeMode::Present,
+            ShapeMode::Guard,
+            ShapeMode::Settle,
+            ShapeMode::Recoil,
+        ] {
+            let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+            for (i, p) in particles[..12].iter_mut().enumerate() {
+                let angle = i as f32 * std::f32::consts::TAU / 12.0;
+                p.position = Vec2::new(angle.cos(), angle.sin()) * 0.32;
+                p.inverse_mass = 0.5 + i as f32 * 0.1;
+            }
+            let before = particles;
+            apply_posture_field(
+                &mut particles,
+                12,
+                Vec2::ZERO,
+                ShapeIntent {
+                    mode,
+                    axis: Vec2::X,
+                    strength: 1.0,
+                },
+                Vec2::ONE,
+                1.5,
+            );
+            let net = particles[..12]
+                .iter()
+                .map(|p| p.force / p.inverse_mass)
+                .sum::<Vec2>();
+            assert!(net.length() < 1.0e-5, "{mode:?}: {net:?}");
+            assert!(particles[..12].iter().all(|p| p.force.length() <= 1.20001));
+            for i in 0..12 {
+                assert_eq!(particles[i].inverse_mass, before[i].inverse_mass);
+                assert_eq!(particles[i].position, before[i].position);
+            }
+        }
+    }
 
     #[test]
     fn character_well_is_continuous_bounded_and_component_agnostic() {

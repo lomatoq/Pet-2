@@ -111,7 +111,7 @@ impl SomaticActuationBus {
                 Some(crate::BehaviorProgramId::MoveInspectPauseScan)
             );
         if meaningful {
-            phenotype.face.microsaccade_amount_multiplier *= 0.55;
+            phenotype.face.microsaccade_amount_multiplier *= 0.4;
             phenotype.pbf.idle_lean_angle_multiplier *= 0.5;
             phenotype.visual_physiology.droplet_energy *= 0.6;
         }
@@ -126,6 +126,12 @@ impl SomaticActuationBus {
             phenotype.action.social_approach = 0.0;
             phenotype.expression.mouth_curve = phenotype.expression.mouth_curve.min(0.0);
             phenotype.expression.cheek_glow = 0.0;
+            phenotype.expression.geometry.mouth[1] =
+                phenotype.expression.geometry.mouth[1].min(0.0);
+            phenotype.expression.geometry.mouth[2] =
+                phenotype.expression.geometry.mouth[2].min(0.0);
+            phenotype.expression.geometry.lids[0][2] = 0.0;
+            phenotype.expression.geometry.lids[1][2] = 0.0;
             phenotype.material.soul_glow_strength_multiplier =
                 phenotype.material.soul_glow_strength_multiplier.min(1.0);
             if packet.regime.primary == SomaticRegime::Threatened {

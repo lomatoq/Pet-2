@@ -99,6 +99,8 @@ impl SavedEcologyRng {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EcologyState {
+    #[serde(default)]
+    pub successful_touch_sides: [u32; 2],
     pub schema_version: u32,
     pub identity_seed: u64,
     pub next_object_id: u64,
@@ -131,6 +133,7 @@ impl EcologyState {
             next_object_id = orb.id.wrapping_add(1).max(1);
         }
         Self {
+            successful_touch_sides: [0; 2],
             schema_version: ECOLOGY_STATE_SCHEMA_VERSION,
             identity_seed,
             next_object_id,

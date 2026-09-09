@@ -135,7 +135,9 @@ impl BodyMaterialSnapshot {
         if self.identity_seed != expected_identity_seed {
             return Err(BodySnapshotError::IdentityMismatch);
         }
-        if self.tuning_schema_version != expected_tuning_schema {
+        if self.tuning_schema_version != expected_tuning_schema
+            && !(self.tuning_schema_version == 21 && expected_tuning_schema == 22)
+        {
             return Err(BodySnapshotError::TuningSchemaMismatch);
         }
         if self.structural_tuning_hash != liquid_structural_tuning_hash(expected_tuning) {

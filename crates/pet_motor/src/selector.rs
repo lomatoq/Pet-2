@@ -263,6 +263,20 @@ pub fn choose_program(
         }
     }
 
+    if context.world_goal == crate::MotorWorldGoal::PetMore {
+        let program = if context.pet_touched {
+            P::SocialRubNuzzleCursor
+        } else {
+            P::SocialPettingSolicitation
+        };
+        if eligible(program) {
+            return Some(ProgramDecision {
+                program,
+                cause: MotorCause::WorldEvent,
+                priority: definition(program).priority,
+            });
+        }
+    }
     if goal.action == ActionId::InvitePetting {
         let program =
             if context.body.contact.duration > 0.10 && goal.felt.contact_pleasantness > 0.42 {
@@ -473,10 +487,10 @@ pub fn lock_target(
         }
         P::SocialPettingSolicitation => {
             let offset = context.cursor_position - context.body.motion.world_position;
+            let diameter = context.body_diameter.max(Vec2::splat(0.0001));
+            let follow = (offset / diameter).clamp_length_max(0.35) * diameter;
             Some(BehaviorTarget::Point(
-                (context.body.motion.world_position
-                    + offset.normalize_or_zero() * (offset.length() - 0.035).clamp(0.0, 0.03))
-                .clamp(Vec2::ZERO, Vec2::ONE),
+                (context.body.motion.world_position + follow).clamp(Vec2::ZERO, Vec2::ONE),
             ))
         }
         P::SocialRubNuzzleCursor | P::TouchSoftTouchYield | P::TouchSustainedHoldRelaxOrResist => {

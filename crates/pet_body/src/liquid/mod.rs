@@ -528,6 +528,20 @@ impl LiquidMorphRuntime {
         self.somatic_feedback
     }
 
+    /// Predicted affine extension, independent of measured deformation. Never
+    /// suppress physical strain/pain: this only identifies commanded shape.
+    pub fn intended_posture_extension(&self) -> f32 {
+        use pet_motor::ShapeMode;
+        let extension = match self.somatic_actuation.shape.mode {
+            ShapeMode::Neutral => 0.0,
+            ShapeMode::Reach | ShapeMode::Settle => 0.16,
+            ShapeMode::Present => 0.02,
+            ShapeMode::Guard => 0.05,
+            ShapeMode::Recoil => 1.0 / 0.94 - 1.0,
+        };
+        extension * self.somatic_actuation.shape.strength * self.tuning.posture_gain
+    }
+
     fn effective_material_parameters(&self) -> MaterialParameters {
         let mut parameters = MaterialParameters::from_tuning(self.tuning);
         parameters.viscosity *= self.runtime_actuation.viscosity_multiplier;
@@ -798,7 +812,15 @@ impl LiquidMorphRuntime {
             self.local_containment_bounds,
             self.interaction_tuning,
         );
-        let somatic_step = apply_somatic_actuation(
+        let posture_energy = motor_field::apply_posture_field(
+            &mut self.particles,
+            self.particle_count,
+            self.components.main_com,
+            self.somatic_actuation.shape,
+            motion.world_to_body_scale,
+            self.tuning.posture_gain,
+        );
+        let mut somatic_step = apply_somatic_actuation(
             &mut self.particles,
             self.particle_count,
             self.body_origin,
@@ -809,6 +831,9 @@ impl LiquidMorphRuntime {
             &self.somatic_actuation,
             dt,
         );
+        somatic_step.local_energy += posture_energy;
+        somatic_step.total_field_energy += posture_energy;
+        somatic_step.local_energy_inside += posture_energy;
         if sensors.interaction_actuation.local_pulse > 0.0
             || sensors.interaction_actuation.recoil > 0.0
         {

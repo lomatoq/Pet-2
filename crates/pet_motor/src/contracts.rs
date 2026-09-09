@@ -395,6 +395,7 @@ pub enum MotorCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MotorWorldGoal {
+    PetMore,
     None,
     ReturnHome,
     SleepInDen,
@@ -495,8 +496,23 @@ pub enum ExpectedResponse {
     Attention,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BidStatus {
+    #[default]
+    Waiting,
+    Accepted,
+    TimedOut,
+    Cancelled,
+    Invalidated,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SocialBid {
+    #[serde(default)]
+    pub object_id: Option<u64>,
+    #[serde(default)]
+    pub status: BidStatus,
     pub bid_id: u64,
     pub target: Option<BehaviorTarget>,
     pub expected_response: ExpectedResponse,
@@ -547,6 +563,12 @@ pub struct SurfaceCandidate {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BehaviorContextFrame {
+    #[serde(default)]
+    pub orb_id: Option<u64>,
+    #[serde(default = "default_body_diameter")]
+    pub body_diameter: Vec2,
+    #[serde(default)]
+    pub preferred_touch_side: f32,
     pub frame_id: u64,
     pub timestamp_seconds: f64,
     pub body: BodyFeedbackV2,
@@ -608,6 +630,9 @@ pub struct BehaviorContextFrame {
 impl Default for BehaviorContextFrame {
     fn default() -> Self {
         Self {
+            orb_id: None,
+            body_diameter: default_body_diameter(),
+            preferred_touch_side: 0.0,
             frame_id: 0,
             timestamp_seconds: 0.0,
             body: BodyFeedbackV2::default(),
@@ -967,6 +992,8 @@ pub enum SomaticRegime {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SomaticActuationPacket {
+    #[serde(default)]
+    pub shape: ShapeIntent,
     pub frame_id: u64,
     pub source_bout_id: u64,
     pub program: Option<BehaviorProgramId>,
@@ -987,6 +1014,7 @@ pub struct SomaticActuationPacket {
 impl Default for SomaticActuationPacket {
     fn default() -> Self {
         Self {
+            shape: ShapeIntent::default(),
             frame_id: 0,
             source_bout_id: 0,
             program: None,
@@ -1006,8 +1034,34 @@ impl Default for SomaticActuationPacket {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeMode {
+    #[default]
+    Neutral,
+    Reach,
+    Present,
+    Guard,
+    Settle,
+    Recoil,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShapeIntent {
+    pub mode: ShapeMode,
+    /// Real attention/contact direction in normalized desktop coordinates.
+    pub axis: Vec2,
+    pub strength: f32,
+}
+
 impl SomaticActuationPacket {
     pub fn sanitize(&mut self) {
+        self.shape.strength = unit(self.shape.strength);
+        if !self.shape.axis.is_finite() {
+            self.shape.axis = Vec2::ZERO;
+        }
+        self.shape.axis = self.shape.axis.clamp_length_max(1.0);
         self.locomotion.speed_multiplier =
             finite(self.locomotion.speed_multiplier, 1.0).clamp(0.0, 1.50);
         self.phase_progress = unit(self.phase_progress);
@@ -1160,4 +1214,8 @@ pub(crate) fn finite(value: f32, fallback: f32) -> f32 {
 
 pub(crate) fn finite_vec(value: Vec2) -> Vec2 {
     if value.is_finite() { value } else { Vec2::ZERO }
+}
+
+fn default_body_diameter() -> Vec2 {
+    Vec2::new(0.06, 0.10)
 }

@@ -1,3 +1,4 @@
+mod face_capture;
 use std::{
     collections::{BTreeSet, VecDeque},
     env,
@@ -69,6 +70,14 @@ const BACKGROUNDS: [ReviewBackground; 6] = [
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::args().nth(1).as_deref() == Some("--face-captures") {
+        return face_capture::run(
+            env::args()
+                .nth(2)
+                .unwrap_or_else(|| "face-captures".into())
+                .into(),
+        );
+    }
     let mut live_pet = false;
     let mut data_dir = None;
     let mut promote_report = None;
@@ -472,6 +481,7 @@ struct LabUi {
     emotional_arousal: f32,
     interest: f32,
     preview_emotion: Option<EmotionKind>,
+    canonical_face: Option<lifecore::FacePose>,
     preview_emotion_intensity: f32,
     focus_lock: bool,
     pending_revision: Option<u64>,
@@ -581,7 +591,11 @@ impl ApplicationHandler for BodyLab {
             }
         };
         let store = self.store.clone().or_else(|| StateStore::discover().ok());
-        let mut profile = LiquidTuningProfile::for_seed(self.genome.identity_seed);
+        let mut profile: LiquidTuningProfile = serde_json::from_str(include_str!(
+            "../../../config/embodiment/active-liquid-profile-r11.json"
+        ))
+        .expect("checked production profile");
+        profile.seed = self.genome.identity_seed;
         let mut migrated_material_preview = false;
         if let Some(saved) = store
             .as_ref()
@@ -734,6 +748,7 @@ impl ApplicationHandler for BodyLab {
             emotional_arousal: 0.25,
             interest: 0.45,
             preview_emotion: None,
+            canonical_face: None,
             preview_emotion_intensity: 1.0,
             focus_lock: false,
             pending_revision: None,
@@ -1334,7 +1349,12 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
         fast.apparent_scale = 0.98 + arousal * 0.045 - levels.fatigue * 0.035;
         runtime.ui.profile.nervous.apply(&mut fast);
         expression = fast.expression;
-        body.set_fast_phenotype_actuation(fast);
+        body.set_fast_phenotype_actuation(fast.clone());
+    }
+    if let Some(pose) = runtime.ui.canonical_face {
+        expression = pose.expression();
+        fast.expression = expression;
+        body.set_fast_phenotype_actuation(fast.clone());
     }
     let interaction_target = if runtime.ui.focus_distance < -0.25 {
         Some(InteractionTarget::Cursor)
@@ -2853,6 +2873,7 @@ fn build_lab_control_envelope(
         | LabControlCommand::FocusMode { .. }
         | LabControlCommand::ClearDrivePulses
         | LabControlCommand::RunMotorProgram { .. }
+        | LabControlCommand::SetFacePose { .. }
         | LabControlCommand::CancelMotorProgram
         | LabControlCommand::DeleteGestureConvention { .. }
         | LabControlCommand::RollbackGestureConventions { .. }
@@ -2899,6 +2920,7 @@ fn lab_control_description(command: &LabControlCommand) -> String {
         LabControlCommand::RunMotorProgram { program } => {
             format!("motor fixture {}", program.wire_name())
         }
+        LabControlCommand::SetFacePose { pose } => format!("transient face {pose:?}"),
         LabControlCommand::CancelMotorProgram => "cancel motor fixture".into(),
         LabControlCommand::DeleteGestureConvention { convention_id } => {
             format!("delete gesture convention {convention_id}")
@@ -3610,6 +3632,17 @@ fn live_controlled_intervention(ui: &mut egui::Ui, monitor: &mut LivePetMonitor)
             });
 
             ui.separator();
+            ui.strong("Production face · transient override");
+            ui.horizontal_wrapped(|ui| {
+                for pose in lifecore::FacePose::ALL {
+                    if ui.add_enabled(enabled, egui::Button::new(format!("{pose:?}"))).clicked() {
+                        pending_command = Some(LabControlCommand::SetFacePose { pose: Some(pose) });
+                    }
+                }
+                if ui.add_enabled(enabled, egui::Button::new("Autonomous face")).clicked() {
+                    pending_command = Some(LabControlCommand::SetFacePose { pose: None });
+                }
+            });
             ui.strong(format!(
                 "Motor catalog · {} / {} numerically verified",
                 monitor.motor_validation.passed_program_count,
@@ -4105,6 +4138,15 @@ fn live_motor_and_body(ui: &mut egui::Ui, latest: &Value) {
 }
 
 fn live_drives(ui: &mut egui::Ui, latest: &Value) {
+    egui::CollapsingHeader::new("Production face and shape channels").show(ui, |ui| {
+        if let Some(channels) = latest.pointer("/details/face_channels") {
+            for name in ["owner", "fixture", "source_felt", "desired", "mixed", "smoothed", "renderer_geometry",
+                "renderer_mouth_open", "renderer_blinks", "shape_intent", "geometry_saturated", "cpu_geometry_90_seconds"] {
+                if let Some(value) = channels.get(name) { ui.label(format!("{name}: {value}")); }
+            }
+            ui.small("90% latency is measured at CPU geometry output; image captures validate the GPU endpoint separately.");
+        } else { ui.label("Waiting for matching Pet telemetry."); }
+    });
     ui.heading("Internal drives");
     let overlay_active = boolean(latest, "/details/lab_interventions/overlay_active");
     if overlay_active {
@@ -5873,6 +5915,15 @@ impl LabUi {
                     ui.selectable_value(&mut self.scenario, scenario, scenario_name(scenario));
                 }
             });
+        egui::ComboBox::from_label("Canonical production face")
+            .selected_text(format!("{:?}", self.canonical_face))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.canonical_face, None, "Release fixture");
+                for pose in lifecore::FacePose::ALL {
+                    ui.selectable_value(&mut self.canonical_face, Some(pose), format!("{pose:?}"));
+                }
+            });
+        ui.small("Transient geometry only; use Calm for fixed face or a motion scenario for face + motion. Live Pet is autonomous.");
         egui::ComboBox::from_label("Face emotion")
             .selected_text(emotion_name(self.preview_emotion))
             .show_ui(ui, |ui| {
@@ -6720,6 +6771,7 @@ impl LabUi {
                 );
                 ui.separator();
                 ui.label("Fluid solve and surface");
+                ui.add(Slider::new(&mut p.posture_gain, 0.0..=1.5).text("Semantic posture (0 = rollback)"));
                 ui.add(
                     Slider::new(&mut p.density_compliance, 1.0e-8..=5.0e-4)
                         .logarithmic(true)
@@ -7283,8 +7335,8 @@ impl LabUi {
             {
                 self.pending_revision = None;
                 self.status = format!(
-                    "Applied by Pet · revision {} · build {}",
-                    ack.profile_revision, ack.build_version
+                    "Applied by Pet · revision {} · build {} · profile {:016x}",
+                    ack.profile_revision, ack.build_version, ack.profile_hash
                 );
             }
             Ok(Some(_)) | Ok(None) => {

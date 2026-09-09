@@ -113,6 +113,7 @@ pub enum EpisodeReason {
     TrappedObject,
     FoodOpportunity,
     SharedAttentionCue,
+    PettingContinuation,
     VisualNovelty,
     AutonomousPlay,
     PracticeDue,
@@ -127,6 +128,7 @@ pub enum ExpectedOutcome {
     #[default]
     None,
     UserTouchesObject,
+    UserTouchesPet,
     ObjectMoves,
     ObjectReturnsHome,
     PressureFalls,
@@ -149,6 +151,7 @@ pub struct ActivityEpisode {
     pub commitment_remaining: f32,
     pub attempts: u8,
     pub prediction_confidence: f32,
+    pub contact_side: f32,
     pub expected_outcome: ExpectedOutcome,
 }
 
@@ -240,6 +243,7 @@ pub struct EcologyOutput {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EcologyBehaviorFrame {
+    pub social_contact: SocialContactFrame,
     pub selected_action: ActionId,
     pub pet_position: Vec2,
     pub pet_velocity: Vec2,
@@ -274,6 +278,19 @@ pub struct EcologyBehaviorFrame {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SocialContactFrame {
+    pub touched: bool,
+    pub pleasantness: f32,
+    pub pain: f32,
+    pub fatigue: f32,
+    pub boundary: bool,
+    pub side: f32,
+    /// Diameter in normalized x/y coordinates, measured from the real silhouette.
+    pub diameter: Vec2,
+    pub social_drive: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PhysicalGrabFrame {
     pub contact: bool,
     pub swept_contact: bool,
@@ -299,6 +316,10 @@ pub struct EpisodeDirector {
     visual_episode_cooldown: f32,
     orb_bid_cooldown: f32,
     endogenous_idle_seconds: f32,
+    pleasant_touch_seconds: f32,
+    previous_touch: bool,
+    touch_side: f32,
+    petting_cooldown: f32,
     endogenous_play_cooldown: f32,
 }
 
@@ -310,6 +331,10 @@ impl Default for EpisodeDirector {
             visual_episode_cooldown: 0.0,
             orb_bid_cooldown: 0.0,
             endogenous_idle_seconds: 0.0,
+            pleasant_touch_seconds: 0.0,
+            previous_touch: false,
+            touch_side: 0.0,
+            petting_cooldown: 0.0,
             endogenous_play_cooldown: 0.0,
         }
     }
@@ -332,23 +357,23 @@ impl EpisodeDirector {
     /// Applies a user refusal to the current bid without touching attachment or
     /// any learned social bond. The cooldown is a hard, non-learned constraint.
     pub fn observe_explicit_refusal(&mut self, state: &mut EcologyState, timestamp: f64) -> bool {
-        let Some(_active) = self
-            .active
-            .filter(|episode| episode.goal == EpisodeGoal::OfferOrb)
-        else {
+        let Some(refused) = self.active.filter(|episode| {
+            episode.goal == EpisodeGoal::OfferOrb
+                || episode.phase == EpisodePhase::AskForHelp
+                || episode.reason_code == EpisodeReason::PettingContinuation
+        }) else {
             return false;
         };
         self.active = None;
         self.orb_bid_cooldown = 45.0;
         self.endogenous_play_cooldown = self.endogenous_play_cooldown.max(45.0);
         self.endogenous_idle_seconds = 0.0;
-        state.episode_stats.aborted[EpisodeGoal::OfferOrb.index()] =
-            state.episode_stats.aborted[EpisodeGoal::OfferOrb.index()].saturating_add(1);
-        if let Some(orb) = state
-            .objects
-            .iter_mut()
-            .find(|object| object.kind == ObjectKind::Orb)
-        {
+        state.episode_stats.aborted[refused.goal.index()] =
+            state.episode_stats.aborted[refused.goal.index()].saturating_add(1);
+        self.petting_cooldown = 35.0;
+        if let Some(orb) = state.objects.iter_mut().find(|object| {
+            refused.goal == EpisodeGoal::OfferOrb && Some(object.id) == refused.object_id
+        }) {
             orb.preference = (orb.preference - 0.004).clamp(-1.0, 1.0);
             if timestamp.is_finite() && timestamp >= 0.0 {
                 orb.last_interaction_seconds = timestamp;
@@ -478,6 +503,73 @@ impl EpisodeDirector {
             );
         }
 
+        self.petting_cooldown = (self.petting_cooldown - dt).max(0.0);
+        let contact = frame.social_contact;
+        let pleasant = contact.touched
+            && contact.pleasantness > 0.42
+            && contact.pain < 0.2
+            && contact.fatigue < 0.65
+            && !contact.boundary;
+        if pleasant {
+            self.pleasant_touch_seconds += dt;
+            if contact.side.abs() > 0.01 {
+                self.touch_side = contact.side.signum();
+            }
+        } else if contact.touched {
+            self.pleasant_touch_seconds = 0.0;
+        }
+        let released = self.previous_touch && !contact.touched;
+        self.previous_touch = contact.touched;
+        let request_more = released
+            && self.pleasant_touch_seconds >= 0.35
+            && self.petting_cooldown <= 0.0
+            && self.active.is_none()
+            && !frame.focus_mode
+            && !frame.sleeping
+            && frame.user_available > 0.2
+            && contact.social_drive > frame.autonomy_drive
+            && contact.pain < 0.2
+            && contact.fatigue < 0.65
+            && !contact.boundary;
+        if released {
+            if self.pleasant_touch_seconds >= 0.35 && self.touch_side != 0.0 {
+                let side_index = usize::from(self.touch_side > 0.0);
+                state.successful_touch_sides[side_index] =
+                    state.successful_touch_sides[side_index].saturating_add(1);
+            }
+            self.pleasant_touch_seconds = 0.0;
+        }
+        if request_more {
+            let id = state.episode_stats.next_episode_id;
+            state.episode_stats.next_episode_id = id.saturating_add(1);
+            state.episode_stats.started[EpisodeGoal::SharedAttention.index()] += 1;
+            let offset = frame.cursor_position - frame.pet_position;
+            let diameter = contact.diameter.max(Vec2::splat(0.0001));
+            let in_diameters = offset / diameter;
+            let follow = in_diameters.clamp_length_max(0.35) * diameter;
+            self.active = Some(ActivityEpisode {
+                id,
+                goal: EpisodeGoal::SharedAttention,
+                phase: EpisodePhase::Orient,
+                object_id: None,
+                target_position: Some((frame.pet_position + follow).clamp(Vec2::ZERO, Vec2::ONE)),
+                reason_code: EpisodeReason::PettingContinuation,
+                elapsed_seconds: 0.0,
+                phase_elapsed_seconds: 0.0,
+                commitment_remaining: 7.0,
+                attempts: 0,
+                prediction_confidence: 0.52,
+                contact_side: self.touch_side,
+                expected_outcome: ExpectedOutcome::UserTouchesPet,
+            });
+            self.petting_cooldown =
+                (12.0 + 15.0 * frame.autonomy_drive + 8.0 * (1.0 - frame.user_available))
+                    .clamp(12.0, 35.0);
+            push_outcome(
+                &mut output,
+                EcologyOutcome::EpisodeStarted(EpisodeGoal::SharedAttention),
+            );
+        }
         if self.active.is_none()
             && let Some((goal, reason, object_id)) = select_episode(state, frame)
         {
@@ -497,6 +589,7 @@ impl EpisodeDirector {
                 commitment_remaining: commitment_for(goal),
                 attempts: 0,
                 prediction_confidence: 0.52,
+                contact_side: 0.0,
                 expected_outcome: expected_outcome_for(goal),
             });
             if goal == EpisodeGoal::SoloOrbPlay && reason == EpisodeReason::AutonomousPlay {
@@ -514,7 +607,11 @@ impl EpisodeDirector {
         active.elapsed_seconds += dt;
         active.phase_elapsed_seconds += dt;
         active.commitment_remaining = (active.commitment_remaining - dt).max(0.0);
+        let previous_goal = active.goal;
         let step = drive_episode(state, frame, &mut active, &mut output, dt);
+        if previous_goal == EpisodeGoal::OfferOrb && active.goal != previous_goal {
+            self.orb_bid_cooldown = 20.0;
+        }
         output.debug.active_goal = Some(active.goal);
         output.debug.active_phase = Some(active.phase);
         if output.debug.selected_reason == EpisodeReason::NoEligibleEpisode {
@@ -973,13 +1070,25 @@ fn drive_episode(
             if orb.lifecycle == ObjectLifecycle::GrabbedByUser
                 && active.phase == EpisodePhase::WaitForUser
                 && active.phase_elapsed_seconds > 0.0
+                && active.target_position.is_some_and(|offered| {
+                    desktop_distance(offered, orb.position, frame.desktop_aspect) >= 0.004
+                })
                 && orb.last_interaction_seconds
                     > frame.timestamp - f64::from(active.phase_elapsed_seconds)
             {
-                active.phase = EpisodePhase::Celebrate;
-                output.body_intent.pose = PoseIntent::Display;
-                output.vocal_trigger = Some(EcologyVocalTrigger::ToyOffer);
-                return EpisodeStep::Complete;
+                state.episode_stats.completed[EpisodeGoal::OfferOrb.index()] += 1;
+                push_outcome(
+                    output,
+                    EcologyOutcome::EpisodeCompleted(EpisodeGoal::OfferOrb),
+                );
+                state.episode_stats.started[EpisodeGoal::InterceptOrb.index()] += 1;
+                active.goal = EpisodeGoal::InterceptOrb;
+                active.reason_code = EpisodeReason::UserEngaged;
+                active.elapsed_seconds = 0.0;
+                set_phase(active, EpisodePhase::Orient);
+                active.commitment_remaining = commitment_for(EpisodeGoal::InterceptOrb);
+                output.body_intent.expression = lifecore::FacePose::Playful.expression();
+                return EpisodeStep::Continue;
             }
             match active.phase {
                 EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.28 => {
@@ -989,6 +1098,18 @@ fn drive_episode(
                     set_phase(active, EpisodePhase::Manipulate);
                 }
                 EpisodePhase::Manipulate if active.phase_elapsed_seconds >= 0.35 => {
+                    push_command(
+                        output,
+                        ObjectCommand::Release {
+                            object_id: orb.id,
+                            velocity: Vec2::ZERO,
+                        },
+                    );
+                    active.target_position = Some(orb.position);
+                    set_phase(active, EpisodePhase::Prepare);
+                }
+                EpisodePhase::Prepare if active.phase_elapsed_seconds >= 0.45 => {
+                    active.target_position = Some(orb.position);
                     set_phase(active, EpisodePhase::WaitForUser);
                     output.vocal_trigger = Some(EcologyVocalTrigger::ToyOffer);
                 }
@@ -1013,11 +1134,17 @@ fn drive_episode(
                 output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.42);
             } else if matches!(
                 active.phase,
-                EpisodePhase::Manipulate | EpisodePhase::WaitForUser
+                EpisodePhase::Manipulate | EpisodePhase::Prepare | EpisodePhase::WaitForUser
             ) {
                 let toward_user = (frame.cursor_position - frame.pet_position).normalize_or_zero();
-                let offer_target =
-                    (frame.pet_position + toward_user * 0.045).clamp(Vec2::ZERO, Vec2::ONE);
+                let offer_target = (frame.pet_position
+                    + toward_user
+                        * frame
+                            .social_contact
+                            .diameter
+                            .max(Vec2::new(0.04 / frame.desktop_aspect.max(0.1), 0.04))
+                        * 0.5)
+                    .clamp(Vec2::ZERO, Vec2::ONE);
                 if active.phase == EpisodePhase::Manipulate {
                     push_command(
                         output,
@@ -1028,17 +1155,31 @@ fn drive_episode(
                         },
                     );
                 }
-                output.body_intent.target_position = frame.pet_position;
+                output.body_intent.target_position = if active.phase == EpisodePhase::Prepare {
+                    (orb.position
+                        - toward_user
+                            * frame
+                                .social_contact
+                                .diameter
+                                .max(Vec2::new(0.04 / frame.desktop_aspect.max(0.1), 0.04))
+                            * 0.65)
+                        .clamp(Vec2::ZERO, Vec2::ONE)
+                } else {
+                    frame.pet_position
+                };
                 output.body_intent.locomotion = LocomotionMode::Hover;
-                output.body_intent.desired_speed = 0.0;
-                output.body_intent.gaze_target =
-                    Some(if active.phase_elapsed_seconds % 1.5 < 0.5 {
-                        orb.position
-                    } else if active.phase_elapsed_seconds % 1.5 < 1.0 {
-                        frame.cursor_position
-                    } else {
-                        orb.position
-                    });
+                output.body_intent.desired_speed = if active.phase == EpisodePhase::Prepare {
+                    0.20
+                } else {
+                    0.0
+                };
+                output.body_intent.gaze_target = Some(if active.phase_elapsed_seconds < 0.5 {
+                    orb.position
+                } else if active.phase_elapsed_seconds < 1.0 {
+                    frame.cursor_position
+                } else {
+                    orb.position
+                });
             }
         }
         EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay => {
@@ -1294,6 +1435,10 @@ fn drive_episode(
                     set_phase(active, EpisodePhase::Manipulate);
                 }
                 EpisodePhase::Manipulate => {
+                    if !frame.orb_physical.contact {
+                        set_phase(active, EpisodePhase::Approach);
+                        return EpisodeStep::Continue;
+                    }
                     let direction = if frame.window_escape_direction.length_squared() > 1.0e-6 {
                         frame.window_escape_direction.normalize()
                     } else {
@@ -1322,6 +1467,7 @@ fn drive_episode(
                     if active.attempts < 2 {
                         set_phase(active, EpisodePhase::Manipulate);
                     } else if frame.user_activity > 0.02
+                        && frame.nearest_window_edge.is_some()
                         && active
                             .target_position
                             .is_some_and(|before| before.distance(orb.position) < 0.01)
@@ -1336,7 +1482,10 @@ fn drive_episode(
                     if active.phase_elapsed_seconds >= 3.5 {
                         return EpisodeStep::Abort(EpisodeReason::TimedOut);
                     }
-                    output.body_intent.gaze_target = if active.phase_elapsed_seconds % 0.9 < 0.45 {
+                    output.body_intent.expression = lifecore::FacePose::Confused.expression();
+                    output.body_intent.gaze_target = if active.phase_elapsed_seconds < 0.5 {
+                        frame.nearest_window_edge
+                    } else if active.phase_elapsed_seconds < 1.0 {
                         Some(orb.position)
                     } else {
                         Some(frame.cursor_position)
@@ -1689,6 +1838,62 @@ fn drive_episode(
                 return EpisodeStep::Complete;
             }
         }
+        EpisodeGoal::SharedAttention
+            if active.reason_code == EpisodeReason::PettingContinuation =>
+        {
+            let contact = frame.social_contact;
+            output.body_intent.gaze_target = Some(frame.cursor_position);
+            output.body_intent.expression = lifecore::FacePose::Affectionate.expression();
+            output.body_intent.target_position =
+                active.target_position.unwrap_or(frame.pet_position);
+            output.body_intent.locomotion = LocomotionMode::Arrive;
+            output.body_intent.desired_speed = 0.16;
+            if contact.boundary || contact.pain >= 0.2 {
+                output.body_intent.expression = lifecore::FacePose::Boundary.expression();
+                output.body_intent.target_position = (frame.pet_position
+                    - (frame.cursor_position - frame.pet_position).normalize_or_zero()
+                        * contact.diameter
+                        * 0.3)
+                    .clamp(Vec2::ZERO, Vec2::ONE);
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            }
+            if active.phase == EpisodePhase::Orient && active.phase_elapsed_seconds >= 0.18 {
+                set_phase(active, EpisodePhase::Approach);
+            }
+            if active.phase == EpisodePhase::Approach
+                && (active.phase_elapsed_seconds >= 0.6
+                    || ((output.body_intent.target_position - frame.pet_position)
+                        / contact.diameter.max(Vec2::splat(0.0001)))
+                    .length()
+                        < 0.12)
+            {
+                set_phase(active, EpisodePhase::WaitForUser);
+            }
+            if active.phase == EpisodePhase::WaitForUser {
+                output.body_intent.target_position = frame.pet_position;
+                output.body_intent.desired_speed = 0.0;
+                if contact.touched && contact.pleasantness > 0.42 {
+                    set_phase(active, EpisodePhase::Manipulate);
+                } else if active.phase_elapsed_seconds >= 3.5
+                    || ((frame.cursor_position - frame.pet_position)
+                        / contact.diameter.max(Vec2::splat(0.0001)))
+                    .length()
+                        > 2.5
+                {
+                    return EpisodeStep::Abort(EpisodeReason::TimedOut);
+                }
+            }
+            if active.phase == EpisodePhase::Manipulate {
+                let side = active.contact_side.signum();
+                output.body_intent.target_position = (frame.pet_position
+                    + Vec2::new(side * contact.diameter.x * 0.08, 0.0))
+                .clamp(Vec2::ZERO, Vec2::ONE);
+                output.body_intent.desired_speed = if contact.touched { 0.08 } else { 0.0 };
+                if !contact.touched || active.phase_elapsed_seconds >= 1.5 {
+                    return EpisodeStep::Complete;
+                }
+            }
+        }
         EpisodeGoal::SharedAttention => {
             let Some(target) = frame.visual_target else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
@@ -2038,6 +2243,7 @@ mod tests {
 
     fn behavior_frame(action: ActionId) -> EcologyBehaviorFrame {
         EcologyBehaviorFrame {
+            social_contact: SocialContactFrame::default(),
             selected_action: action,
             pet_position: Vec2::splat(0.5),
             pet_velocity: Vec2::ZERO,
@@ -2091,6 +2297,148 @@ mod tests {
         assert_eq!(
             state.episode_stats.started[EpisodeGoal::OfferOrb.index()],
             1
+        );
+    }
+
+    fn pet_more_fixture() -> (EcologyState, EpisodeDirector, EcologyBehaviorFrame) {
+        let mut state = EcologyState::new(42);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.autonomy_drive = 0.1;
+        frame.play_drive = 0.0;
+        frame.curiosity_drive = 0.0;
+        frame.cursor_position = frame.pet_position + Vec2::new(0.025, 0.0);
+        frame.social_contact = SocialContactFrame {
+            touched: true,
+            pleasantness: 0.8,
+            side: 1.0,
+            diameter: Vec2::new(0.06, 0.10),
+            social_drive: 1.0,
+            ..Default::default()
+        };
+        for _ in 0..10 {
+            frame.timestamp += 0.05;
+            let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        }
+        frame.social_contact.touched = false;
+        frame.timestamp += 0.05;
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(
+            director.active.unwrap().reason_code,
+            EpisodeReason::PettingContinuation
+        );
+        let target = director.active.unwrap().target_position.unwrap();
+        assert!(
+            ((target - frame.pet_position) / frame.social_contact.diameter).length() <= 0.35001
+        );
+        for _ in 0..20 {
+            frame.timestamp += 0.05;
+            let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        }
+        assert_eq!(director.active.unwrap().phase, EpisodePhase::WaitForUser);
+        (state, director, frame)
+    }
+
+    #[test]
+    fn pet_more_acceptance_timeout_and_boundary_have_distinct_outcomes() {
+        for branch in 0..3 {
+            let (mut state, mut director, mut frame) = pet_more_fixture();
+            let before = state.episode_stats.completed[EpisodeGoal::SharedAttention.index()];
+            if branch == 0 {
+                frame.social_contact.touched = true;
+            }
+            if branch == 2 {
+                frame.social_contact.boundary = true;
+            }
+            let mut outcomes = Vec::new();
+            for _ in 0..90 {
+                frame.timestamp += 0.05;
+                let out = director.tick(&mut state, frame, representative_intent(), 0.05);
+                outcomes.extend_from_slice(&out.outcomes[..out.outcome_count]);
+            }
+            if branch == 0 {
+                assert_eq!(
+                    state.episode_stats.completed[EpisodeGoal::SharedAttention.index()],
+                    before + 1
+                );
+            } else {
+                assert_eq!(
+                    state.episode_stats.completed[EpisodeGoal::SharedAttention.index()],
+                    before
+                );
+                let reason = if branch == 1 {
+                    EpisodeReason::TimedOut
+                } else {
+                    EpisodeReason::SafetyAbort
+                };
+                assert!(outcomes.contains(&EcologyOutcome::EpisodeAborted(
+                    EpisodeGoal::SharedAttention,
+                    reason
+                )));
+            }
+            assert_eq!(state.successful_touch_sides, [0, 1]);
+            let loaded: EcologyState =
+                serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            assert_eq!(loaded.successful_touch_sides, [0, 1]);
+        }
+    }
+
+    #[test]
+    fn offer_requires_same_object_motion_and_credits_handoff_once() {
+        let mut state = EcologyState::new(42);
+        let orb = state.objects[0].clone();
+        let mut director = EpisodeDirector {
+            active: Some(ActivityEpisode {
+                id: 9,
+                goal: EpisodeGoal::OfferOrb,
+                phase: EpisodePhase::WaitForUser,
+                object_id: Some(orb.id),
+                target_position: Some(orb.position),
+                reason_code: EpisodeReason::BrainRequestedOrb,
+                elapsed_seconds: 1.0,
+                phase_elapsed_seconds: 0.0,
+                commitment_remaining: 4.0,
+                attempts: 0,
+                prediction_confidence: 0.6,
+                contact_side: 0.0,
+                expected_outcome: ExpectedOutcome::UserTouchesObject,
+            }),
+            ..EpisodeDirector::default()
+        };
+        let mut frame = behavior_frame(ActionId::BringProceduralOrb);
+        frame.timestamp = 10.0;
+        frame.cursor_position = Vec2::new(0.9, 0.1);
+        let unrelated = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(
+            unrelated.debug.active_phase,
+            Some(EpisodePhase::WaitForUser)
+        );
+        state.objects[0].lifecycle = ObjectLifecycle::GrabbedByUser;
+        state.objects[0].last_interaction_seconds = 10.1;
+        frame.timestamp = 10.1;
+        let pressed = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(pressed.debug.active_phase, Some(EpisodePhase::WaitForUser));
+        state.objects[0].position.x += 0.02;
+        state.objects[0].last_interaction_seconds = 10.15;
+        frame.timestamp = 10.15;
+        let accepted = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(accepted.debug.active_goal, Some(EpisodeGoal::InterceptOrb));
+        assert_eq!(
+            state.episode_stats.completed[EpisodeGoal::OfferOrb.index()],
+            1
+        );
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(
+            state.episode_stats.completed[EpisodeGoal::OfferOrb.index()],
+            1
+        );
+        state.objects.clear();
+        let lost = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert!(
+            lost.outcomes[..lost.outcome_count].contains(&EcologyOutcome::EpisodeAborted(
+                EpisodeGoal::InterceptOrb,
+                EpisodeReason::SafetyAbort
+            ))
         );
     }
 
@@ -2241,12 +2589,17 @@ mod tests {
                 commitment_remaining: 3.0,
                 attempts: 0,
                 prediction_confidence: 0.5,
+                contact_side: 0.0,
                 expected_outcome: ExpectedOutcome::ObjectReturnsHome,
             }),
             tick: 0,
             visual_episode_cooldown: 0.0,
             orb_bid_cooldown: 0.0,
             endogenous_idle_seconds: 0.0,
+            pleasant_touch_seconds: 0.0,
+            previous_touch: false,
+            touch_side: 0.0,
+            petting_cooldown: 0.0,
             endogenous_play_cooldown: 0.0,
         };
         state.objects[0].position = state.den.anchor;
@@ -2394,6 +2747,7 @@ mod tests {
         let orb_position = state.objects[0].position;
         let mut frame = behavior_frame(ActionId::IdleHover);
         frame.orb_trapped = true;
+        frame.nearest_window_edge = Some(Vec2::new(0.55, 0.5));
         frame.pet_position = orb_position;
         frame.orb_physical = PhysicalGrabFrame {
             contact: true,

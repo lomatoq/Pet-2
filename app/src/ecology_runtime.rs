@@ -164,6 +164,7 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
 }
 
 pub(crate) struct EcologyResolveFrame<'a> {
+    pub social_contact: pet_ecology::SocialContactFrame,
     pub selected_action: ActionId,
     pub drives: Drives,
     pub sensors: &'a SensorFrame,
@@ -239,6 +240,7 @@ impl EcologyRuntime {
         frame: EcologyResolveFrame<'_>,
     ) -> EcologyOutput {
         let EcologyResolveFrame {
+            social_contact,
             selected_action,
             drives,
             sensors,
@@ -248,6 +250,7 @@ impl EcologyRuntime {
             orb_physical,
         } = frame;
         let frame = EcologyBehaviorFrame {
+            social_contact,
             selected_action,
             pet_position: body.world_position,
             pet_velocity: body.velocity,
@@ -819,6 +822,21 @@ impl EcologyRuntime {
             .copied()
             .take(output.object_command_count)
         {
+            let commanded_object = match command {
+                ObjectCommand::ApplyImpulse { object_id, .. }
+                | ObjectCommand::MoveToward { object_id, .. }
+                | ObjectCommand::Release { object_id, .. }
+                | ObjectCommand::Store { object_id, .. } => Some(object_id),
+                _ => None,
+            };
+            if commanded_object.is_some_and(|id| {
+                self.state
+                    .objects
+                    .iter()
+                    .any(|o| o.id == id && o.lifecycle == ObjectLifecycle::GrabbedByUser)
+            }) {
+                continue;
+            }
             match command {
                 ObjectCommand::None => {}
                 ObjectCommand::ApplyImpulse { object_id, impulse } => {
@@ -1424,6 +1442,7 @@ mod tests {
         let _ = runtime.resolve_intent(
             intent,
             EcologyResolveFrame {
+                social_contact: Default::default(),
                 selected_action: ActionId::BringProceduralOrb,
                 drives: Drives::initial(&lifecore::Genome::from_seed(78).temperament),
                 sensors: &sensors,

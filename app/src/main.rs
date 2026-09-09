@@ -1201,6 +1201,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         let ecology_output = ecology.resolve_intent(
             output.body_intent,
             EcologyResolveFrame {
+                social_contact: Default::default(),
                 selected_action: output.selected_action,
                 drives: life.state.drives,
                 sensors: &sensors,
@@ -1866,6 +1867,7 @@ struct PetRuntime {
     background_timings: TimingWindow,
     pending_gesture_convention: Option<PendingGestureConvention>,
     lab_pointer_fixture: Option<LabPointerFixture>,
+    lab_face_pose: Option<lifecore::FacePose>,
     last_convention_update_episode: u64,
     shutdown_for_promotion: bool,
     runtime_ack_accumulator: f32,
@@ -2057,6 +2059,7 @@ fn apply_lab_pointer_fixture(runtime: &mut PetRuntime, dt: f32) {
     }
     if sample.finished {
         runtime.lab_pointer_fixture = None;
+        runtime.lab_face_pose = None;
     }
 }
 
@@ -2116,6 +2119,7 @@ impl PetApplication {
         }
         if runtime.lab_session.expire(now) {
             runtime.lab_pointer_fixture = None;
+            runtime.lab_face_pose = None;
             runtime.lab_motor_program = None;
             runtime.lab_motor_restart = false;
             runtime.motor.cancel_lab_fixture();
@@ -2733,6 +2737,22 @@ impl PetApplication {
             let ecology_output = runtime.ecology.resolve_intent(
                 output.body_intent,
                 EcologyResolveFrame {
+                    social_contact: pet_ecology::SocialContactFrame {
+                        touched: runtime.sensors.pet_touched,
+                        pleasantness: runtime.nervous_system.snapshot().felt.contact_pleasantness,
+                        pain: runtime.nervous_system.snapshot().felt.pain_like,
+                        fatigue: runtime.nervous_system.snapshot().derived.fatigue,
+                        boundary: runtime.sensors.interaction_actuation.resistance > 0.5,
+                        side: (runtime.sensors.cursor_position.x
+                            - runtime.body.simulation.feedback.world_position.x)
+                            .signum(),
+                        diameter: runtime.screen_collision_half_extent_px * 2.0
+                            / Vec2::new(
+                                runtime.topology.virtual_physical_bounds.width().max(1) as f32,
+                                runtime.topology.virtual_physical_bounds.height().max(1) as f32,
+                            ),
+                        social_drive: runtime.life.state.drives.social,
+                    },
                     selected_action: output.selected_action,
                     drives: runtime.life.state.drives,
                     sensors: &runtime.sensors,
@@ -2776,22 +2796,7 @@ impl PetApplication {
                     .nervous_system
                     .observe_repeated_motor_failure(episode.id, episode.attempts);
             }
-            if ecology_output.outcomes[..ecology_output.outcome_count]
-                .iter()
-                .any(|o| {
-                    matches!(
-                        o,
-                        EcologyOutcome::EpisodeCompleted(
-                            EpisodeGoal::ChaseOrb
-                                | EpisodeGoal::InterceptOrb
-                                | EpisodeGoal::SoloOrbPlay
-                                | EpisodeGoal::OfferOrb
-                        )
-                    )
-                })
-            {
-                runtime.motor.note_play_success();
-            }
+
             if ecology_output.outcomes[..ecology_output.outcome_count]
                 .iter()
                 .any(|o| matches!(o, EcologyOutcome::MorselConsumed(_)))
@@ -2904,6 +2909,27 @@ impl PetApplication {
             // it cannot touch identity, solver cadence/counts, learning rates,
             // topology limits, or the genome loudness ceiling.
             nervous_calibration.apply(&mut phenotype);
+            if let Some(episode) = runtime.ecology.active_episode() {
+                let pose = if episode.reason_code == pet_ecology::EpisodeReason::PettingContinuation
+                {
+                    Some(lifecore::FacePose::Affectionate)
+                } else if episode.phase == EpisodePhase::AskForHelp {
+                    Some(lifecore::FacePose::Confused)
+                } else if episode.goal == EpisodeGoal::OfferOrb
+                    && episode.phase == EpisodePhase::WaitForUser
+                {
+                    Some(lifecore::FacePose::Playful)
+                } else {
+                    None
+                };
+                if let Some(pose) = pose.filter(|_| {
+                    runtime.nervous_system.snapshot().felt.pain_like < 0.2
+                        && runtime.nervous_system.snapshot().felt.restraint < 0.18
+                        && runtime.nervous_system.snapshot().felt.startle < 0.35
+                }) {
+                    phenotype.expression = pose.expression();
+                }
+            }
             phenotype.apply_to_intent(
                 &mut output.body_intent,
                 &runtime.sensors,
@@ -2918,6 +2944,11 @@ impl PetApplication {
                 &mut output.body_intent,
             );
             keep_eyes_available_during_active_locomotion(&mut output.body_intent);
+            if let Some(pose) = runtime.lab_face_pose {
+                output.body_intent.expression = pose.expression();
+                phenotype.expression = output.body_intent.expression;
+            }
+
             // The nervous action blend can move the semantic target after the
             // ecology projection, so enforce the monitor-union invariant once
             // more at the final intent boundary.
@@ -3128,6 +3159,21 @@ impl PetApplication {
                     "material_variant": format!("{:?}", runtime.body.tuning_profile().material.variant),
                     "liquid_profile_name": runtime.body.tuning_profile().name.as_str(),
                     "liquid_profile_revision": runtime.body.tuning_profile().profile_revision,
+                    "face_channels": {
+                        "owner": if runtime.lab_face_pose.is_some() { "lab_transient" } else { "phenotype_director" },
+                        "fixture": runtime.lab_face_pose,
+                        "source_felt": runtime.nervous_system.snapshot().felt,
+                        "shape_intent": runtime.last_motor_packet.shape,
+                        "geometry_saturated": runtime.body.expression.geometry_saturated,
+                        "cpu_geometry_90_seconds": runtime.body.expression.geometry_90_seconds,
+                        "target_age_seconds": runtime.body.expression.geometry_age_seconds,
+                        "desired": runtime.body.fast_phenotype_actuation().expression,
+                        "mixed": runtime.intent.expression,
+                        "smoothed": runtime.body.expression.current,
+                        "renderer_geometry": runtime.body.embodiment.pose.geometry,
+                        "renderer_mouth_open": runtime.body.embodiment.pose.mouth_open,
+                        "renderer_blinks": [runtime.body.embodiment.pose.blink_left, runtime.body.embodiment.pose.blink_right],
+                    },
                     "world_position": runtime.body.simulation.feedback.world_position.to_array(),
                     "target_position": runtime.intent.target_position.to_array(),
                     "velocity": runtime.body.simulation.feedback.velocity.to_array(),
@@ -3731,6 +3777,7 @@ impl ApplicationHandler for PetApplication {
             background_timings: TimingWindow::default(),
             pending_gesture_convention: None,
             lab_pointer_fixture: None,
+            lab_face_pose: None,
             last_convention_update_episode: 0,
             shutdown_for_promotion: false,
             runtime_ack_accumulator: 1.0,
@@ -4397,6 +4444,7 @@ fn poll_lab_control(
             let closed = runtime.lab_session.close(token, monotonic_now);
             if closed {
                 runtime.lab_pointer_fixture = None;
+                runtime.lab_face_pose = None;
                 runtime.lab_motor_program = None;
                 runtime.lab_motor_restart = false;
                 runtime.motor.cancel_lab_fixture();
@@ -4474,6 +4522,14 @@ fn poll_lab_control(
                 false
             }
         }
+        LabControlCommand::SetFacePose { pose } => {
+            if session_authorized {
+                runtime.lab_face_pose = pose;
+                true
+            } else {
+                false
+            }
+        }
         LabControlCommand::CancelMotorProgram => {
             let changed = runtime.lab_motor_program.take().is_some();
             runtime.lab_motor_restart = false;
@@ -4530,6 +4586,7 @@ const fn lab_command_name(command: &LabControlCommand) -> &'static str {
         LabControlCommand::ClearDrivePulses => "clear_drive_pulses",
         LabControlCommand::StimulatePointerGesture { .. } => "stimulate_pointer_gesture",
         LabControlCommand::RunMotorProgram { .. } => "run_motor_program",
+        LabControlCommand::SetFacePose { .. } => "set_face_pose",
         LabControlCommand::CancelMotorProgram => "cancel_motor_program",
         LabControlCommand::DeleteGestureConvention { .. } => "delete_gesture_convention",
         LabControlCommand::RollbackGestureConventions { .. } => "rollback_gesture_conventions",
@@ -4980,7 +5037,15 @@ fn build_motor_context(runtime: &mut PetRuntime) -> BehaviorContextFrame {
         (liquid_bounds.main_maximum.y.max(1.0) / desktop_height).clamp(0.012, 0.25);
     let gesture = runtime.vita.latest_embodied_gesture();
     let snapshot = runtime.nervous_system.snapshot();
-    let world_goal = motor_world_goal(runtime.ecology.active_episode().map(|episode| episode.goal));
+    let world_goal = if runtime
+        .ecology
+        .active_episode()
+        .is_some_and(|e| e.reason_code == pet_ecology::EpisodeReason::PettingContinuation)
+    {
+        MotorWorldGoal::PetMore
+    } else {
+        motor_world_goal(runtime.ecology.active_episode().map(|episode| episode.goal))
+    };
     let world_event = runtime
         .ecology
         .take_den_event()
@@ -5084,6 +5149,19 @@ fn build_motor_context(runtime: &mut PetRuntime) -> BehaviorContextFrame {
             .active_episode()
             .is_some_and(|e| e.phase == EpisodePhase::AskForHelp),
         orb_position: orb.map(|object| object.position),
+        orb_id: orb.map(|object| object.id),
+        preferred_touch_side: match state.successful_touch_sides[1]
+            .cmp(&state.successful_touch_sides[0])
+        {
+            std::cmp::Ordering::Greater => 1.0,
+            std::cmp::Ordering::Less => -1.0,
+            std::cmp::Ordering::Equal => 0.0,
+        },
+        body_diameter: runtime.screen_collision_half_extent_px * 2.0
+            / Vec2::new(
+                runtime.topology.virtual_physical_bounds.width().max(1) as f32,
+                runtime.topology.virtual_physical_bounds.height().max(1) as f32,
+            ),
         orb_stored: orb.is_some_and(|object| object.lifecycle == ObjectLifecycle::StoredInDen),
         world_goal,
         world_event,
@@ -5752,6 +5830,9 @@ fn load_migrate_apply_liquid_tuning(
     }
     store
         .save_liquid_tuning_status(&LiquidTuningAcknowledgement {
+            profile_hash: lifecore::stable_hash_bytes(
+                &serde_json::to_vec(&applied).map_err(|e| e.to_string())?,
+            ),
             profile_revision: applied.profile_revision,
             schema_version: applied.schema_version,
             material_variant: applied.material.variant,
@@ -5832,6 +5913,16 @@ fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningPro
         profile.nervous.expression_gain = 1.40;
         profile.nervous.motion_gain = 1.30;
     }
+    if profile.face.scale == [0.96, 1.02] {
+        profile.face.scale = [1.104, 1.173];
+        profile.profile_revision = profile.profile_revision.saturating_add(1);
+    }
+    if profile.material.rim_strength == 4.0 && profile.material.halo == 0.09 {
+        profile.material.rim_strength = 2.0;
+        profile.material.halo = 0.045;
+        profile.material.narrow_rim_strength = 1.6;
+        profile.material.broad_rim_strength = 0.35;
+    }
     let reference = approved_production_liquid_tuning(profile.seed);
     let stale_body = profile.render_mode != BodyRenderMode::ParticlePbf;
     let stale_material = profile.material.variant != MaterialVariant::CinematicJelly;
@@ -5888,7 +5979,7 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.translucency = 0.84;
     profile.material.refraction = 2.4;
     profile.material.blur = 2.8;
-    profile.material.rim_strength = 4.0;
+    profile.material.rim_strength = 2.0;
     profile.material.rim_power = 5.5;
     profile.material.broad_specular = 0.25;
     profile.material.broad_specular_power = 11.0;
@@ -5905,7 +5996,7 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.direct_scatter = 0.55;
     profile.material.transmission_hue_preservation = 0.25;
     profile.material.internal_flow = 0.12;
-    profile.material.halo = 0.09;
+    profile.material.halo = 0.045;
     profile.material.opacity = 0.6;
     profile.material.cinematic_smoothing = 0.07;
     profile.material.internal_orb_count = 6;
@@ -5918,8 +6009,8 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.studio_intensity = 1.5;
     profile.material.studio_base_roughness = 0.62;
     profile.material.studio_coat_roughness = 0.21;
-    profile.material.narrow_rim_strength = 3.0;
-    profile.material.broad_rim_strength = 0.62;
+    profile.material.narrow_rim_strength = 1.6;
+    profile.material.broad_rim_strength = 0.35;
     profile.material.rim_saturation = 1.15;
     profile.material.edge_light_width = 23.0;
     profile.material.caustic_strength = 0.55;
@@ -5937,7 +6028,7 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.bloom_strength = 0.05;
 
     profile.face.origin = [0.0, -0.03];
-    profile.face.scale = [0.96, 1.02];
+    profile.face.scale = [1.104, 1.173];
     profile.face.eye_size_scale = 0.55;
     profile.face.eye_spacing_scale = 1.0;
     profile.face.pupil_scale = 1.5;

@@ -109,6 +109,9 @@ pub enum LabControlCommand {
         program: BehaviorProgramId,
     },
     CancelMotorProgram,
+    SetFacePose {
+        pose: Option<lifecore::FacePose>,
+    },
     DeleteGestureConvention {
         convention_id: u64,
     },
@@ -200,6 +203,7 @@ impl LabControlCommand {
             | Self::FocusMode { .. }
             | Self::ClearDrivePulses
             | Self::RunMotorProgram { .. }
+            | Self::SetFacePose { .. }
             | Self::CancelMotorProgram
             | Self::DeleteGestureConvention { .. }
             | Self::RollbackGestureConventions { .. }

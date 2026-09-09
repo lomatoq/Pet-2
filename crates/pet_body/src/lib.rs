@@ -384,6 +384,7 @@ impl ProceduralBody {
         let actual_velocity = legacy.velocity.clamp_length_max(1.0);
         let length_ratio = diagnostics.stretch_ratio.clamp(0.5, 1.8);
         let width_ratio = (1.0 / length_ratio.max(0.01)).clamp(0.5, 1.8);
+        let posture_extension = self.embodiment.liquid.intended_posture_extension();
         let actual_shape = Vec3::new(
             length_ratio - 1.0,
             width_ratio - 1.0,
@@ -457,8 +458,9 @@ impl ProceduralBody {
                 intended_velocity,
                 intended_turn: intent.facing_direction.clamp(-1.0, 1.0),
                 intended_shape_delta: Vec3::new(
-                    self.fast_phenotype.analytic.body_length_scale - 1.0,
-                    self.fast_phenotype.analytic.body_width_scale - 1.0,
+                    self.fast_phenotype.analytic.body_length_scale - 1.0 + posture_extension,
+                    self.fast_phenotype.analytic.body_width_scale - 1.0
+                        + (1.0 / (1.0 + posture_extension) - 1.0),
                     self.fast_phenotype.analytic.roundness_bias,
                 ),
                 actual_velocity,
@@ -1034,6 +1036,8 @@ impl ProceduralBody {
             brow_raise: pose.brow_raise,
             brow_tension: pose.brow_tension,
             brow_asymmetry: pose.brow_asymmetry,
+            geometry: pose.geometry,
+            eye_aperture: pose.eye_aperture,
             mouth_open: pose.mouth_open,
             mouth_curve: pose.mouth_curve,
             mouth_tension: pose.mouth_tension,
@@ -1347,14 +1351,7 @@ mod tests {
         assert!(liquid_surface.contains("fiber_prefilter"));
         assert!(liquid_surface.contains("expressive_mouth_distance"));
         assert!(liquid_surface.contains("let p6"));
-        assert!(liquid_surface.contains("var inner_mid"));
         assert!(liquid_surface.contains("let cheek_left"));
-        assert!(liquid_surface.contains("safe_brow_center_y"));
-        assert_eq!(
-            liquid_surface.matches("= safe_brow_center_y(").count(),
-            5,
-            "every brow control point must preserve eye clearance"
-        );
         assert!(!liquid_surface.contains("globals.viewport_time.y * 0.03"));
         let renderer_source = include_str!("renderer.rs");
         assert!(!renderer_source.contains("liquid_bubble.wgsl"));

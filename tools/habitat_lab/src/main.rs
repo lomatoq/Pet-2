@@ -286,6 +286,7 @@ impl Lab {
             interaction_target: None,
         };
         let frame = EcologyBehaviorFrame {
+            social_contact: Default::default(),
             selected_action: self.selected_action,
             pet_position: self.pet_position,
             pet_velocity: self.pet_velocity,
@@ -421,6 +422,21 @@ impl Lab {
             .copied()
             .take(output.object_command_count)
         {
+            let commanded_object = match command {
+                ObjectCommand::ApplyImpulse { object_id, .. }
+                | ObjectCommand::MoveToward { object_id, .. }
+                | ObjectCommand::Release { object_id, .. }
+                | ObjectCommand::Store { object_id, .. } => Some(object_id),
+                _ => None,
+            };
+            if commanded_object.is_some_and(|id| {
+                self.state
+                    .objects
+                    .iter()
+                    .any(|o| o.id == id && o.lifecycle == ObjectLifecycle::GrabbedByUser)
+            }) {
+                continue;
+            }
             match command {
                 ObjectCommand::None => {}
                 ObjectCommand::ApplyImpulse { object_id, impulse } => {
@@ -675,6 +691,7 @@ fn setup_scenario(lab: &mut Lab, scenario: &str) -> Result<(), Box<dyn Error>> {
             orb.velocity = Vec2::ZERO;
             orb.lifecycle = ObjectLifecycle::Free;
             lab.orb_trapped = true;
+            lab.nearest_window_edge = Some(lab.orb().position);
             lab.user_activity = 0.55;
             lab.window_escape_direction = Vec2::X;
         }
@@ -840,7 +857,11 @@ fn scripted_offer_play(lab: &mut Lab, tick: u64) {
         }
     } else if lab.active() == Some((EpisodeGoal::OfferOrb, EpisodePhase::WaitForUser)) {
         let cursor = lab.cursor;
+        let object_id = lab.orb().id;
+        lab.clear_den_slot_references(object_id);
+        let timestamp = lab.timestamp;
         let orb = lab.orb_mut();
+        orb.last_interaction_seconds = timestamp;
         orb.lifecycle = ObjectLifecycle::GrabbedByUser;
         orb.position = cursor;
         orb.velocity = Vec2::ZERO;
@@ -866,6 +887,7 @@ fn scripted_habitat_story(lab: &mut Lab, tick: u64) -> Result<(), Box<dyn Error>
         orb.velocity = Vec2::ZERO;
         orb.lifecycle = ObjectLifecycle::Free;
         lab.orb_trapped = true;
+        lab.nearest_window_edge = Some(lab.orb().position);
         lab.window_escape_direction = Vec2::new(-1.0, 0.0);
         lab.flags.trap_started = true;
     }
