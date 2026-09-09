@@ -3,6 +3,7 @@
 mod body_bridge;
 mod body_resonance;
 mod breath;
+mod endpoint_watcher;
 mod engine;
 mod filter;
 mod glottis;
@@ -17,6 +18,7 @@ mod visual_feedback;
 mod voice_diagnostics;
 
 pub use body_bridge::*;
+pub use endpoint_watcher::*;
 pub use engine::*;
 pub use motif::*;
 pub use mutation::*;

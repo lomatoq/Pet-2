@@ -14,8 +14,15 @@ use lifecore::{
 use morph_brain::{MorphBrain, nervous_system_frame};
 use pet_audio::{AudioCallbackLevels, AudioVisualFeedback};
 use pet_body::{NervousReadabilityTuning, ProceduralBody};
+use pet_motor::{SomaticActuationBus, SomaticActuationPacket};
 
 use crate::vita_runtime::VitaRuntime;
+
+pub struct MotorActuationFrame<'a> {
+    pub packet: &'a SomaticActuationPacket,
+    pub context: &'a pet_motor::BehaviorContextFrame,
+    pub scene_pose: Option<lifecore::FacePose>,
+}
 
 #[derive(Debug, Clone)]
 pub struct NervousSystemRuntime {
@@ -34,6 +41,10 @@ pub struct NervousSystemRuntime {
     consumed_body_frame: u64,
     body_time: f64,
     executed_locomotion: lifecore::LocomotionMode,
+    last_failed_attempt: Option<(u64, u8)>,
+    motor_outcome: EpisodeContextV1,
+    offline_motor: Option<pet_motor::BehaviorPerformanceRuntime>,
+    rendered_response_id: Option<u64>,
 }
 
 impl Default for NervousSystemRuntime {
@@ -54,6 +65,10 @@ impl Default for NervousSystemRuntime {
             consumed_body_frame: 0,
             body_time: 0.0,
             executed_locomotion: lifecore::LocomotionMode::Hover,
+            last_failed_attempt: None,
+            motor_outcome: EpisodeContextV1::default(),
+            offline_motor: None,
+            rendered_response_id: None,
         }
     }
 }
@@ -122,8 +137,6 @@ impl NervousSystemRuntime {
             EmbodiedGestureKind::SoftTouch
                 | EmbodiedGestureKind::Tickle
                 | EmbodiedGestureKind::RhythmicTouch
-                | EmbodiedGestureKind::SharedPlayInvitation
-                | EmbodiedGestureKind::FragmentHelp
         );
         self.gesture = GestureFrameV1 {
             episode_id: classification.episode_id,
@@ -149,7 +162,7 @@ impl NervousSystemRuntime {
             episode_id: classification.episode_id,
             open: !classification.ended,
             closed: classification.ended,
-            reward_positive: if positive_social {
+            reward_positive: if positive_social && classification.ended {
                 classification.confidence * (1.0 - boundary_violation)
             } else {
                 0.0
@@ -159,7 +172,7 @@ impl NervousSystemRuntime {
             successful_play: 0.0,
             goal_congruent_motor_success: 0.0,
             rhythmic_synchrony: self.gesture.rhythm_strength,
-            safe_social_exchange: if positive_social {
+            safe_social_exchange: if positive_social && classification.ended {
                 classification.confidence * (1.0 - boundary_violation)
             } else {
                 0.0
@@ -213,6 +226,76 @@ impl NervousSystemRuntime {
         intent: &mut BodyIntent,
         dt: f32,
     ) {
+        self.apply_offline_actuation(life, vita, morph, body, sensors, intent, None, dt);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_offline_actuation(
+        &mut self,
+        life: &mut LifeCore,
+        vita: &VitaRuntime,
+        morph: &MorphBrain,
+        body: &mut ProceduralBody,
+        sensors: &mut SensorFrame,
+        intent: &mut BodyIntent,
+        ecology: Option<&mut crate::EcologyRuntime>,
+        dt: f32,
+    ) {
+        let pose = ecology
+            .as_ref()
+            .and_then(|e| crate::motor_scene_pose(e.active_episode()));
+        let context =
+            crate::motor_context::from_frames(self, vita, body, life, sensors, intent, ecology);
+        let goal = lifecore::BehaviorGoalFrame {
+            action: life.state.current_action,
+            body_intent: intent.clone(),
+            affect: life.state.affect,
+            drives: life.state.drives,
+            felt: self.snapshot.felt,
+            derived: self.snapshot.derived,
+            attachment: life.state.affect.attachment,
+            recent_outcome: None,
+        };
+        let packet = self
+            .offline_motor
+            .get_or_insert_with(|| {
+                pet_motor::BehaviorPerformanceRuntime::new(life.state.genome.identity_seed)
+            })
+            .tick(&goal, &context, dt);
+        self.set_attention(
+            packet.expression.gaze_target.or(intent.gaze_target),
+            lifecore::AttentionTargetKind::ObjectGoal,
+            context.orb_id,
+            1.0,
+        );
+        self.apply_motor_actuation(
+            life,
+            vita,
+            morph,
+            body,
+            sensors,
+            intent,
+            Some(MotorActuationFrame {
+                packet: &packet,
+                context: &context,
+                scene_pose: pose,
+            }),
+            dt,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_motor_actuation(
+        &mut self,
+        life: &mut LifeCore,
+        vita: &VitaRuntime,
+        morph: &MorphBrain,
+        body: &mut ProceduralBody,
+        sensors: &mut SensorFrame,
+        intent: &mut BodyIntent,
+        motor: Option<MotorActuationFrame<'_>>,
+        dt: f32,
+    ) {
         let tuning = body.tuning_profile();
         let calibration = tuning.nervous.for_live_runtime();
         let mut phenotype = self.resolve_actuation(
@@ -220,16 +303,50 @@ impl NervousSystemRuntime {
             vita,
             morph,
             vita.interaction_actuation(),
+            motor
+                .as_ref()
+                .map_or(&SomaticActuationPacket::default(), |m| m.packet),
             tuning.interaction.soft_touch_pressure_max,
             calibration,
             dt,
         );
+        let protective = motor.as_ref().is_some_and(|m| {
+            m.packet.regime.primary == pet_motor::SomaticRegime::Threatened
+                || m.packet
+                    .program
+                    .is_some_and(|p| p.family() == pet_motor::ProgramFamily::DefenseIntegrity)
+        });
         calibration.apply(&mut phenotype);
+        if let Some(motor) = &motor
+            && let Some(pose) = motor.scene_pose
+            && self.snapshot.felt.pain_like < 0.2
+            && self.snapshot.felt.restraint < 0.18
+            && self.snapshot.felt.startle < 0.35
+            && !life.state.focus_mode
+            && !protective
+        {
+            phenotype.expression = pose.expression();
+        }
         phenotype.apply_to_intent(intent, sensors, body.simulation.feedback.world_position);
+        if let Some(motor) = motor {
+            SomaticActuationBus::apply_to_intent(motor.packet, motor.context, intent);
+            body.set_somatic_actuation(motor.packet.clone());
+        }
         life.learning
             .body
             .adapt_intent(intent, body.simulation.feedback.cursor_contact);
-        vita.apply_interaction_expression(intent, sensors, &body.simulation.feedback);
+        if !protective {
+            vita.apply_interaction_expression(intent, sensors, &body.simulation.feedback);
+        }
+        self.rendered_response_id = vita
+            .active_interaction_plan()
+            .filter(|plan| {
+                !protective
+                    && !life.state.focus_mode
+                    && vita.interaction_turn().state == lifecore::InteractionTurnState::Responding
+                    && vita.interaction_turn().elapsed_seconds >= plan.onset_seconds
+            })
+            .map(|plan| plan.response_id);
         phenotype.expression = intent.expression;
         phenotype.face.gaze_target = intent.gaze_target;
         sensors.interaction_actuation = phenotype.interaction;
@@ -239,12 +356,15 @@ impl NervousSystemRuntime {
 
     /// Called after the platform's final target/velocity constraints.
     pub fn commit_intent(
-        &self,
+        &mut self,
         life: &mut LifeCore,
-        body: &ProceduralBody,
+        body: &mut ProceduralBody,
         sensors: &SensorFrame,
         intent: &BodyIntent,
     ) {
+        self.actuation.expression = intent.expression;
+        self.actuation.face.gaze_target = intent.gaze_target;
+        body.set_fast_phenotype_actuation(self.actuation.clone());
         let command = body.simulation.preview_motor_velocity(
             &life.state.genome.body,
             intent,
@@ -254,6 +374,46 @@ impl NervousSystemRuntime {
         life.learning
             .body
             .begin(self.body_feedback, command, self.body_time);
+    }
+
+    /// Called after two measured failed impulses against the same object goal.
+    pub fn observe_repeated_motor_failure(&mut self, goal_id: u64, attempts: u8) {
+        if attempts >= 2 && self.last_failed_attempt != Some((goal_id, attempts)) {
+            self.last_failed_attempt = Some((goal_id, attempts));
+            self.motor_outcome.repeated_intentional_failure = 0.5;
+        }
+    }
+
+    pub fn observe_outcomes(&mut self, outcomes: &[pet_ecology::EcologyOutcome]) {
+        for outcome in outcomes {
+            // Generic completion can mean only a timeout or a queued command.
+            // OfferOrb is completed by same-object user displacement; contact is measured.
+            match outcome {
+                pet_ecology::EcologyOutcome::EpisodeCompleted(
+                    pet_ecology::EpisodeGoal::OfferOrb,
+                ) => {
+                    self.motor_outcome.successful_play = 1.0;
+                    self.motor_outcome.goal_congruent_motor_success = 1.0;
+                }
+                pet_ecology::EcologyOutcome::ObjectContact(_) => {
+                    self.motor_outcome.goal_congruent_motor_success = 1.0;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn set_attention(
+        &mut self,
+        position: Option<glam::Vec2>,
+        kind: lifecore::AttentionTargetKind,
+        id: Option<u64>,
+        confidence: f32,
+    ) {
+        self.perception.attention_target_position = position.filter(|p| p.is_finite());
+        self.perception.attention_target_kind = kind;
+        self.perception.attention_target_id = id;
+        self.perception.attention_confidence = confidence.clamp(0.0, 1.0);
     }
 
     pub fn set_selected_salience(&mut self, salience: f32) {
@@ -298,16 +458,22 @@ impl NervousSystemRuntime {
             morph_brain::MorphCommand::Idle
         };
         morph.acknowledge_execution(command);
-        if let Some(plan) = vita.active_interaction_plan()
-            && vita.interaction_turn().elapsed_seconds >= plan.onset_seconds
+        if let Some(response_id) = self.rendered_response_id.take()
+            && vita
+                .active_interaction_plan()
+                .is_some_and(|plan| plan.response_id == response_id)
         {
-            life.acknowledge_interaction_execution(plan.response_id);
+            life.acknowledge_interaction_execution(response_id);
         }
         self.gesture_age += dt.clamp(0.0, 0.25);
         if self.gesture_age > 1.0 {
             self.gesture = GestureFrameV1::default();
             self.episode = EpisodeContextV1::default();
         }
+        let motor_outcome = std::mem::take(&mut self.motor_outcome);
+        self.episode.successful_play = motor_outcome.successful_play;
+        self.episode.goal_congruent_motor_success = motor_outcome.goal_congruent_motor_success;
+        self.episode.repeated_intentional_failure = motor_outcome.repeated_intentional_failure;
         let source = self.source(life, vita, morph, soft_touch_pressure_max, calibration);
         self.snapshot = self.interoception.tick(&source, dt);
         let mut episode = self.episode;
@@ -335,6 +501,10 @@ impl NervousSystemRuntime {
         vita.integrate_felt_state(self.snapshot.felt, episode, dt);
         morph.set_somatic_input(self.snapshot.morph_sensors);
         self.episode = episode;
+        // Outcome impulses are consumed once; LifeCore owns their inertia.
+        self.episode.goal_congruent_motor_success = 0.0;
+        self.episode.successful_play = 0.0;
+        self.episode.repeated_intentional_failure = 0.0;
         if episode.closed {
             self.gesture = GestureFrameV1::default();
             self.episode = EpisodeContextV1 {
@@ -355,6 +525,7 @@ impl NervousSystemRuntime {
         vita: &VitaRuntime,
         morph: &MorphBrain,
         vita_interaction: InteractionBodyActuation,
+        motor_actuation: &SomaticActuationPacket,
         soft_touch_pressure_max: f32,
         calibration: NervousReadabilityTuning,
         dt: f32,
@@ -362,6 +533,7 @@ impl NervousSystemRuntime {
         let source = self.source(life, vita, morph, soft_touch_pressure_max, calibration);
         let mut actuation = self.phenotype.tick(&source, self.snapshot, dt);
         merge_interaction(&mut actuation.interaction, vita_interaction);
+        SomaticActuationBus::compose(&mut actuation, motor_actuation);
         self.actuation = actuation.clone();
         actuation
     }
@@ -532,6 +704,34 @@ fn merge_interaction(phenotype: &mut InteractionBodyActuation, vita: Interaction
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_measured_ecology_outcomes_supply_motor_credit_and_survive_stale_gestures() {
+        use pet_ecology::{EcologyOutcome as O, EpisodeGoal as G};
+        let mut nervous = NervousSystemRuntime::default();
+        nervous.observe_outcomes(&[
+            O::EpisodeCompleted(G::SharedAttention),
+            O::EpisodeCompleted(G::StoreMorsel),
+        ]);
+        assert_eq!(nervous.motor_outcome.goal_congruent_motor_success, 0.0);
+        nervous.gesture_age = 5.0;
+        nervous.observe_outcomes(&[O::EpisodeCompleted(G::OfferOrb)]);
+        let mut life = LifeCore::new(lifecore::Genome::from_seed(7), 11);
+        let mut vita = VitaRuntime::new(7, None);
+        let mut morph = MorphBrain::new(7, None).unwrap();
+        nervous.body_feedback.frame_id = 1;
+        nervous.prepare_cognition_tick(
+            &mut life,
+            &mut vita,
+            &mut morph,
+            0.15,
+            NervousReadabilityTuning::default().for_live_runtime(),
+            0.05,
+        );
+        assert!(nervous.episode.reward_positive > 0.0);
+        assert_eq!(nervous.motor_outcome, EpisodeContextV1::default());
+        assert_eq!(nervous.episode.goal_congruent_motor_success, 0.0);
+    }
 
     #[test]
     fn transient_gesture_and_pain_recover_without_another_gesture() {

@@ -8,8 +8,8 @@ use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AffectState, AppraisalState, BodyIntent, Drives, ExpressionState, InteractionBodyActuation,
-    MoodState, PoseIntent, SensorFrame, TemperamentGenome, VoiceGenome,
+    ActionId, AffectState, AppraisalState, BodyIntent, Drives, ExpressionState,
+    InteractionBodyActuation, MoodState, PoseIntent, SensorFrame, TemperamentGenome, VoiceGenome,
 };
 
 pub const NERVOUS_SYSTEM_SCHEMA_VERSION: u32 = 1;
@@ -525,6 +525,21 @@ pub struct EpisodeContextV1 {
 pub struct PerceptionSelectionV1 {
     pub selected_salience: f32,
     pub selected_object_slot: Option<u8>,
+    pub attention_target_id: Option<u64>,
+    pub attention_target_position: Option<glam::Vec2>,
+    pub attention_target_kind: AttentionTargetKind,
+    pub attention_confidence: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttentionTargetKind {
+    Danger,
+    Interaction,
+    ObjectGoal,
+    Social,
+    Visual,
+    #[default]
+    Free,
 }
 
 /// Slow, bounded evidence accumulated from closed embodied episodes. These
@@ -581,6 +596,25 @@ pub struct EmbodimentSourceFrame {
     pub episode: EpisodeContextV1,
     pub perception: PerceptionSelectionV1,
     pub soft_touch_pressure_max: f32,
+}
+
+/// Semantic goal handed to the motor-performance layer after LifeCore, VITA,
+/// and ecology have finished choosing *what* the creature is trying to do.
+///
+/// The frame deliberately contains no PBF phase or solver detail. LifeCore
+/// remains the sole owner of action choice, homeostasis, appraisal, and
+/// learning; a motor runtime may only decide how to perform this goal over
+/// time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BehaviorGoalFrame {
+    pub action: ActionId,
+    pub body_intent: BodyIntent,
+    pub affect: AffectState,
+    pub drives: Drives,
+    pub felt: FeltStateV1,
+    pub derived: DerivedNervousState,
+    pub attachment: f32,
+    pub recent_outcome: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]

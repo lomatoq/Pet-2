@@ -47,6 +47,12 @@ pub const R12_FAST_COUPLING_IDS: [&str; 28] = [
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BodyPhenotypeDirector {
     output: FastPhenotypeActuation,
+    #[serde(skip)]
+    pose_candidate: crate::FacePose,
+    #[serde(skip)]
+    pose_candidate_seconds: f32,
+    #[serde(skip)]
+    pose_held_seconds: f32,
     #[serde(default = "default_true")]
     fast_couplings_enabled: bool,
 }
@@ -55,6 +61,9 @@ impl Default for BodyPhenotypeDirector {
     fn default() -> Self {
         Self {
             output: FastPhenotypeActuation::default(),
+            pose_candidate: crate::FacePose::Awake,
+            pose_candidate_seconds: 0.0,
+            pose_held_seconds: 0.0,
             fast_couplings_enabled: true,
         }
     }
@@ -72,7 +81,25 @@ impl BodyPhenotypeDirector {
         interoception: InteroceptionSnapshot,
         dt: f32,
     ) -> FastPhenotypeActuation {
-        let raw = raw_targets(source, interoception);
+        let mut raw = raw_targets(source, interoception);
+        let candidate = raw.expression.face_pose;
+        if candidate != self.pose_candidate {
+            self.pose_candidate = candidate;
+            self.pose_candidate_seconds = 0.0;
+        }
+        self.pose_candidate_seconds += dt.clamp(0.0, 0.25);
+        self.pose_held_seconds += dt.clamp(0.0, 0.25);
+        let safety = matches!(
+            candidate,
+            crate::FacePose::Startled | crate::FacePose::Boundary
+        );
+        if candidate != self.output.expression.face_pose {
+            if safety || (self.pose_candidate_seconds >= 0.15 && self.pose_held_seconds >= 0.65) {
+                self.pose_held_seconds = 0.0;
+            } else {
+                raw.expression = self.output.expression;
+            }
+        }
         if !self.fast_couplings_enabled {
             self.output = FastPhenotypeActuation {
                 frame_id: source.frame_id,
@@ -236,28 +263,9 @@ impl BodyPhenotypeDirector {
         self.output.interaction.allow_intentional_bud = t.interaction.allow_intentional_bud;
         self.output.interaction.sanitize();
 
-        macro_rules! expression {
-            ($name:ident, $r:expr, $f:expr) => {
-                f!(expression.$name, $r, $f)
-            };
-        }
-        expression!(squint, 0.08, 0.85);
-        expression!(pupil_size, 0.12, 0.50);
-        expression!(pupil_focus, 0.12, 0.50);
-        expression!(brow_raise, 0.10, 0.75);
-        expression!(brow_tension, 0.10, 0.75);
-        expression!(mouth_open, 0.06, 0.75);
-        expression!(mouth_curve, 0.10, 0.75);
-        expression!(mouth_tension, 0.10, 0.75);
-        expression!(cheek_glow, 0.10, 0.75);
-        expression!(body_glow, 0.10, 0.75);
-        expression!(eye_aperture, 0.08, 0.85);
-        expression!(eye_scale, 0.12, 0.50);
-        expression!(brow_asymmetry, 0.14, 0.60);
-        expression!(mouth_compression, 0.08, 0.45);
-        expression!(mouth_asymmetry, 0.14, 0.60);
-        expression!(effort, 0.08, 0.45);
-        expression!(relief, 0.06, 0.75);
+        // ExpressionRuntime owns the sole attack/release envelope. This director
+        // selects and holds semantic targets, without a second low-pass filter.
+        self.output.expression = t.expression;
         self.output.expression.blink_left = 0.0;
         self.output.expression.blink_right = 0.0;
         f!(apparent_scale, 0.45, 1.60);
@@ -268,6 +276,7 @@ const fn default_true() -> bool {
     true
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> FastPhenotypeActuation {
     let d = i.derived;
     let f = i.felt;
@@ -426,39 +435,92 @@ fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> Fast
             + 0.20 * d.attention_strength
             + 0.15 * d.confidence,
     );
-    out.expression = crate::ExpressionState {
-        pupil_focus: focus,
-        pupil_size: (0.42 + 0.34 * d.arousal + 0.12 * d.neural_threat).clamp(0.32, 0.92),
-        eye_scale: (0.96 + 0.10 * e.interest + 0.08 * f.surprise - 0.08 * d.fatigue)
-            .clamp(0.88, 1.18),
-        eye_aperture: (0.72 + 0.18 * f.surprise + 0.12 * e.interest + 0.16 * f.startle
-            - 0.28 * d.fatigue
-            - 0.14 * e.sadness)
-            .clamp(0.28, 1.0),
-        squint: unit(0.15 + 0.42 * f.pain_like + 0.20 * e.protest + 0.12 * d.stress),
-        brow_asymmetry: confusion_asymmetry,
-        mouth_asymmetry: confusion_asymmetry,
-        mouth_curve: bounded_signed(
-            0.65 * d.positive_valence + 0.22 * e.affection
-                - 0.58 * d.negative_valence
-                - 0.30 * e.protest,
-        ),
-        mouth_tension: unit(0.20 + 0.45 * e.protest + 0.30 * e.fear + 0.20 * e.determination),
-        brow_raise: bounded_signed(0.38 * f.surprise + 0.20 * e.interest - 0.35 * e.protest),
-        brow_tension: unit(0.18 + 0.42 * e.fear + 0.38 * e.protest + 0.22 * e.determination),
-        cheek_glow: unit(0.15 + 0.50 * e.affection + 0.25 * e.joy),
-        body_glow: unit(0.20 + 0.40 * e.joy + 0.25 * e.affection + 0.15 * e.determination),
-        effort: f.physical_load,
-        mouth_compression: unit(0.15 + 0.75 * f.physical_load),
-        relief: f.relief,
-        mouth_open: unit(
-            0.46 * source.voice_feedback.envelope
-                + 0.22 * f.surprise
-                + 0.16 * f.startle
-                + 0.16 * f.physical_load,
-        ),
-        ..crate::ExpressionState::default()
+    let mut expression = crate::ExpressionState::default();
+    expression.pupil_focus = focus;
+    expression.pupil_size = (0.42 + 0.34 * d.arousal + 0.12 * d.neural_threat).clamp(0.32, 0.92);
+    expression.eye_scale =
+        (0.96 + 0.10 * e.interest + 0.08 * f.surprise - 0.08 * d.fatigue).clamp(0.88, 1.18);
+    // One is the neutral aperture in the renderer and readability calibration
+    // amplifies deviations around that neutral. A 0.72 base therefore made a
+    // fully awake animal look chronically drowsy even at near-zero fatigue.
+    expression.eye_aperture = (0.94 + 0.18 * f.surprise + 0.12 * e.interest + 0.16 * f.startle
+        - 0.34 * d.fatigue
+        - 0.14 * e.sadness)
+        .clamp(0.28, 1.0);
+    expression.squint = unit(0.15 + 0.42 * f.pain_like + 0.20 * e.protest + 0.12 * d.stress);
+    expression.brow_asymmetry = confusion_asymmetry;
+    expression.mouth_asymmetry = confusion_asymmetry;
+    expression.mouth_curve = bounded_signed(
+        0.65 * d.positive_valence + 0.22 * e.affection
+            - 0.58 * d.negative_valence
+            - 0.30 * e.protest,
+    );
+    expression.mouth_tension =
+        unit(0.20 + 0.45 * e.protest + 0.30 * e.fear + 0.20 * e.determination);
+    expression.brow_raise =
+        bounded_signed(0.38 * f.surprise + 0.20 * e.interest - 0.35 * e.protest);
+    expression.brow_tension =
+        unit(0.18 + 0.42 * e.fear + 0.38 * e.protest + 0.22 * e.determination);
+    expression.cheek_glow = unit(0.15 + 0.50 * e.affection + 0.25 * e.joy);
+    expression.body_glow = unit(0.20 + 0.40 * e.joy + 0.25 * e.affection + 0.15 * e.determination);
+    expression.effort = f.physical_load;
+    expression.mouth_compression = unit(0.15 + 0.75 * f.physical_load);
+    expression.relief = f.relief;
+    expression.mouth_open = unit(
+        0.46 * source.voice_feedback.envelope
+            + 0.22 * f.surprise
+            + 0.16 * f.startle
+            + 0.16 * f.physical_load,
+    );
+    // A categorical geometry carrier plus a bounded secondary modifier.
+    // These are readouts of existing felt state, never another emotion owner.
+    let has_target = source.perception.attention_target_position.is_some()
+        && source.perception.attention_confidence >= 0.3;
+    let scores = [
+        if has_target { e.interest } else { 0.0 },
+        e.playfulness,
+        e.affection,
+        d.fatigue,
+        e.confusion,
+        e.fear.max(f.startle).max(f.pain_like),
+        e.protest,
+    ];
+    let dominant_expression = if scores[6] > 0.35 && f.startle < 0.35 && f.pain_like < 0.2 {
+        6
+    } else if scores[5] > 0.35 {
+        5
+    } else {
+        scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(i, _)| i)
     };
+    let pose = if scores[dominant_expression] <= 0.25 {
+        crate::FacePose::Awake
+    } else {
+        [
+            crate::FacePose::Curious,
+            crate::FacePose::Playful,
+            crate::FacePose::Affectionate,
+            crate::FacePose::Tired,
+            crate::FacePose::Confused,
+            crate::FacePose::Startled,
+            crate::FacePose::Boundary,
+        ][dominant_expression]
+    };
+    let mut canonical = pose.expression();
+    if pose == crate::FacePose::Startled && f.startle < 0.2 {
+        canonical.mouth_open = 0.0;
+        canonical.mouth_curve = -0.18;
+    }
+    // Geometry has one owner; arousal remains a bounded physiological pupil channel.
+    let pupil_size = expression.pupil_size;
+    let body_glow = expression.body_glow;
+    expression = canonical;
+    expression.pupil_size = pupil_size;
+    expression.body_glow = body_glow;
+    out.expression = expression;
 
     out.visual_physiology = VisualPhysiologyActuation {
         pulse_amplitude: unit(0.16 + 0.42 * d.arousal + 0.18 * f.startle + 0.12 * f.physical_load),
@@ -486,11 +548,8 @@ fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> Fast
     };
 
     out.face = FaceRuntimeActuation {
-        gaze_target: if source.perception.selected_salience > 0.05 {
-            Some(source.body.contact.point_world)
-        } else {
-            None
-        },
+        gaze_target: source.perception.attention_target_position,
+
         microsaccade_amount_multiplier: (1.0 + 0.20 * d.curiosity - 0.35 * d.attention_commitment)
             .clamp(0.55, 1.20),
         microsaccade_rate_multiplier: (0.90 + 0.25 * d.curiosity + 0.20 * e.anxiety
@@ -2177,6 +2236,22 @@ mod tests {
         assert!((0.94..=1.05).contains(&output.analytic.body_length_scale));
         assert!((0.70..=1.35).contains(&output.material.emission_multiplier));
         assert!(output.material.hue_shift_turns.abs() <= 0.0222);
+    }
+
+    #[test]
+    fn awake_eyes_are_open_and_fatigue_remains_visibly_distinct() {
+        let s = source();
+        let awake = raw_targets(&s, InteroceptionSnapshot::default());
+        let mut drowsy_state = InteroceptionSnapshot::default();
+        drowsy_state.derived.fatigue = 1.0;
+        let drowsy = raw_targets(&s, drowsy_state);
+
+        assert!(awake.expression.eye_aperture >= 0.90);
+        assert!(drowsy.expression.eye_aperture <= 0.65);
+        assert!(
+            awake.expression.eye_aperture - drowsy.expression.eye_aperture >= 0.30,
+            "awake and drowsy eyelids must remain perceptually separable"
+        );
     }
 
     #[test]

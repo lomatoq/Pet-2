@@ -600,6 +600,30 @@ impl VitaRuntime {
             intent.gaze_target = Some(gaze.clamp(Vec2::ZERO, Vec2::ONE));
         }
         let target = plan.expression;
+        // R13 renders explicit geometry. Keep the learned response's meaning
+        // in those channels as well as the legacy scalar expression channels.
+        use lifecore::{CommunicativeIntent as Meaning, FacePose};
+        let pose = if plan.reason == lifecore::InteractionReasonCode::QuietAcknowledgement {
+            FacePose::Awake
+        } else {
+            match plan.communicative_intent {
+                Meaning::InviteRepeat | Meaning::InviteSpin | Meaning::YieldAndInviteReturn => {
+                    FacePose::Playful
+                }
+                Meaning::AcknowledgeContact | Meaning::AcknowledgeHelp => FacePose::Affectionate,
+                Meaning::ResistSafely | Meaning::SetCalmBoundary | Meaning::Disengage => {
+                    FacePose::Boundary
+                }
+                Meaning::Inspect | Meaning::OrientToFragment => FacePose::Curious,
+            }
+        };
+        intent
+            .expression
+            .geometry
+            .approach(pose.expression().geometry, weight);
+        if weight > 0.5 {
+            intent.expression.face_pose = pose;
+        }
         blend(
             &mut intent.expression.eye_aperture,
             target.eye_aperture,
@@ -887,7 +911,7 @@ mod tests {
     fn semantic_expression_survives_final_nervous_packet_and_focus_cancels_turn() {
         let mut life = LifeCore::new(Genome::from_seed(17), 19);
         let mut vita = VitaRuntime::new(17, None);
-        let morph = morph_brain::MorphBrain::new(17, None).unwrap();
+        let mut morph = morph_brain::MorphBrain::new(17, None).unwrap();
         let mut body = pet_body::ProceduralBody::generate(&life.state.genome).unwrap();
         let mut nervous = crate::NervousSystemRuntime::default();
         let mut sensors = SensorFrame::default();
@@ -898,6 +922,8 @@ mod tests {
             response_id: 7,
             episode_id: 9,
             onset_seconds: 0.0,
+            communicative_intent: lifecore::CommunicativeIntent::InviteRepeat,
+            reason: lifecore::InteractionReasonCode::SharedRitual,
             expression: lifecore::InteractionExpressionTarget {
                 mouth_curve: 0.8,
                 amplitude: 1.0,
@@ -907,6 +933,12 @@ mod tests {
         };
         vita.interaction_turn.begin_episode(9);
         assert!(vita.accept_interaction_response(plan));
+        life.state.interactions.pending_credit = Some(lifecore::PendingInteractionCredit {
+            response_id: plan.response_id,
+            episode_id: plan.episode_id,
+            executed: false,
+            ..Default::default()
+        });
         nervous.apply_actuation(
             &mut life,
             &vita,
@@ -918,6 +950,63 @@ mod tests {
         );
         assert!((intent.expression.mouth_curve - 0.8).abs() < 1.0e-5);
         assert_eq!(intent.expression, nervous.actuation().expression);
+        nervous.prepare(&mut life, &mut vita, &mut morph, &body, 0.05);
+        assert!(
+            !life.state.interactions.pending_credit.unwrap().executed,
+            "planning/render composition alone is not an executed response"
+        );
+        assert_eq!(
+            intent.expression.geometry,
+            lifecore::FacePose::Playful.expression().geometry
+        );
+        let packet = pet_motor::SomaticActuationPacket {
+            program: Some(pet_motor::BehaviorProgramId::DefenseThreatHardenCompact),
+            ..Default::default()
+        };
+        let context = pet_motor::BehaviorContextFrame::default();
+        nervous.apply_motor_actuation(
+            &mut life,
+            &vita,
+            &morph,
+            &mut body,
+            &mut sensors,
+            &mut intent,
+            Some(crate::nervous_system_runtime::MotorActuationFrame {
+                packet: &packet,
+                context: &context,
+                scene_pose: Some(lifecore::FacePose::Affectionate),
+            }),
+            0.05,
+        );
+        assert!(intent.expression.mouth_curve <= 0.0);
+        assert!(intent.expression.geometry.mouth[1] <= 0.0);
+        assert_eq!(intent.expression, nervous.actuation().expression);
+        body.fixed_update(&life.state.genome, &intent, &sensors, 1.0 / 120.0);
+        nervous.observe_body(&body, &intent, &sensors);
+        nervous.prepare(&mut life, &mut vita, &mut morph, &body, 0.05);
+        assert!(
+            !life.state.interactions.pending_credit.unwrap().executed,
+            "a protective packet suppressed the social response"
+        );
+        nervous.apply_motor_actuation(
+            &mut life,
+            &vita,
+            &morph,
+            &mut body,
+            &mut sensors,
+            &mut intent,
+            None,
+            0.05,
+        );
+        nervous.prepare(&mut life, &mut vita, &mut morph, &body, 0.05);
+        assert!(
+            !life.state.interactions.pending_credit.unwrap().executed,
+            "the previously consumed frame cannot acknowledge a new response"
+        );
+        body.fixed_update(&life.state.genome, &intent, &sensors, 1.0 / 120.0);
+        nervous.observe_body(&body, &intent, &sensors);
+        nervous.prepare(&mut life, &mut vita, &mut morph, &body, 0.05);
+        assert!(life.state.interactions.pending_credit.unwrap().executed);
         vita.apply_feedback(&FeedbackEvent::FocusModeEnabled);
         assert!(vita.active_interaction_plan().is_none());
     }

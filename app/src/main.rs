@@ -6,6 +6,7 @@
 
 mod ecology_runtime;
 mod evolution_runner;
+mod motor_context;
 mod nervous_system_runtime;
 mod pointer_replay_runner;
 #[allow(dead_code)]
@@ -26,10 +27,10 @@ use std::{
 };
 
 use desktop_host::{
-    DesktopVisualFrame, DisplayTopology, EventLogEntry, EvolutionPersistence, LabControlCommand,
-    LabControlEnvelope, LabDrive, LabGesture, MonitorId, MonitorInfo,
-    PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition, PhysicalDesktopPoint, PlatformBackend,
-    PointerState, PortablePetState, RUNTIME_LOAD_ACK_SCHEMA_VERSION, RectI,
+    DesktopBackgroundCaptureRegion, DesktopVisualFrame, DisplayTopology, EventLogEntry,
+    EvolutionPersistence, LabControlCommand, LabControlEnvelope, LabDrive, LabGesture, MonitorId,
+    MonitorInfo, PORTABLE_STATE_SCHEMA_VERSION, PersistedPetPosition, PhysicalDesktopPoint,
+    PlatformBackend, PointerState, PortablePetState, RUNTIME_LOAD_ACK_SCHEMA_VERSION, RectI,
     RuntimeLoadAcknowledgement, RuntimeLoadStatus, SensorNormalizer, StateStore,
     VISUAL_GRID_HEIGHT as DESKTOP_VISUAL_GRID_HEIGHT,
     VISUAL_GRID_WIDTH as DESKTOP_VISUAL_GRID_WIDTH, create_platform_backend,
@@ -40,17 +41,17 @@ use glam::Vec2;
 #[cfg(test)]
 use lifecore::MAX_MUTATION_HISTORY;
 use lifecore::{
-    ActionId, BodyIntent, CollisionEvent, DebugState, Drives, EmbodiedGestureEvent,
-    EmbodiedGestureKind, ExpressionDirector, ExpressionState, FeedbackEvent, Genome,
-    GestureBoundaryEvent, LIFECORE_HZ, LifeCore, LivingStateFrame, LocomotionMode, PoseIntent,
-    SensorFrame, VitaOutput, VocalArbiter, VocalTrigger, persisted_life_snapshot_hash,
-    stable_hash_bytes,
+    ActionId, BehaviorGoalFrame, BodyIntent, CollisionEvent, DebugState, Drives,
+    EmbodiedGestureEvent, EmbodiedGestureKind, ExpressionDirector, ExpressionState, FeedbackEvent,
+    Genome, GestureBoundaryEvent, LIFECORE_HZ, LifeCore, LivingStateFrame, LocomotionMode,
+    PoseIntent, SensorFrame, SurfaceId, VitaOutput, VocalArbiter, VocalTrigger,
+    persisted_life_snapshot_hash, stable_hash_bytes,
 };
 use morph_brain::{MorphBrain, MorphBrainState, MorphCommand, MorphOutput};
 use nervous_system_runtime::NervousSystemRuntime;
 use pet_audio::{
-    AudioCallbackLevels, AudioEngine, AudioVisualFeedback, BodyVoiceAnalyzer, SelectedOutputConfig,
-    global_body_voice_bridge,
+    AudioCallbackLevels, AudioEngine, AudioVisualFeedback, BodyVoiceAnalyzer, DefaultOutputWatcher,
+    SelectedOutputConfig, global_body_voice_bridge,
 };
 use pet_body::{
     BodyMaterialSnapshot, BodyRenderMode, ColorSourceMode, EcologyCaptureExclusion,
@@ -62,6 +63,10 @@ use pet_ecology::ObjectLifecycle;
 use pet_ecology::{
     ActionSignature, ConventionOutcome, EcologyOutcome, EcologyVocalTrigger, EpisodeGoal,
     EpisodePhase, GestureConventionMeaning, GestureSignature, MorselProfile, ObjectKind,
+};
+use pet_motor::{
+    BehaviorContextFrame, BehaviorPerformanceRuntime, BehaviorProgramId, MotorWorldEvent,
+    MotorWorldGoal, SomaticActuationPacket, SurfaceCandidate, VoiceSemanticIntent,
 };
 use pet_perception::{
     EmbodiedGestureClassifierTuning, SpatialVisualCell, SpatialVisualFrame, VisualFeatureFrame,
@@ -93,6 +98,8 @@ const SLEEP_FRAME: Duration = Duration::from_micros(16_667);
 const PRODUCTION_FLIGHT_RESPONSE_SCALE: f32 = 2.15;
 const PRODUCTION_FLIGHT_ACCELERATION_LIMIT: f32 = 4.20;
 const VISUAL_SAMPLE_INTERVAL: f32 = 1.0 / 8.0;
+const DEN_CAPTURE_HALF_EXTENT_REFERENCE_PX: f32 = 220.0;
+const DEN_CAPTURE_MAXIMUM_OUTPUT_DIMENSION: u32 = 512;
 // A delayed event-loop callback must not replay a quarter-second of navigation
 // before presenting one frame. Three fixed ticks preserve normal 120 Hz
 // cadence while turning a long stall into a small time drop instead of a visual
@@ -388,6 +395,10 @@ struct AudioManager {
     state: AudioManagerState,
     selected_config: Option<SelectedOutputConfig>,
     device_name: Option<String>,
+    endpoint_id: Option<String>,
+    endpoint_generation: u64,
+    endpoint_switch_reason: Option<String>,
+    endpoint_recovery_errors: u64,
     last_error: Option<String>,
     last_request: Option<u64>,
     retry_attempt: usize,
@@ -415,6 +426,19 @@ enum AudioWorkerEvent {
     Ready {
         config: SelectedOutputConfig,
         device_name: String,
+        endpoint_id: String,
+        generation: u64,
+        reason: String,
+    },
+    EndpointChanged {
+        config: SelectedOutputConfig,
+        device_name: String,
+        endpoint_id: String,
+        generation: u64,
+        reason: String,
+    },
+    RecoveryError {
+        error: String,
     },
     StartFailed {
         error: String,
@@ -439,6 +463,11 @@ struct AudioWorkerChannels {
 const AUDIO_COMMAND_CAPACITY: usize = 32;
 const AUDIO_EVENT_CAPACITY: usize = 64;
 const AUDIO_OWNER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const AUDIO_ENDPOINT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn default_endpoint_changed(current: &str, detected: &str) -> bool {
+    !detected.is_empty() && current != detected
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TimingPercentiles {
@@ -566,6 +595,10 @@ impl AudioManager {
             },
             selected_config: None,
             device_name: None,
+            endpoint_id: None,
+            endpoint_generation: 0,
+            endpoint_switch_reason: None,
+            endpoint_recovery_errors: 0,
             last_error: None,
             last_request: None,
             retry_attempt: 0,
@@ -617,13 +650,30 @@ impl AudioManager {
                 AudioWorkerEvent::Ready {
                     config,
                     device_name,
+                    endpoint_id,
+                    generation,
+                    reason,
+                }
+                | AudioWorkerEvent::EndpointChanged {
+                    config,
+                    device_name,
+                    endpoint_id,
+                    generation,
+                    reason,
                 } => {
                     self.state = AudioManagerState::Ready;
                     self.selected_config = Some(config);
                     self.device_name = Some(device_name);
+                    self.endpoint_id = Some(endpoint_id);
+                    self.endpoint_generation = generation;
+                    self.endpoint_switch_reason = Some(reason);
                     self.retry_attempt = 0;
                     self.retry_at = None;
                     self.last_error = None;
+                }
+                AudioWorkerEvent::RecoveryError { error } => {
+                    self.endpoint_recovery_errors = self.endpoint_recovery_errors.saturating_add(1);
+                    self.last_error = Some(error);
                 }
                 AudioWorkerEvent::StartFailed { error }
                 | AudioWorkerEvent::RuntimeLost { error } => {
@@ -649,6 +699,7 @@ impl AudioManager {
         self.event_receiver = None;
         self.selected_config = None;
         self.device_name = None;
+        self.endpoint_id = None;
         while let Some(request_id) = self.pending_requests.pop_front() {
             self.unheard_rejections.push_back(request_id);
             self.rejected_requests = self.rejected_requests.saturating_add(1);
@@ -808,7 +859,10 @@ fn spawn_audio_owner_worker_with(
 }
 
 fn audio_owner_loop(commands: Receiver<AudioWorkerCommand>, events: SyncSender<AudioWorkerEvent>) {
-    let engine = match AudioEngine::try_start() {
+    let watcher = DefaultOutputWatcher::new();
+    let mut watcher_error = watcher.as_ref().err().cloned();
+    let watcher = watcher.ok();
+    let mut engine = match AudioEngine::try_start() {
         Ok(engine) => engine,
         Err(error) => {
             let _ = events.send(AudioWorkerEvent::StartFailed {
@@ -817,23 +871,47 @@ fn audio_owner_loop(commands: Receiver<AudioWorkerCommand>, events: SyncSender<A
             return;
         }
     };
+    let mut endpoint_id = watcher
+        .as_ref()
+        .and_then(|watcher| watcher.current_endpoint_id().ok())
+        .unwrap_or_else(|| engine.device_name().to_owned());
+    let mut generation = 1_u64;
+    let mut last_endpoint_poll = Instant::now();
     engine.clear_visual_feedback();
     if events
         .send(AudioWorkerEvent::Ready {
             config: engine.selected_config(),
             device_name: engine.device_name().to_owned(),
+            endpoint_id: endpoint_id.clone(),
+            generation,
+            reason: "startup_default_multimedia".into(),
         })
         .is_err()
     {
         return;
     }
+    if let Some(error) = watcher_error.take() {
+        let _ = events.send(AudioWorkerEvent::RecoveryError {
+            error: format!(
+                "Core Audio notification unavailable; using 500 ms fallback polling: {error}"
+            ),
+        });
+    }
 
-    let mut pending_unheard = VecDeque::with_capacity(AUDIO_COMMAND_CAPACITY);
+    #[derive(Clone)]
+    struct PendingUnheard {
+        voice: lifecore::VoiceGenome,
+        motif: lifecore::VocalMotif,
+        request: lifecore::VocalRequest,
+    }
+
+    let mut pending_unheard: VecDeque<PendingUnheard> =
+        VecDeque::with_capacity(AUDIO_COMMAND_CAPACITY);
     loop {
         while let Some(request_id) = engine.poll_started_request() {
             if let Some(index) = pending_unheard
                 .iter()
-                .position(|(pending_id, _)| *pending_id == request_id)
+                .position(|pending| pending.request.performance_seed == request_id)
             {
                 pending_unheard.remove(index);
                 if events
@@ -846,9 +924,9 @@ fn audio_owner_loop(commands: Receiver<AudioWorkerCommand>, events: SyncSender<A
         }
         if engine.poll_runtime_event().is_some() {
             engine.clear_visual_feedback();
-            for (request_id, _) in pending_unheard.drain(..) {
+            for pending in pending_unheard.drain(..) {
                 let _ = events.send(AudioWorkerEvent::RequestRejected {
-                    request_id,
+                    request_id: pending.request.performance_seed,
                     error: "audio stream failed before the request was heard".into(),
                 });
             }
@@ -858,13 +936,105 @@ fn audio_owner_loop(commands: Receiver<AudioWorkerCommand>, events: SyncSender<A
             return;
         }
 
+        let notification = watcher
+            .as_ref()
+            .is_some_and(DefaultOutputWatcher::take_notification);
+        let fallback_due = last_endpoint_poll.elapsed() >= AUDIO_ENDPOINT_FALLBACK_POLL_INTERVAL;
+        if notification || fallback_due {
+            last_endpoint_poll = Instant::now();
+            let detected: Result<String, String> = watcher.as_ref().map_or_else(
+                || AudioEngine::default_output_device_name().map_err(|error| error.to_string()),
+                DefaultOutputWatcher::current_endpoint_id,
+            );
+            match detected {
+                Ok(detected_id) if default_endpoint_changed(&endpoint_id, &detected_id) => {
+                    let reason = if notification {
+                        "core_audio_notification"
+                    } else {
+                        "fallback_poll"
+                    };
+                    match AudioEngine::try_start() {
+                        Ok(next_engine) => {
+                            // Drain a last callback acknowledgement before the
+                            // old stream is dropped. Requests already heard are
+                            // never replayed on the new endpoint.
+                            while let Some(request_id) = engine.poll_started_request() {
+                                if let Some(index) = pending_unheard.iter().position(|pending| {
+                                    pending.request.performance_seed == request_id
+                                }) {
+                                    pending_unheard.remove(index);
+                                    if events
+                                        .send(AudioWorkerEvent::RequestHeard { request_id })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            engine.clear_visual_feedback();
+                            engine = next_engine;
+                            engine.clear_visual_feedback();
+                            endpoint_id = detected_id;
+                            generation = generation.saturating_add(1);
+                            let replay = pending_unheard.iter().cloned().collect::<Vec<_>>();
+                            for pending in replay {
+                                if let Err(error) =
+                                    engine.enqueue(&pending.voice, &pending.motif, &pending.request)
+                                {
+                                    let request_id = pending.request.performance_seed;
+                                    pending_unheard.retain(|queued| {
+                                        queued.request.performance_seed != request_id
+                                    });
+                                    let _ = events.send(AudioWorkerEvent::RequestRejected {
+                                        request_id,
+                                        error: format!(
+                                            "new default endpoint rejected unheard request: {error}"
+                                        ),
+                                    });
+                                }
+                            }
+                            if events
+                                .send(AudioWorkerEvent::EndpointChanged {
+                                    config: engine.selected_config(),
+                                    device_name: engine.device_name().to_owned(),
+                                    endpoint_id: endpoint_id.clone(),
+                                    generation,
+                                    reason: reason.into(),
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = events.send(AudioWorkerEvent::RecoveryError {
+                                error: format!(
+                                    "default output changed but stream recreation failed: {error}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = events.send(AudioWorkerEvent::RecoveryError {
+                        error: format!("default output fallback check failed: {error}"),
+                    });
+                }
+            }
+        }
+
         match commands.recv_timeout(AUDIO_OWNER_POLL_INTERVAL) {
             Ok(AudioWorkerCommand::Enqueue {
                 voice,
                 motif,
                 request,
             }) => match engine.enqueue(&voice, &motif, &request) {
-                Ok(()) => pending_unheard.push_back((request.performance_seed, request.motif_id)),
+                Ok(()) => pending_unheard.push_back(PendingUnheard {
+                    voice,
+                    motif,
+                    request,
+                }),
                 Err(error) => {
                     if events
                         .send(AudioWorkerEvent::RequestRejected {
@@ -1093,9 +1263,20 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         );
         sensors.interaction_actuation = vita.interaction_actuation();
         output.body_intent = resolved_intent;
+        let orb_physical = ecology.orb_physical_frame(&body, &feedback, 1080.0, dt);
         let ecology_output = ecology.resolve_intent(
             output.body_intent,
             EcologyResolveFrame {
+                social_contact: pet_ecology::SocialContactFrame {
+                    touched: sensors.pet_touched,
+                    pleasantness: nervous.snapshot().felt.contact_pleasantness,
+                    pain: nervous.snapshot().felt.pain_like,
+                    fatigue: nervous.snapshot().derived.fatigue,
+                    boundary: sensors.interaction_actuation.resistance > 0.5,
+                    side: (sensors.cursor_position.x - feedback.world_position.x).signum(),
+                    social_drive: life.state.drives.social,
+                    ..Default::default()
+                },
                 selected_action: output.selected_action,
                 drives: life.state.drives,
                 sensors: &sensors,
@@ -1103,6 +1284,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
                 focus_mode: life.state.focus_mode
                     || vita.state().desktop_rhythm.protects_focused_work(),
                 dt,
+                orb_physical,
             },
         );
         for outcome in ecology_output.outcomes[..ecology_output.outcome_count]
@@ -1122,17 +1304,19 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
                 _ => {}
             }
         }
+        nervous.observe_outcomes(&ecology_output.outcomes[..ecology_output.outcome_count]);
         output.body_intent = ecology_output.body_intent;
-        nervous.apply_actuation(
+        nervous.apply_offline_actuation(
             &mut life,
             &vita,
             &morph,
             &mut body,
             &mut sensors,
             &mut output.body_intent,
+            Some(&mut ecology),
             dt,
         );
-        nervous.commit_intent(&mut life, &body, &sensors, &output.body_intent);
+        nervous.commit_intent(&mut life, &mut body, &sensors, &output.body_intent);
         let visual_mind = visual_mind_input(
             &life,
             &sensors,
@@ -1507,6 +1691,71 @@ struct LabInterventionState {
     last_effective_drives: Option<Drives>,
 }
 
+#[derive(Debug, Default)]
+struct LabSessionState {
+    token: Option<String>,
+    session_id: Option<u64>,
+    expires_at: Option<Instant>,
+}
+
+impl LabSessionState {
+    fn open(&mut self, token: String, lease_seconds: u32, now: Instant) -> bool {
+        let session_id = desktop_host::lab_session_id(&token);
+        let changed = self.session_id != Some(session_id);
+        self.token = Some(token);
+        self.session_id = Some(session_id);
+        self.expires_at = now.checked_add(Duration::from_secs(u64::from(
+            lease_seconds.min(desktop_host::LAB_SESSION_LEASE_SECONDS),
+        )));
+        changed
+    }
+
+    fn renew(&mut self, token: &str, lease_seconds: u32, now: Instant) -> bool {
+        if !self.accepts(Some(token), now) {
+            return false;
+        }
+        self.expires_at = now.checked_add(Duration::from_secs(u64::from(
+            lease_seconds.min(desktop_host::LAB_SESSION_LEASE_SECONDS),
+        )));
+        true
+    }
+
+    fn close(&mut self, token: &str, now: Instant) -> bool {
+        if !self.accepts(Some(token), now) {
+            return false;
+        }
+        self.token = None;
+        self.session_id = None;
+        self.expires_at = None;
+        true
+    }
+
+    fn accepts(&self, token: Option<&str>, now: Instant) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at > now) && self.token.as_deref() == token
+    }
+
+    fn active(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at > now)
+    }
+
+    fn expire(&mut self, now: Instant) -> bool {
+        if self.token.is_some() && !self.active(now) {
+            self.token = None;
+            self.session_id = None;
+            self.expires_at = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expires_in_ms(&self, now: Instant) -> Option<u64> {
+        self.expires_at
+            .and_then(|expires_at| expires_at.checked_duration_since(now))
+            .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
+    }
+}
+
 impl Default for LabInterventionState {
     fn default() -> Self {
         Self::new(0)
@@ -1623,6 +1872,10 @@ struct PetRuntime {
     vita: VitaRuntime,
     morph: MorphBrain,
     ecology: EcologyRuntime,
+    motor: BehaviorPerformanceRuntime,
+    last_motor_packet: SomaticActuationPacket,
+    lab_motor_program: Option<BehaviorProgramId>,
+    lab_motor_restart: bool,
     brain_mode: BrainMode,
     dev_mode: bool,
     body: ProceduralBody,
@@ -1638,6 +1891,9 @@ struct PetRuntime {
     screen_velocity_px: Vec2,
     screen_collision_half_extent_px: Vec2,
     screen_edge_contact: bool,
+    screen_edge_gap_px: f32,
+    screen_edge_support_stable_seconds: f32,
+    screen_edge_supported: bool,
     last_update: Instant,
     last_present: Instant,
     next_frame_deadline: Instant,
@@ -1646,6 +1902,7 @@ struct PetRuntime {
     maximum_body_steps_per_frame: u32,
     maximum_screen_tick_step_px: f32,
     screen_tick_jump_events: u64,
+    collision_impulse_count: u64,
     presented_pose: PresentedPoseMonitor,
     presentation_cadence: PresentationCadence,
     skipped_render_frames: u64,
@@ -1657,6 +1914,7 @@ struct PetRuntime {
     tuning_poll_accumulator: f32,
     lab_control_poll_accumulator: f32,
     lab_interventions: LabInterventionState,
+    lab_session: LabSessionState,
     tuning_last_modified: Option<SystemTime>,
     was_sleeping: bool,
     visible_after_first_frame: bool,
@@ -1665,6 +1923,7 @@ struct PetRuntime {
     debug_interval: f32,
     debug_accumulator: f32,
     telemetry_sequence: u64,
+    runtime_session_id: u64,
     fps_accumulator: f32,
     frames_since_fps: u32,
     fps: f32,
@@ -1697,6 +1956,7 @@ struct PetRuntime {
     background_timings: TimingWindow,
     pending_gesture_convention: Option<PendingGestureConvention>,
     lab_pointer_fixture: Option<LabPointerFixture>,
+    lab_face_pose: Option<lifecore::FacePose>,
     last_convention_update_episode: u64,
     shutdown_for_promotion: bool,
     runtime_ack_accumulator: f32,
@@ -1747,10 +2007,21 @@ impl LabPointerFixture {
 
     fn step(&mut self, dt: f32) -> LabPointerSample {
         let dt = dt.clamp(1.0 / 240.0, 0.05);
+        let first_sample = self.elapsed_seconds <= f32::EPSILON;
         let phase = (self.elapsed_seconds / self.duration_seconds).clamp(0.0, 1.0);
+        // Pull/release has a fixed authored gesture cadence.  Body Lab may keep
+        // the fixture alive longer so an operator can observe rebound and
+        // recovery, but that observation tail must not slow the physical pull
+        // below the classifier and motor thresholds.
+        let pull_phase = (self.elapsed_seconds / 1.2).clamp(0.0, 1.0);
+        // Soft touch is a brief contact. A longer Body Lab duration is only
+        // an observation tail and must not turn it into a sustained hold.
+        let soft_touch_phase = (self.elapsed_seconds / 0.55).clamp(0.0, 1.0);
         let strength = 0.35 + self.intensity * 0.65;
         let (local, mut down) = match self.gesture {
-            LabGesture::SoftTouch => (Vec2::new(-0.07, 0.01), phase < 0.72),
+            // Touch near the authored surface instead of burying the cursor
+            // deep in the soft body and manufacturing pull-level pressure.
+            LabGesture::SoftTouch => (Vec2::new(-0.16, 0.01), soft_touch_phase < 0.72),
             LabGesture::SlowStretch => (
                 Vec2::new(-0.06 + phase.min(0.82) * 0.30 * strength, 0.01),
                 phase < 0.84,
@@ -1779,8 +2050,10 @@ impl LabPointerFixture {
             ),
             LabGesture::Hold => (Vec2::new(-0.045, 0.02), phase < 0.92),
             LabGesture::PullRelease => (
-                Vec2::new(-0.05 + phase.min(0.72) / 0.72 * 0.35 * strength, 0.0),
-                phase < 0.72,
+                // Reach classifier speed without pulling far enough to turn
+                // the acceptance fixture into a body-integrity emergency.
+                Vec2::new(-0.05 + pull_phase.min(0.55) / 0.55 * 0.24 * strength, 0.0),
+                pull_phase < 0.72,
             ),
             LabGesture::RealSplitRemerge => {
                 let distance = phase.min(0.78) / 0.78 * 0.58 * strength;
@@ -1810,7 +2083,15 @@ impl LabPointerFixture {
         if finished {
             down = false;
         }
-        let velocity_local = (local - self.previous_local) / dt;
+        // The fixture begins with the pointer already at its authored contact
+        // point. Treating the default zero vector as a previous cursor sample
+        // manufactured a large onset velocity, causing stationary holds and
+        // soft touches to be misclassified as stretches or flicks.
+        let velocity_local = if first_sample {
+            Vec2::ZERO
+        } else {
+            (local - self.previous_local) / dt
+        };
         let sample = LabPointerSample {
             local,
             velocity_local,
@@ -1825,7 +2106,7 @@ impl LabPointerFixture {
     }
 }
 
-fn apply_lab_pointer_fixture(runtime: &mut PetRuntime, sensors: &mut SensorFrame, dt: f32) {
+fn apply_lab_pointer_fixture(runtime: &mut PetRuntime, dt: f32) {
     let body_position = runtime.body.simulation.feedback.world_position;
     let scale = runtime.body.embodiment.world_to_body_scale();
     let safe_scale = Vec2::new(
@@ -1836,12 +2117,15 @@ fn apply_lab_pointer_fixture(runtime: &mut PetRuntime, sensors: &mut SensorFrame
             -1.0
         },
     );
-    let Some(fixture) = runtime.lab_pointer_fixture.as_mut() else {
-        return;
+    let (gesture, fixture_phase, sample) = {
+        let Some(fixture) = runtime.lab_pointer_fixture.as_mut() else {
+            return;
+        };
+        let gesture = fixture.gesture;
+        let fixture_phase = (fixture.elapsed_seconds / fixture.duration_seconds).clamp(0.0, 1.0);
+        (gesture, fixture_phase, fixture.step(dt))
     };
-    let gesture = fixture.gesture;
-    let fixture_phase = (fixture.elapsed_seconds / fixture.duration_seconds).clamp(0.0, 1.0);
-    let sample = fixture.step(dt);
+    let sensors = &mut runtime.sensors;
     sensors.cursor_position = body_position + sample.local / safe_scale;
     sensors.cursor_velocity = sample.velocity_local / safe_scale;
     sensors.cursor_acceleration = Vec2::ZERO;
@@ -1864,6 +2148,7 @@ fn apply_lab_pointer_fixture(runtime: &mut PetRuntime, sensors: &mut SensorFrame
     }
     if sample.finished {
         runtime.lab_pointer_fixture = None;
+        runtime.lab_face_pose = None;
     }
 }
 
@@ -1921,6 +2206,18 @@ impl PetApplication {
             runtime.lab_control_poll_accumulator %= LAB_CONTROL_POLL_INTERVAL_SECONDS;
             poll_lab_control(&self.store, runtime, SystemTime::now(), now);
         }
+        if runtime.lab_session.expire(now) {
+            runtime.lab_pointer_fixture = None;
+            runtime.lab_face_pose = None;
+            runtime.lab_motor_program = None;
+            runtime.lab_motor_restart = false;
+            runtime.motor.cancel_lab_fixture();
+        }
+        runtime.debug_interval = if runtime.dev_mode || runtime.lab_session.active(now) {
+            DEV_MODE_LOG_INTERVAL
+        } else {
+            DEBUG_LOG_INTERVAL
+        };
         if runtime.shutdown_for_promotion {
             runtime.platform.shutdown();
             runtime.ecology.prepare_shutdown();
@@ -2071,6 +2368,12 @@ impl PetApplication {
                 local_time_01(),
             );
             runtime.sensors.embodied_interaction = runtime.body.embodied_interaction_frame();
+            // A dev fixture is an alternate pointer observation, not a
+            // post-physics visual effect. Install it into the canonical sensor
+            // frame before Vita observes it so body physics, gesture
+            // classification, LifeCore, and pet_motor all consume the same
+            // causal sample.
+            apply_lab_pointer_fixture(runtime, observation_dt);
             runtime.body.simulation.feedback.cursor_contact =
                 runtime.sensors.embodied_interaction.contact.active;
             if petting_started {
@@ -2176,8 +2479,7 @@ impl PetApplication {
                 runtime.vita.percept().scroll_velocity,
                 runtime.vita.percept().window_pressure,
             );
-            let mut body_sensors = runtime.sensors.clone();
-            apply_lab_pointer_fixture(runtime, &mut body_sensors, body_dt);
+            let body_sensors = runtime.sensors.clone();
             runtime.body.fixed_update(
                 &runtime.life.state.genome,
                 &runtime.intent,
@@ -2205,15 +2507,42 @@ impl PetApplication {
             }
             runtime.body.set_ecology_visual_effect(ecology_effect);
             let previous_screen_center = runtime.screen_body_center;
+            let bottom_edge_sleep = runtime.life.state.current_action == ActionId::Sleep
+                || matches!(
+                    runtime.last_motor_packet.program,
+                    Some(
+                        pet_motor::BehaviorProgramId::RestSurfaceRoostSearch
+                            | pet_motor::BehaviorProgramId::RestLandingSoftTouchdown
+                            | pet_motor::BehaviorProgramId::RestSitSettle
+                            | pet_motor::BehaviorProgramId::RestNremSleep
+                    )
+                );
             apply_screen_domain(
                 &mut runtime.body,
                 &runtime.topology,
                 runtime.window.inner_size(),
+                bottom_edge_sleep,
                 &mut runtime.screen_body_center,
                 &mut runtime.screen_velocity_px,
                 &mut runtime.screen_collision_half_extent_px,
                 &mut runtime.screen_edge_contact,
                 body_dt,
+            );
+            if runtime.body.simulation.feedback.collision.is_some() {
+                runtime.collision_impulse_count = runtime.collision_impulse_count.saturating_add(1);
+            }
+            let liquid_bounds = runtime
+                .body
+                .liquid_visual_bounds_pixels(runtime.window.inner_size().height.max(1) as f32);
+            runtime.screen_edge_gap_px = runtime.topology.virtual_physical_bounds.maximum.y as f32
+                - (runtime.screen_body_center.y + liquid_bounds.main_maximum.y);
+            update_screen_edge_support_state(
+                bottom_edge_sleep,
+                runtime.screen_edge_gap_px,
+                runtime.screen_velocity_px.y,
+                body_dt,
+                &mut runtime.screen_edge_support_stable_seconds,
+                &mut runtime.screen_edge_supported,
             );
             let screen_tick_step = runtime.screen_body_center.distance(previous_screen_center);
             runtime.maximum_screen_tick_step_px =
@@ -2261,8 +2590,20 @@ impl PetApplication {
         // The ecology shader uses it locally for the den lens; captured pixels
         // remain process-local and are never persisted or added to telemetry.
         let background_started = Instant::now();
+        let den_capture_region = {
+            let den = &runtime.ecology.state().den;
+            den_background_capture_region(
+                den.anchor,
+                den.size_scale,
+                runtime.body.tuning_profile().den.displacement_radius,
+                runtime.window.inner_size(),
+            )
+        };
         if background_capture_is_armed(runtime.presented_pose.frame_count)
-            && let Some(frame) = runtime.platform.capture_overlay_background(&runtime.window)
+            && let Some(capture_region) = den_capture_region
+            && let Some(frame) = runtime
+                .platform
+                .capture_overlay_background(&runtime.window, capture_region)
         {
             let den = &runtime.ecology.state().den;
             // The visible den, displaced rim and glow fit inside this authored
@@ -2270,16 +2611,19 @@ impl PetApplication {
             // clean pixels in that region while live capture continues around
             // it, preventing recursive optical feedback without freezing the
             // rest of the desktop texture.
-            let exclusion_radius = frame.height as f32
+            let capture_minimum = Vec2::new(frame.normalized_region[0], frame.normalized_region[1]);
+            let capture_extent = Vec2::new(frame.normalized_region[2], frame.normalized_region[3]);
+            let exclusion_center = (den.anchor - capture_minimum) / capture_extent;
+            let exclusion_radius = frame.height as f32 / capture_extent.y
                 * (105.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX)
                 * den.size_scale
                 * den_capture_exclusion_scale(
                     runtime.body.tuning_profile().den.displacement_radius,
                 );
-            let exclusion_feather =
-                frame.height as f32 * (36.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX);
+            let exclusion_feather = frame.height as f32 / capture_extent.y
+                * (36.0 / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX);
             let exclusion =
-                EcologyCaptureExclusion::new(den.anchor, exclusion_radius, exclusion_feather);
+                EcologyCaptureExclusion::new(exclusion_center, exclusion_radius, exclusion_feather);
             let seeding_clean_background =
                 background_capture_needs_clean_seed(runtime.background_clean_seed_frames);
             let background_updated =
@@ -2288,22 +2632,25 @@ impl PetApplication {
                     // whole frame is clean. Do not apply the den retention mask
                     // until the history has converged; otherwise one bad startup
                     // sample is frozen under the lens for the entire process.
-                    runtime.ecology_renderer.update_background(
+                    runtime.ecology_renderer.update_background_region_excluding(
                         runtime.renderer.device(),
                         runtime.renderer.queue(),
                         frame.width,
                         frame.height,
                         frame.bytes_per_row,
                         &frame.bgra8,
+                        frame.normalized_region,
+                        None,
                     )
                 } else {
-                    runtime.ecology_renderer.update_background_excluding(
+                    runtime.ecology_renderer.update_background_region_excluding(
                         runtime.renderer.device(),
                         runtime.renderer.queue(),
                         frame.width,
                         frame.height,
                         frame.bytes_per_row,
                         &frame.bgra8,
+                        frame.normalized_region,
                         exclusion,
                     )
                 };
@@ -2394,9 +2741,9 @@ impl PetApplication {
                 LIFE_DT,
             );
             // Lab drive pulses are an observational experiment layer, never a
-            // second homeostasis owner. Morph sees a reversible overlay on the
-            // pre-LifeCore state, then LifeCore advances from its exact natural
-            // drives as it always has.
+            // second homeostasis owner. Morph and LifeCore arbitration see the
+            // same reversible overlay; LifeCore still advances and persists its
+            // exact natural drives.
             let morph_overlay = runtime
                 .lab_interventions
                 .drive_overlay(runtime.life.state.drives, tick_started);
@@ -2413,10 +2760,12 @@ impl PetApplication {
                 LIFE_DT,
             );
             morph_overlay.restore_exact(&mut runtime.life.state.drives);
-            let mut output =
-                runtime
-                    .life
-                    .tick(&runtime.sensors, &runtime.body.simulation.feedback, LIFE_DT);
+            let mut output = runtime.life.tick_with_transient_drives(
+                &runtime.sensors,
+                &runtime.body.simulation.feedback,
+                LIFE_DT,
+                Some(morph_overlay.effective),
+            );
             runtime.expression_director.tick(LIFE_DT);
             if let Some((mut event, signature)) = runtime.vita.take_embodied_gesture_observation() {
                 let episode_id = event.classification.episode_id;
@@ -2470,9 +2819,31 @@ impl PetApplication {
             );
             let vita_gaze = resolved_intent.gaze_target;
             output.body_intent = resolved_intent;
+            let orb_physical = runtime.ecology.orb_physical_frame(
+                &runtime.body,
+                &runtime.body.simulation.feedback,
+                runtime.window.inner_size().height as f32,
+                LIFE_DT,
+            );
             let ecology_output = runtime.ecology.resolve_intent(
                 output.body_intent,
                 EcologyResolveFrame {
+                    social_contact: pet_ecology::SocialContactFrame {
+                        touched: runtime.sensors.pet_touched,
+                        pleasantness: runtime.nervous_system.snapshot().felt.contact_pleasantness,
+                        pain: runtime.nervous_system.snapshot().felt.pain_like,
+                        fatigue: runtime.nervous_system.snapshot().derived.fatigue,
+                        boundary: runtime.sensors.interaction_actuation.resistance > 0.5,
+                        side: (runtime.sensors.cursor_position.x
+                            - runtime.body.simulation.feedback.world_position.x)
+                            .signum(),
+                        diameter: runtime.screen_collision_half_extent_px * 2.0
+                            / Vec2::new(
+                                runtime.topology.virtual_physical_bounds.width().max(1) as f32,
+                                runtime.topology.virtual_physical_bounds.height().max(1) as f32,
+                            ),
+                        social_drive: runtime.life.state.drives.social,
+                    },
                     selected_action: output.selected_action,
                     drives: runtime.life.state.drives,
                     sensors: &runtime.sensors,
@@ -2480,6 +2851,7 @@ impl PetApplication {
                     focus_mode: runtime.life.state.focus_mode
                         || runtime.vita.state().desktop_rhythm.protects_focused_work(),
                     dt: LIFE_DT,
+                    orb_physical,
                 },
             );
             resolution_overlay.restore_exact(&mut runtime.life.state.drives);
@@ -2507,6 +2879,105 @@ impl PetApplication {
                 ecology_target: ecology_gaze,
                 source: gaze_source,
             };
+            let mut motor_context = build_motor_context(runtime);
+            if let Some(episode) = runtime.ecology.active_episode()
+                && episode.phase == EpisodePhase::AskForHelp
+                && episode.attempts >= 2
+            {
+                runtime
+                    .nervous_system
+                    .observe_repeated_motor_failure(episode.id, episode.attempts);
+            }
+
+            if ecology_output.outcomes[..ecology_output.outcome_count]
+                .iter()
+                .any(|o| matches!(o, EcologyOutcome::MorselConsumed(_)))
+            {
+                motor_context.world_event = MotorWorldEvent::FoodConsumed;
+            }
+            let nervous_snapshot = runtime.nervous_system.snapshot();
+            runtime
+                .nervous_system
+                .observe_outcomes(&ecology_output.outcomes[..ecology_output.outcome_count]);
+            let recent_outcome = ecology_output.outcomes[..ecology_output.outcome_count]
+                .last()
+                .map(|outcome| stable_hash_bytes(format!("{outcome:?}").as_bytes()));
+            let motor_goal = BehaviorGoalFrame {
+                action: output.selected_action,
+                body_intent: ecology_output.body_intent.clone(),
+                affect: output.affect,
+                drives: runtime.life.state.drives,
+                felt: nervous_snapshot.felt,
+                derived: nervous_snapshot.derived,
+                attachment: runtime.life.state.affect.attachment,
+                recent_outcome,
+            };
+            let mut motor_packet = if let Some(program) = runtime.lab_motor_program {
+                if runtime.lab_motor_restart {
+                    runtime
+                        .motor
+                        .begin_lab_fixture(program, &motor_goal, &motor_context);
+                    runtime.lab_motor_restart = false;
+                }
+                let packet = runtime
+                    .motor
+                    .tick_lab_fixture(&motor_goal, &motor_context, LIFE_DT);
+                if runtime.motor.active().is_none() {
+                    runtime.lab_motor_program = None;
+                }
+                packet
+            } else {
+                runtime.motor.tick(&motor_goal, &motor_context, LIFE_DT)
+            };
+            let danger = motor_goal.felt.startle > 0.4 || motor_goal.felt.pain_like > 0.2;
+            let (attention, kind) = if danger {
+                (
+                    Some(if motor_context.body.contact.contact_count > 0 {
+                        motor_context.body.contact.point_world
+                    } else {
+                        runtime.sensors.cursor_position
+                    }),
+                    lifecore::AttentionTargetKind::Danger,
+                )
+            } else if runtime.sensors.pet_touched {
+                (
+                    Some(runtime.sensors.cursor_position),
+                    lifecore::AttentionTargetKind::Interaction,
+                )
+            } else if motor_packet.expression.gaze_target.is_some() {
+                (
+                    motor_packet.expression.gaze_target,
+                    if runtime.motor.active().is_some_and(|a| {
+                        matches!(a.locked_target, Some(pet_motor::BehaviorTarget::Cursor(_)))
+                    }) {
+                        lifecore::AttentionTargetKind::Social
+                    } else {
+                        lifecore::AttentionTargetKind::ObjectGoal
+                    },
+                )
+            } else if ecology_output.body_intent.gaze_target.is_some() {
+                (
+                    ecology_output.body_intent.gaze_target,
+                    lifecore::AttentionTargetKind::ObjectGoal,
+                )
+            } else if let Some(target) = runtime.vita.visual_attention_target() {
+                (Some(target.position), lifecore::AttentionTargetKind::Visual)
+            } else {
+                (None, lifecore::AttentionTargetKind::Free)
+            };
+            if danger {
+                motor_packet.expression.gaze_target = attention;
+            }
+            runtime.nervous_system.set_attention(
+                attention,
+                kind,
+                if kind == lifecore::AttentionTargetKind::ObjectGoal {
+                    runtime.ecology.active_episode().and_then(|e| e.object_id)
+                } else {
+                    None
+                },
+                f32::from(attention.is_some()),
+            );
             output.body_intent = ecology_output.body_intent;
             let ecology_vocal_trigger = ecology_output.vocal_trigger;
             preserve_navigation_during_material_drag(
@@ -2515,20 +2986,29 @@ impl PetApplication {
                 runtime.sensors.pet_dragged,
             );
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
-            runtime.nervous_system.apply_actuation(
+            runtime.nervous_system.apply_motor_actuation(
                 &mut runtime.life,
                 &runtime.vita,
                 &runtime.morph,
                 &mut runtime.body,
                 &mut runtime.sensors,
                 &mut output.body_intent,
+                Some(nervous_system_runtime::MotorActuationFrame {
+                    packet: &motor_packet,
+                    context: &motor_context,
+                    scene_pose: motor_scene_pose(runtime.ecology.active_episode()),
+                }),
                 LIFE_DT,
             );
             keep_eyes_available_during_active_locomotion(&mut output.body_intent);
+            if let Some(pose) = runtime.lab_face_pose {
+                output.body_intent.expression = pose.expression();
+            }
+            runtime.last_motor_packet = motor_packet;
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
             runtime.nervous_system.commit_intent(
                 &mut runtime.life,
-                &runtime.body,
+                &mut runtime.body,
                 &runtime.sensors,
                 &output.body_intent,
             );
@@ -2543,6 +3023,11 @@ impl PetApplication {
                 runtime.save_accumulator = 30.0;
             }
             runtime.was_sleeping = sleeping;
+            if output.vocal_request.is_none()
+                && let Some(trigger) = motor_vocal_trigger(&runtime.last_motor_packet)
+            {
+                output.vocal_request = runtime.life.request_vocalization(trigger, &runtime.sensors);
+            }
             if let Some(trigger) = ecology_vocal_trigger {
                 if let Some(request) = output.vocal_request.take() {
                     runtime.life.cancel_vocal_request(request.performance_seed);
@@ -2556,7 +3041,7 @@ impl PetApplication {
         }
         if runtime.debug_accumulator >= runtime.debug_interval {
             runtime.debug_accumulator %= runtime.debug_interval;
-            if runtime.debug_logging
+            if (runtime.debug_logging || runtime.lab_session.active(Instant::now()))
                 && let Some(debug) = &runtime.last_debug
             {
                 runtime.telemetry_sequence = runtime.telemetry_sequence.saturating_add(1);
@@ -2657,6 +3142,15 @@ impl PetApplication {
                     morph_telemetry_json(runtime.last_morph, runtime.brain_mode, morph_diagnostics);
                 let lab_interventions =
                     lab_interventions_telemetry_json(&runtime.lab_interventions, Instant::now());
+                let lab_now = Instant::now();
+                let lab_session = serde_json::json!({
+                    "active": runtime.lab_session.active(lab_now),
+                    "session_id": runtime.lab_session.session_id,
+                    "protocol_version": desktop_host::LAB_SESSION_PROTOCOL_VERSION,
+                    "expires_in_ms": runtime.lab_session.expires_in_ms(lab_now),
+                    "lease_seconds": desktop_host::LAB_SESSION_LEASE_SECONDS,
+                    "renew_seconds": desktop_host::LAB_SESSION_RENEW_SECONDS,
+                });
                 let body_interaction = body_interaction_telemetry_json(runtime);
                 let nervous_snapshot = runtime.nervous_system.snapshot();
                 let nervous_body_feedback = runtime.nervous_system.body_feedback();
@@ -2672,12 +3166,15 @@ impl PetApplication {
                 let audio_visual = runtime.audio.visual_feedback();
                 let audio_levels = runtime.audio.callback_levels();
                 let body_feedback = &runtime.body.simulation.feedback;
+                let locomotion_diagnostics = runtime.body.simulation.diagnostics();
                 let action_definition = runtime.life.state.current_action.definition();
                 let mut debug_details = serde_json::json!({
                     "telemetry_schema": "pet2.causal_telemetry",
                     "telemetry_schema_version": CAUSAL_TELEMETRY_SCHEMA_VERSION,
                     "schema_version": CAUSAL_TELEMETRY_SCHEMA_VERSION,
                     "sequence": telemetry_sequence,
+                    "runtime_session_id": runtime.runtime_session_id,
+                    "lab_session": lab_session,
                     "identity_seed": runtime.life.state.genome.identity_seed,
                     "lineage_id": format!("{:032x}", runtime.life.state.genome.lineage_id),
                     "generation": runtime.life.state.genome.generation,
@@ -2724,6 +3221,21 @@ impl PetApplication {
                     "material_variant": format!("{:?}", runtime.body.tuning_profile().material.variant),
                     "liquid_profile_name": runtime.body.tuning_profile().name.as_str(),
                     "liquid_profile_revision": runtime.body.tuning_profile().profile_revision,
+                    "face_channels": {
+                        "owner": if runtime.lab_face_pose.is_some() { "lab_transient" } else { "phenotype_director" },
+                        "fixture": runtime.lab_face_pose,
+                        "source_felt": runtime.nervous_system.snapshot().felt,
+                        "shape_intent": runtime.last_motor_packet.shape,
+                        "geometry_saturated": runtime.body.expression.geometry_saturated,
+                        "cpu_geometry_90_seconds": runtime.body.expression.geometry_90_seconds,
+                        "target_age_seconds": runtime.body.expression.geometry_age_seconds,
+                        "desired": runtime.body.fast_phenotype_actuation().expression,
+                        "mixed": runtime.intent.expression,
+                        "smoothed": runtime.body.expression.current,
+                        "renderer_geometry": runtime.body.embodiment.pose.geometry,
+                        "renderer_mouth_open": runtime.body.embodiment.pose.mouth_open,
+                        "renderer_blinks": [runtime.body.embodiment.pose.blink_left, runtime.body.embodiment.pose.blink_right],
+                    },
                     "world_position": runtime.body.simulation.feedback.world_position.to_array(),
                     "target_position": runtime.intent.target_position.to_array(),
                     "velocity": runtime.body.simulation.feedback.velocity.to_array(),
@@ -2736,6 +3248,9 @@ impl PetApplication {
                         )).to_array(),
                     "screen_collision_half_extent_px": runtime.screen_collision_half_extent_px.to_array(),
                     "screen_edge_contact": runtime.screen_edge_contact,
+                    "screen_edge_gap_px": runtime.screen_edge_gap_px,
+                    "screen_edge_support_stable_seconds": runtime.screen_edge_support_stable_seconds,
+                    "screen_edge_supported": runtime.screen_edge_supported,
                     "maximum_screen_tick_step_px": runtime.maximum_screen_tick_step_px,
                     "screen_tick_jump_events": runtime.screen_tick_jump_events,
                     "dropped_body_time_seconds": runtime.dropped_body_time_seconds,
@@ -2771,6 +3286,12 @@ impl PetApplication {
                         })),
                         "pose_error": body_feedback.pose_error,
                         "locomotion_completed": body_feedback.locomotion_completed,
+                        "screen_jerk_px_s3": locomotion_diagnostics.jerk_px_s3.to_array(),
+                        "acceleration_delta_px_s2": locomotion_diagnostics.acceleration_delta_px_s2.to_array(),
+                        "controller_saturation_fraction": locomotion_diagnostics.saturation_fraction(),
+                        "acceleration_limited": locomotion_diagnostics.acceleration_limited,
+                        "jerk_limited": locomotion_diagnostics.jerk_limited,
+                        "collision_impulse_count": runtime.collision_impulse_count,
                         "locomotion": format!("{:?}", runtime.intent.locomotion),
                         "desired_speed": runtime.intent.desired_speed,
                         "pose": format!("{:?}", runtime.intent.pose),
@@ -2845,6 +3366,26 @@ impl PetApplication {
                         "source_episode_id": nervous_snapshot.source_episode_id,
                         "fast_actuation": nervous_actuation,
                         "readability_calibration": runtime.body.tuning_profile().nervous,
+                    },
+                    "motor": {
+                        "lab_program_override": runtime.lab_motor_program,
+                        "active_performance": runtime.motor.active(),
+                        "packet": &runtime.last_motor_packet,
+                        "somatic_feedback": runtime.body.somatic_feedback(),
+                        "last_completion": runtime.motor.last_completion(),
+                        "trace_tail": runtime.motor.trace_tail(24),
+                        "field_budget": pet_motor::LOCAL_FIELD_BUDGET,
+                        "surface_attachment_budget": pet_motor::SURFACE_ATTACHMENT_BUDGET,
+                        "screen_edge_contact_evidence": {
+                            "gap_px": runtime.screen_edge_gap_px,
+                            "normal_velocity_px_s": runtime.screen_velocity_px.y,
+                            "stable_seconds": runtime.screen_edge_support_stable_seconds,
+                            "supported": runtime.screen_edge_supported,
+                            "approach_threshold_px": 8.0,
+                            "support_threshold_px": 4.0,
+                            "revoke_threshold_px": 6.0,
+                            "required_dwell_seconds": 0.30,
+                        },
                     },
                     "fusion": serde_json::Value::Null,
                     "intent_pose": format!("{:?}", runtime.intent.pose),
@@ -2986,6 +3527,10 @@ impl PetApplication {
                     },
                     "audio_state": format!("{:?}", runtime.audio.state),
                     "audio_device": runtime.audio.device_name(),
+                    "audio_endpoint_id": runtime.audio.endpoint_id,
+                    "audio_endpoint_generation": runtime.audio.endpoint_generation,
+                    "audio_endpoint_switch_reason": runtime.audio.endpoint_switch_reason,
+                    "audio_endpoint_recovery_errors": runtime.audio.endpoint_recovery_errors,
                     "audio_config": runtime.audio.selected_config().map(|config| format!("{:?}", config)),
                     "audio_last_request": runtime.audio.last_request,
                     "audio_last_error": runtime.audio.last_error,
@@ -2998,6 +3543,12 @@ impl PetApplication {
                     "audio": {
                         "state": format!("{:?}", runtime.audio.state),
                         "configured": runtime.audio.selected_config().is_some(),
+                        "endpoint_id": runtime.audio.endpoint_id,
+                        "device_name": runtime.audio.device_name(),
+                        "generation": runtime.audio.endpoint_generation,
+                        "switch_reason": runtime.audio.endpoint_switch_reason,
+                        "recovery_errors": runtime.audio.endpoint_recovery_errors,
+                        "last_recovery_error": runtime.audio.last_error,
                         "active": audio_visual.active,
                         "motif_id": audio_visual.motif_id,
                         "syllable_index": audio_visual.syllable_index,
@@ -3192,6 +3743,7 @@ impl ApplicationHandler for PetApplication {
         let last_morph = prepared.morph.last_output();
         let loaded_life_state_hash = prepared.loaded_life_state_hash;
         let loaded_genome_hash = prepared.life.state.genome.stable_hash();
+        let identity_seed = prepared.life.state.genome.identity_seed;
         self.runtime = Some(PetRuntime {
             window,
             renderer,
@@ -3206,6 +3758,10 @@ impl ApplicationHandler for PetApplication {
             vita: prepared.vita,
             morph: prepared.morph,
             ecology: prepared.ecology,
+            motor: BehaviorPerformanceRuntime::new(identity_seed),
+            last_motor_packet: SomaticActuationPacket::default(),
+            lab_motor_program: None,
+            lab_motor_restart: false,
             brain_mode: self.arguments.brain_mode,
             dev_mode: self.arguments.dev_mode,
             audio,
@@ -3218,6 +3774,9 @@ impl ApplicationHandler for PetApplication {
             screen_velocity_px: Vec2::ZERO,
             screen_collision_half_extent_px: Vec2::ZERO,
             screen_edge_contact: false,
+            screen_edge_gap_px: 10_000.0,
+            screen_edge_support_stable_seconds: 0.0,
+            screen_edge_supported: false,
             last_update: runtime_started,
             last_present: runtime_started,
             next_frame_deadline: runtime_started,
@@ -3226,6 +3785,7 @@ impl ApplicationHandler for PetApplication {
             maximum_body_steps_per_frame: 0,
             maximum_screen_tick_step_px: 0.0,
             screen_tick_jump_events: 0,
+            collision_impulse_count: 0,
             presented_pose: PresentedPoseMonitor::default(),
             presentation_cadence: PresentationCadence::default(),
             skipped_render_frames: 0,
@@ -3237,6 +3797,7 @@ impl ApplicationHandler for PetApplication {
             tuning_poll_accumulator: 0.0,
             lab_control_poll_accumulator: LAB_CONTROL_POLL_INTERVAL_SECONDS,
             lab_interventions: LabInterventionState::new(runtime_started_unix_ms),
+            lab_session: LabSessionState::default(),
             tuning_last_modified,
             was_sleeping: false,
             visible_after_first_frame: false,
@@ -3249,6 +3810,9 @@ impl ApplicationHandler for PetApplication {
             },
             debug_accumulator: 0.0,
             telemetry_sequence: 0,
+            runtime_session_id: stable_hash_bytes(
+                format!("{}:{runtime_started_unix_ms}", std::process::id()).as_bytes(),
+            ),
             fps_accumulator: 0.0,
             frames_since_fps: 0,
             fps: 0.0,
@@ -3281,6 +3845,7 @@ impl ApplicationHandler for PetApplication {
             background_timings: TimingWindow::default(),
             pending_gesture_convention: None,
             lab_pointer_fixture: None,
+            lab_face_pose: None,
             last_convention_update_episode: 0,
             shutdown_for_promotion: false,
             runtime_ack_accumulator: 1.0,
@@ -3688,6 +4253,18 @@ fn apply_shared_feedback(runtime: &mut PetRuntime, event: FeedbackEvent) {
         runtime
             .ecology
             .observe_explicit_refusal(runtime.sensors.timestamp);
+        runtime.motor.cancel_social_request();
+    }
+    if matches!(
+        event,
+        FeedbackEvent::FocusModeEnabled | FeedbackEvent::FocusModeDisabled
+    ) {
+        runtime.vita.apply_feedback(&event);
+        if matches!(event, FeedbackEvent::FocusModeEnabled) {
+            runtime.motor.cancel_social_request();
+        }
+        runtime.life.apply_feedback(event);
+        return;
     }
     apply_gesture_convention_feedback(runtime, &event);
     runtime.vita.apply_feedback(&event);
@@ -3721,6 +4298,30 @@ fn stage_gesture_convention(
         return;
     };
     if let Some(matched) = recognized {
+        runtime
+            .motor
+            .acknowledge_recognition(runtime.sensors.cursor_position, matched.confidence);
+        let repeated = runtime
+            .pending_gesture_convention
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.existing_id == Some(matched.id)
+                    && pending.episode_id != event.classification.episode_id
+                    && runtime.sensors.timestamp - pending.observed_at <= 3.5
+            });
+        if matched.confidence < 0.75 && !repeated {
+            event.classification.committed = false;
+            event.classification.confidence = event.classification.confidence.min(0.35);
+            runtime.motor.await_gesture_repetition();
+            runtime.pending_gesture_convention = Some(PendingGestureConvention {
+                episode_id: event.classification.episode_id,
+                meaning,
+                signature,
+                existing_id: Some(matched.id),
+                observed_at: runtime.sensors.timestamp.max(0.0),
+            });
+            return;
+        }
         event.classification.kind = gesture_for_convention_meaning(matched.meaning);
         event.classification.confidence = event.classification.confidence.max(matched.confidence);
         event.classification.committed = true;
@@ -3880,7 +4481,49 @@ fn poll_lab_control(
     }
 
     let command_id = envelope.command_id;
+    let session_token = envelope.session_token.clone();
+    let session_authorized = runtime.dev_mode
+        || runtime
+            .lab_session
+            .accepts(session_token.as_deref(), monotonic_now);
+    let requires_active_session = !matches!(
+        envelope.command,
+        LabControlCommand::OpenSession { .. }
+            | LabControlCommand::RenewSession { .. }
+            | LabControlCommand::CloseSession
+            | LabControlCommand::ShutdownForPromotion
+    );
+    if requires_active_session && !session_authorized {
+        runtime.lab_interventions.note_applied(false);
+        return;
+    }
     let changed = match envelope.command {
+        LabControlCommand::OpenSession {
+            protocol_version: _,
+            lease_seconds,
+        } => runtime.lab_session.open(
+            session_token.unwrap_or_default(),
+            lease_seconds,
+            monotonic_now,
+        ),
+        LabControlCommand::RenewSession { lease_seconds } => {
+            session_token.as_deref().is_some_and(|token| {
+                runtime
+                    .lab_session
+                    .renew(token, lease_seconds, monotonic_now)
+            })
+        }
+        LabControlCommand::CloseSession => session_token.as_deref().is_some_and(|token| {
+            let closed = runtime.lab_session.close(token, monotonic_now);
+            if closed {
+                runtime.lab_pointer_fixture = None;
+                runtime.lab_face_pose = None;
+                runtime.lab_motor_program = None;
+                runtime.lab_motor_restart = false;
+                runtime.motor.cancel_lab_fixture();
+            }
+            closed
+        }),
         LabControlCommand::CueAttention {
             position,
             duration_seconds,
@@ -3935,13 +4578,36 @@ fn poll_lab_control(
             intensity,
             duration_seconds,
         } => {
-            if runtime.dev_mode {
+            if session_authorized {
                 runtime.lab_pointer_fixture =
                     Some(LabPointerFixture::new(gesture, intensity, duration_seconds));
                 true
             } else {
                 false
             }
+        }
+        LabControlCommand::RunMotorProgram { program } => {
+            if session_authorized {
+                runtime.lab_motor_program = Some(program);
+                runtime.lab_motor_restart = true;
+                true
+            } else {
+                false
+            }
+        }
+        LabControlCommand::SetFacePose { pose } => {
+            if session_authorized {
+                runtime.lab_face_pose = pose;
+                true
+            } else {
+                false
+            }
+        }
+        LabControlCommand::CancelMotorProgram => {
+            let changed = runtime.lab_motor_program.take().is_some();
+            runtime.lab_motor_restart = false;
+            runtime.motor.cancel_lab_fixture();
+            changed
         }
         LabControlCommand::DeleteGestureConvention { convention_id } => {
             let changed = runtime.ecology.delete_gesture_convention(convention_id);
@@ -3983,12 +4649,18 @@ fn unix_time_millis(time: SystemTime) -> u64 {
 
 const fn lab_command_name(command: &LabControlCommand) -> &'static str {
     match command {
+        LabControlCommand::OpenSession { .. } => "open_session",
+        LabControlCommand::RenewSession { .. } => "renew_session",
+        LabControlCommand::CloseSession => "close_session",
         LabControlCommand::CueAttention { .. } => "cue_attention",
         LabControlCommand::DrivePulse { .. } => "drive_pulse",
         LabControlCommand::Reward { .. } => "reward",
         LabControlCommand::FocusMode { .. } => "focus_mode",
         LabControlCommand::ClearDrivePulses => "clear_drive_pulses",
         LabControlCommand::StimulatePointerGesture { .. } => "stimulate_pointer_gesture",
+        LabControlCommand::RunMotorProgram { .. } => "run_motor_program",
+        LabControlCommand::SetFacePose { .. } => "set_face_pose",
+        LabControlCommand::CancelMotorProgram => "cancel_motor_program",
         LabControlCommand::DeleteGestureConvention { .. } => "delete_gesture_convention",
         LabControlCommand::RollbackGestureConventions { .. } => "rollback_gesture_conventions",
         LabControlCommand::ClearGestureConventions => "clear_gesture_conventions",
@@ -4410,6 +5082,90 @@ fn activity_family(
         | ActionId::ExploreScreen
         | ActionId::PeekFromEdge
         | ActionId::Metamorphosis => "explore",
+    }
+}
+
+fn motor_scene_pose(episode: Option<&pet_ecology::ActivityEpisode>) -> Option<lifecore::FacePose> {
+    let e = episode?;
+    if e.reason_code == pet_ecology::EpisodeReason::PettingContinuation {
+        Some(lifecore::FacePose::Affectionate)
+    } else if e.phase == EpisodePhase::AskForHelp {
+        Some(lifecore::FacePose::Confused)
+    } else if e.goal == EpisodeGoal::OfferOrb && e.phase == EpisodePhase::WaitForUser {
+        Some(lifecore::FacePose::Playful)
+    } else {
+        None
+    }
+}
+
+fn motor_world_goal(goal: Option<EpisodeGoal>) -> MotorWorldGoal {
+    match goal {
+        Some(EpisodeGoal::ReturnHome) => MotorWorldGoal::ReturnHome,
+        Some(EpisodeGoal::SleepInDen) => MotorWorldGoal::SleepInDen,
+        Some(EpisodeGoal::CarryOrbHome) => MotorWorldGoal::CarryOrbHome,
+        Some(EpisodeGoal::ReturnOrb) => MotorWorldGoal::ReturnOrb,
+        Some(EpisodeGoal::RetrieveOrb) => MotorWorldGoal::RetrieveOrb,
+        Some(EpisodeGoal::InspectWindow) => MotorWorldGoal::InspectWindow,
+        Some(EpisodeGoal::RideWindow) => MotorWorldGoal::RideWindow,
+        Some(EpisodeGoal::SharedAttention) => MotorWorldGoal::SharedAttention,
+        Some(EpisodeGoal::OfferOrb) => MotorWorldGoal::OfferOrb,
+        _ => MotorWorldGoal::None,
+    }
+}
+
+fn build_motor_context(runtime: &mut PetRuntime) -> BehaviorContextFrame {
+    let mut context = motor_context::from_frames(
+        &runtime.nervous_system,
+        &runtime.vita,
+        &runtime.body,
+        &runtime.life,
+        &runtime.sensors,
+        &runtime.intent,
+        Some(&mut runtime.ecology),
+    );
+    let desktop_size = Vec2::new(
+        runtime.topology.virtual_physical_bounds.width().max(1) as f32,
+        runtime.topology.virtual_physical_bounds.height().max(1) as f32,
+    );
+    let bounds = runtime
+        .body
+        .liquid_visual_bounds_pixels(runtime.window.inner_size().height.max(1) as f32);
+    context.body_bottom_extent =
+        (bounds.main_maximum.y.max(1.0) / desktop_size.y).clamp(0.012, 0.25);
+    context.body_diameter = runtime.screen_collision_half_extent_px * 2.0 / desktop_size;
+    context.screen_edge_gap_px = runtime.screen_edge_gap_px;
+    context.screen_edge_normal_velocity_px_s = runtime.screen_velocity_px.y;
+    context.screen_edge_support_stable_seconds = runtime.screen_edge_support_stable_seconds;
+    context.screen_edge_supported = runtime.screen_edge_supported;
+    context.surfaces.push(SurfaceCandidate {
+        surface_id: SurfaceId("screen:bottom_edge".into()),
+        minimum: Vec2::new(0.0, 1.0 - 1.0 / desktop_size.y),
+        maximum: Vec2::ONE,
+        velocity: Vec2::ZERO,
+        familiarity: 1.0,
+        recent_failed_landings: 0,
+    });
+    context
+}
+
+fn motor_vocal_trigger(packet: &SomaticActuationPacket) -> Option<VocalTrigger> {
+    if !packet.voice.emit_once || packet.voice.intensity <= 0.01 {
+        return None;
+    }
+    match packet.voice.semantic {
+        VoiceSemanticIntent::None
+        | VoiceSemanticIntent::PhysiologicalBreath
+        | VoiceSemanticIntent::Yawn
+        | VoiceSemanticIntent::DreamMurmur => None,
+        VoiceSemanticIntent::Notice => Some(VocalTrigger::VisualNotice),
+        VoiceSemanticIntent::Contact | VoiceSemanticIntent::Ack => Some(VocalTrigger::SoftTouch),
+        VoiceSemanticIntent::Invite => Some(VocalTrigger::ToyOffer),
+        VoiceSemanticIntent::Query => Some(VocalTrigger::NeedHelp),
+        VoiceSemanticIntent::Effort => Some(VocalTrigger::MissAndRetry),
+        VoiceSemanticIntent::Boundary => Some(VocalTrigger::CalmBoundary),
+        VoiceSemanticIntent::Alarm => Some(VocalTrigger::PhysicalStartle),
+        VoiceSemanticIntent::Relief => Some(VocalTrigger::HomeReturn),
+        VoiceSemanticIntent::Purr => Some(VocalTrigger::Action(ActionId::Purr)),
     }
 }
 
@@ -5119,6 +5875,9 @@ fn load_migrate_apply_liquid_tuning(
     }
     store
         .save_liquid_tuning_status(&LiquidTuningAcknowledgement {
+            profile_hash: lifecore::stable_hash_bytes(
+                &serde_json::to_vec(&applied).map_err(|e| e.to_string())?,
+            ),
             profile_revision: applied.profile_revision,
             schema_version: applied.schema_version,
             material_variant: applied.material.variant,
@@ -5136,6 +5895,31 @@ fn den_capture_exclusion_scale(displacement_radius: f32) -> f32 {
     // that support in the clean desktop history so expanding past 1.0 never
     // exposes recursive overlay pixels at the new circular edge.
     (displacement_radius.clamp(0.45, 1.30) * 1.055).max(1.0)
+}
+
+fn den_background_capture_region(
+    anchor: Vec2,
+    den_scale: f32,
+    displacement_radius: f32,
+    overlay_size: PhysicalSize<u32>,
+) -> Option<DesktopBackgroundCaptureRegion> {
+    if !anchor.is_finite() || overlay_size.width == 0 || overlay_size.height == 0 {
+        return None;
+    }
+    let scale = if den_scale.is_finite() {
+        den_scale.clamp(0.50, 2.0)
+    } else {
+        1.0
+    };
+    let half_extent_y = DEN_CAPTURE_HALF_EXTENT_REFERENCE_PX
+        / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX
+        * scale
+        * den_capture_exclusion_scale(displacement_radius);
+    let half_extent_x = half_extent_y * overlay_size.height as f32 / overlay_size.width as f32;
+    let half_extent = Vec2::new(half_extent_x, half_extent_y);
+    let minimum = (anchor - half_extent).clamp(Vec2::ZERO, Vec2::ONE);
+    let maximum = (anchor + half_extent).clamp(Vec2::ZERO, Vec2::ONE);
+    DesktopBackgroundCaptureRegion::new(minimum, maximum, DEN_CAPTURE_MAXIMUM_OUTPUT_DIMENSION)
 }
 
 fn background_capture_is_armed(presented_frames: u64) -> bool {
@@ -5167,6 +5951,17 @@ fn load_restore_body_state(store: &StateStore, body: &mut ProceduralBody) -> Res
 /// material remain available inside Body Lab for diagnostics, but a stale user
 /// profile must not silently switch the desktop organism back to either lane.
 fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningProfile {
+    // Migrate only the exact previous stock pair; retain authored overrides.
+    if (profile.nervous.expression_gain - 1.28).abs() < 0.0001
+        && (profile.nervous.motion_gain - 1.20).abs() < 0.0001
+    {
+        profile.nervous.expression_gain = 1.40;
+        profile.nervous.motion_gain = 1.30;
+    }
+    if profile.face.scale == [0.96, 1.02] {
+        profile.face.scale = [1.104, 1.173];
+        profile.profile_revision = profile.profile_revision.saturating_add(1);
+    }
     let reference = approved_production_liquid_tuning(profile.seed);
     let stale_body = profile.render_mode != BodyRenderMode::ParticlePbf;
     let stale_material = profile.material.variant != MaterialVariant::CinematicJelly;
@@ -5298,7 +6093,7 @@ fn approved_production_liquid_tuning(seed: u64) -> LiquidTuningProfile {
     profile.material.bloom_strength = 0.05;
 
     profile.face.origin = [0.0, -0.03];
-    profile.face.scale = [0.96, 1.02];
+    profile.face.scale = [1.104, 1.173];
     profile.face.eye_size_scale = 0.55;
     profile.face.eye_spacing_scale = 1.0;
     profile.face.pupil_scale = 1.5;
@@ -5646,6 +6441,7 @@ fn apply_screen_domain(
     body: &mut ProceduralBody,
     topology: &DisplayTopology,
     overlay_size: PhysicalSize<u32>,
+    bottom_edge_sleep: bool,
     previous_center: &mut Vec2,
     previous_velocity_px: &mut Vec2,
     collision_half_extent_px: &mut Vec2,
@@ -5685,12 +6481,21 @@ fn apply_screen_domain(
                 + (observed_half_extent.y - collision_half_extent_px.y) * release
         };
     }
+    let bounds_minimum = -*collision_half_extent_px;
+    let mut bounds_maximum = *collision_half_extent_px;
+    if bottom_edge_sleep {
+        // During the sleep approach the collision hull must follow the real
+        // lower liquid silhouette. A symmetric hull based on a taller upper
+        // lobe leaves a visible air gap even when its synthetic constraint says
+        // "contact". Other axes retain the conservative smoothed hull.
+        bounds_maximum.y = visual.main_maximum.y.max(1.0);
+    }
     let constrained = constrain_center_swept(
         topology,
         *previous_center,
         proposed,
-        -*collision_half_extent_px,
-        *collision_half_extent_px,
+        bounds_minimum,
+        bounds_maximum,
     );
     let rejected = proposed - constrained;
     let collided = rejected.length_squared() > 0.25;
@@ -5727,6 +6532,34 @@ fn apply_screen_domain(
     *previous_center = constrained;
     *previous_velocity_px = physical_velocity;
     *was_in_contact = collided;
+}
+
+fn update_screen_edge_support_state(
+    sleep_approach_active: bool,
+    gap_px: f32,
+    normal_velocity_px_s: f32,
+    dt: f32,
+    stable_seconds: &mut f32,
+    supported: &mut bool,
+) {
+    let dt = if dt.is_finite() {
+        dt.clamp(0.0, 0.05)
+    } else {
+        0.0
+    };
+    let measured_contact = sleep_approach_active
+        && gap_px.is_finite()
+        && gap_px.abs() <= 4.0
+        && normal_velocity_px_s.is_finite()
+        && normal_velocity_px_s.abs() <= 36.0;
+    if measured_contact {
+        *stable_seconds = (*stable_seconds + dt).min(8.0);
+    } else if !sleep_approach_active || !gap_px.is_finite() || gap_px.abs() > 6.0 {
+        *stable_seconds = 0.0;
+    } else {
+        *stable_seconds = (*stable_seconds - dt * 2.5).max(0.0);
+    }
+    *supported = sleep_approach_active && *stable_seconds >= 0.30 && gap_px.abs() <= 6.0;
 }
 
 fn constrain_center_swept(
@@ -5943,6 +6776,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lab_session_requires_the_exact_token_and_expires_without_lab_cleanup() {
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let wrong = "fedcba9876543210fedcba9876543210";
+        let now = Instant::now();
+        let mut session = LabSessionState::default();
+
+        assert!(session.open(token.clone(), desktop_host::LAB_SESSION_LEASE_SECONDS, now));
+        assert!(session.active(now));
+        assert!(session.accepts(Some(&token), now));
+        assert!(!session.accepts(Some(wrong), now));
+        assert!(!session.renew(wrong, desktop_host::LAB_SESSION_LEASE_SECONDS, now));
+        assert!(session.renew(
+            &token,
+            desktop_host::LAB_SESSION_LEASE_SECONDS,
+            now + Duration::from_secs(desktop_host::LAB_SESSION_RENEW_SECONDS.into())
+        ));
+        assert!(session.active(now + Duration::from_secs(12)));
+        assert!(session.expire(now + Duration::from_secs(14)));
+        assert!(!session.active(now + Duration::from_secs(14)));
+        assert!(session.token.is_none());
+        assert!(session.session_id.is_none());
+    }
+
+    #[test]
+    fn lab_session_close_is_token_scoped_and_immediate() {
+        let token = "0123456789abcdef0123456789abcdef".to_owned();
+        let now = Instant::now();
+        let mut session = LabSessionState::default();
+        session.open(token.clone(), desktop_host::LAB_SESSION_LEASE_SECONDS, now);
+
+        assert!(!session.close("fedcba9876543210fedcba9876543210", now));
+        assert!(session.active(now));
+        assert!(session.close(&token, now));
+        assert!(!session.active(now));
+    }
+
+    #[test]
+    fn screen_edge_support_requires_real_gap_low_velocity_and_300ms_dwell() {
+        let mut stable = 0.0;
+        let mut supported = false;
+        for _ in 0..35 {
+            update_screen_edge_support_state(
+                true,
+                3.5,
+                12.0,
+                1.0 / 120.0,
+                &mut stable,
+                &mut supported,
+            );
+        }
+        assert!(!supported, "less than 300 ms must not count as support");
+        update_screen_edge_support_state(true, 3.5, 12.0, 1.0 / 120.0, &mut stable, &mut supported);
+        assert!(supported);
+        assert!((stable - 0.30).abs() < 0.01);
+    }
+
+    #[test]
+    fn screen_edge_support_rejects_fast_or_false_constraint_contact_and_revokes_by_gap() {
+        let mut stable = 0.0;
+        let mut supported = false;
+        for _ in 0..120 {
+            update_screen_edge_support_state(
+                true,
+                2.0,
+                80.0,
+                1.0 / 120.0,
+                &mut stable,
+                &mut supported,
+            );
+        }
+        assert_eq!(stable, 0.0);
+        assert!(!supported);
+
+        stable = 0.31;
+        supported = true;
+        update_screen_edge_support_state(true, 6.5, 0.0, 1.0 / 120.0, &mut stable, &mut supported);
+        assert_eq!(stable, 0.0);
+        assert!(!supported);
+    }
+
+    #[test]
     fn command_line_parses_pointer_replay_and_typed_evolution_controls() {
         let parsed = Arguments::parse(
             [
@@ -5969,6 +6883,91 @@ mod tests {
         assert_eq!(parsed.evolution_report, Some(PathBuf::from("report.json")));
         assert_eq!(parsed.evolution_persist, Some(EvolutionPersistence::DryRun));
         assert_eq!(parsed.evolution_max_generations, Some(1));
+    }
+
+    #[test]
+    fn lab_hold_fixture_does_not_invent_an_onset_flick() {
+        let mut fixture = LabPointerFixture::new(LabGesture::Hold, 0.72, 1.4);
+
+        let first = fixture.step(1.0 / 60.0);
+        let second = fixture.step(1.0 / 60.0);
+
+        assert!(first.down);
+        assert!(first.pressed);
+        assert_eq!(first.velocity_local, Vec2::ZERO);
+        assert!(second.down);
+        assert!(!second.pressed);
+        assert_eq!(second.velocity_local, Vec2::ZERO);
+    }
+
+    #[test]
+    fn lab_soft_touch_begins_at_the_surface_without_onset_motion() {
+        let mut fixture = LabPointerFixture::new(LabGesture::SoftTouch, 0.35, 2.0);
+
+        let first = fixture.step(1.0 / 60.0);
+
+        assert!(first.down);
+        assert!(first.pressed);
+        assert!(first.local.x <= -0.12);
+        assert_eq!(first.velocity_local, Vec2::ZERO);
+    }
+
+    #[test]
+    fn soft_touch_observation_tail_does_not_extend_contact() {
+        let mut authored = LabPointerFixture::new(LabGesture::SoftTouch, 0.35, 0.55);
+        let mut observable = LabPointerFixture::new(LabGesture::SoftTouch, 0.35, 2.0);
+
+        for frame in 0..33 {
+            let short = authored.step(1.0 / 60.0);
+            let long = observable.step(1.0 / 60.0);
+            assert_eq!(short.down, long.down, "frame {frame}");
+            assert_eq!(short.pressed, long.pressed, "frame {frame}");
+            assert_eq!(short.released, long.released, "frame {frame}");
+        }
+
+        assert!(authored.step(1.0 / 60.0).finished);
+        assert!(!observable.step(1.0 / 60.0).finished);
+    }
+
+    #[test]
+    fn longer_pull_fixture_preserves_the_authored_pull_and_release_cadence() {
+        let mut authored = LabPointerFixture::new(LabGesture::PullRelease, 0.72, 1.2);
+        let mut observable = LabPointerFixture::new(LabGesture::PullRelease, 0.72, 4.0);
+
+        for frame in 0..72 {
+            let short = authored.step(1.0 / 60.0);
+            let long = observable.step(1.0 / 60.0);
+            assert_eq!(short.local, long.local, "frame {frame}");
+            assert_eq!(short.velocity_local, long.velocity_local, "frame {frame}");
+            assert_eq!(short.down, long.down, "frame {frame}");
+            assert_eq!(short.pressed, long.pressed, "frame {frame}");
+            assert_eq!(short.released, long.released, "frame {frame}");
+        }
+
+        assert!(authored.step(1.0 / 60.0).finished);
+        assert!(!observable.step(1.0 / 60.0).finished);
+    }
+
+    #[test]
+    fn pull_fixture_is_fast_but_bounded() {
+        let mut fixture = LabPointerFixture::new(LabGesture::PullRelease, 0.72, 4.0);
+        let mut peak_speed = 0.0_f32;
+        let mut minimum_x = f32::INFINITY;
+        let mut maximum_x = f32::NEG_INFINITY;
+
+        for _ in 0..72 {
+            let sample = fixture.step(1.0 / 60.0);
+            peak_speed = peak_speed.max(sample.velocity_local.length());
+            minimum_x = minimum_x.min(sample.local.x);
+            maximum_x = maximum_x.max(sample.local.x);
+        }
+
+        assert!(peak_speed >= 0.25, "peak speed {peak_speed}");
+        assert!(
+            maximum_x - minimum_x <= 0.20,
+            "travel {}",
+            maximum_x - minimum_x
+        );
     }
 
     #[test]
@@ -6087,6 +7086,7 @@ mod tests {
             command_id,
             issued_unix_ms,
             expires_after_ms,
+            session_token: Some("0123456789abcdef0123456789abcdef".into()),
             command: command.clone(),
         };
         let mut state = LabInterventionState::default();
@@ -6123,6 +7123,7 @@ mod tests {
             command_id,
             issued_unix_ms,
             expires_after_ms: 30_000,
+            session_token: Some("0123456789abcdef0123456789abcdef".into()),
             command: LabControlCommand::Reward { value: 0.5 },
         };
         let mut state = LabInterventionState::new(2_000);
@@ -6310,6 +7311,25 @@ mod tests {
         assert_eq!(manager.take_heard_request(), None);
         assert_eq!(manager.take_unheard_rejection(), None);
         assert!(manager.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn fake_endpoint_watcher_switches_only_on_a_new_multimedia_endpoint() {
+        let samples = ["endpoint-a", "endpoint-a", "endpoint-b", "endpoint-b"];
+        let mut current = samples[0].to_owned();
+        let mut generations = 1_u64;
+        for detected in samples.into_iter().skip(1) {
+            if default_endpoint_changed(&current, detected) {
+                current = detected.to_owned();
+                generations += 1;
+            }
+        }
+        assert_eq!(current, "endpoint-b");
+        assert_eq!(generations, 2);
+        assert_eq!(
+            AUDIO_ENDPOINT_FALLBACK_POLL_INTERVAL,
+            Duration::from_millis(500)
+        );
     }
 
     fn two_monitor_topology() -> DisplayTopology {
@@ -6865,6 +7885,37 @@ mod tests {
         assert!((den_capture_exclusion_scale(1.0) - 1.055).abs() < 1.0e-6);
         assert!((den_capture_exclusion_scale(1.30) - 1.3715).abs() < 1.0e-6);
         assert_eq!(den_capture_exclusion_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn den_background_capture_is_a_square_local_roi() {
+        let region = den_background_capture_region(
+            Vec2::splat(0.5),
+            1.0,
+            0.8,
+            PhysicalSize::new(3_840, 1_152),
+        )
+        .unwrap();
+        let pixel_width = (region.maximum_normalized.x - region.minimum_normalized.x) * 3_840.0;
+        let pixel_height = (region.maximum_normalized.y - region.minimum_normalized.y) * 1_152.0;
+
+        assert!((pixel_width - 440.0).abs() < 0.01);
+        assert!((pixel_height - 440.0).abs() < 0.01);
+        assert_eq!(region.maximum_output_dimension, 512);
+    }
+
+    #[test]
+    fn den_background_capture_clips_to_overlay_edges() {
+        let region = den_background_capture_region(
+            Vec2::new(0.01, 0.02),
+            1.0,
+            1.3,
+            PhysicalSize::new(1_920, 1_080),
+        )
+        .unwrap();
+
+        assert_eq!(region.minimum_normalized, Vec2::ZERO);
+        assert!(region.maximum_normalized.cmple(Vec2::ONE).all());
     }
 
     #[test]

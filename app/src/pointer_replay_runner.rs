@@ -240,7 +240,7 @@ fn execute_replay(
                 &mut intent,
                 1.0 / 20.0,
             );
-            nervous.commit_intent(&mut life, &body, &sensors, &intent);
+            nervous.commit_intent(&mut life, &mut body, &sensors, &intent);
         }
         body.fixed_update(&life.state.genome, &intent, &sensors, BODY_DT);
         body.embodied_update(

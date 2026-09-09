@@ -100,6 +100,10 @@ struct Globals {
     glow_orb_position_radius: [[f32; 4]; MAX_INTERNAL_GLOW_ORBS],
     glow_orb_color_intensity: [[f32; 4]; MAX_INTERNAL_GLOW_ORBS],
     soul_glow_position_radius: [[f32; 4]; MAX_SOUL_GLOW_LOBES],
+    face_lids: [[f32; 4]; 2],
+    face_brows: [[f32; 4]; 2],
+    face_mouth: [f32; 4],
+    face_eye: [f32; 4],
 }
 
 #[repr(C)]
@@ -234,6 +238,8 @@ pub struct RenderParameters {
     pub brow_raise: f32,
     pub brow_tension: f32,
     pub brow_asymmetry: f32,
+    pub geometry: lifecore::FaceGeometry,
+    pub eye_aperture: f32,
     pub mouth_open: f32,
     pub mouth_curve: f32,
     pub mouth_tension: f32,
@@ -3250,6 +3256,8 @@ impl Default for RenderParameters {
             brow_raise: 0.0,
             brow_tension: 0.0,
             brow_asymmetry: 0.0,
+            geometry: lifecore::FaceGeometry::default(),
+            eye_aperture: 1.0,
             mouth_open: 0.0,
             mouth_curve: 0.1,
             mouth_tension: 0.0,
@@ -3426,6 +3434,15 @@ fn globals_for_resolved(
         }
     });
     Globals {
+        face_lids: parameters.geometry.sanitized().lids,
+        face_brows: parameters.geometry.sanitized().brows,
+        face_mouth: parameters.geometry.sanitized().mouth,
+        face_eye: [
+            bounded(parameters.eye_aperture, 0.0, 1.0, 1.0),
+            0.0,
+            0.0,
+            0.0,
+        ],
         viewport_time: [
             aspect,
             parameters.time,
@@ -4089,7 +4106,23 @@ mod tests {
     #[test]
     fn globals_layout_is_wgsl_uniform_safe() {
         assert_eq!(align_of::<Globals>(), 4);
-        assert_eq!(size_of::<Globals>(), 93 * 16);
+        let shader = naga::front::wgsl::parse_str(include_str!("liquid_surface.wgsl")).unwrap();
+        let shader_size = shader
+            .types
+            .iter()
+            .find_map(|(_, ty)| {
+                if ty.name.as_deref() == Some("Globals") {
+                    if let naga::TypeInner::Struct { span, .. } = ty.inner {
+                        Some(span as usize)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(size_of::<Globals>(), shader_size);
         assert_eq!(size_of::<Globals>() % 16, 0);
         assert_eq!(size_of::<ShadowFilterGlobals>(), 10 * 16);
         assert_eq!(size_of::<ShadowFilterGlobals>() % 16, 0);

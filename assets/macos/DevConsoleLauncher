@@ -11,19 +11,6 @@ if [[ ! -d "$pet_app" ]]; then
   exit 1
 fi
 
-# Replace the normal single-instance Pet with the same signed application in
-# bounded telemetry mode. The console itself remains a normal macOS window.
-osascript -e 'tell application id "io.lomatoq.pet2" to quit' >/dev/null 2>&1 || true
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if ! pgrep -x Pet2 >/dev/null; then
-    break
-  fi
-  sleep 0.2
-done
-if pgrep -x Pet2 >/dev/null; then
-  pkill -x Pet2
-fi
-
-open -n "$pet_app" --args --dev-mode
-sleep 1
+# Connect to Pet owns the temporary lease and optional launch. Opening the
+# console never interrupts the companion or forces permanent telemetry.
 exec "$console" --live-pet

@@ -10,6 +10,7 @@ directories.workspace = true
 glam.workspace = true
 lifecore = { path = "../lifecore" }
 pet_ecology = { path = "../pet_ecology" }
+pet_motor = { path = "../pet_motor" }
 raw-window-handle.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -682,6 +682,10 @@ pub enum InteractionTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ExpressionState {
+    #[serde(default)]
+    pub geometry: crate::FaceGeometry,
+    #[serde(default)]
+    pub face_pose: crate::FacePose,
     pub blink_left: f32,
     pub blink_right: f32,
     pub squint: f32,
@@ -713,6 +717,8 @@ pub struct ExpressionState {
 impl Default for ExpressionState {
     fn default() -> Self {
         Self {
+            geometry: crate::FaceGeometry::default(),
+            face_pose: crate::FacePose::Awake,
             blink_left: 0.0,
             blink_right: 0.0,
             squint: 0.0,

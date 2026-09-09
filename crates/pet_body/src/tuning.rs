@@ -2,7 +2,7 @@ use lifecore::{ExpressionState, FastPhenotypeActuation, VocalRequest, VoiceGenom
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 21;
+pub const LIQUID_TUNING_SCHEMA_VERSION: u32 = 22;
 const OLDEST_MIGRATABLE_LIQUID_TUNING_SCHEMA_VERSION: u32 = 6;
 
 /// Approved Body Lab seed-42 palette. Cinematic intentionally uses this authored
@@ -40,7 +40,7 @@ pub enum ColorSourceMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LiquidTuningProfile {
     pub schema_version: u32,
     pub profile_revision: u64,
@@ -195,6 +195,9 @@ pub struct InteractionTuning {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiquidTuningAcknowledgement {
+    /// Hash of the canonical serialized, actually applied profile.
+    #[serde(default)]
+    pub profile_hash: u64,
     pub profile_revision: u64,
     pub schema_version: u32,
     pub material_variant: MaterialVariant,
@@ -215,8 +218,10 @@ pub struct AnalyticTuning {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PbfTuning {
+    /// Gain of the zero-COM semantic posture field; zero is rollback.
+    pub posture_gain: f32,
     pub fixed_hz: f32,
     pub particle_count: usize,
     pub substeps: usize,
@@ -477,7 +482,7 @@ impl LiquidTuningProfile {
             // so loading a file cannot silently change its look.
             self.material.variant = MaterialVariant::CurrentSafe;
             self.schema_version = LIQUID_TUNING_SCHEMA_VERSION;
-        } else if (9..=20).contains(&self.schema_version) {
+        } else if (9..=21).contains(&self.schema_version) {
             // Cinematic profiles already opted into their material. Schemas 10
             // through 15 preserve the selected material lane. Schema 16 replaces
             // the unstable mode-switched solver settings below without touching
@@ -659,8 +664,8 @@ impl Default for NervousReadabilityTuning {
             soul_glow_gain: 1.55,
             internal_flow_gain: 1.50,
             pulse_gain: 1.45,
-            expression_gain: 1.28,
-            motion_gain: 1.20,
+            expression_gain: 1.40,
+            motion_gain: 1.30,
             voice_gain: 1.12,
             threat_sensitivity: 1.0,
             pain_sensitivity: 1.0,
@@ -1022,6 +1027,7 @@ impl AnalyticTuning {
 impl Default for PbfTuning {
     fn default() -> Self {
         Self {
+            posture_gain: 1.0,
             fixed_hz: 120.0,
             particle_count: 96,
             substeps: 1,
@@ -1116,6 +1122,7 @@ impl PbfTuning {
     }
 
     fn sanitize(&mut self) {
+        self.posture_gain = bounded(self.posture_gain, 0.0, 1.5, 1.0);
         // Schema 16 has one authoritative, deterministic time lane. The legacy
         // fields remain serialized so older profiles still load, but cannot create
         // drag/impact-only solver modes.
@@ -1494,7 +1501,7 @@ mod tests {
     #[test]
     fn schema_twenty_one_defaults_keep_the_single_stable_solver_lane() {
         let pbf = PbfTuning::default();
-        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 21);
+        assert_eq!(LIQUID_TUNING_SCHEMA_VERSION, 22);
         assert_eq!(pbf.substeps, 1);
         assert_eq!(pbf.impact_substeps, 1);
         assert_eq!(pbf.density_iterations, 6);
@@ -1597,7 +1604,7 @@ mod tests {
         profile.material.color_source_mode = ColorSourceMode::Authored;
         profile.material.genome_color_blend = 0.0;
         let migrated = profile.sanitized().expect("schema 17 migration");
-        assert_eq!(migrated.schema_version, 21);
+        assert_eq!(migrated.schema_version, 22);
         assert_eq!(
             migrated.material.color_source_mode,
             ColorSourceMode::GenomeAuthoredBlend
@@ -1612,7 +1619,7 @@ mod tests {
         profile.schema_version = 18;
         profile.material.mood_color_blend = 0.0;
         let migrated = profile.sanitized().expect("schema 18 migration");
-        assert_eq!(migrated.schema_version, 21);
+        assert_eq!(migrated.schema_version, 22);
         assert_eq!(migrated.material.mood_color_blend, 0.72);
     }
 

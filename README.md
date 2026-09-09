@@ -167,11 +167,11 @@ keyboard hooks:
 
 ## Pet2 Dev Console
 
-Both packages keep one companion tool: `Pet2 Dev Console.exe` on Windows and
-`Pet2 Dev Console.app` on macOS. Run `Pet2-Dev.cmd`, `Pet2-Dev.command`, or the
-application itself to start Pet 2 with 5 Hz causal telemetry.
-If a normal Pet 2 instance is already running, close it first because the
-desktop organism is single-instance on both platforms.
+The companion is `Pet2 Dev Console.exe` on Windows and `Pet2 Dev Console.app`
+on macOS. Its Connect to Pet button attaches to the normal release or starts
+the installed companion. A temporary authenticated lease enables 5 Hz telemetry
+and motor tests; Disconnect closes it and an abandoned lease expires after
+10 seconds. Packaged binary pairs are verified before launch.
 
 `F1`–`F4` switch Character, Perception, Behavior, and Diagnostics. Diagnostics
 uses `Space`, arrow keys, the timeline slider, and playback-rate buttons to
@@ -203,6 +203,13 @@ observation counts, prediction confidence/error, progress and rehearsal updates.
 The legacy `--simulate-hours` option is now an
 explicit approximate calendar-only compatibility path and cannot generate
 synthetic interaction learning.
+
+The open `Controlled intervention` section in Live Brain also contains the full
+indexed 64-program motor catalog. `Run selected` executes one bounded program
+through the same motor bus and particle PBF body as autonomous behavior; it does
+not play a separate preview animation. The panel displays deterministic numeric
+acceptance, the selected phase grammar, and live program/phase telemetry, while
+`Cancel` returns control to the brain.
 
 Telemetry is written to an 8 MiB `telemetry.jsonl` plus one rotated previous
 file. The older semantic `events.jsonl` is not truncated or rotated and no

@@ -69,6 +69,7 @@ struct EcologyInstance {
     den_noise: [f32; 4],
     den_material: [f32; 4],
     den_mask: [f32; 4],
+    background_uv_rect: [f32; 4],
 }
 
 pub struct EcologyRenderer {
@@ -82,6 +83,7 @@ pub struct EcologyRenderer {
     background_size: (u32, u32),
     background_bytes_per_row: u32,
     smoothed_background_bgra: Vec<u8>,
+    background_uv_rect: [f32; 4],
     background_freshness: f32,
     den_activity: f32,
     den_activity_integral_seconds: f32,
@@ -158,7 +160,8 @@ impl EcologyRenderer {
                         5 => Float32x4,
                         6 => Float32x4,
                         7 => Float32x4,
-                        8 => Float32x4
+                        8 => Float32x4,
+                        9 => Float32x4
                     ],
                 }],
             },
@@ -248,6 +251,7 @@ impl EcologyRenderer {
             background_size: (1, 1),
             background_bytes_per_row: 4,
             smoothed_background_bgra: Vec::new(),
+            background_uv_rect: [0.0, 0.0, 1.0, 1.0],
             background_freshness: 0.0,
             den_activity: 0.0,
             den_activity_integral_seconds: 0.0,
@@ -293,14 +297,51 @@ impl EcologyRenderer {
         bgra8: &[u8],
         exclusion: Option<EcologyCaptureExclusion>,
     ) -> bool {
+        self.update_background_region_excluding(
+            device,
+            queue,
+            width,
+            height,
+            bytes_per_row,
+            bgra8,
+            [0.0, 0.0, 1.0, 1.0],
+            exclusion,
+        )
+    }
+
+    /// Uploads a compact desktop crop and records where that crop lies in the
+    /// overlay. The shader maps screen-global den coordinates into this local
+    /// texture, so the optical displacement remains spatially correct without
+    /// a full-desktop upload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_background_region_excluding(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        bytes_per_row: u32,
+        bgra8: &[u8],
+        background_uv_rect: [f32; 4],
+        exclusion: Option<EcologyCaptureExclusion>,
+    ) -> bool {
         if width == 0
             || height == 0
             || bytes_per_row < width.saturating_mul(4)
             || bgra8.len() < bytes_per_row as usize * height as usize
+            || background_uv_rect.iter().any(|value| !value.is_finite())
+            || background_uv_rect[0] < 0.0
+            || background_uv_rect[1] < 0.0
+            || background_uv_rect[2] <= 0.0
+            || background_uv_rect[3] <= 0.0
+            || background_uv_rect[0] + background_uv_rect[2] > 1.000_01
+            || background_uv_rect[1] + background_uv_rect[3] > 1.000_01
         {
             return false;
         }
-        if self.background_size != (width, height) {
+        self.background_uv_rect = background_uv_rect;
+        let background_resized = self.background_size != (width, height);
+        if background_resized {
             self.background_texture = create_ecology_background_texture(device, width, height);
             self.background_size = (width, height);
             self.background_bind_group = create_ecology_background_bind_group(
@@ -311,7 +352,7 @@ impl EcologyRenderer {
             );
         }
         let expected_length = bytes_per_row as usize * height as usize;
-        if self.background_size != (width, height)
+        if background_resized
             || self.background_bytes_per_row != bytes_per_row
             || self.smoothed_background_bgra.len() != expected_length
         {
@@ -536,6 +577,7 @@ impl EcologyRenderer {
                 self.den_tuning.center_mask_opacity,
                 self.den_tuning.displacement_blur,
             ],
+            background_uv_rect: self.background_uv_rect,
         };
         count += 1;
 
@@ -593,6 +635,7 @@ impl EcologyRenderer {
                 den_noise: [0.0; 4],
                 den_material: [0.0; 4],
                 den_mask: [0.0; 4],
+                background_uv_rect: [0.0; 4],
             };
             count += 1;
         }
@@ -929,6 +972,10 @@ mod tests {
             source.contains("let particle_time = time + activity_integral * orb_speedup_fraction")
         );
         assert!(source.contains("let refraction_opacity = mix(0.052, 0.58, capture_freshness)"));
+        assert!(
+            source.contains("let capture_uv = (input.screen_uv - input.background_uv_rect.xy)")
+        );
+        assert!(source.contains("optical_shift_local * input.local_to_screen / capture_extent"));
         assert!(source.contains("fn minimum_reconstruction_alpha"));
         assert!(source.contains("let desired_background = mix(background_reference, refracted"));
         assert!(source.contains("let reconstructed_source = max("));

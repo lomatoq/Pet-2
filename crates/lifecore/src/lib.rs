@@ -10,6 +10,7 @@ mod affect;
 mod bandit;
 mod development;
 mod drives;
+mod face_geometry;
 mod genome;
 mod interaction;
 mod interoception;
@@ -34,6 +35,7 @@ pub use affect::*;
 pub use bandit::*;
 pub use development::*;
 pub use drives::*;
+pub use face_geometry::*;
 pub use genome::*;
 pub use interaction::*;
 pub use interoception::*;
@@ -80,7 +82,7 @@ impl FeedbackEvent {
             Self::Ignored => -0.25,
             Self::PushedAway => -0.60,
             Self::MuteOrHide => -0.80,
-            Self::FocusModeEnabled => -1.00,
+            Self::FocusModeEnabled => 0.0,
             Self::FocusModeDisabled => 0.0,
             Self::Reward(value) => value.clamp(-1.0, 1.0),
         }
@@ -193,6 +195,20 @@ impl LifeCore {
     }
 
     pub fn tick(&mut self, sensors: &SensorFrame, body: &BodyFeedback, dt: f32) -> LifeOutput {
+        self.tick_with_transient_drives(sensors, body, dt, None)
+    }
+
+    /// Advances natural homeostasis while letting a bounded experiment expose
+    /// alternate drive values to this tick's action arbitration. The supplied
+    /// values are never written back into persistent homeostasis; only real
+    /// consequences of the selected action can affect later natural ticks.
+    pub fn tick_with_transient_drives(
+        &mut self,
+        sensors: &SensorFrame,
+        body: &BodyFeedback,
+        dt: f32,
+        transient_drives: Option<Drives>,
+    ) -> LifeOutput {
         let dt = finite_dt(dt);
         self.learning.body.tick(dt);
         self.last_work_pressure = sensors.desktop_focus_pressure.clamp(0.0, 1.0);
@@ -242,17 +258,41 @@ impl LifeCore {
 
         let brain_inputs = build_brain_inputs(&self.state, sensors, body);
         let readouts = self.brain.tick(&brain_inputs, dt);
+        let natural_drives = self.state.drives;
+        let decision_drives = transient_drives.unwrap_or(natural_drives);
         let context = ContextualBandit::context(
             sensors,
-            &self.state.drives,
+            &decision_drives,
             &self.state.affect,
             self.state.ignored_attempts,
             self.state.successful_interactions,
         );
+        // score_actions, action_temperature, conditions_met, and the threat
+        // interrupt all read the authoritative LifeState. Swap only across the
+        // decision boundary, then restore by assignment so clamp edges cannot
+        // leak a temporary pulse into persistent homeostasis.
+        self.state.drives = decision_drives;
         let scores = self.score_actions(sensors, body, &context, &readouts.actions);
         self.last_context = context;
-        let sampled = sample_softmax(&scores, action_temperature(&self.state), &mut self.rng);
+        let sleep_score = scores[ActionId::Sleep.index()];
+        let urgent_sleep = decision_drives.sleep >= 0.72
+            && decision_drives.safety < 0.62
+            && sleep_score > -99.0
+            && body
+                .collision
+                .as_ref()
+                .is_none_or(|collision| collision.intensity <= 0.45);
+        // Severe sleep pressure is a physiological priority, not a cosmetic
+        // probability nudge. It still passes the ordinary commitment and
+        // interruption gate below, and threat/contact can prevent or wake it.
+        let sampled = if urgent_sleep {
+            ActionId::Sleep
+        } else {
+            sample_softmax(&scores, action_temperature(&self.state), &mut self.rng)
+        };
         let switched = self.maybe_switch_action(sampled, &scores, sensors, body, &context);
+        let (strongest_drive, strongest_drive_value) = decision_drives.strongest();
+        self.state.drives = natural_drives;
         let expression = ExpressionState::from_readouts(readouts.expressions, self.state.affect);
         let body_intent = body_intent_for(self.state.current_action, sensors, body, expression);
         let vocal_request = if switched && self.state.current_action.is_vocal() {
@@ -264,7 +304,6 @@ impl LifeCore {
         } else {
             None
         };
-        let (strongest_drive, strongest_drive_value) = self.state.drives.strongest();
         let debug = DebugState {
             strongest_drive,
             strongest_drive_value,
@@ -286,6 +325,16 @@ impl LifeCore {
     }
 
     pub fn apply_feedback(&mut self, event: FeedbackEvent) {
+        // Availability is not a reward or a relationship outcome.
+        if matches!(
+            event,
+            FeedbackEvent::FocusModeEnabled | FeedbackEvent::FocusModeDisabled
+        ) {
+            self.state.focus_mode = matches!(event, FeedbackEvent::FocusModeEnabled);
+            self.state.pending_attention = None;
+            self.state.interactions.pending_credit = None;
+            return;
+        }
         let interaction_outcome = self.state.interactions.pending_credit.map(|credit| {
             let kind = match &event {
                 FeedbackEvent::PettingStarted
@@ -966,7 +1015,15 @@ impl LifeCore {
         let minimum_done = self.state.action_elapsed_seconds >= current_definition.minimum_duration;
         let maximum_done = self.state.action_elapsed_seconds >= current_definition.maximum_duration;
         let challenger_wins = scores[sampled.index()] > scores[current.index()] + 0.24;
+        // Sleep is a committed physiological cycle, not an ordinary five-second
+        // action bout.  Its drive is intentionally relieved during sleep, so
+        // allowing that falling drive to win arbitration immediately made NREM
+        // and REM unreachable.  Explicit contact and threats still wake it;
+        // otherwise the authored maximum duration owns the cycle.
+        let committed_sleep =
+            current == ActionId::Sleep && !maximum_done && !direct_interaction && !threat;
         if sampled == current
+            || committed_sleep
             || (!minimum_done && !direct_interaction && !threat)
             || (!maximum_done && !direct_interaction && !threat && !challenger_wins)
         {
@@ -2344,6 +2401,82 @@ mod tests {
 
         assert!(!switched);
         assert_eq!(core.state.current_action, ActionId::SelfPlay);
+    }
+
+    #[test]
+    fn sleep_remains_committed_after_its_drive_is_relieved() {
+        let mut core = LifeCore::new(Genome::from_seed(47), 47);
+        core.state.current_action = ActionId::Sleep;
+        core.state.action_elapsed_seconds = ActionId::Sleep.definition().minimum_duration + 1.0;
+        core.state.drives.sleep = 0.0;
+        let mut scores = [0.0; ACTION_COUNT];
+        scores[ActionId::WakeUp.index()] = 10.0;
+
+        let switched = core.maybe_switch_action(
+            ActionId::WakeUp,
+            &scores,
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            &[0.0; CONTEXT_SIZE],
+        );
+
+        assert!(!switched);
+        assert_eq!(core.state.current_action, ActionId::Sleep);
+
+        core.state.action_elapsed_seconds = ActionId::Sleep.definition().maximum_duration;
+        let switched = core.maybe_switch_action(
+            ActionId::WakeUp,
+            &scores,
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            &[0.0; CONTEXT_SIZE],
+        );
+
+        assert!(switched);
+        assert_eq!(core.state.current_action, ActionId::WakeUp);
+    }
+
+    #[test]
+    fn transient_drive_values_do_not_overwrite_natural_homeostasis() {
+        let mut core = LifeCore::new(Genome::from_seed(48), 48);
+        let initial_sleep = core.state.drives.sleep;
+        let mut transient = core.state.drives;
+        transient.sleep = 1.0;
+
+        let _ = core.tick_with_transient_drives(
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            1.0 / LIFECORE_HZ,
+            Some(transient),
+        );
+
+        assert!(core.state.drives.sleep < initial_sleep + 0.01);
+    }
+
+    #[test]
+    fn bounded_sleep_drive_preset_selects_sleep_within_its_eight_second_window() {
+        let mut core = LifeCore::new(Genome::from_seed(49), 49);
+        core.state.drives.sleep = 0.0;
+        let sensors = SensorFrame::default();
+        let body = BodyFeedback::default();
+        let mut selected_sleep = false;
+
+        for _ in 0..(8 * LIFECORE_HZ as usize) {
+            let mut transient = core.state.drives;
+            transient.sleep = (transient.sleep + 0.85).clamp(0.0, 1.0);
+            let output = core.tick_with_transient_drives(
+                &sensors,
+                &body,
+                1.0 / LIFECORE_HZ,
+                Some(transient),
+            );
+            if output.selected_action == ActionId::Sleep {
+                selected_sleep = true;
+                break;
+            }
+        }
+
+        assert!(selected_sleep, "the lab sleep pulse never reached Sleep");
     }
 
     #[test]

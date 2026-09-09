@@ -11,6 +11,7 @@ glam.workspace = true
 lifecore = { path = "../lifecore" }
 pet_audio = { path = "../pet_audio" }
 pet_ecology = { path = "../pet_ecology" }
+pet_motor = { path = "../pet_motor" }
 serde.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true

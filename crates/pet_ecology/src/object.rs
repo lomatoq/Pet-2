@@ -10,6 +10,14 @@ pub const MAX_ACTIVE_MORSELS: usize = 3;
 pub const MAX_OBJECT_SPEED: f32 = 2.5;
 pub const REFERENCE_DESKTOP_HEIGHT_PX: f32 = 1_152.0;
 
+/// The only geometry object physics may consume. Visual glow is deliberately
+/// not represented here.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PhysicalInteractionHull {
+    pub center: Vec2,
+    pub radius_px_at_reference: f32,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectKind {
@@ -56,6 +64,14 @@ pub struct WorldObject {
 }
 
 impl WorldObject {
+    #[must_use]
+    pub const fn physical_hull(&self) -> PhysicalInteractionHull {
+        PhysicalInteractionHull {
+            center: self.position,
+            radius_px_at_reference: self.radius_px_at_reference,
+        }
+    }
+
     #[must_use]
     pub fn canonical_orb(identity_seed: u64, den_anchor: Vec2) -> Self {
         let id = canonical_orb_id(identity_seed);
@@ -184,4 +200,30 @@ fn unit_pair(seed: u64) -> Vec2 {
     let x = (seed >> 40) as f32 / (1_u32 << 24) as f32;
     let y = (splitmix64(seed) >> 40) as f32 / (1_u32 << 24) as f32;
     Vec2::new(x, y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orb_physical_hull_is_bit_identical_across_the_full_glow_sweep() {
+        let mut orb = WorldObject::canonical_orb(0x0B_BA11, Vec2::splat(0.5));
+        let expected = orb.physical_hull();
+        assert_eq!(
+            expected.radius_px_at_reference.to_bits(),
+            31.0_f32.to_bits()
+        );
+
+        for step in 0..=100 {
+            orb.glow = step as f32 / 100.0;
+            let actual = orb.physical_hull();
+            assert_eq!(actual.center.x.to_bits(), expected.center.x.to_bits());
+            assert_eq!(actual.center.y.to_bits(), expected.center.y.to_bits());
+            assert_eq!(
+                actual.radius_px_at_reference.to_bits(),
+                expected.radius_px_at_reference.to_bits()
+            );
+        }
+    }
 }

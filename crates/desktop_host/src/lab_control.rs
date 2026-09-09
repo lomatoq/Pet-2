@@ -1,10 +1,15 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use pet_motor::BehaviorProgramId;
+
 /// Wire-format version for the bounded Body Lab -> Pet command slot.
-pub const LAB_CONTROL_SCHEMA_VERSION: u32 = 3;
+pub const LAB_CONTROL_SCHEMA_VERSION: u32 = 4;
 pub const LAB_CONTROL_MIN_EXPIRY_MS: u32 = 100;
 pub const LAB_CONTROL_MAX_EXPIRY_MS: u32 = 30_000;
+pub const LAB_SESSION_PROTOCOL_VERSION: u32 = 2;
+pub const LAB_SESSION_LEASE_SECONDS: u32 = 10;
+pub const LAB_SESSION_RENEW_SECONDS: u32 = 3;
 
 const MIN_ATTENTION_DURATION_SECONDS: f32 = 0.1;
 const MAX_ATTENTION_DURATION_SECONDS: f32 = 10.0;
@@ -22,6 +27,8 @@ pub struct LabControlEnvelope {
     pub command_id: u64,
     pub issued_unix_ms: u64,
     pub expires_after_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
     pub command: LabControlCommand,
 }
 
@@ -36,6 +43,14 @@ impl LabControlEnvelope {
         if !(LAB_CONTROL_MIN_EXPIRY_MS..=LAB_CONTROL_MAX_EXPIRY_MS).contains(&self.expires_after_ms)
         {
             return Err(LabControlValidationError::InvalidExpiry);
+        }
+        if let Some(token) = self.session_token.as_deref()
+            && !valid_session_token(token)
+        {
+            return Err(LabControlValidationError::InvalidSessionToken);
+        }
+        if self.command.requires_session_token() && self.session_token.is_none() {
+            return Err(LabControlValidationError::MissingSessionToken);
         }
         self.command.validate()
     }
@@ -58,6 +73,14 @@ impl LabControlEnvelope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LabControlCommand {
+    OpenSession {
+        protocol_version: u32,
+        lease_seconds: u32,
+    },
+    RenewSession {
+        lease_seconds: u32,
+    },
+    CloseSession,
     CueAttention {
         position: [f32; 2],
         duration_seconds: f32,
@@ -79,6 +102,16 @@ pub enum LabControlCommand {
         intensity: f32,
         duration_seconds: f32,
     },
+    /// Runs exactly one bounded catalog bout through the production motor and
+    /// PBF path. The live brain keeps advancing but cannot replace the selected
+    /// program until that bout completes or the operator cancels it.
+    RunMotorProgram {
+        program: BehaviorProgramId,
+    },
+    CancelMotorProgram,
+    SetFacePose {
+        pose: Option<lifecore::FacePose>,
+    },
     DeleteGestureConvention {
         convention_id: u64,
     },
@@ -91,8 +124,22 @@ pub enum LabControlCommand {
 }
 
 impl LabControlCommand {
+    const fn requires_session_token(&self) -> bool {
+        !matches!(self, Self::ShutdownForPromotion)
+    }
+
     fn validate(&self) -> Result<(), LabControlValidationError> {
         match self {
+            Self::OpenSession {
+                protocol_version,
+                lease_seconds,
+            } => {
+                if *protocol_version != LAB_SESSION_PROTOCOL_VERSION {
+                    return Err(LabControlValidationError::UnsupportedSessionProtocol);
+                }
+                validate_lease(*lease_seconds)
+            }
+            Self::RenewSession { lease_seconds } => validate_lease(*lease_seconds),
             Self::CueAttention {
                 position,
                 duration_seconds,
@@ -152,8 +199,12 @@ impl LabControlCommand {
             Self::RollbackGestureConventions { version } if *version == 0 => {
                 Err(LabControlValidationError::InvalidConventionVersion)
             }
-            Self::FocusMode { .. }
+            Self::CloseSession
+            | Self::FocusMode { .. }
             | Self::ClearDrivePulses
+            | Self::RunMotorProgram { .. }
+            | Self::SetFacePose { .. }
+            | Self::CancelMotorProgram
             | Self::DeleteGestureConvention { .. }
             | Self::RollbackGestureConventions { .. }
             | Self::ClearGestureConventions
@@ -213,6 +264,14 @@ pub enum LabControlValidationError {
     InvalidCommandId,
     #[error("Lab control expiry is outside the bounded lifetime")]
     InvalidExpiry,
+    #[error("Lab session token must be exactly 128 bits encoded as lowercase hexadecimal")]
+    InvalidSessionToken,
+    #[error("Lab command requires a session token")]
+    MissingSessionToken,
+    #[error("unsupported Lab session protocol")]
+    UnsupportedSessionProtocol,
+    #[error("Lab session lease must be exactly 10 seconds")]
+    InvalidSessionLease,
     #[error("attention position must contain two finite normalized coordinates")]
     InvalidAttentionPosition,
     #[error("attention cue duration is outside its safe range")]
@@ -233,6 +292,30 @@ pub enum LabControlValidationError {
     InvalidConventionVersion,
 }
 
+fn valid_session_token(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_lease(lease_seconds: u32) -> Result<(), LabControlValidationError> {
+    if lease_seconds == LAB_SESSION_LEASE_SECONDS {
+        Ok(())
+    } else {
+        Err(LabControlValidationError::InvalidSessionLease)
+    }
+}
+
+/// Non-secret identifier used to correlate telemetry with one Lab lease. The
+/// 128-bit token itself is never written to telemetry.
+#[must_use]
+pub fn lab_session_id(token: &str) -> u64 {
+    token.bytes().fold(0xCBF2_9CE4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01B3)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +326,7 @@ mod tests {
             command_id: 7,
             issued_unix_ms: 1_000,
             expires_after_ms: 2_000,
+            session_token: Some("0123456789abcdef0123456789abcdef".into()),
             command,
         }
     }
@@ -261,6 +345,81 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<LabControlEnvelope>(&json).unwrap(),
             control
+        );
+    }
+
+    #[test]
+    fn every_motor_program_round_trips_through_the_closed_lab_contract() {
+        for program in BehaviorProgramId::ALL {
+            let control = envelope(LabControlCommand::RunMotorProgram { program });
+            control.validate().unwrap();
+            let json = serde_json::to_string(&control).unwrap();
+            assert!(json.contains("\"type\":\"run_motor_program\""));
+            assert_eq!(
+                serde_json::from_str::<LabControlEnvelope>(&json).unwrap(),
+                control,
+                "{}",
+                program.wire_name()
+            );
+        }
+    }
+
+    #[test]
+    fn session_v2_requires_exactly_128_bits_of_lowercase_hex_and_a_ten_second_lease() {
+        envelope(LabControlCommand::OpenSession {
+            protocol_version: LAB_SESSION_PROTOCOL_VERSION,
+            lease_seconds: LAB_SESSION_LEASE_SECONDS,
+        })
+        .validate()
+        .unwrap();
+
+        for invalid in [
+            "",
+            "0123456789abcdef",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "g123456789abcdef0123456789abcdef",
+        ] {
+            let mut control = envelope(LabControlCommand::CloseSession);
+            control.session_token = Some(invalid.into());
+            assert_eq!(
+                control.validate(),
+                Err(LabControlValidationError::InvalidSessionToken),
+                "{invalid:?}"
+            );
+        }
+
+        let mut missing = envelope(LabControlCommand::RunMotorProgram {
+            program: BehaviorProgramId::MoveOrientReflex,
+        });
+        missing.session_token = None;
+        assert_eq!(
+            missing.validate(),
+            Err(LabControlValidationError::MissingSessionToken)
+        );
+
+        for lease_seconds in [
+            0,
+            LAB_SESSION_LEASE_SECONDS - 1,
+            LAB_SESSION_LEASE_SECONDS + 1,
+        ] {
+            assert_eq!(
+                envelope(LabControlCommand::OpenSession {
+                    protocol_version: LAB_SESSION_PROTOCOL_VERSION,
+                    lease_seconds,
+                })
+                .validate(),
+                Err(LabControlValidationError::InvalidSessionLease)
+            );
+        }
+        assert_eq!(
+            envelope(LabControlCommand::OpenSession {
+                protocol_version: LAB_SESSION_PROTOCOL_VERSION + 1,
+                lease_seconds: LAB_SESSION_LEASE_SECONDS,
+            })
+            .validate(),
+            Err(LabControlValidationError::UnsupportedSessionProtocol)
         );
     }
 

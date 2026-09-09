@@ -76,6 +76,25 @@ fi
 codesign --force --deep --sign "$codesign_identity" "$pet_app"
 codesign --force --deep --sign "$codesign_identity" "$console_app"
 
+# Sign first so the manifest hashes the final executable bytes. Updating the
+# resource seal below does not re-sign the nested DevConsole executable.
+python3 - "$pet_app" "$console_app" "$workspace/Cargo.toml" <<'PY'
+import hashlib, json, pathlib, re, sys
+pet, console, cargo = map(pathlib.Path, sys.argv[1:])
+def entry(path):
+    data = path.read_bytes()
+    return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+version = re.search(r'^version\s*=\s*"([^"]+)"', cargo.read_text(), re.M).group(1)
+manifest = {"schema": "pet2.release_manifest.v1", "release_version": version,
+    "lab_control_protocol": 2, "compatible_pair": True,
+    "files": {"pet": entry(pet / "Contents/MacOS/Pet2"),
+              "lab": entry(console / "Contents/Resources/DevConsole")}}
+(console / "Contents/Resources/release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+PY
+codesign --force --sign "$codesign_identity" "$console_app"
+codesign --verify --deep --strict "$pet_app"
+codesign --verify --deep --strict "$console_app"
+
 dist_payload="$dist_root/$package_name"
 archive="$dist_root/$package_name.zip"
 if [[ -e "$dist_payload" ]]; then

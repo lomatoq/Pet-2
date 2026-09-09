@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 use desktop_host::{StateStore, StorageError};
 use glam::Vec2;
@@ -6,16 +6,18 @@ use lifecore::{ActionId, BodyFeedback, BodyIntent, Drives, SensorFrame};
 use morph_brain::{
     MORPH_ACTION_CONTROL_COUNT, MORPH_OBJECT_SLOT_COUNT, MorphObjectInput, MorphWorldInput,
 };
-use pet_body::EcologyVisualEffect;
+use pet_body::{EcologyVisualEffect, ProceduralBody};
 use pet_ecology::{
-    ActionSignature, ActivityEpisode, ContactSource, ConventionOutcome, EcologyBehaviorFrame,
-    EcologyDecisionTrace, EcologyOutcome, EcologyOutput, EcologyState, EcologyVisualContext,
-    EcologyVocalTrigger, EmbodiedEnvironmentFrame, EpisodeDirector, EpisodeGoal, ExternalContact,
-    GestureConventionMatch, GestureConventionMeaning, GestureSignature, MAX_OBJECT_SPEED,
-    MorselProfile, ObjectCommand, ObjectId, ObjectKind, ObjectLifecycle, ObjectPhysicsConfig,
+    ActionSignature, ActivityEpisode, ContactSource, ConventionOutcome, DEN_ATTRACTION_RADIUS_PX,
+    EcologyBehaviorFrame, EcologyDecisionTrace, EcologyOutcome, EcologyOutput, EcologyState,
+    EcologyVisualContext, EcologyVocalTrigger, EmbodiedEnvironmentFrame, EpisodeDirector,
+    EpisodeGoal, ExternalContact, GestureConventionMatch, GestureConventionMeaning,
+    GestureSignature, MAX_OBJECT_SPEED, MorselProfile, ObjectCommand, ObjectId, ObjectKind,
+    ObjectLifecycle, ObjectPhysicsConfig, PhysicalGrabFrame, REFERENCE_DESKTOP_HEIGHT_PX,
     RhythmSignature, WindowAffordanceFrame, WorldObject, orb_is_inside_den_latch,
     resolve_object_body_contact, step_den_attraction, step_object_with_windows,
 };
+use pet_motor::MotorWorldEvent;
 
 /// Application integration boundary for the portable habitat. Native input,
 /// rendering and body physics stay in their existing owners.
@@ -31,6 +33,10 @@ pub struct EcologyRuntime {
     last_pointer_seconds: f64,
     environment: EmbodiedEnvironmentFrame,
     orb_trapped_seconds: f32,
+    orb_in_den_field: bool,
+    orb_capture_active: bool,
+    orb_capture_accelerated: bool,
+    den_events: VecDeque<MotorWorldEvent>,
     last_visual_context: EcologyVisualContext,
     visual_target: Option<Vec2>,
     visual_hue: f32,
@@ -158,12 +164,14 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
 }
 
 pub(crate) struct EcologyResolveFrame<'a> {
+    pub social_contact: pet_ecology::SocialContactFrame,
     pub selected_action: ActionId,
     pub drives: Drives,
     pub sensors: &'a SensorFrame,
     pub body: &'a BodyFeedback,
     pub focus_mode: bool,
     pub dt: f32,
+    pub orb_physical: PhysicalGrabFrame,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -203,6 +211,10 @@ impl EcologyRuntime {
             last_pointer_seconds: 0.0,
             environment: EmbodiedEnvironmentFrame::default(),
             orb_trapped_seconds: 0.0,
+            orb_in_den_field: false,
+            orb_capture_active: false,
+            orb_capture_accelerated: false,
+            den_events: VecDeque::with_capacity(8),
             last_visual_context: EcologyVisualContext::default(),
             visual_target: None,
             visual_hue: 0.0,
@@ -228,18 +240,22 @@ impl EcologyRuntime {
         frame: EcologyResolveFrame<'_>,
     ) -> EcologyOutput {
         let EcologyResolveFrame {
+            social_contact,
             selected_action,
             drives,
             sensors,
             body,
             focus_mode,
             dt,
+            orb_physical,
         } = frame;
         let frame = EcologyBehaviorFrame {
+            social_contact,
             selected_action,
             pet_position: body.world_position,
             pet_velocity: body.velocity,
             desktop_aspect: self.desktop_aspect,
+            orb_physical,
             cursor_position: sensors.cursor_position,
             pointer_down: sensors.pointer_down,
             user_activity: sensors.user_activity_rate,
@@ -301,6 +317,79 @@ impl EcologyRuntime {
         output
     }
 
+    /// Resolves the orb against the unpadded main PBF component. This adapter
+    /// is kept in the desktop app because the portable ecology crate has no
+    /// renderer dependency.
+    #[must_use]
+    pub(crate) fn orb_physical_frame(
+        &self,
+        body: &ProceduralBody,
+        feedback: &BodyFeedback,
+        viewport_height: f32,
+        dt: f32,
+    ) -> PhysicalGrabFrame {
+        let Some(orb) = self
+            .state
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Orb)
+        else {
+            return PhysicalGrabFrame {
+                socket_position: feedback.world_position,
+                ..PhysicalGrabFrame::default()
+            };
+        };
+        let viewport_height = viewport_height.max(1.0);
+        let aspect = self.desktop_aspect.clamp(0.25, 8.0);
+        let to_pixels = |world: Vec2| {
+            Vec2::new(
+                (world.x - feedback.world_position.x) * aspect,
+                world.y - feedback.world_position.y,
+            ) * viewport_height
+        };
+        let current_center = to_pixels(orb.position);
+        let previous_orb = orb.position - orb.velocity * dt.max(0.0);
+        let previous_body = feedback.world_position - feedback.velocity * dt.max(0.0);
+        let previous_center = Vec2::new(
+            (previous_orb.x - previous_body.x) * aspect,
+            previous_orb.y - previous_body.y,
+        ) * viewport_height;
+        let radius_px = orb.physical_hull().radius_px_at_reference * viewport_height
+            / REFERENCE_DESKTOP_HEIGHT_PX;
+        let contact = body.liquid_physical_circle_contact_pixels(
+            previous_center,
+            current_center,
+            radius_px,
+            viewport_height,
+        );
+        let normal_px = contact.map_or_else(
+            || current_center.normalize_or(Vec2::new(1.0, 0.0)),
+            |contact| contact.normal,
+        );
+        let surface_px = contact.map_or_else(
+            || body.liquid_physical_support_pixels(normal_px, viewport_height),
+            |contact| contact.body_point,
+        );
+        // The center remains 65% of a physical radius outside the surface:
+        // exactly 35% of the core is embedded into the liquid silhouette.
+        let socket_px = surface_px + normal_px * radius_px * 0.65;
+        let from_pixels = |offset: Vec2| {
+            feedback.world_position
+                + Vec2::new(
+                    offset.x / (viewport_height * aspect),
+                    offset.y / viewport_height,
+                )
+        };
+        PhysicalGrabFrame {
+            contact: contact.is_some(),
+            swept_contact: contact.is_some_and(|contact| contact.swept),
+            socket_position: from_pixels(socket_px).clamp(Vec2::ZERO, Vec2::ONE),
+            body_surface_position: from_pixels(surface_px).clamp(Vec2::ZERO, Vec2::ONE),
+            normal_world: Vec2::new(normal_px.x / aspect, normal_px.y).normalize_or_zero(),
+            penetration_px: contact.map_or(0.0, |contact| contact.penetration_px),
+        }
+    }
+
     pub fn fixed_update(
         &mut self,
         desktop_aspect: f32,
@@ -341,6 +430,17 @@ impl EcologyRuntime {
         }
         let mut orb_has_opposing_contacts = false;
         let den_anchor = self.state.den.anchor;
+        let previous_orb = self
+            .state
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Orb)
+            .map(|orb| {
+                (
+                    orb.velocity.length(),
+                    orb.lifecycle == ObjectLifecycle::StoredInDen,
+                )
+            });
         let orb_slot = self
             .state
             .objects
@@ -423,6 +523,46 @@ impl EcologyRuntime {
                 .find(|object| object.kind == ObjectKind::Orb)
                 .map(|object| object.position);
         }
+        let current_orb = self
+            .state
+            .objects
+            .iter()
+            .find(|object| object.kind == ObjectKind::Orb)
+            .map(|orb| (orb.position, orb.velocity.length(), orb.lifecycle));
+        if let Some((position, speed, lifecycle)) = current_orb {
+            let field_now = desktop_distance(position, den_anchor, self.desktop_aspect)
+                * reference_height
+                <= DEN_ATTRACTION_RADIUS_PX;
+            let stored_now = lifecycle == ObjectLifecycle::StoredInDen;
+            let stored_before = previous_orb.is_some_and(|(_, stored)| stored);
+            let capture_eligible =
+                matches!(lifecycle, ObjectLifecycle::Free | ObjectLifecycle::Sleeping);
+            let previous_speed = previous_orb.map_or(0.0, |(previous_speed, _)| previous_speed);
+            if stored_now && !stored_before {
+                self.publish_den_event(MotorWorldEvent::OrbStored);
+                self.orb_capture_active = false;
+                self.orb_capture_accelerated = false;
+            } else if field_now && !self.orb_in_den_field && capture_eligible {
+                self.publish_den_event(MotorWorldEvent::DenFieldEntered);
+                self.orb_capture_active = false;
+                self.orb_capture_accelerated = false;
+            } else if field_now && !self.orb_capture_active && capture_eligible {
+                self.publish_den_event(MotorWorldEvent::OrbCaptureStarted);
+                self.orb_capture_active = true;
+            } else if field_now
+                && self.orb_capture_active
+                && !self.orb_capture_accelerated
+                && speed > previous_speed + 0.002
+            {
+                self.publish_den_event(MotorWorldEvent::OrbCaptureAcceleration);
+                self.orb_capture_accelerated = true;
+            } else if !field_now && self.orb_capture_active {
+                self.publish_den_event(MotorWorldEvent::CaptureFailed);
+                self.orb_capture_active = false;
+                self.orb_capture_accelerated = false;
+            }
+            self.orb_in_den_field = field_now;
+        }
         // Being inside a window bounding box is not a trap. Large/maximized
         // windows routinely cover the orb, and lower z-order edges may be fully
         // occluded. A trap requires sustained, physically resolved opposing
@@ -441,6 +581,23 @@ impl EcologyRuntime {
     #[must_use]
     pub const fn environment(&self) -> &EmbodiedEnvironmentFrame {
         &self.environment
+    }
+
+    /// Drains one ordered den-capture transition for the slower cognition
+    /// cadence. Fixed physics may publish several transitions between two
+    /// cognition ticks, so a bounded queue preserves their causal order.
+    pub fn take_den_event(&mut self) -> Option<MotorWorldEvent> {
+        self.den_events.pop_front()
+    }
+
+    fn publish_den_event(&mut self, event: MotorWorldEvent) {
+        if event == MotorWorldEvent::None || self.den_events.back() == Some(&event) {
+            return;
+        }
+        if self.den_events.len() == 8 {
+            self.den_events.pop_front();
+        }
+        self.den_events.push_back(event);
     }
 
     pub fn spawn_morsel(
@@ -665,6 +822,21 @@ impl EcologyRuntime {
             .copied()
             .take(output.object_command_count)
         {
+            let commanded_object = match command {
+                ObjectCommand::ApplyImpulse { object_id, .. }
+                | ObjectCommand::MoveToward { object_id, .. }
+                | ObjectCommand::Release { object_id, .. }
+                | ObjectCommand::Store { object_id, .. } => Some(object_id),
+                _ => None,
+            };
+            if commanded_object.is_some_and(|id| {
+                self.state
+                    .objects
+                    .iter()
+                    .any(|o| o.id == id && o.lifecycle == ObjectLifecycle::GrabbedByUser)
+            }) {
+                continue;
+            }
             match command {
                 ObjectCommand::None => {}
                 ObjectCommand::ApplyImpulse { object_id, impulse } => {
@@ -1081,6 +1253,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn orb_contact_socket_and_carry_anchor_are_bit_identical_for_glow_zero_to_one() {
+        use lifecore::{ExpressionState, Genome, LocomotionMode, PoseIntent};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 0x6100, true).unwrap();
+        let genome = Genome::from_seed(0x6100);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        let viewport_height = 1_080.0;
+        let aspect = 16.0 / 9.0;
+        runtime.desktop_aspect = aspect;
+        body.set_desktop_motion_space(Vec2::new(1_920.0, viewport_height), viewport_height);
+        let feedback = BodyFeedback {
+            world_position: Vec2::splat(0.5),
+            ..BodyFeedback::default()
+        };
+        let intent = BodyIntent {
+            locomotion: LocomotionMode::Hover,
+            target_position: feedback.world_position,
+            target_surface: None,
+            desired_speed: 0.0,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Neutral,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+        for _ in 0..12 {
+            body.embodied_update(
+                &intent,
+                &SensorFrame::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                1.0 / 120.0,
+            );
+        }
+        let support_px = body.liquid_physical_support_pixels(Vec2::X, viewport_height);
+        let radius_px = 31.0 * viewport_height / REFERENCE_DESKTOP_HEIGHT_PX;
+        runtime.state.objects[0].position = feedback.world_position
+            + Vec2::new(
+                (support_px.x + radius_px * 0.50) / (viewport_height * aspect),
+                0.0,
+            );
+        runtime.state.objects[0].velocity = Vec2::ZERO;
+
+        runtime.state.objects[0].glow = 0.0;
+        let expected = runtime.orb_physical_frame(&body, &feedback, viewport_height, 1.0 / 120.0);
+        assert!(
+            expected.contact,
+            "fixture must overlap the 31 px physical core"
+        );
+        for step in 1..=100 {
+            runtime.state.objects[0].glow = step as f32 / 100.0;
+            let actual = runtime.orb_physical_frame(&body, &feedback, viewport_height, 1.0 / 120.0);
+            assert_eq!(actual, expected, "glow step {step} changed object physics");
+        }
+    }
+
+    #[test]
     fn orb_hit_test_and_throw_capture_are_bounded() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
@@ -1210,12 +1442,18 @@ mod tests {
         let _ = runtime.resolve_intent(
             intent,
             EcologyResolveFrame {
+                social_contact: Default::default(),
                 selected_action: ActionId::BringProceduralOrb,
                 drives: Drives::initial(&lifecore::Genome::from_seed(78).temperament),
                 sensors: &sensors,
                 body: &body,
                 focus_mode: false,
                 dt: 0.05,
+                orb_physical: PhysicalGrabFrame {
+                    contact: true,
+                    socket_position: body.world_position,
+                    ..PhysicalGrabFrame::default()
+                },
             },
         );
         assert_eq!(runtime.state.den.slots, [None; 3]);
@@ -1516,5 +1754,60 @@ mod tests {
             ObjectLifecycle::Sleeping
         );
         runtime.state.validate().unwrap();
+    }
+
+    #[test]
+    fn den_capture_publishes_ordered_physical_transitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 82, true).unwrap();
+        let den = runtime.state.den.anchor;
+        let orb = &mut runtime.state.objects[0];
+        orb.position = (den + Vec2::new(0.0, -0.16)).clamp(Vec2::ZERO, Vec2::ONE);
+        orb.velocity = Vec2::ZERO;
+        orb.lifecycle = ObjectLifecycle::Free;
+        let body = BodyFeedback {
+            world_position: Vec2::new(0.5, 0.2),
+            ..BodyFeedback::default()
+        };
+        let windows = WindowAffordanceFrame::default();
+
+        runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+        assert_eq!(
+            runtime.take_den_event(),
+            Some(MotorWorldEvent::DenFieldEntered)
+        );
+        runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+        assert_eq!(
+            runtime.take_den_event(),
+            Some(MotorWorldEvent::OrbCaptureStarted)
+        );
+        for _ in 0..24 {
+            runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+            if runtime
+                .den_events
+                .contains(&MotorWorldEvent::OrbCaptureAcceleration)
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            runtime.take_den_event(),
+            Some(MotorWorldEvent::OrbCaptureAcceleration)
+        );
+
+        runtime.state.objects[0].position = Vec2::new(0.5, 0.2);
+        runtime.state.objects[0].velocity = Vec2::ZERO;
+        runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+        assert_eq!(
+            runtime.take_den_event(),
+            Some(MotorWorldEvent::CaptureFailed)
+        );
+
+        runtime.state.objects[0].position = den + Vec2::new(0.0, -0.0005);
+        runtime.state.objects[0].velocity = Vec2::ZERO;
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::Free;
+        runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+        assert_eq!(runtime.take_den_event(), Some(MotorWorldEvent::OrbStored));
     }
 }

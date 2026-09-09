@@ -52,6 +52,10 @@ struct Globals {
     glow_orb_position_radius: array<vec4<f32>, 8>,
     glow_orb_color_intensity: array<vec4<f32>, 8>,
     soul_glow_position_radius: array<vec4<f32>, 6>,
+    face_lids: array<vec4<f32>, 2>,
+    face_brows: array<vec4<f32>, 2>,
+    face_mouth: vec4<f32>,
+    face_eye: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -427,13 +431,17 @@ fn eye_center(side: f32) -> vec2<f32> {
     return vec2<f32>(side * spacing, 0.008);
 }
 
-fn lid_aperture(local_eye: vec2<f32>, blink: f32, squint: f32) -> f32 {
+fn lid_aperture(local_eye: vec2<f32>, blink: f32, squint: f32, side: f32) -> f32 {
+    let shape = globals.face_lids[select(1u, 0u, side < 0.0)];
     let x2 = local_eye.x * local_eye.x;
-    let upper = 0.80 - x2 * 0.21 - blink * 1.46 - squint * 0.28;
-    let lower = -0.78 + x2 * 0.12 + blink * 0.72 + squint * 0.16;
-    let upper_open = 1.0 - smoothstep(upper - 0.055, upper + 0.055, local_eye.y);
-    let lower_open = smoothstep(lower - 0.055, lower + 0.055, local_eye.y);
-    return upper_open * lower_open;
+    let inner_to_outer = clamp(local_eye.x * side * 0.5 + 0.5, 0.0, 1.0);
+    let upper = 1.02 - x2 * (0.12 + shape.w * 0.12)
+        + mix(shape.x, shape.y, inner_to_outer) * 0.5 - blink * 1.65 - squint * 0.2 - (1.0 - globals.face_eye.x) * 1.7;
+    let lower = -0.98 + x2 * 0.12 + shape.z * 0.95 + blink * 0.72 + squint * 0.16;
+    let aa = max(fwidth(local_eye.y), 0.035);
+    let upper_open = 1.0 - smoothstep(upper - aa, upper + aa, local_eye.y);
+    let lower_open = smoothstep(lower - aa, lower + aa, local_eye.y);
+    return upper_open * lower_open * (1.0 - smoothstep(0.94, 0.995, blink));
 }
 
 fn eye_layer(
@@ -472,7 +480,7 @@ fn eye_layer(
         return vec4<f32>(body_color, 0.0);
     }
     let blink = select(globals.lids_brows.y, globals.lids_brows.x, side < 0.0);
-    let aperture = lid_aperture(local, blink, globals.lids_brows.z);
+    let aperture = lid_aperture(local, blink, globals.lids_brows.z, side);
     let visible = eye_mask * aperture;
     let lid_presence = smoothstep(0.02, 0.18, max(blink, globals.lids_brows.z * 0.48));
     let lid = eye_mask * (1.0 - aperture) * lid_presence;
@@ -613,53 +621,22 @@ fn segment_distance(point: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     return length(point - (a + segment * t));
 }
 
-fn safe_brow_center_y(candidate: f32, center: vec2<f32>, radii: vec2<f32>) -> f32 {
-    // The brow mask has a 0.016-unit soft outer stroke and its cinematic relief
-    // shadow is displaced 0.005 downward. Keep both above the 1.02 eye boundary
-    // even at the strongest down/tense pose, with a small antialiasing buffer.
-    let eye_top = center.y + radii.y * 1.02;
-    return max(candidate, eye_top + 0.024);
-}
-
 fn brow_distance(point: vec2<f32>, side: f32) -> f32 {
     let center = eye_center(side);
     let radii = eye_radii();
-    let raise = globals.lids_brows.w * 0.042;
-    let tension = globals.brow_mouth.x;
-    let asymmetry = globals.brow_mouth.y * side * 0.016;
-    // Negative mouth valence with low tension raises the inner brow (sad/worried),
-    // while tension pulls it down and inward (alarm/frustration). Four connected
-    // spans keep those silhouettes smooth and readable instead of hinge-like.
-    let inner_raise = saturate(-globals.brow_mouth.w) * (1.0 - tension * 0.55);
-    var inner = center + vec2<f32>(
-        -side * (radii.x * 0.70 + tension * 0.010),
-        radii.y * 1.08 + raise + inner_raise * 0.038 - tension * 0.040 + asymmetry,
-    );
-    var inner_mid = center + vec2<f32>(
-        -side * radii.x * 0.34,
-        radii.y * 1.10 + raise + inner_raise * 0.032 - tension * 0.014 + asymmetry * 0.55,
-    );
-    var crown = center + vec2<f32>(
-        0.0,
-        radii.y * 1.12 + raise + inner_raise * 0.016 + tension * 0.004,
-    );
-    var outer_mid = center + vec2<f32>(
-        side * radii.x * 0.36,
-        radii.y * 1.11 + raise * 0.90 - inner_raise * 0.004 + tension * 0.007 - asymmetry * 0.45,
-    );
-    var outer = center + vec2<f32>(
-        side * radii.x * 0.70,
-        radii.y * 1.07 + raise * 0.76 - inner_raise * 0.014 + tension * 0.010 - asymmetry,
-    );
-    inner.y = safe_brow_center_y(inner.y, center, radii);
-    inner_mid.y = safe_brow_center_y(inner_mid.y, center, radii);
-    crown.y = safe_brow_center_y(crown.y, center, radii);
-    outer_mid.y = safe_brow_center_y(outer_mid.y, center, radii);
-    outer.y = safe_brow_center_y(outer.y, center, radii);
-    return min(
-        min(segment_distance(point, inner, inner_mid), segment_distance(point, inner_mid, crown)),
-        min(segment_distance(point, crown, outer_mid), segment_distance(point, outer_mid, outer)),
-    );
+    let shape = globals.face_brows[select(1u, 0u, side < 0.0)];
+    let raise = globals.lids_brows.w * 0.028;
+    let base = center.y + radii.y * 1.12 + raise;
+    var distance = 10.0;
+    var previous = vec2<f32>(center.x - side * radii.x * 0.8, base + shape.x * 0.045);
+    for (var i = 1u; i <= 8u; i += 1u) {
+        let t = f32(i) / 8.0;
+        let next = vec2<f32>(center.x + side * radii.x * mix(-0.8, 0.8, t),
+            base + mix(shape.x, shape.y, t) * 0.045 + shape.z * 0.035 * 4.0 * t * (1.0 - t));
+        distance = min(distance, segment_distance(point, previous, next));
+        previous = next;
+    }
+    return distance / shape.w;
 }
 
 fn brow_mask(point: vec2<f32>, side: f32) -> f32 {
@@ -671,7 +648,8 @@ fn expressive_mouth_y(normalized_x: f32, curve: f32, tension: f32) -> f32 {
     let center_arc = -curve * 0.048 * (1.0 - x * x);
     let corner_lift = curve * 0.010 * smoothstep(0.56, 1.0, abs(x));
     let pressed_center = tension * 0.004 * (1.0 - abs(x));
-    return center_arc + corner_lift + pressed_center;
+    return center_arc + corner_lift + pressed_center
+        + mix(globals.face_mouth.y, globals.face_mouth.z, x * 0.5 + 0.5) * 0.035 * abs(x);
 }
 
 fn expressive_mouth_distance(local: vec2<f32>, width: f32, curve: f32, tension: f32) -> f32 {
@@ -707,18 +685,19 @@ fn mouth_layer(
     let curve = globals.brow_mouth.w;
     let tension = globals.mouth_voice.x;
     let voice = globals.mouth_voice.z;
-    let width = 0.065 + tension * 0.036 + open * 0.022;
-    let height = 0.010 + open * 0.065 + voice * 0.010;
+    let width = (0.065 + tension * 0.020) * globals.face_mouth.x;
+    let height = (0.010 + open * 0.065 + voice * 0.010) * (1.0 - globals.face_mouth.w * 0.65);
     let local = point - center;
     let normalized_x = clamp(local.x / width, -1.0, 1.0);
     let expressive_y = expressive_mouth_y(normalized_x, curve, tension);
-    let deformed_local = vec2<f32>(local.x, local.y - expressive_y * 0.35);
+    let deformed_local = vec2<f32>(local.x, local.y - expressive_y);
     let ellipse = length(deformed_local / vec2<f32>(width, max(height, 0.006)));
     let open_gate = smoothstep(0.025, 0.13, open);
     let closed_gate = 1.0 - open_gate;
     let open_mask = (1.0 - smoothstep(0.88, 1.02, ellipse)) * open_gate;
     let line_distance = expressive_mouth_distance(local, width, curve, tension);
-    let line_mask = (1.0 - smoothstep(0.006, 0.015, line_distance)) * closed_gate;
+    let line_aa = max(fwidth(line_distance), 0.003);
+    let line_mask = (1.0 - smoothstep(0.010 - line_aa, 0.010 + line_aa, line_distance)) * closed_gate;
     let feature_mask = max(open_mask, line_mask);
     let open_distance = (ellipse - 1.0) * min(width, max(height, 0.006));
     let closed_distance = line_distance - 0.010;
@@ -1194,6 +1173,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         * pow(core, 0.82);
     color += pigment * globals.mouth_voice.w * sin(globals.viewport_time.y * 24.0 + point.y * 17.0) * 0.012;
 
+    // Local contrast backing suppresses internal pattern only behind the features.
+    let face_region = 1.0 - smoothstep(0.22, 0.34, length(face_space(point)));
+    color = mix(color, color * 0.76, face_region * globals.face_tuning.x);
     let body_face_color = color;
     let face_point = face_space(point);
     let highlight_shift = select(
@@ -1201,8 +1183,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         cinematic_screen_probe.xy * 0.72,
         CINEMATIC,
     );
-    let left_socket = eye_socket_relief(face_point, -1.0);
-    let right_socket = eye_socket_relief(face_point, 1.0);
+    let left_socket = eye_socket_relief(face_point, -1.0) * globals.face_tuning.x;
+    let right_socket = eye_socket_relief(face_point, 1.0) * globals.face_tuning.x;
     if (CINEMATIC) {
         let socket = max(left_socket, right_socket);
         color *= 1.0 - socket.x * globals.cinematic_h.x * 0.34;
@@ -1251,6 +1233,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             brow_distance_field - 0.012,
             1.0,
         );
+        // A softly lit contour remains legible on black jelly independently of halo.
+        brow_color = max(brow_color, vec3<f32>(0.32, 0.34, 0.35));
         brow_color += chroma_preserving_rim(
             pigment,
             glow_color,

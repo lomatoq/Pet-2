@@ -550,6 +550,7 @@ mod tests {
             command_id,
             issued_unix_ms: 1_728_000_000_000,
             expires_after_ms: 5_000,
+            session_token: Some("0123456789abcdef0123456789abcdef".into()),
             command,
         }
     }

@@ -219,7 +219,11 @@ impl PlatformBackend for MacOsBackend {
         true
     }
 
-    fn capture_overlay_background(&mut self, window: &Window) -> Option<DesktopBackgroundFrame> {
+    fn capture_overlay_background(
+        &mut self,
+        window: &Window,
+        _region: crate::DesktopBackgroundCaptureRegion,
+    ) -> Option<DesktopBackgroundFrame> {
         let native = self.window.as_ref()?;
         let frame = native.frame();
         // AppKit is bottom-up in points; Quartz is top-down in points. Using
@@ -363,6 +367,7 @@ impl QuartzBackgroundWorker {
                             request.width * 4,
                         );
                     let frame = DesktopBackgroundFrame {
+                        normalized_region: [0.0, 0.0, 1.0, 1.0],
                         width: request.width,
                         height: request.height,
                         bytes_per_row: request.width * 4,
