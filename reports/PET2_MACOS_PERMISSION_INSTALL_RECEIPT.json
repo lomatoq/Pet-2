@@ -9,6 +9,22 @@
   "state_sha256_before_launch": "bdbe8281228f10b92be62a23426413390a303f0d6a85a25b8582cda1df77f3ec",
   "signing_authority": "Developer ID Application: Andrei Darapei (KKM3M9K749)",
   "team_identifier": "KKM3M9K749",
-  "launch_attempt": "Succeeded via LaunchServices; runtime acknowledged loading the preserved state. Subsequent ack was stopped.",
-  "screen_capture_status": "Pending one-time reauthorization: TCC still stores cdhash 407eed9e1f538b05a16e8cc58eb89ba081c4c0be from an older ad-hoc build."
+  "launch_attempt": "Succeeded via LaunchServices, then a second graceful restart succeeded. Pet is running.",
+  "screen_capture_status": "Verified after reauthorization and subsequent restart: screen_capture=true, fresh coarse visual scene, no TCC identity mismatch.",
+  "after_restart_check": {
+    "checked_unix_ms": 1788988406898,
+    "runtime_ack": {
+      "schema_version": 1,
+      "status": "running",
+      "pid": 19410,
+      "executable_version": "0.1.0",
+      "loaded_life_state_hash": 8477786927047781704,
+      "loaded_genome_hash": 17271310480675578128,
+      "updated_unix_ms": 1788988406679
+    },
+    "screen_capture": true,
+    "visual_grid_age_ms": 9.251874923706055,
+    "coarse_scene_available": true,
+    "identity_mismatch_after_restart": false
+  }
 }

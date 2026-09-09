@@ -46,12 +46,18 @@ Apple describes designated requirements and privacy-resource identity in
   installation. See `PET2_MACOS_PERMISSION_INSTALL_RECEIPT.json` for backup location
   and archive hash.
 - LaunchServices launched the new Pet and its runtime acknowledged the preserved
-  state. The subsequent observed acknowledgement was stopped.
+  state. After reauthorization, a further graceful restart also succeeded.
 
-## Remaining one-time consent
+## Verified consent recovery
 
 The first launch still encountered the old TCC requirement, now compared against
-the correct Developer ID requirement. The user was asked to remove the old Pet2
-entry in Screen & System Audio Recording, add `/Applications/Pet2.app`, and enable
-access. A successful screen capture and clean repeated launch are not yet
-verified. No permission was silently granted or reset for other applications.
+the correct Developer ID requirement. The user was asked to renew the Pet2 entry
+in Screen & System Audio Recording. A later user-started instance reported
+`screen_capture=true` and a fresh visual grid (approximately 9 ms old).
+
+We then gracefully saved, stopped, and relaunched the installed Pet. Fresh bounded
+Lab diagnostics again confirmed `screen_capture=true`, `coarse_scene.available=true`,
+and a visual grid age of approximately 9 ms. The TCC log contained no identity
+mismatch after that restart. The diagnostic lease was explicitly closed; Pet
+remains running normally. No permission was silently granted or reset for other
+applications. The saved genome hash stayed unchanged across the checks.
