@@ -45,6 +45,8 @@ jobs:
       - run: bash ./scripts/build_macos.sh
       - run: bash ./scripts/test_headless.sh
       - run: bash ./scripts/package_macos.sh
+        env:
+          PET2_ALLOW_ADHOC_SIGNING: "1"
       - run: |
           package_dir="$(mktemp -d)"
           ditto -x -k dist/Pet2-macos-arm64.zip "$package_dir"

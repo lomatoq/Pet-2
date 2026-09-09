@@ -97,9 +97,16 @@ therefore not duplicated in Spotlight or Launchpad by an unpacked build tree.
 For privacy permission continuity across releases, package with an installed
 Developer ID Application identity. The packaging script selects one
 automatically when available, or accepts an explicit
-`PET2_CODESIGN_IDENTITY="Developer ID Application: …"` override. Ad-hoc signing
-remains the CI/local fallback but cannot promise stable TCC identity after
-executable contents change.
+`PET2_CODESIGN_IDENTITY="Developer ID Application: …"` override. Packaging fails
+if no identity is visible (including when a sandbox prevents Keychain access),
+instead of silently changing the app's privacy identity. Disposable CI builds
+must explicitly opt in with `PET2_ALLOW_ADHOC_SIGNING=1`; do not install these as
+updates on a Mac where Pet already has screen-recording permission.
+
+When upgrading from an older ad-hoc build, quit Pet, remove its old entry from
+System Settings → Privacy & Security → Screen & System Audio Recording, then
+add `/Applications/Pet2.app` and enable it. This one-time reauthorization binds
+the permission to the Developer ID signature used by subsequent updates.
 
 The checked-in ICO and ICNS packaging assets are reproducible with
 `scripts/generate_icons.ps1`; they are not loaded by the organism at runtime.

@@ -1,0 +1,14 @@
+{
+  "backup": "/Users/darap/projects/Pet-2/target/install-backups/20260909-230839",
+  "package_sha256": "131a2e15ef8ac79f1cce70d48f4535c284c03f50e2d8134dddc131c8d2718782",
+  "bundles_verified": [
+    "Pet2.app",
+    "Pet2 Dev Console.app"
+  ],
+  "saved_state_unchanged_before_launch": true,
+  "state_sha256_before_launch": "bdbe8281228f10b92be62a23426413390a303f0d6a85a25b8582cda1df77f3ec",
+  "signing_authority": "Developer ID Application: Andrei Darapei (KKM3M9K749)",
+  "team_identifier": "KKM3M9K749",
+  "launch_attempt": "Succeeded via LaunchServices; runtime acknowledged loading the preserved state. Subsequent ack was stopped.",
+  "screen_capture_status": "Pending one-time reauthorization: TCC still stores cdhash 407eed9e1f538b05a16e8cc58eb89ba081c4c0be from an older ad-hoc build."
+}

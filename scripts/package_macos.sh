@@ -22,7 +22,16 @@ if [[ -z "$codesign_identity" ]]; then
       | head -n 1
   )"
 fi
-codesign_identity="${codesign_identity:--}"
+if [[ -z "$codesign_identity" || "$codesign_identity" == "-" ]]; then
+  if [[ "${PET2_ALLOW_ADHOC_SIGNING:-0}" != "1" ]]; then
+    echo "error: no usable signing identity; refusing an ad-hoc application update" >&2
+    echo "Use a session with Keychain access and a Developer ID Application identity," >&2
+    echo "or set PET2_CODESIGN_IDENTITY explicitly. For disposable CI builds only," >&2
+    echo "set PET2_ALLOW_ADHOC_SIGNING=1 (screen-recording grants will not survive updates)." >&2
+    exit 1
+  fi
+  codesign_identity="-"
+fi
 
 dist_root="$workspace/dist"
 payload="$package_root/$package_name"
