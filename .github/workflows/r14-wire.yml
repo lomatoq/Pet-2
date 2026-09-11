@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: r14-wire-${{ github.ref }}
+  group: r14-wire-v2-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -48,9 +48,6 @@ jobs:
         shell: pwsh
         run: cargo check --workspace --all-targets
 
-      # Once the complete workspace compiles, persist the actual wired Rust files
-      # to the branch. The remaining gates continue below, but the user can now
-      # pull and build the real integration instead of a generation recipe.
       - name: Commit compiled integration
         shell: pwsh
         run: |
