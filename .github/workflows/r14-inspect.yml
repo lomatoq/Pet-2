@@ -1,0 +1,29 @@
+name: R14 Inspect Generated Wiring
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/affectionate-companion-r14]
+    paths:
+      - .github/workflows/r14-inspect.yml
+      - scripts/r14_wire.py
+      - scripts/r14_preflight.py
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/affectionate-companion-r14
+      - shell: pwsh
+        run: python scripts/r14_wire.py
+      - shell: pwsh
+        run: python scripts/r14_preflight.py
+      - name: Print generated audio admission wiring
+        shell: pwsh
+        run: |
+          Select-String -Path app/src/main.rs -Pattern 'quiet|admission|vocal.*gap|last.*vocal|voice.*budget|vocal.*window' -Context 5,10
