@@ -1,0 +1,63 @@
+name: R14 Validate Wired Companion
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/affectionate-companion-r14]
+    paths:
+      - app/src/**
+      - crates/lifecore/src/**
+      - crates/pet_perception/src/**
+      - crates/pet_motor/src/**
+      - crates/pet_body/src/**
+      - crates/pet_audio/src/**
+      - crates/pet_ecology/src/**
+      - .github/workflows/r14-validate.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r14-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-wired-source:
+    if: github.repository == 'lomatoq/Pet-2' && github.ref == 'refs/heads/codex/affectionate-companion-r14'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/affectionate-companion-r14
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Rustfmt is clean
+        shell: pwsh
+        run: cargo fmt --all -- --check
+
+      - name: Compile entire workspace
+        shell: pwsh
+        run: cargo check --workspace --all-targets
+
+      - name: Test companion contracts and audio delivery semantics
+        shell: pwsh
+        run: |
+          cargo test -p lifecore companion
+          cargo test -p pet_perception companion
+          cargo test -p pet_perception habituation
+          cargo test -p pet_body gaze
+          cargo test -p pet_body blink
+          cargo test -p pet_audio nonphonated
+          cargo test -p pet2 worker_acknowledgement_cancels_rejected_audio_but_credits_heard_audio
+
+      - name: Strict clippy for production companion surface
+        shell: pwsh
+        run: cargo clippy -p lifecore -p pet_ecology -p pet_perception -p pet_motor -p pet_body -p pet_audio -p pet2 --all-targets -- -D warnings
+
+      - name: Build Windows Pet2 release
+        shell: pwsh
+        run: cargo build -p pet2 --release --target x86_64-pc-windows-msvc
