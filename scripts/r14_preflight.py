@@ -16,4 +16,12 @@ replace_once(
     "fn preferences_require_repeated_evidence_to_become_confident()",
 )
 
+# Keep the newly exported social-memory implementation clean under the project's
+# strict `clippy -D warnings` gate.
+replace_once(
+    "crates/lifecore/src/companion.rs",
+    """        if self.preferences.len() >= MAX_COMPANION_PREFERENCES {\n            if let Some((index, _)) = self\n                .preferences\n                .iter()\n                .enumerate()\n                .min_by(|left, right| left.1.1.confidence.total_cmp(&right.1.1.confidence))\n            {\n                self.preferences.remove(index);\n            }\n        }\n""",
+    """        if self.preferences.len() >= MAX_COMPANION_PREFERENCES\n            && let Some((index, _)) = self\n                .preferences\n                .iter()\n                .enumerate()\n                .min_by(|left, right| left.1.1.confidence.total_cmp(&right.1.1.confidence))\n        {\n            self.preferences.remove(index);\n        }\n""",
+)
+
 print("R14 preflight fixes applied")
