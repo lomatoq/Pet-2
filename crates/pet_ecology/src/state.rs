@@ -1,47 +1,35 @@
-use glam::Vec2;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DenState, EcologyError, GestureConventionLibrary, MAX_ACTIVE_MORSELS, MAX_OBJECTS,
-    MetabolicState, MimesisLibrary, MorselProfile, ObjectId, ObjectKind, ObjectLifecycle,
-    TasteProfile, WorldObject, canonical_orb_id,
+    EcologyError, HabitatObject, MimesisSkill, ObjectId, ObjectKind, ObjectLifecycle,
+    PersistentDen, TasteMemoryEntry, MAX_HABITAT_OBJECTS, MAX_MIMESIS_SKILLS, MAX_TASTE_MEMORIES,
 };
 
-pub const ECOLOGY_STATE_SCHEMA_VERSION: u32 = 2;
-pub const MAX_OBJECT_MEMORIES: usize = 32;
-pub const EPISODE_GOAL_COUNT: usize = 27;
+pub const ECOLOGY_SCHEMA_VERSION: u32 = 1;
+pub const EPISODE_GOAL_COUNT: usize = 15;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ObjectMemory {
-    pub object_id: ObjectId,
-    pub interaction_count: u32,
-    pub positive_outcomes: u32,
-    pub negative_outcomes: u32,
-    pub prediction_error_ema: f32,
-    pub last_seen_seconds: f64,
-}
-
-impl ObjectMemory {
-    #[must_use]
-    fn is_valid(&self) -> bool {
-        self.object_id != 0
-            && self
-                .positive_outcomes
-                .saturating_add(self.negative_outcomes)
-                <= self.interaction_count
-            && self.prediction_error_ema.is_finite()
-            && (0.0..=1.0).contains(&self.prediction_error_ema)
-            && self.last_seen_seconds.is_finite()
-            && self.last_seen_seconds >= 0.0
-    }
+pub struct EcologyState {
+    pub schema_version: u32,
+    pub identity_seed: u64,
+    pub rng: SavedEcologyRng,
+    pub objects: Vec<HabitatObject>,
+    pub den: PersistentDen,
+    pub taste_memory: Vec<TasteMemoryEntry>,
+    pub mimesis_skills: Vec<MimesisSkill>,
+    pub episode_stats: EpisodeStats,
+    pub next_object_id: u64,
+    pub elapsed_seconds: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EpisodeStats {
-    pub started: [u32; EPISODE_GOAL_COUNT],
-    pub completed: [u32; EPISODE_GOAL_COUNT],
-    pub aborted: [u32; EPISODE_GOAL_COUNT],
-    pub interrupted_by_shutdown: u32,
+    pub started: [u64; EPISODE_GOAL_COUNT],
+    pub completed: [u64; EPISODE_GOAL_COUNT],
+    pub aborted: [u64; EPISODE_GOAL_COUNT],
+    pub interrupted_by_shutdown: u64,
     pub next_episode_id: u64,
 }
 
@@ -65,6 +53,7 @@ pub struct SavedEcologyRng {
 
 impl SavedEcologyRng {
     #[must_use]
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn for_seed(identity_seed: u64) -> Self {
         let mut seed = [0_u8; 32];
         let mut value = identity_seed;
@@ -92,293 +81,113 @@ impl SavedEcologyRng {
     }
 
     #[must_use]
-    fn is_valid(&self) -> bool {
-        self.seed.iter().any(|byte| *byte != 0)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EcologyState {
-    pub schema_version: u32,
-    pub identity_seed: u64,
-    pub next_object_id: u64,
-    pub objects: Vec<WorldObject>,
-    pub den: DenState,
-    pub metabolism: MetabolicState,
-    pub taste: TasteProfile,
-    pub skills: MimesisLibrary,
-    #[serde(default)]
-    pub gesture_conventions: GestureConventionLibrary,
-    pub object_memories: Vec<ObjectMemory>,
-    pub episode_stats: EpisodeStats,
-    pub rng: SavedEcologyRng,
-}
-
-impl Default for EcologyState {
-    fn default() -> Self {
-        Self::new(0x5045_5432_EC01_06A1)
+    pub fn restore(&self) -> ChaCha8Rng {
+        let mut rng = ChaCha8Rng::from_seed(self.seed);
+        for _ in 0..self.draw_count {
+            let _ = rng.next_u64();
+        }
+        rng
     }
 }
 
 impl EcologyState {
     #[must_use]
     pub fn new(identity_seed: u64) -> Self {
-        let identity_seed = identity_seed.max(1);
-        let den = DenState::for_seed(identity_seed);
-        let orb = WorldObject::canonical_orb(identity_seed, den.anchor);
-        let mut next_object_id = super::object::splitmix64(orb.id).max(1);
-        if next_object_id == orb.id {
-            next_object_id = orb.id.wrapping_add(1).max(1);
-        }
+        let rng = SavedEcologyRng::for_seed(identity_seed);
+        let mut object_rng = rng.restore();
+        let orb = HabitatObject::new_orb(ObjectId(1), &mut object_rng);
         Self {
-            schema_version: ECOLOGY_STATE_SCHEMA_VERSION,
+            schema_version: ECOLOGY_SCHEMA_VERSION,
             identity_seed,
-            next_object_id,
+            rng,
             objects: vec![orb],
-            den,
-            metabolism: MetabolicState::default(),
-            taste: TasteProfile::default(),
-            skills: MimesisLibrary {
-                skills: Vec::new(),
-                next_skill_id: 1,
-            },
-            gesture_conventions: GestureConventionLibrary::default(),
-            object_memories: Vec::new(),
+            den: PersistentDen::default(),
+            taste_memory: Vec::new(),
+            mimesis_skills: Vec::new(),
             episode_stats: EpisodeStats::default(),
-            rng: SavedEcologyRng::for_seed(identity_seed ^ 0xEC01_06A1_5EED_0001),
+            next_object_id: 2,
+            elapsed_seconds: 0.0,
         }
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> Self {
-        self.clone()
-    }
-
-    pub fn restore(mut snapshot: Self) -> Result<Self, EcologyError> {
-        snapshot.validate()?;
-        if snapshot.schema_version == 1 {
-            // Legacy mimesis skills were motor memories, not user-language
-            // evidence. Never invent conventions during migration.
-            snapshot.gesture_conventions = GestureConventionLibrary::default();
-            snapshot.schema_version = ECOLOGY_STATE_SCHEMA_VERSION;
-        }
-        snapshot.objects.retain(|object| {
-            object.kind == ObjectKind::Orb || object.lifecycle != ObjectLifecycle::Consumed
-        });
-        for object in &mut snapshot.objects {
-            if matches!(
-                object.lifecycle,
-                ObjectLifecycle::GrabbedByUser | ObjectLifecycle::CarriedByPet
-            ) {
-                object.lifecycle = ObjectLifecycle::Free;
-                object.velocity = glam::Vec2::ZERO;
-            }
-        }
-        snapshot.ensure_canonical_orb();
-        snapshot.validate()?;
-        Ok(snapshot)
     }
 
     pub fn validate(&self) -> Result<(), EcologyError> {
-        if !matches!(self.schema_version, 1 | ECOLOGY_STATE_SCHEMA_VERSION) {
-            return Err(EcologyError::UnsupportedSchema {
-                found: self.schema_version,
-                expected: ECOLOGY_STATE_SCHEMA_VERSION,
-            });
+        if self.schema_version != ECOLOGY_SCHEMA_VERSION {
+            return Err(EcologyError::InvalidState(format!(
+                "unsupported ecology schema {}",
+                self.schema_version
+            )));
         }
-        if self.identity_seed == 0 {
-            return Err(EcologyError::InvalidIdentitySeed);
+        if self.objects.len() > MAX_HABITAT_OBJECTS {
+            return Err(EcologyError::InvalidState(format!(
+                "object capacity exceeded: {}",
+                self.objects.len()
+            )));
         }
-        if self.objects.len() > MAX_OBJECTS {
-            return Err(EcologyError::TooManyObjects);
+        if self.taste_memory.len() > MAX_TASTE_MEMORIES {
+            return Err(EcologyError::InvalidState(format!(
+                "taste-memory capacity exceeded: {}",
+                self.taste_memory.len()
+            )));
         }
-        if self
-            .objects
-            .iter()
-            .filter(|object| object.is_active_morsel())
-            .count()
-            > MAX_ACTIVE_MORSELS
-        {
-            return Err(EcologyError::TooManyMorsels);
+        if self.mimesis_skills.len() > MAX_MIMESIS_SKILLS {
+            return Err(EcologyError::InvalidState(format!(
+                "mimesis-skill capacity exceeded: {}",
+                self.mimesis_skills.len()
+            )));
         }
-        if self
+        let mut seen = std::collections::HashSet::new();
+        for object in &self.objects {
+            object.validate()?;
+            if !seen.insert(object.id) {
+                return Err(EcologyError::InvalidState(format!(
+                    "duplicate object id {}",
+                    object.id.0
+                )));
+            }
+        }
+        let canonical_orbs = self
             .objects
             .iter()
             .filter(|object| object.kind == ObjectKind::Orb)
-            .count()
-            != 1
-            || self
-                .objects
-                .iter()
-                .find(|object| object.kind == ObjectKind::Orb)
-                .is_none_or(|orb| orb.id != canonical_orb_id(self.identity_seed))
-        {
-            return Err(EcologyError::InvalidCanonicalOrbCount);
-        }
-        for (index, object) in self.objects.iter().enumerate() {
-            object.validate()?;
-            if self.objects[..index]
-                .iter()
-                .any(|other| other.id == object.id)
-            {
-                return Err(EcologyError::DuplicateObjectId);
-            }
-        }
-        if self.next_object_id == 0
-            || self
-                .objects
-                .iter()
-                .any(|object| object.id == self.next_object_id)
-        {
-            return Err(EcologyError::InvalidNextObjectId);
+            .count();
+        if canonical_orbs != 1 {
+            return Err(EcologyError::InvalidState(format!(
+                "expected exactly one canonical orb, found {canonical_orbs}"
+            )));
         }
         self.den.validate()?;
-        for (index, slot) in self.den.slots.iter().enumerate() {
-            if let Some(object_id) = slot
-                && (self.den.slots[..index].contains(&Some(*object_id))
-                    || self
-                        .objects
-                        .iter()
-                        .find(|object| object.id == *object_id)
-                        .is_none_or(|object| object.lifecycle != ObjectLifecycle::StoredInDen))
-            {
-                return Err(EcologyError::InvalidDenSlot);
+        for slot in &self.den.slots {
+            if let Some(object_id) = slot.object_id {
+                let Some(object) = self.objects.iter().find(|object| object.id == object_id) else {
+                    return Err(EcologyError::InvalidState(format!(
+                        "den slot references missing object {}",
+                        object_id.0
+                    )));
+                };
+                if object.lifecycle != ObjectLifecycle::Stored {
+                    return Err(EcologyError::InvalidState(format!(
+                        "den slot object {} is not stored",
+                        object_id.0
+                    )));
+                }
             }
         }
-        self.metabolism.validate()?;
-        self.taste.validate()?;
-        self.skills.validate()?;
-        self.gesture_conventions.validate()?;
-        if self.object_memories.len() > MAX_OBJECT_MEMORIES {
-            return Err(EcologyError::TooManyObjectMemories);
+        for taste in &self.taste_memory {
+            taste.validate()?;
         }
-        for (index, memory) in self.object_memories.iter().enumerate() {
-            if !memory.is_valid()
-                || self.object_memories[..index]
-                    .iter()
-                    .any(|other| other.object_id == memory.object_id)
-            {
-                return Err(EcologyError::InvalidObjectMemory);
-            }
+        for skill in &self.mimesis_skills {
+            skill.validate()?;
         }
-        if self.episode_stats.next_episode_id == 0 {
-            return Err(EcologyError::InvalidEpisodeStats);
-        }
-        if !self.rng.is_valid() {
-            return Err(EcologyError::InvalidRng);
-        }
-        Ok(())
-    }
-
-    pub fn ensure_canonical_orb(&mut self) {
-        let expected_id = canonical_orb_id(self.identity_seed);
-        if self
-            .objects
-            .iter()
-            .any(|object| object.kind == ObjectKind::Orb && object.id == expected_id)
-        {
-            return;
-        }
-        self.objects.retain(|object| object.kind != ObjectKind::Orb);
-        if self.objects.len() < MAX_OBJECTS {
-            self.objects.push(WorldObject::canonical_orb(
-                self.identity_seed,
-                self.den.anchor,
+        if self.next_object_id == 0 {
+            return Err(EcologyError::InvalidState(
+                "next object id must be non-zero".into(),
             ));
         }
-    }
-
-    pub fn spawn_morsel(
-        &mut self,
-        position: Vec2,
-        profile: MorselProfile,
-        timestamp: f64,
-    ) -> Option<ObjectId> {
-        if !position.is_finite()
-            || !profile.is_valid()
-            || !timestamp.is_finite()
-            || timestamp < 0.0
-            || self.objects.len() >= MAX_OBJECTS
-            || self
-                .objects
-                .iter()
-                .filter(|object| object.is_active_morsel())
-                .count()
-                >= MAX_ACTIVE_MORSELS
-        {
-            return None;
+        if !self.elapsed_seconds.is_finite() || self.elapsed_seconds < 0.0 {
+            return Err(EcologyError::InvalidState(
+                "elapsed_seconds must be finite and non-negative".into(),
+            ));
         }
-        let mut id = self.next_object_id.max(1);
-        for _ in 0..MAX_OBJECTS {
-            if !self.objects.iter().any(|object| object.id == id) {
-                break;
-            }
-            id = super::object::splitmix64(id).max(1);
-        }
-        if self.objects.iter().any(|object| object.id == id) {
-            return None;
-        }
-        let mut morsel = WorldObject::morsel(id, position, profile);
-        morsel.last_interaction_seconds = timestamp;
-        self.objects.push(morsel);
-        self.next_object_id = super::object::splitmix64(id).max(1);
-        while self
-            .objects
-            .iter()
-            .any(|object| object.id == self.next_object_id)
-        {
-            self.next_object_id = super::object::splitmix64(self.next_object_id).max(1);
-        }
-        Some(id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_is_deterministic_and_has_one_canonical_orb() {
-        let first = EcologyState::new(42);
-        let second = EcologyState::new(42);
-        assert_eq!(first, second);
-        first.validate().unwrap();
-        assert_eq!(first.objects.len(), 1);
-        assert_eq!(first.objects[0].kind, ObjectKind::Orb);
-    }
-
-    #[test]
-    fn invalid_float_is_rejected() {
-        let mut state = EcologyState::new(42);
-        state.objects[0].position.x = f32::NAN;
-        assert_eq!(state.validate(), Err(EcologyError::InvalidObject));
-    }
-
-    #[test]
-    fn morsel_spawn_is_bounded_and_preserves_the_canonical_orb() {
-        let mut state = EcologyState::new(43);
-        let profile = MorselProfile {
-            hue: 0.2,
-            saturation: 0.8,
-            value: 0.9,
-            warmth: 0.6,
-            pulse_rate: 0.4,
-            stimulation: 0.5,
-            cohesion_bias: 0.7,
-            novelty: 0.8,
-        };
-        for index in 0..MAX_ACTIVE_MORSELS + 2 {
-            let result = state.spawn_morsel(Vec2::splat(0.4), profile.clone(), index as f64);
-            assert_eq!(result.is_some(), index < MAX_ACTIVE_MORSELS);
-        }
-        assert_eq!(
-            state
-                .objects
-                .iter()
-                .filter(|object| object.kind == ObjectKind::Orb)
-                .count(),
-            1
-        );
-        state.validate().unwrap();
+        Ok(())
     }
 }
