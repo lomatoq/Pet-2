@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "principle": "raw signals never map directly to expressions; semantic events feed appraisal and intent",
+  "families": {
+    "pointer": [
+      "pointer_approach",
+      "pointer_withdraw",
+      "pointer_hover",
+      "soft_touch",
+      "stroke",
+      "hold",
+      "pull",
+      "release",
+      "tickle",
+      "flick",
+      "rhythmic_tap",
+      "circle_gesture",
+      "play_invitation",
+      "pet_drag",
+      "object_drag_near_pet",
+      "object_throw",
+      "fragment_attempt",
+      "fragment_help"
+    ],
+    "user_activity": [
+      "user_active",
+      "user_idle_short",
+      "user_idle_long",
+      "user_returned",
+      "work_burst_started",
+      "work_burst_ended",
+      "rapid_pointer_work",
+      "slow_pointer_work",
+      "repetitive_click_activity"
+    ],
+    "window": [
+      "window_appeared",
+      "window_disappeared",
+      "window_moved",
+      "window_resized",
+      "window_maximized",
+      "window_minimized",
+      "window_foreground",
+      "window_background",
+      "surface_near_pass",
+      "surface_collision",
+      "free_space_changed",
+      "pet_occluded",
+      "pet_trapped",
+      "pet_freed"
+    ],
+    "visual": [
+      "visual_novelty",
+      "salient_color",
+      "salient_motion",
+      "structured_shape",
+      "habituated_visual"
+    ],
+    "ui_automation_opt_in": [
+      "focus_changed",
+      "button_invoked",
+      "selection_changed",
+      "menu_opened",
+      "menu_closed",
+      "dialog_opened",
+      "dialog_closed",
+      "progress_started",
+      "progress_completed",
+      "scroll_started",
+      "scroll_ended",
+      "app_busy",
+      "app_idle"
+    ],
+    "application_adapter_opt_in": [
+      "creative_task_started",
+      "creative_task_completed",
+      "build_started",
+      "build_completed",
+      "render_started",
+      "render_completed",
+      "meeting_started",
+      "meeting_ended",
+      "media_started",
+      "media_stopped",
+      "game_session_started",
+      "game_session_ended"
+    ],
+    "body": [
+      "pain_detected",
+      "overstrain",
+      "pressure_boundary",
+      "fragment_detached",
+      "fragment_remerged",
+      "body_recovered",
+      "support_acquired",
+      "support_lost",
+      "fatigue_transition",
+      "wake_transition"
+    ]
+  },
+  "response_tiers": {
+    "0": "ignore",
+    "1": "gaze_only",
+    "2": "gaze_plus_small_orientation",
+    "3": "short_motor_response",
+    "4": "full_episode"
+  },
+  "rules": [
+    "cursor proximity is never touch",
+    "window motion is never petting or play consent",
+    "ambiguous desktop events never reduce attachment",
+    "repeated predictable harmless events habituate toward tier 0 or 1",
+    "novelty or real threat may dishabituate",
+    "full episodes require high semantic confidence or safety urgency",
+    "UI text, document contents, password values, clipboard and chat contents are not persistent semantic input",
+    "application completion is not automatically celebration",
+    "user return permits greeting but does not require a sound"
+  ]
+}
