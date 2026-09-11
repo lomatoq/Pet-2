@@ -44,9 +44,21 @@ jobs:
         shell: pwsh
         run: cargo fmt --all
 
-      - name: Full Windows validation
+      - name: Compile entire workspace
         shell: pwsh
-        run: ./scripts/build_windows.ps1
+        run: cargo check --workspace --all-targets
+
+      - name: Test companion-facing crates and app
+        shell: pwsh
+        run: cargo test -p lifecore -p pet_perception -p pet_motor -p pet_body -p pet_audio -p pet2
+
+      - name: Strict clippy on modified runtime surface
+        shell: pwsh
+        run: cargo clippy -p lifecore -p pet_perception -p pet_motor -p pet_body -p pet_audio -p pet2 --all-targets -- -D warnings
+
+      - name: Build Windows Pet2 release
+        shell: pwsh
+        run: cargo build -p pet2 --release --target x86_64-pc-windows-msvc
 
       - name: Commit validated integration
         shell: pwsh
