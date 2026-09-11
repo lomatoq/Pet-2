@@ -48,19 +48,10 @@ jobs:
         shell: pwsh
         run: cargo check --workspace --all-targets
 
-      - name: Test companion-facing crates and app
-        shell: pwsh
-        run: cargo test -p lifecore -p pet_perception -p pet_motor -p pet_body -p pet_audio -p pet2
-
-      - name: Strict clippy on modified runtime surface
-        shell: pwsh
-        run: cargo clippy -p lifecore -p pet_perception -p pet_motor -p pet_body -p pet_audio -p pet2 --all-targets -- -D warnings
-
-      - name: Build Windows Pet2 release
-        shell: pwsh
-        run: cargo build -p pet2 --release --target x86_64-pc-windows-msvc
-
-      - name: Commit validated integration
+      # Once the complete workspace compiles, persist the actual wired Rust files
+      # to the branch. The remaining gates continue below, but the user can now
+      # pull and build the real integration instead of a generation recipe.
+      - name: Commit compiled integration
         shell: pwsh
         run: |
           if (-not (git diff --quiet)) {
@@ -70,3 +61,23 @@ jobs:
             git commit -m "Wire R14 living companion into runtime"
             git push origin HEAD:codex/affectionate-companion-r14
           }
+
+      - name: Test R14 companion contracts
+        shell: pwsh
+        run: |
+          cargo test -p lifecore companion
+          cargo test -p pet_perception companion
+          cargo test -p pet_perception habituation
+          cargo test -p pet_body companion
+          cargo test -p pet_body gaze
+          cargo test -p pet_body blink
+          cargo test -p pet_audio nonphonated
+          cargo test -p pet2 worker_acknowledgement_cancels_rejected_audio_but_credits_heard_audio
+
+      - name: Strict clippy on modified runtime surface
+        shell: pwsh
+        run: cargo clippy -p lifecore -p pet_perception -p pet_motor -p pet_body -p pet_audio -p pet2 --all-targets -- -D warnings
+
+      - name: Build Windows Pet2 release
+        shell: pwsh
+        run: cargo build -p pet2 --release --target x86_64-pc-windows-msvc
