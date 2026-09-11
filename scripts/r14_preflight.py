@@ -48,4 +48,25 @@ replace_once(
 )
 replace_all(expression_path, "GazeMode::", "CompanionGazeMode::")
 
+# Quiet-vocal admission must account for sounds that were ACTUALLY heard by the
+# callback, not commands merely accepted by the host queue. Otherwise a device
+# rejection burns the eight-second social cooldown even though the pet emitted
+# nothing, and LifeCore's delivery-credit contract becomes false.
+main_path = "app/src/main.rs"
+replace_once(
+    main_path,
+    """                AudioWorkerEvent::RequestHeard { request_id } => {\n                    if self.remove_pending_request(request_id) {\n                        self.heard_requests.push_back(request_id);\n                        self.accepted_requests = self.accepted_requests.saturating_add(1);\n                        self.last_error = None;\n                    }\n                }\n""",
+    """                AudioWorkerEvent::RequestHeard { request_id } => {\n                    if self.remove_pending_request(request_id) {\n                        let now = Instant::now();\n                        self.recent_voice_accepts.push_back(now);\n                        // Any heard vocal, including a safety vocal, buys the pet\n                        // a quiet refractory period before ordinary chatter.\n                        self.last_nonurgent_voice = Some(now);\n                        self.heard_requests.push_back(request_id);\n                        self.accepted_requests = self.accepted_requests.saturating_add(1);\n                        self.last_error = None;\n                    }\n                }\n""",
+)
+replace_once(
+    main_path,
+    """        if !urgent {\n            if self.recent_voice_accepts.len() >= 6\n                || self\n                    .last_nonurgent_voice\n                    .is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(8))\n            {\n                return false;\n            }\n        }\n""",
+    """        if !urgent {\n            if !self.pending_requests.is_empty()\n                || self.recent_voice_accepts.len() >= 6\n                || self\n                    .last_nonurgent_voice\n                    .is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(8))\n            {\n                return false;\n            }\n        }\n""",
+)
+replace_once(
+    main_path,
+    """            Ok(()) => {\n                self.pending_requests.push_back(request.performance_seed);\n                self.last_error = None;\n                self.recent_voice_accepts.push_back(now);\n                if !urgent {\n                    self.last_nonurgent_voice = Some(now);\n                }\n                true\n            }\n""",
+    """            Ok(()) => {\n                self.pending_requests.push_back(request.performance_seed);\n                self.last_error = None;\n                true\n            }\n""",
+)
+
 print("R14 preflight fixes applied")
