@@ -4,6 +4,7 @@
 )]
 #![recursion_limit = "512"]
 
+mod companion_runtime;
 mod ecology_runtime;
 mod evolution_runner;
 mod nervous_system_runtime;
@@ -372,6 +373,8 @@ struct AudioManager {
     recent_rms: f32,
     recent_peak: f32,
     body_voice_analyzer: BodyVoiceAnalyzer,
+    recent_voice_accepts: VecDeque<Instant>,
+    last_nonurgent_voice: Option<Instant>,
 }
 
 enum AudioWorkerCommand {
@@ -572,6 +575,8 @@ impl AudioManager {
             recent_rms: 0.0,
             recent_peak: 0.0,
             body_voice_analyzer: BodyVoiceAnalyzer::default(),
+            recent_voice_accepts: VecDeque::with_capacity(8),
+            last_nonurgent_voice: None,
         };
         if !disabled {
             manager.start_in_background();
@@ -643,6 +648,11 @@ impl AudioManager {
                 }
                 AudioWorkerEvent::RequestHeard { request_id } => {
                     if self.remove_pending_request(request_id) {
+                        let now = Instant::now();
+                        self.recent_voice_accepts.push_back(now);
+                        // Any heard vocal, including a safety vocal, buys the pet
+                        // a quiet refractory period before ordinary chatter.
+                        self.last_nonurgent_voice = Some(now);
                         self.heard_requests.push_back(request_id);
                         self.accepted_requests = self.accepted_requests.saturating_add(1);
                         self.last_error = None;
@@ -718,6 +728,25 @@ impl AudioManager {
         motif: &lifecore::VocalMotif,
         request: &lifecore::VocalRequest,
     ) -> bool {
+        let now = Instant::now();
+        while self
+            .recent_voice_accepts
+            .front()
+            .is_some_and(|instant| now.duration_since(*instant) >= Duration::from_secs(60))
+        {
+            self.recent_voice_accepts.pop_front();
+        }
+        let urgent = request.priority >= 220;
+        if !urgent {
+            if !self.pending_requests.is_empty()
+                || self.recent_voice_accepts.len() >= 6
+                || self
+                    .last_nonurgent_voice
+                    .is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(8))
+            {
+                return false;
+            }
+        }
         self.last_request = Some(request.motif_id);
         if self.state != AudioManagerState::Ready {
             self.rejected_requests = self.rejected_requests.saturating_add(1);
@@ -4923,6 +4952,8 @@ fn build_motor_context(runtime: &mut PetRuntime) -> BehaviorContextFrame {
             .vita
             .visual_attention_target()
             .map_or(0.0, |target| target.score),
+        companion_intent: runtime.vita.companion_intent().primary,
+        companion_confidence: runtime.vita.companion_intent().confidence,
         gesture: gesture.kind,
         gesture_confidence: gesture.confidence,
         gesture_ended: gesture.ended,

@@ -76,19 +76,35 @@ impl BlinkController {
         self.physiological_clock += dt;
 
         if protective {
-            self.request(BlinkRequest { owner: BlinkOwner::Protective, strength: 1.0, duration: 0.12 });
+            self.request(BlinkRequest {
+                owner: BlinkOwner::Protective,
+                strength: 1.0,
+                duration: 0.12,
+            });
         } else if sleeping {
-            self.request(BlinkRequest { owner: BlinkOwner::Sleep, strength: 1.0, duration: 2.5 });
+            self.request(BlinkRequest {
+                owner: BlinkOwner::Sleep,
+                strength: 1.0,
+                duration: 2.5,
+            });
         } else if fatigue.is_finite() && fatigue > 0.82 && self.active.is_none() {
-            self.request(BlinkRequest { owner: BlinkOwner::Fatigue, strength: 0.75, duration: 0.42 });
+            self.request(BlinkRequest {
+                owner: BlinkOwner::Fatigue,
+                strength: 0.75,
+                duration: 0.42,
+            });
         } else if self.active.is_none()
             && self.social_refractory <= 0.0
             && self.physiological_clock >= self.next_physiological
         {
-            self.request(BlinkRequest { owner: BlinkOwner::Physiological, strength: 1.0, duration: 0.14 });
+            self.request(BlinkRequest {
+                owner: BlinkOwner::Physiological,
+                strength: 1.0,
+                duration: 0.14,
+            });
             self.physiological_clock = 0.0;
-            self.next_physiological = 3.5
-                + 3.4 * (0.5 + 0.5 * (self.seed_phase + self.physiological_clock * 0.37).sin());
+            self.next_physiological =
+                3.5 + 3.4 * (0.5 + 0.5 * (self.seed_phase + self.physiological_clock * 0.37).sin());
         }
 
         let Some(active) = self.active else {
@@ -121,11 +137,19 @@ impl Default for BlinkController {
 }
 
 fn finite_unit(value: f32) -> f32 {
-    if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 }
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn finite_dt(value: f32) -> f32 {
-    if value.is_finite() { value.clamp(0.0, 0.1) } else { 0.0 }
+    if value.is_finite() {
+        value.clamp(0.0, 0.1)
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -135,15 +159,25 @@ mod tests {
     #[test]
     fn social_blink_blocks_lower_priority_physiological_blink() {
         let mut blink = BlinkController::new(7);
-        blink.request(BlinkRequest { owner: BlinkOwner::Social, strength: 1.0, duration: 0.5 });
-        for _ in 0..12 { let _ = blink.tick(0.05, false, false, 0.0); }
+        blink.request(BlinkRequest {
+            owner: BlinkOwner::Social,
+            strength: 1.0,
+            duration: 0.5,
+        });
+        for _ in 0..12 {
+            let _ = blink.tick(0.05, false, false, 0.0);
+        }
         assert!(blink.social_refractory > 1.0);
     }
 
     #[test]
     fn protective_blink_preempts_social() {
         let mut blink = BlinkController::new(3);
-        blink.request(BlinkRequest { owner: BlinkOwner::Social, strength: 0.8, duration: 0.6 });
+        blink.request(BlinkRequest {
+            owner: BlinkOwner::Social,
+            strength: 0.8,
+            duration: 0.6,
+        });
         let out = blink.tick(0.02, false, true, 0.0);
         assert_eq!(out.owner, BlinkOwner::Protective);
     }

@@ -1,7 +1,8 @@
 use glam::Vec2;
 use lifecore::{CompanionIntentFrame, PrimaryIntent};
 
-use crate::{BlinkController, BlinkOwner, BlinkRequest, GazeController, GazeMode, GazePlan};
+use crate::gaze_controller::GazeMode as CompanionGazeMode;
+use crate::{BlinkController, BlinkOwner, BlinkRequest, GazeController, GazePlan};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FaceTarget {
@@ -58,6 +59,7 @@ pub enum ExpressionOwner {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ExpressionEvidence {
+    pub body_position: Vec2,
     pub contact_point: Option<Vec2>,
     pub contact_pressure: f32,
     pub contact_strain: f32,
@@ -80,6 +82,7 @@ pub struct CompanionExpressionTarget {
     pub owner: ExpressionOwner,
 }
 
+#[derive(Debug, Clone)]
 pub struct CompanionExpressionDirector {
     gaze: GazeController,
     blink: BlinkController,
@@ -108,10 +111,10 @@ impl CompanionExpressionDirector {
 
         // Appraisal modulation is deliberately small: it enriches the semantic
         // intent rather than replacing it with a generic emotion mask.
-        face.pupil_size = (face.pupil_size + intent.arousal * 0.12 + intent.surprise * 0.10)
-            .clamp(0.0, 1.0);
-        face.brow_raise = (face.brow_raise + intent.curiosity * 0.08 + intent.surprise * 0.12)
-            .clamp(-1.0, 1.0);
+        face.pupil_size =
+            (face.pupil_size + intent.arousal * 0.12 + intent.surprise * 0.10).clamp(0.0, 1.0);
+        face.brow_raise =
+            (face.brow_raise + intent.curiosity * 0.08 + intent.surprise * 0.12).clamp(-1.0, 1.0);
         face.brow_tension = (face.brow_tension
             + intent.frustration * 0.10
             + evidence.motor_error.clamp(0.0, 1.0) * 0.08)
@@ -119,8 +122,10 @@ impl CompanionExpressionDirector {
         body.internal_pulse = (body.internal_pulse + intent.arousal * 0.08).clamp(0.0, 1.0);
         body.glow = (body.glow + intent.attachment * 0.05 + intent.arousal * 0.04).clamp(0.0, 0.65);
 
-        if matches!(intent.primary, PrimaryIntent::AcceptContact | PrimaryIntent::Nuzzle)
-            && intent.contact_pleasantness > 0.20
+        if matches!(
+            intent.primary,
+            PrimaryIntent::AcceptContact | PrimaryIntent::Nuzzle
+        ) && intent.contact_pleasantness > 0.20
         {
             owner = ExpressionOwner::Contact;
             let pleasant = intent.contact_pleasantness.clamp(0.0, 1.0);
@@ -128,9 +133,10 @@ impl CompanionExpressionDirector {
             face.squint = (face.squint + pleasant * 0.08).clamp(0.0, 0.35);
             face.brow_tension *= 1.0 - pleasant * 0.60;
             body.contact_yield = (body.contact_yield + pleasant * 0.18).clamp(0.0, 1.0);
-            body.viscosity_multiplier = (body.viscosity_multiplier - pleasant * 0.10).clamp(0.75, 1.35);
-            if let Some(point) = evidence.contact_point.filter(Vec2::is_finite) {
-                let axis = (point - intent.target.position.unwrap_or(Vec2::splat(0.5))).normalize_or_zero();
+            body.viscosity_multiplier =
+                (body.viscosity_multiplier - pleasant * 0.10).clamp(0.75, 1.35);
+            if let Some(point) = evidence.contact_point.filter(|point| point.is_finite()) {
+                let axis = (point - evidence.body_position).normalize_or_zero();
                 body.lean += axis * 0.05 * pleasant;
             }
         }
@@ -170,11 +176,19 @@ impl CompanionExpressionDirector {
             secondary_target: intent.target.position,
             target_velocity: evidence.target_velocity,
             mode: gaze_mode,
-            acquire_tau: if matches!(intent.primary, PrimaryIntent::StartleFreeze) { 0.035 } else { 0.07 },
+            acquire_tau: if matches!(intent.primary, PrimaryIntent::StartleFreeze) {
+                0.035
+            } else {
+                0.07
+            },
             release_tau: 0.18,
             dwell_min: 0.20,
             dwell_max: 1.10,
-            lead_seconds: if gaze_mode == GazeMode::PredictiveIntercept { 0.12 } else { 0.0 },
+            lead_seconds: if gaze_mode == CompanionGazeMode::PredictiveIntercept {
+                0.12
+            } else {
+                0.0
+            },
             micro_saccade_amplitude: if intent.confidence > 0.6 { 0.004 } else { 0.0 },
             confidence: intent.confidence,
         };
@@ -182,7 +196,11 @@ impl CompanionExpressionDirector {
         face.pupil_focus = gaze.pupil_focus;
 
         if matches!(intent.primary, PrimaryIntent::Sleep) {
-            self.blink.request(BlinkRequest { owner: BlinkOwner::Sleep, strength: 1.0, duration: 2.5 });
+            self.blink.request(BlinkRequest {
+                owner: BlinkOwner::Sleep,
+                strength: 1.0,
+                duration: 2.5,
+            });
         } else if matches!(intent.primary, PrimaryIntent::QuietCompanionship)
             && intent.attachment > 0.55
             && intent.arousal < 0.45
@@ -190,9 +208,18 @@ impl CompanionExpressionDirector {
         {
             // The runtime should gate this with a social event/refractory condition;
             // this request is safe because BlinkController arbitrates/refracts it.
-            self.blink.request(BlinkRequest { owner: BlinkOwner::Social, strength: 0.82, duration: 0.52 });
+            self.blink.request(BlinkRequest {
+                owner: BlinkOwner::Social,
+                strength: 0.82,
+                duration: 0.52,
+            });
         }
-        let blink = self.blink.tick(dt, intent.primary == PrimaryIntent::Sleep, danger, intent.fatigue);
+        let blink = self.blink.tick(
+            dt,
+            intent.primary == PrimaryIntent::Sleep,
+            danger,
+            intent.fatigue,
+        );
 
         sanitize_face(&mut face);
         sanitize_body(&mut body);
@@ -207,18 +234,28 @@ impl CompanionExpressionDirector {
     }
 }
 
-fn gaze_mode_for(intent: PrimaryIntent, uncertainty: f32) -> GazeMode {
+fn gaze_mode_for(intent: PrimaryIntent, uncertainty: f32) -> CompanionGazeMode {
     if uncertainty > 0.45 {
-        return GazeMode::SocialReference;
+        return CompanionGazeMode::SocialReference;
     }
     match intent {
-        PrimaryIntent::Sleep => GazeMode::Sleep,
-        PrimaryIntent::Intercept | PrimaryIntent::Chase | PrimaryIntent::Catch => GazeMode::PredictiveIntercept,
-        PrimaryIntent::AcceptContact | PrimaryIntent::Nuzzle | PrimaryIntent::InviteContact => GazeMode::ContactMonitor,
-        PrimaryIntent::QuietCompanionship | PrimaryIntent::SocialCheckIn => GazeMode::MutualGaze,
-        PrimaryIntent::Avoid | PrimaryIntent::GuardPain | PrimaryIntent::RejectContact => GazeMode::AvoidantCheck,
-        PrimaryIntent::Inspect | PrimaryIntent::Explore | PrimaryIntent::SearchObject => GazeMode::Inspect,
-        _ => GazeMode::Track,
+        PrimaryIntent::Sleep => CompanionGazeMode::Sleep,
+        PrimaryIntent::Intercept | PrimaryIntent::Chase | PrimaryIntent::Catch => {
+            CompanionGazeMode::PredictiveIntercept
+        }
+        PrimaryIntent::AcceptContact | PrimaryIntent::Nuzzle | PrimaryIntent::InviteContact => {
+            CompanionGazeMode::ContactMonitor
+        }
+        PrimaryIntent::QuietCompanionship | PrimaryIntent::SocialCheckIn => {
+            CompanionGazeMode::MutualGaze
+        }
+        PrimaryIntent::Avoid | PrimaryIntent::GuardPain | PrimaryIntent::RejectContact => {
+            CompanionGazeMode::AvoidantCheck
+        }
+        PrimaryIntent::Inspect | PrimaryIntent::Explore | PrimaryIntent::SearchObject => {
+            CompanionGazeMode::Inspect
+        }
+        _ => CompanionGazeMode::Track,
     }
 }
 
@@ -367,15 +404,26 @@ fn sanitize_face(face: &mut FaceTarget) {
 
 fn sanitize_body(body: &mut BodyStyleTarget) {
     body.compactness = unit(body.compactness);
-    body.lean = if body.lean.is_finite() { body.lean.clamp(Vec2::splat(-1.0), Vec2::ONE) } else { Vec2::ZERO };
+    body.lean = if body.lean.is_finite() {
+        body.lean.clamp(Vec2::splat(-1.0), Vec2::ONE)
+    } else {
+        Vec2::ZERO
+    };
     body.buoyancy = unit(body.buoyancy);
     body.viscosity_multiplier = finite(body.viscosity_multiplier, 1.0).clamp(0.75, 1.35);
-    body.surface_tension_multiplier = finite(body.surface_tension_multiplier, 1.0).clamp(0.75, 1.35);
+    body.surface_tension_multiplier =
+        finite(body.surface_tension_multiplier, 1.0).clamp(0.75, 1.35);
     body.contact_yield = unit(body.contact_yield);
     body.internal_pulse = unit(body.internal_pulse);
     body.glow = unit(body.glow);
 }
 
-fn unit(value: f32) -> f32 { finite(value, 0.0).clamp(0.0, 1.0) }
-fn signed(value: f32) -> f32 { finite(value, 0.0).clamp(-1.0, 1.0) }
-fn finite(value: f32, fallback: f32) -> f32 { if value.is_finite() { value } else { fallback } }
+fn unit(value: f32) -> f32 {
+    finite(value, 0.0).clamp(0.0, 1.0)
+}
+fn signed(value: f32) -> f32 {
+    finite(value, 0.0).clamp(-1.0, 1.0)
+}
+fn finite(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}

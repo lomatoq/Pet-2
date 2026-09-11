@@ -338,7 +338,13 @@ impl EmbodiedRuntime {
             dt,
         );
         self.update_attention_face_pose(mode, mind, feedback);
-        self.update_blink(mode, intent, affect, expression, dt);
+        let authored_blink = expression.blink_left.max(expression.blink_right);
+        if authored_blink > 0.02 {
+            self.pose.blink_left = expression.blink_left.clamp(0.0, 1.0);
+            self.pose.blink_right = expression.blink_right.clamp(0.0, 1.0);
+        } else {
+            self.update_blink(mode, intent, affect, expression, dt);
+        }
         self.pose.eye_aperture = smooth(
             self.pose.eye_aperture,
             expression.eye_aperture.clamp(0.0, 1.0),
@@ -365,9 +371,9 @@ impl EmbodiedRuntime {
         self.pose.mouth_curve = smooth(
             self.pose.mouth_curve,
             (expression.mouth_curve
-                + expression.relief * 0.18
-                + expression.mouth_asymmetry * 0.12
-                + affect.valence * 0.34)
+                + expression.relief * 0.08
+                + expression.mouth_asymmetry * 0.08
+                + affect.valence * 0.08)
                 .clamp(-1.0, 1.0),
             11.0,
             dt,
@@ -384,19 +390,19 @@ impl EmbodiedRuntime {
         );
         self.pose.brow_raise = smooth(
             self.pose.brow_raise,
-            (expression.brow_raise + affect.arousal * 0.22).clamp(-1.0, 1.0),
+            (expression.brow_raise + affect.arousal * 0.06).clamp(-1.0, 1.0),
             12.0,
             dt,
         );
         self.pose.brow_tension = smooth(
             self.pose.brow_tension,
-            (expression.brow_tension + affect.stress * 0.36).clamp(0.0, 1.0),
+            (expression.brow_tension + affect.stress * 0.10).clamp(0.0, 1.0),
             14.0,
             dt,
         );
-        let procedural_asymmetry = (self.elapsed * 0.41 + self.seed_phase).sin() * 0.12
+        let procedural_asymmetry = (self.elapsed * 0.41 + self.seed_phase).sin() * 0.035
             + if intent.pose == PoseIntent::Curious {
-                0.18
+                0.05
             } else {
                 0.0
             };

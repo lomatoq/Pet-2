@@ -1,6 +1,7 @@
 use glam::Vec2;
 use lifecore::{
-    AppraisedEvent, CompanionEventKind, CompanionEventSource, IntentTarget, IntentTargetKind,
+    AppraisedEvent, CompanionEventKind, CompanionEventSource, EmbodiedGestureKind, IntentTarget,
+    IntentTargetKind,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -19,10 +20,14 @@ pub struct CompanionEventInput {
     pub contact_strain: f32,
     pub contact_seconds: f32,
     pub gesture_confidence: f32,
+    pub gesture: Option<EmbodiedGestureKind>,
     pub user_idle_seconds: f32,
     pub user_activity_rate: f32,
     pub previous_user_idle_seconds: f32,
     pub visual_novelty: f32,
+    pub window_motion: f32,
+    pub window_pressure: f32,
+    pub window_target: Option<Vec2>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -84,9 +89,21 @@ impl CompanionEventBuilder {
                     novelty: 0.12,
                     controllability: 0.90,
                     directness: 0.35,
-                    social_likelihood: if kind == CompanionEventKind::PointerHover { 0.48 } else { 0.28 },
-                    threat_likelihood: if input.cursor_velocity.length() > 0.9 { 0.18 } else { 0.03 },
-                    play_likelihood: if input.cursor_velocity.length() > 0.12 { 0.22 } else { 0.08 },
+                    social_likelihood: if kind == CompanionEventKind::PointerHover {
+                        0.48
+                    } else {
+                        0.28
+                    },
+                    threat_likelihood: if input.cursor_velocity.length() > 0.9 {
+                        0.18
+                    } else {
+                        0.03
+                    },
+                    play_likelihood: if input.cursor_velocity.length() > 0.12 {
+                        0.22
+                    } else {
+                        0.08
+                    },
                     contact_quality: 0.0,
                     prediction_error: 0.10,
                     expectedness: 0.60,
@@ -104,14 +121,20 @@ impl CompanionEventBuilder {
                 .clamp(-1.0, 1.0);
             let kind = if input.pointer_released {
                 CompanionEventKind::Release
-            } else if input.contact_strain > 0.72 || speed > 1.0 {
-                CompanionEventKind::Flick
-            } else if input.contact_seconds > 0.45 && speed < 0.025 {
-                CompanionEventKind::Hold
-            } else if input.contact_seconds > 0.15 && speed < 0.35 {
-                CompanionEventKind::Stroke
             } else {
-                CompanionEventKind::SoftTouch
+                match input.gesture {
+                    Some(EmbodiedGestureKind::Tickle) => CompanionEventKind::Tickle,
+                    Some(EmbodiedGestureKind::RhythmicTouch) => CompanionEventKind::RhythmicTap,
+                    Some(EmbodiedGestureKind::SharedPlayInvitation) => {
+                        CompanionEventKind::PlayInvitation
+                    }
+                    Some(EmbodiedGestureKind::PullAndRelease) => CompanionEventKind::Pull,
+                    Some(EmbodiedGestureKind::SharpFlick) => CompanionEventKind::Flick,
+                    _ if input.contact_strain > 0.72 || speed > 1.0 => CompanionEventKind::Flick,
+                    _ if input.contact_seconds > 0.45 && speed < 0.025 => CompanionEventKind::Hold,
+                    _ if input.contact_seconds > 0.15 && speed < 0.35 => CompanionEventKind::Stroke,
+                    _ => CompanionEventKind::SoftTouch,
+                }
             };
             out.push(AppraisedEvent {
                 source: CompanionEventSource::DirectContact,
@@ -127,8 +150,16 @@ impl CompanionEventBuilder {
                 controllability: 0.72,
                 directness: 1.0,
                 social_likelihood: if quality > 0.3 { 0.82 } else { 0.20 },
-                threat_likelihood: if quality < 0.0 { (-quality).clamp(0.0, 1.0) } else { 0.02 },
-                play_likelihood: if kind == CompanionEventKind::Flick { 0.18 } else { 0.12 },
+                threat_likelihood: if quality < 0.0 {
+                    (-quality).clamp(0.0, 1.0)
+                } else {
+                    0.02
+                },
+                play_likelihood: if kind == CompanionEventKind::Flick {
+                    0.18
+                } else {
+                    0.12
+                },
                 contact_quality: quality,
                 prediction_error: (input.cursor_acceleration.length() * 0.12).clamp(0.0, 1.0),
                 expectedness: 0.55,
@@ -160,7 +191,11 @@ impl CompanionEventBuilder {
             out.push(AppraisedEvent {
                 source: CompanionEventSource::DesktopActivity,
                 kind: CompanionEventKind::UserReturned,
-                target: IntentTarget { kind: IntentTargetKind::UserProxy, confidence: 0.8, ..IntentTarget::default() },
+                target: IntentTarget {
+                    kind: IntentTargetKind::UserProxy,
+                    confidence: 0.8,
+                    ..IntentTarget::default()
+                },
                 confidence: 0.85,
                 novelty: (input.previous_user_idle_seconds / 900.0).clamp(0.1, 0.8),
                 controllability: 0.0,
@@ -179,7 +214,11 @@ impl CompanionEventBuilder {
             out.push(AppraisedEvent {
                 source: CompanionEventSource::VisualField,
                 kind: CompanionEventKind::VisualNovelty,
-                target: IntentTarget { kind: IntentTargetKind::ScreenRegion, confidence: input.visual_novelty, ..IntentTarget::default() },
+                target: IntentTarget {
+                    kind: IntentTargetKind::ScreenRegion,
+                    confidence: input.visual_novelty,
+                    ..IntentTarget::default()
+                },
                 confidence: input.visual_novelty,
                 novelty: input.visual_novelty,
                 controllability: 0.2,
@@ -190,6 +229,35 @@ impl CompanionEventBuilder {
                 contact_quality: 0.0,
                 prediction_error: input.visual_novelty,
                 expectedness: 1.0 - input.visual_novelty,
+                timestamp: input.timestamp,
+            });
+        }
+
+        if input.window_motion > 0.08 || input.window_pressure > 0.08 {
+            let pressure = input.window_pressure.clamp(0.0, 1.0);
+            out.push(AppraisedEvent {
+                source: CompanionEventSource::WindowEnvironment,
+                kind: if pressure > 0.55 {
+                    CompanionEventKind::SurfaceCollision
+                } else {
+                    CompanionEventKind::WindowMoved
+                },
+                target: IntentTarget {
+                    kind: IntentTargetKind::Surface,
+                    position: input.window_target.filter(|point| point.is_finite()),
+                    confidence: input.window_motion.max(pressure).clamp(0.0, 1.0),
+                    component_id: None,
+                },
+                confidence: input.window_motion.max(pressure).clamp(0.0, 1.0),
+                novelty: (input.window_motion * 0.35 + pressure * 0.65).clamp(0.0, 1.0),
+                controllability: 0.20,
+                directness: 0.0,
+                social_likelihood: 0.0,
+                threat_likelihood: pressure,
+                play_likelihood: 0.0,
+                contact_quality: 0.0,
+                prediction_error: pressure,
+                expectedness: (1.0 - input.window_motion).clamp(0.0, 1.0),
                 timestamp: input.timestamp,
             });
         }
@@ -214,7 +282,11 @@ mod tests {
             cursor_distance: 0.01,
             ..CompanionEventInput::default()
         });
-        assert!(batch.iter().all(|event| event.source != CompanionEventSource::DirectContact));
+        assert!(
+            batch
+                .iter()
+                .all(|event| event.source != CompanionEventSource::DirectContact)
+        );
     }
 
     #[test]
@@ -227,7 +299,10 @@ mod tests {
             user_idle_seconds: 0.0,
             ..CompanionEventInput::default()
         });
-        let returned = batch.iter().find(|event| event.kind == CompanionEventKind::UserReturned).unwrap();
+        let returned = batch
+            .iter()
+            .find(|event| event.kind == CompanionEventKind::UserReturned)
+            .unwrap();
         assert!(returned.social_likelihood > 0.5);
         assert!(returned.directness < 0.5);
     }

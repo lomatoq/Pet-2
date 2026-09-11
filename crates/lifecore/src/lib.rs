@@ -7,6 +7,7 @@
 mod actions;
 mod affect;
 mod bandit;
+mod companion;
 mod development;
 mod drives;
 mod genome;
@@ -30,6 +31,7 @@ use serde::{Deserialize, Serialize};
 pub use actions::*;
 pub use affect::*;
 pub use bandit::*;
+pub use companion::*;
 pub use development::*;
 pub use drives::*;
 pub use genome::*;

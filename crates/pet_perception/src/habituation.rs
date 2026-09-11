@@ -24,7 +24,9 @@ pub struct HabituationTable {
 
 impl Default for HabituationTable {
     fn default() -> Self {
-        Self { entries: [HabituationEntry::default(); CAPACITY] }
+        Self {
+            entries: [HabituationEntry::default(); CAPACITY],
+        }
     }
 }
 
@@ -42,7 +44,12 @@ impl HabituationTable {
             .unwrap_or_else(|| self.replacement_index());
         let entry = &mut self.entries[index];
         if !entry.valid || entry.key != key {
-            *entry = HabituationEntry { key, exposure: 0.0, last_seen: now, valid: true };
+            *entry = HabituationEntry {
+                key,
+                exposure: 0.0,
+                last_seen: now,
+                valid: true,
+            };
         }
         let novelty_override = event.novelty > 0.70
             || event.threat_likelihood > 0.45
@@ -97,7 +104,11 @@ fn key_for(event: AppraisedEvent) -> HabituationKey {
         let y = (point.y.clamp(0.0, 0.999) * 4.0) as u8;
         1 + x + y * 4
     });
-    HabituationKey { source: event.source, kind: event.kind, target_bin }
+    HabituationKey {
+        source: event.source,
+        kind: event.kind,
+        target_bin,
+    }
 }
 
 #[cfg(test)]
@@ -129,7 +140,9 @@ mod tests {
     #[test]
     fn threat_dishabituates_response() {
         let mut table = HabituationTable::default();
-        for i in 0..8 { let _ = table.apply(event(0.05, 0.0, i as f64)); }
+        for i in 0..8 {
+            let _ = table.apply(event(0.05, 0.0, i as f64));
+        }
         let dangerous = table.apply(event(0.8, 0.8, 9.0));
         assert!(dangerous.confidence > 0.9);
     }

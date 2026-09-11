@@ -2,10 +2,13 @@
 //! This crate intentionally contains no platform-specific APIs.
 
 mod animation;
+mod blink_controller;
+mod companion_expression_director;
 mod droplets;
 mod ecology_render;
 mod embodiment;
 mod expression;
+mod gaze_controller;
 mod graph;
 mod liquid;
 mod liquid_render;
@@ -18,12 +21,15 @@ mod tuning;
 mod visual_traits;
 
 pub use animation::{AnimationRuntime, JointState};
+pub use blink_controller::*;
+pub use companion_expression_director::*;
 pub use droplets::{
     DropletLifecycle, DropletMotion, DropletRenderState, DropletRuntime, DropletState, MAX_DROPLETS,
 };
 pub use ecology_render::{EcologyCaptureExclusion, EcologyRenderer};
 pub use embodiment::{EmbodiedPose, EmbodiedRuntime, GazeMode, VoiceVisualState};
 pub use expression::ExpressionRuntime;
+pub use gaze_controller::*;
 pub use graph::{BodyGraph, BodyNode, BodyPart};
 pub use liquid::{
     BODY_MATERIAL_SNAPSHOT_SCHEMA_VERSION, BodyMaterialSnapshot, BodySnapshotError,
@@ -521,10 +527,24 @@ impl ProceduralBody {
         voice: VoiceVisualState,
         dt: f32,
     ) {
+        let mut presented_intent = intent.clone();
+        presented_intent.expression = self.fast_phenotype.expression;
+        if let Some(gaze) = self.fast_phenotype.face.gaze_target {
+            presented_intent.gaze_target = Some(gaze);
+        }
         self.animation
-            .update(&self.graph, intent, affect.arousal, dt);
+            .update(&self.graph, &presented_intent, affect.arousal, dt);
+        let authored_blink = presented_intent
+            .expression
+            .blink_left
+            .max(presented_intent.expression.blink_right);
+        let procedural_blink = if authored_blink > 0.02 {
+            0.0
+        } else {
+            self.animation.blink
+        };
         self.expression
-            .update(intent.expression, self.animation.blink, dt);
+            .update(presented_intent.expression, procedural_blink, dt);
         let mut effective_traits = self.visual_traits;
         let effect = self.ecology_visual_effect;
         effective_traits.flow_speed =
@@ -539,7 +559,7 @@ impl ProceduralBody {
             &self.body_genome,
             &effective_traits,
             visual_mind,
-            intent,
+            &presented_intent,
             sensors,
             &self.simulation.feedback,
             affect,

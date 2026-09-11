@@ -4,10 +4,14 @@
 //! stores typed characters, key codes, screenshots, microphone recordings, window
 //! text, accessibility names, clipboard contents, or document content.
 
+mod companion_events;
 mod embodied_gesture;
+mod habituation;
 mod visual_grid;
 
+pub use companion_events::*;
 pub use embodied_gesture::*;
+pub use habituation::*;
 pub use visual_grid::*;
 
 use std::collections::{BTreeMap, VecDeque};

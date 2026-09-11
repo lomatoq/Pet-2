@@ -13,7 +13,9 @@ use lifecore::{
 };
 use morph_brain::{MorphBrain, nervous_system_frame};
 use pet_audio::{AudioCallbackLevels, AudioVisualFeedback};
-use pet_body::{NervousReadabilityTuning, ProceduralBody};
+use pet_body::{
+    CompanionExpressionDirector, ExpressionEvidence, NervousReadabilityTuning, ProceduralBody,
+};
 use pet_motor::{SomaticActuationBus, SomaticActuationPacket};
 
 use crate::vita_runtime::VitaRuntime;
@@ -27,6 +29,8 @@ pub struct NervousSystemRuntime {
     actuation: FastPhenotypeActuation,
     voice_feedback: VoiceFeedbackV1,
     previous_voice_energy: f32,
+    voice_mouth_open: f32,
+    companion_expression: Option<CompanionExpressionDirector>,
     gesture: GestureFrameV1,
     episode: EpisodeContextV1,
     perception: PerceptionSelectionV1,
@@ -43,6 +47,8 @@ impl Default for NervousSystemRuntime {
             actuation: FastPhenotypeActuation::default(),
             voice_feedback: VoiceFeedbackV1::default(),
             previous_voice_energy: 0.0,
+            voice_mouth_open: 0.0,
+            companion_expression: None,
             gesture: GestureFrameV1::default(),
             episode: EpisodeContextV1::default(),
             perception: PerceptionSelectionV1::default(),
@@ -78,6 +84,7 @@ impl NervousSystemRuntime {
             (0.55 * visual.envelope + 0.30 * levels.rms + 0.15 * visual.noisiness).clamp(0.0, 1.0);
         let spectral_flux = (emitted - self.previous_voice_energy).abs().clamp(0.0, 1.0);
         self.previous_voice_energy = emitted;
+        self.voice_mouth_open = visual.mouth_open.clamp(0.0, 1.0);
         let octave_offset =
             (visual.pitch_normalized.clamp(0.0, 1.0) - 0.5) * genome.pitch_range_octaves;
         self.voice_feedback = VoiceFeedbackV1 {
@@ -260,6 +267,33 @@ impl NervousSystemRuntime {
         let mut actuation = self.phenotype.tick(&source, self.snapshot, dt);
         merge_interaction(&mut actuation.interaction, vita_interaction);
         SomaticActuationBus::compose(&mut actuation, motor_actuation);
+
+        let director = self.companion_expression.get_or_insert_with(|| {
+            CompanionExpressionDirector::new(life.state.genome.identity_seed)
+        });
+        let actual = self.body_feedback.efference_copy.actual_velocity;
+        let intended = self.body_feedback.efference_copy.intended_velocity;
+        let contact_point = (self.body_feedback.contact.contact_count > 0)
+            .then_some(self.body_feedback.contact.point_world);
+        let companion = director.tick(
+            vita.companion_intent(),
+            ExpressionEvidence {
+                body_position: self.body_feedback.motion.world_position,
+                contact_point,
+                contact_pressure: self.body_feedback.contact.pressure,
+                contact_strain: self.body_feedback.shape.maximum_strain,
+                body_speed: self.body_feedback.motion.velocity.length(),
+                motor_error: (actual - intended).length().clamp(0.0, 1.0),
+                audio_mouth_open: self.voice_mouth_open,
+                audio_active: self.voice_feedback.phonating,
+                target_velocity: self.body_feedback.motion.velocity,
+                protective_reflex: self.snapshot.felt.startle > 0.55
+                    || self.snapshot.felt.restraint > 0.72,
+                pain_like: self.snapshot.felt.pain_like,
+            },
+            dt,
+        );
+        apply_companion_expression(&mut actuation, companion);
         self.actuation = actuation.clone();
         actuation
     }
@@ -320,6 +354,45 @@ impl NervousSystemRuntime {
         apply_input_sensitivity(&mut source, calibration);
         source
     }
+}
+
+fn apply_companion_expression(
+    actuation: &mut FastPhenotypeActuation,
+    target: pet_body::CompanionExpressionTarget,
+) {
+    let face = target.face;
+    actuation.expression.eye_aperture = face.eye_aperture;
+    actuation.expression.squint = face.squint;
+    actuation.expression.pupil_size = face.pupil_size;
+    actuation.expression.pupil_focus = face.pupil_focus;
+    actuation.expression.brow_raise = face.brow_raise;
+    actuation.expression.brow_tension = face.brow_tension;
+    actuation.expression.brow_asymmetry = face.brow_asymmetry;
+    actuation.expression.mouth_curve = face.mouth_curve;
+    actuation.expression.mouth_open = face.mouth_open;
+    actuation.expression.mouth_tension = face.mouth_tension;
+    actuation.expression.mouth_compression = face.mouth_compression;
+    actuation.expression.mouth_asymmetry = face.mouth_asymmetry;
+    actuation.expression.blink_left = target.blink_left;
+    actuation.expression.blink_right = target.blink_right;
+    actuation.expression.body_glow = target.body.glow;
+    actuation.expression.cheek_glow = (target.body.glow * 0.65).clamp(0.0, 1.0);
+    actuation.face.gaze_target = target.gaze;
+    actuation.pbf.viscosity_multiplier =
+        (actuation.pbf.viscosity_multiplier * target.body.viscosity_multiplier).clamp(0.65, 1.50);
+    actuation.pbf.surface_tension_multiplier = (actuation.pbf.surface_tension_multiplier
+        * target.body.surface_tension_multiplier)
+        .clamp(0.75, 1.35);
+    actuation.pbf.motor_gain_multiplier = (actuation.pbf.motor_gain_multiplier
+        * (0.82 + target.body.contact_yield * 0.30))
+        .clamp(0.50, 1.35);
+    actuation.visual_physiology.pulse_amplitude = actuation
+        .visual_physiology
+        .pulse_amplitude
+        .max(target.body.internal_pulse);
+    actuation.visual_physiology.core_glow_multiplier =
+        (actuation.visual_physiology.core_glow_multiplier * (0.82 + target.body.glow * 0.55))
+            .clamp(0.55, 1.45);
 }
 
 fn apply_input_sensitivity(

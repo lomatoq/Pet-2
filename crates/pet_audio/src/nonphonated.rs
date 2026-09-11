@@ -52,7 +52,11 @@ impl NonPhonatedGesture {
             NonPhonatedKind::SleepBreath => 1.20,
             NonPhonatedKind::ShakeOffBreath => 0.34,
         };
-        Self { request, elapsed: 0.0, duration }
+        Self {
+            request,
+            elapsed: 0.0,
+            duration,
+        }
     }
 
     #[must_use]
@@ -67,8 +71,9 @@ impl NonPhonatedGesture {
         let t = (self.elapsed / self.duration.max(0.01)).clamp(0.0, 1.0);
         let intensity = self.request.intensity;
         let body = body.sanitized();
-        let body_load = (body.slosh_energy * 0.25 + body.bond_strain * 0.35 + body.material_stress * 0.40)
-            .clamp(0.0, 1.0);
+        let body_load =
+            (body.slosh_energy * 0.25 + body.bond_strain * 0.35 + body.material_stress * 0.40)
+                .clamp(0.0, 1.0);
         let (airflow, turbulence, nasal, resonance, mouth) = match self.request.kind {
             NonPhonatedKind::SniffSingle => {
                 let pulse = gaussian(t, 0.46, 0.18);
@@ -80,19 +85,43 @@ impl NonPhonatedGesture {
             }
             NonPhonatedKind::SoftHuff => {
                 let pulse = gaussian(t, 0.42, 0.24);
-                (pulse * 0.62, pulse * 0.30, pulse * 0.18, pulse * 0.24, pulse * 0.10)
+                (
+                    pulse * 0.62,
+                    pulse * 0.30,
+                    pulse * 0.18,
+                    pulse * 0.24,
+                    pulse * 0.10,
+                )
             }
             NonPhonatedKind::ContentExhale => {
                 let pulse = smooth_release(t);
-                (pulse * 0.40, pulse * 0.14, pulse * 0.12, pulse * 0.32, pulse * 0.08)
+                (
+                    pulse * 0.40,
+                    pulse * 0.14,
+                    pulse * 0.12,
+                    pulse * 0.32,
+                    pulse * 0.08,
+                )
             }
             NonPhonatedKind::StartleInhale => {
                 let pulse = gaussian(t, 0.26, 0.12);
-                (pulse * 0.72, pulse * 0.55, pulse * 0.48, pulse * 0.12, pulse * 0.14)
+                (
+                    pulse * 0.72,
+                    pulse * 0.55,
+                    pulse * 0.48,
+                    pulse * 0.12,
+                    pulse * 0.14,
+                )
             }
             NonPhonatedKind::EffortExhale => {
                 let pulse = gaussian(t, 0.46, 0.24) * (0.65 + body_load * 0.35);
-                (pulse * 0.64, pulse * 0.38, pulse * 0.10, pulse * 0.36, pulse * 0.15)
+                (
+                    pulse * 0.64,
+                    pulse * 0.38,
+                    pulse * 0.10,
+                    pulse * 0.36,
+                    pulse * 0.15,
+                )
             }
             NonPhonatedKind::SleepBreath => {
                 let phase = (t * std::f32::consts::PI).sin().max(0.0);
@@ -100,7 +129,13 @@ impl NonPhonatedGesture {
             }
             NonPhonatedKind::ShakeOffBreath => {
                 let pulse = gaussian(t, 0.34, 0.17) + gaussian(t, 0.67, 0.12) * 0.45;
-                (pulse * 0.58, pulse * 0.48, pulse * 0.14, pulse * 0.30, pulse * 0.09)
+                (
+                    pulse * 0.58,
+                    pulse * 0.48,
+                    pulse * 0.14,
+                    pulse * 0.30,
+                    pulse * 0.09,
+                )
             }
         };
         NonPhonatedFrame {
@@ -127,15 +162,44 @@ pub fn choose_nonphonated(
 ) -> Option<NonPhonatedRequest> {
     let draw = finite(deterministic_draw, 1.0).clamp(0.0, 1.0);
     let request = if startle > 0.62 && draw < 0.42 {
-        NonPhonatedRequest { kind: NonPhonatedKind::StartleInhale, intensity: startle.clamp(0.20, 0.75), seed, ..NonPhonatedRequest::default() }
+        NonPhonatedRequest {
+            kind: NonPhonatedKind::StartleInhale,
+            intensity: startle.clamp(0.20, 0.75),
+            seed,
+            ..NonPhonatedRequest::default()
+        }
     } else if settling_after_stress && draw < 0.25 {
-        NonPhonatedRequest { kind: NonPhonatedKind::ShakeOffBreath, intensity: 0.28, seed, ..NonPhonatedRequest::default() }
+        NonPhonatedRequest {
+            kind: NonPhonatedKind::ShakeOffBreath,
+            intensity: 0.28,
+            seed,
+            ..NonPhonatedRequest::default()
+        }
     } else if effort > 0.72 && draw < 0.20 {
-        NonPhonatedRequest { kind: NonPhonatedKind::EffortExhale, intensity: (effort * 0.45).clamp(0.18, 0.48), seed, ..NonPhonatedRequest::default() }
+        NonPhonatedRequest {
+            kind: NonPhonatedKind::EffortExhale,
+            intensity: (effort * 0.45).clamp(0.18, 0.48),
+            seed,
+            ..NonPhonatedRequest::default()
+        }
     } else if pleasant_contact > 0.62 && draw < 0.16 {
-        NonPhonatedRequest { kind: NonPhonatedKind::ContentExhale, intensity: 0.22 + pleasant_contact * 0.16, seed, ..NonPhonatedRequest::default() }
+        NonPhonatedRequest {
+            kind: NonPhonatedKind::ContentExhale,
+            intensity: 0.22 + pleasant_contact * 0.16,
+            seed,
+            ..NonPhonatedRequest::default()
+        }
     } else if intent_is_inspection && draw < 0.18 {
-        NonPhonatedRequest { kind: if draw < 0.07 { NonPhonatedKind::SniffPair } else { NonPhonatedKind::SniffSingle }, intensity: 0.22, seed, ..NonPhonatedRequest::default() }
+        NonPhonatedRequest {
+            kind: if draw < 0.07 {
+                NonPhonatedKind::SniffPair
+            } else {
+                NonPhonatedKind::SniffSingle
+            },
+            intensity: 0.22,
+            seed,
+            ..NonPhonatedRequest::default()
+        }
     } else {
         return None;
     };
@@ -176,7 +240,11 @@ mod tests {
 
     #[test]
     fn sniff_has_no_large_mouth_motion() {
-        let mut gesture = NonPhonatedGesture::new(NonPhonatedRequest { kind: NonPhonatedKind::SniffPair, intensity: 1.0, ..NonPhonatedRequest::default() });
+        let mut gesture = NonPhonatedGesture::new(NonPhonatedRequest {
+            kind: NonPhonatedKind::SniffPair,
+            intensity: 1.0,
+            ..NonPhonatedRequest::default()
+        });
         for _ in 0..20 {
             assert!(gesture.tick(BodyVoiceFrame::default(), 0.02).mouth_open <= 0.35);
         }

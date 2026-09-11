@@ -10,6 +10,7 @@ mod glottis;
 mod motif;
 mod mutation;
 mod noise;
+mod nonphonated;
 mod phonation;
 mod prosody;
 mod ring;
@@ -22,6 +23,7 @@ pub use endpoint_watcher::*;
 pub use engine::*;
 pub use motif::*;
 pub use mutation::*;
+pub use nonphonated::*;
 pub use phonation::PhonationRegime;
 pub use ring::SpscRing;
 pub use visual_feedback::{

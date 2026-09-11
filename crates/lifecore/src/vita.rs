@@ -4,9 +4,9 @@ use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ACTION_COUNT, ActionId, BodyFeedback, BodyIntent, EpisodeContextV1, ExpressionState,
-    FeedbackEvent, FeltStateV1, InteractionTarget, LifeState, LocomotionMode, PoseIntent,
-    SensorFrame,
+    ACTION_COUNT, ActionId, BodyFeedback, BodyIntent, CompanionSocialMemory, EpisodeContextV1,
+    ExpressionState, FeedbackEvent, FeltStateV1, InteractionTarget, LifeState, LocomotionMode,
+    PoseIntent, SensorFrame,
 };
 
 pub const VITA_STATE_SCHEMA_VERSION: u32 = 1;
@@ -737,6 +737,8 @@ pub struct VitaState {
     pub favorite_places: Vec<FavoritePlace>,
     pub elapsed_seconds: f64,
     pub attention_switches: u64,
+    #[serde(default)]
+    pub companion_social: CompanionSocialMemory,
 }
 
 impl Default for VitaState {
@@ -752,6 +754,7 @@ impl Default for VitaState {
             favorite_places: Vec::new(),
             elapsed_seconds: 0.0,
             attention_switches: 0,
+            companion_social: CompanionSocialMemory::default(),
         }
     }
 }

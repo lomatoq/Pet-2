@@ -1,5 +1,5 @@
 use glam::Vec2;
-use lifecore::{BodyFeedbackV2, EmbodiedGestureKind, SurfaceId};
+use lifecore::{BodyFeedbackV2, EmbodiedGestureKind, PrimaryIntent, SurfaceId};
 use serde::{Deserialize, Serialize};
 
 pub const LOCAL_FIELD_BUDGET: usize = 4;
@@ -525,6 +525,10 @@ pub struct BehaviorContextFrame {
     pub pet_touched: bool,
     pub pet_dragged: bool,
     pub selected_salience: f32,
+    #[serde(default)]
+    pub companion_intent: PrimaryIntent,
+    #[serde(default)]
+    pub companion_confidence: f32,
     pub gesture: EmbodiedGestureKind,
     pub gesture_confidence: f32,
     pub gesture_ended: bool,
@@ -574,6 +578,8 @@ impl Default for BehaviorContextFrame {
             pet_touched: false,
             pet_dragged: false,
             selected_salience: 0.0,
+            companion_intent: PrimaryIntent::IdleContent,
+            companion_confidence: 0.0,
             gesture: EmbodiedGestureKind::Unknown,
             gesture_confidence: 0.0,
             gesture_ended: false,

@@ -66,8 +66,8 @@ impl GazeController {
             self.dwell_seconds = 0.0;
             return GazeOutput::default();
         }
-        let primary = plan.primary_target.filter(Vec2::is_finite);
-        let secondary = plan.secondary_target.filter(Vec2::is_finite);
+        let primary = plan.primary_target.filter(|point| point.is_finite());
+        let secondary = plan.secondary_target.filter(|point| point.is_finite());
         let target = match plan.mode {
             GazeMode::SocialReference if self.checkback_phase => secondary.or(primary),
             GazeMode::PredictiveIntercept => primary.map(|point| {
@@ -79,7 +79,11 @@ impl GazeController {
         let Some(mut target) = target else {
             self.dwell_seconds = 0.0;
             return GazeOutput {
-                target: if self.has_current { Some(self.current) } else { None },
+                target: if self.has_current {
+                    Some(self.current)
+                } else {
+                    None
+                },
                 fixation_strength: 0.0,
                 pupil_focus: 0.35,
             };
@@ -106,8 +110,10 @@ impl GazeController {
         self.has_current = true;
 
         // Micro-saccade is intentionally tiny and disabled for interception/threat-like gaze.
-        if matches!(plan.mode, GazeMode::Inspect | GazeMode::MutualGaze | GazeMode::ContactMonitor)
-            && plan.confidence > 0.45
+        if matches!(
+            plan.mode,
+            GazeMode::Inspect | GazeMode::MutualGaze | GazeMode::ContactMonitor
+        ) && plan.confidence > 0.45
         {
             let a = plan.micro_saccade_amplitude.clamp(0.0, 0.015);
             let offset = Vec2::new(
@@ -120,14 +126,19 @@ impl GazeController {
         let distance = self.current.distance(target);
         GazeOutput {
             target: Some(self.current),
-            fixation_strength: (1.0 - distance * 8.0).clamp(0.0, 1.0) * plan.confidence.clamp(0.0, 1.0),
+            fixation_strength: (1.0 - distance * 8.0).clamp(0.0, 1.0)
+                * plan.confidence.clamp(0.0, 1.0),
             pupil_focus: (0.45 + (1.0 - distance * 5.0).clamp(0.0, 1.0) * 0.45).clamp(0.0, 1.0),
         }
     }
 }
 
 fn finite_dt(dt: f32) -> f32 {
-    if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 }
+    if dt.is_finite() {
+        dt.clamp(0.0, 0.1)
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -152,7 +163,13 @@ mod tests {
     #[test]
     fn sleep_disables_gaze() {
         let mut controller = GazeController::default();
-        let out = controller.tick(GazePlan { mode: GazeMode::Sleep, ..GazePlan::default() }, 0.05);
+        let out = controller.tick(
+            GazePlan {
+                mode: GazeMode::Sleep,
+                ..GazePlan::default()
+            },
+            0.05,
+        );
         assert!(out.target.is_none());
     }
 }

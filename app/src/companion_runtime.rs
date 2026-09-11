@@ -46,6 +46,14 @@ pub struct CompanionBrainContext {
 
 impl CompanionRuntime {
     #[must_use]
+    pub fn from_memory(memory: CompanionSocialMemory) -> Self {
+        Self {
+            memory: memory.sanitized(),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
     pub fn tick(
         &mut self,
         events: impl IntoIterator<Item = AppraisedEvent>,
@@ -92,6 +100,10 @@ impl CompanionRuntime {
             self.current = resting_fallback(brain, &self.memory);
             self.intent_age = 0.0;
         }
+        self.current.trust = self.memory.trust;
+        self.current.attachment = self.memory.attachment;
+        self.current.social_safety =
+            (self.current.social_safety * 0.65 + self.memory.social_safety * 0.35).clamp(0.0, 1.0);
         self.current = self.current.sanitized();
         self.current
     }
@@ -101,7 +113,8 @@ impl CompanionRuntime {
         if outcome.clear_direct_user_cause && quality < -0.30 {
             self.memory.update_clear_direct_harm(-quality);
         } else if quality > 0.0 {
-            self.memory.update_safe_social_outcome(quality, outcome.duration);
+            self.memory
+                .update_safe_social_outcome(quality, outcome.duration);
         }
         // Ordinary non-response does not reduce attachment/trust.
     }
@@ -145,9 +158,7 @@ fn intent_from_event(
                 SocialMode::Affiliative,
             )
         }
-        CompanionEventKind::Hold | CompanionEventKind::Pull
-            if event.contact_quality < -0.10 =>
-        {
+        CompanionEventKind::Hold | CompanionEventKind::Pull if event.contact_quality < -0.10 => {
             frame_for(
                 PrimaryIntent::RejectContact,
                 event.target,
@@ -167,15 +178,13 @@ fn intent_from_event(
                 SocialMode::Playful,
             )
         }
-        CompanionEventKind::PointerApproach | CompanionEventKind::PointerHover => {
-            frame_for(
-                PrimaryIntent::Orient,
-                event.target,
-                brain,
-                event.confidence,
-                SocialMode::SocialOrienting,
-            )
-        }
+        CompanionEventKind::PointerApproach | CompanionEventKind::PointerHover => frame_for(
+            PrimaryIntent::Orient,
+            event.target,
+            brain,
+            event.confidence,
+            SocialMode::SocialOrienting,
+        ),
         CompanionEventKind::VisualNovelty
         | CompanionEventKind::WindowAppeared
         | CompanionEventKind::WindowMoved
@@ -210,7 +219,13 @@ fn intent_from_event(
             } else {
                 PrimaryIntent::Orient
             };
-            frame_for(primary, event.target, brain, event.confidence, SocialMode::SocialOrienting)
+            frame_for(
+                primary,
+                event.target,
+                brain,
+                event.confidence,
+                SocialMode::SocialOrienting,
+            )
         }
         CompanionEventKind::AppTaskCompleted | CompanionEventKind::ProgressCompleted => {
             // Desktop completion is not automatically a social celebration.
@@ -245,7 +260,9 @@ fn frame_for(
         target,
         confidence,
         urgency: match primary {
-            PrimaryIntent::GuardPain | PrimaryIntent::EscapePressure | PrimaryIntent::StartleFreeze => 0.9,
+            PrimaryIntent::GuardPain
+            | PrimaryIntent::EscapePressure
+            | PrimaryIntent::StartleFreeze => 0.9,
             PrimaryIntent::RejectContact => 0.7,
             _ => 0.3,
         },
@@ -260,12 +277,35 @@ fn frame_for(
         discomfort: brain.pain_like,
         surprise: 0.0,
         frustration: brain.frustration,
-        anticipation: if matches!(primary, PrimaryIntent::InvitePlay | PrimaryIntent::Intercept) { 0.7 } else { 0.2 },
+        anticipation: if matches!(
+            primary,
+            PrimaryIntent::InvitePlay | PrimaryIntent::Intercept
+        ) {
+            0.7
+        } else {
+            0.2
+        },
         contact_pleasantness: brain.contact_pleasantness,
         agency_match: brain.agency_match,
         expected_outcome: ExpectedOutcome {
-            continuation: if matches!(primary, PrimaryIntent::AcceptContact | PrimaryIntent::InvitePlay) { 0.7 } else { 0.2 },
-            user_response: if matches!(primary, PrimaryIntent::InviteContact | PrimaryIntent::InvitePlay | PrimaryIntent::SocialCheckIn) { 0.7 } else { 0.1 },
+            continuation: if matches!(
+                primary,
+                PrimaryIntent::AcceptContact | PrimaryIntent::InvitePlay
+            ) {
+                0.7
+            } else {
+                0.2
+            },
+            user_response: if matches!(
+                primary,
+                PrimaryIntent::InviteContact
+                    | PrimaryIntent::InvitePlay
+                    | PrimaryIntent::SocialCheckIn
+            ) {
+                0.7
+            } else {
+                0.1
+            },
             object_contact: 0.0,
             success: 0.55,
             uncertainty: (1.0 - confidence).clamp(0.0, 1.0),
@@ -350,7 +390,11 @@ fn event_priority(event: AppraisedEvent) -> f32 {
 }
 
 fn finite_dt(dt: f32) -> f32 {
-    if dt.is_finite() { dt.clamp(0.0, 0.25) } else { 0.0 }
+    if dt.is_finite() {
+        dt.clamp(0.0, 0.25)
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -363,7 +407,11 @@ mod tests {
         let mut runtime = CompanionRuntime::default();
         runtime.memory.attachment = 0.7;
         let before = runtime.memory.attachment;
-        runtime.record_outcome(CompanionOutcome { quality: -0.8, duration: 1.0, clear_direct_user_cause: false });
+        runtime.record_outcome(CompanionOutcome {
+            quality: -0.8,
+            duration: 1.0,
+            clear_direct_user_cause: false,
+        });
         assert_eq!(runtime.memory.attachment, before);
     }
 
@@ -373,14 +421,27 @@ mod tests {
         let event = AppraisedEvent {
             source: CompanionEventSource::DirectContact,
             kind: CompanionEventKind::Stroke,
-            target: IntentTarget { kind: IntentTargetKind::ContactPoint, confidence: 1.0, ..IntentTarget::default() },
+            target: IntentTarget {
+                kind: IntentTargetKind::ContactPoint,
+                confidence: 1.0,
+                ..IntentTarget::default()
+            },
             confidence: 0.95,
             directness: 1.0,
             social_likelihood: 0.9,
             contact_quality: 0.8,
             ..AppraisedEvent::default()
         };
-        let frame = runtime.tick([event], CompanionBrainContext { contact_pleasantness: 0.8, social_safety: 0.9, user_available: 1.0, ..CompanionBrainContext::default() }, 0.25);
+        let frame = runtime.tick(
+            [event],
+            CompanionBrainContext {
+                contact_pleasantness: 0.8,
+                social_safety: 0.9,
+                user_available: 1.0,
+                ..CompanionBrainContext::default()
+            },
+            0.25,
+        );
         assert_eq!(frame.primary, PrimaryIntent::AcceptContact);
     }
 }

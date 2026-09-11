@@ -368,9 +368,9 @@ impl PreferenceValue {
     pub fn update(&mut self, outcome: f32, recency: f32) {
         let outcome = signed(outcome);
         let rate = 0.04 * (1.0 - self.confidence * 0.65);
-        self.expected_pleasantness =
-            (self.expected_pleasantness + (outcome - self.expected_pleasantness) * rate)
-                .clamp(-1.0, 1.0);
+        self.expected_pleasantness = (self.expected_pleasantness
+            + (outcome - self.expected_pleasantness) * rate)
+            .clamp(-1.0, 1.0);
         self.confidence = (self.confidence + 0.025).clamp(0.0, 1.0);
         self.exposure_count = self.exposure_count.saturating_add(1);
         self.recency = unit(recency);
@@ -462,19 +462,22 @@ impl CompanionSocialMemory {
     }
 
     pub fn upsert_preference(&mut self, key: PreferenceKey, outcome: f32, recency: f32) {
-        if let Some((_, value)) = self.preferences.iter_mut().find(|(candidate, _)| *candidate == key) {
+        if let Some((_, value)) = self
+            .preferences
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == key)
+        {
             value.update(outcome, recency);
             return;
         }
-        if self.preferences.len() >= MAX_COMPANION_PREFERENCES {
-            if let Some((index, _)) = self
+        if self.preferences.len() >= MAX_COMPANION_PREFERENCES
+            && let Some((index, _)) = self
                 .preferences
                 .iter()
                 .enumerate()
                 .min_by(|left, right| left.1.1.confidence.total_cmp(&right.1.1.confidence))
-            {
-                self.preferences.remove(index);
-            }
+        {
+            self.preferences.remove(index);
         }
         let mut value = PreferenceValue::default();
         value.update(outcome, recency);
@@ -550,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn preferences_require repeated evidence_to_become_confident() {
+    fn preferences_require_repeated_evidence_to_become_confident() {
         let mut memory = CompanionSocialMemory::default();
         let key = PreferenceKey {
             kind: CompanionEventKind::Stroke,
