@@ -1,0 +1,55 @@
+name: R14 Wire Living Companion
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/affectionate-companion-r14
+    paths:
+      - scripts/r14_wire.py
+      - .github/workflows/r14-wire.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: r14-wire-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wire-and-validate:
+    if: github.repository == 'lomatoq/Pet-2' && github.ref == 'refs/heads/codex/affectionate-companion-r14'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/affectionate-companion-r14
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Wire R14 into production runtime
+        shell: pwsh
+        run: python scripts/r14_wire.py
+
+      - name: Format generated Rust
+        shell: pwsh
+        run: cargo fmt --all
+
+      - name: Full Windows validation
+        shell: pwsh
+        run: ./scripts/build_windows.ps1
+
+      - name: Commit validated integration
+        shell: pwsh
+        run: |
+          if (-not (git diff --quiet)) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add app/src crates/lifecore/src crates/pet_perception/src crates/pet_motor/src crates/pet_body/src crates/pet_audio/src
+            git commit -m "Wire R14 living companion into runtime"
+            git push origin HEAD:codex/affectionate-companion-r14
+          }
