@@ -2,19 +2,22 @@ use std::{fmt, str::FromStr};
 
 use glam::Vec2;
 use lifecore::{
-    ActionId, BodyFeedback, BodyIntent, EmbodiedGestureEvent, EpisodeContextV1, FeedbackEvent,
-    FeltStateV1, InteractionBodyActuation, InteractionGazeTarget, InteractionResponsePlan,
-    InteractionTurnRuntime, InteractionTurnState, LifeState, LocomotionMode, PoseIntent,
-    SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame, VitaState, apply_emotion_to_expression,
+    ActionId, AppraisedEvent, BodyFeedback, BodyIntent, CompanionIntentFrame, EmbodiedGestureEvent,
+    EpisodeContextV1, FeedbackEvent, FeltStateV1, InteractionBodyActuation, InteractionGazeTarget,
+    InteractionResponsePlan, InteractionTurnRuntime, InteractionTurnState, LifeState,
+    LocomotionMode, PoseIntent, SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame, VitaState,
+    apply_emotion_to_expression,
 };
 #[cfg(test)]
 use morph_brain::MORPH_COMMAND_COUNT;
 use morph_brain::{MorphAttention, MorphCommand, MorphOutput};
 use pet_ecology::{GestureSignature, RhythmSignature, WindowAffordanceFrame};
 use pet_perception::{
-    EmbodiedGestureClassifierTuning, PerceptionRuntime, SpatialVisualFrame, VisualAttentionTarget,
-    VisualFeatureFrame,
+    CompanionEventBuilder, CompanionEventInput, EmbodiedGestureClassifierTuning, HabituationTable,
+    PerceptionRuntime, SpatialVisualFrame, VisualAttentionTarget, VisualFeatureFrame,
 };
+
+use crate::companion_runtime::{CompanionBrainContext, CompanionOutcome, CompanionRuntime};
 
 /// Selects the single high-level behavior policy. Physics, rendering and audio
 /// remain locally authoritative in both modes; the mode only changes which
@@ -273,6 +276,11 @@ pub struct VitaRuntime {
     queued_embodied_gesture: Option<EmbodiedGestureEvent>,
     queued_embodied_signature: Option<GestureSignature>,
     active_interaction_plan: Option<InteractionResponsePlan>,
+    companion: CompanionRuntime,
+    companion_habituation: HabituationTable,
+    companion_events: Vec<AppraisedEvent>,
+    companion_previous_idle: f32,
+    companion_last_felt: FeltStateV1,
 }
 
 impl VitaRuntime {
@@ -280,6 +288,7 @@ impl VitaRuntime {
     /// the next appraisal/intent resolution. Keeping this call on the app's
     /// single simulation thread preserves the N -> N+1 feedback invariant.
     pub fn integrate_felt_state(&mut self, felt: FeltStateV1, episode: EpisodeContextV1, dt: f32) {
+        self.companion_last_felt = felt;
         self.mind.integrate_felt_state(felt, episode, dt);
     }
 
@@ -324,6 +333,10 @@ impl VitaRuntime {
                 .as_ref()
                 .map_or(1, |state| state.next_gesture_episode_id),
         );
+        let companion_memory = restored
+            .as_ref()
+            .map(|state| state.companion_social.clone())
+            .unwrap_or_default();
         Self {
             mind: restored.map_or_else(
                 || VitaMind::new(identity_seed),
@@ -340,6 +353,11 @@ impl VitaRuntime {
             queued_embodied_gesture: None,
             queued_embodied_signature: None,
             active_interaction_plan: None,
+            companion: CompanionRuntime::from_memory(companion_memory),
+            companion_habituation: HabituationTable::default(),
+            companion_events: Vec::with_capacity(12),
+            companion_previous_idle: 0.0,
+            companion_last_felt: FeltStateV1::default(),
         }
     }
 
@@ -350,6 +368,42 @@ impl VitaRuntime {
     pub fn observe(&mut self, sensors: &SensorFrame, body: &BodyFeedback, dt: f32) {
         self.percept = self.perception.update(sensors, body, dt);
         self.mind.state.next_gesture_episode_id = self.perception.next_gesture_episode_id();
+        let physical = sensors.embodied_interaction;
+        let latest_gesture = self.perception.latest_embodied_gesture();
+        let window_target = sensors
+            .active_window_rect
+            .map(|rect| (rect.minimum + rect.maximum) * 0.5);
+        let batch = CompanionEventBuilder::build(CompanionEventInput {
+            timestamp: sensors.timestamp,
+            pet_position: body.world_position,
+            cursor_position: sensors.cursor_position,
+            cursor_velocity: sensors.cursor_velocity,
+            cursor_acceleration: sensors.cursor_acceleration,
+            cursor_distance: sensors.cursor_distance_to_pet,
+            pointer_down: sensors.pointer_down,
+            pointer_pressed: sensors.pointer_pressed,
+            pointer_released: sensors.pointer_released,
+            direct_contact: physical.contact.active || sensors.pet_touched || body.cursor_contact,
+            contact_pressure: physical.contact.effective_pressure,
+            contact_strain: physical.material.maximum_strain,
+            contact_seconds: physical.contact.contact_seconds,
+            gesture_confidence: latest_gesture.confidence,
+            gesture: Some(latest_gesture.kind),
+            user_idle_seconds: sensors.user_idle_seconds,
+            user_activity_rate: sensors.user_activity_rate,
+            previous_user_idle_seconds: self.companion_previous_idle,
+            visual_novelty: self.percept.visual_change.unwrap_or(0.0),
+            window_motion: self.percept.window_motion,
+            window_pressure: self.percept.window_pressure,
+            window_target,
+        });
+        self.companion_previous_idle = sensors.user_idle_seconds;
+        self.companion_events.clear();
+        self.companion_events.extend(
+            batch
+                .iter()
+                .map(|event| self.companion_habituation.apply(event)),
+        );
         if let Some(event) = self.perception.take_embodied_gesture() {
             self.queued_embodied_signature = self.perception.take_embodied_gesture_signature();
             if self
@@ -452,8 +506,28 @@ impl VitaRuntime {
         base_intent: &BodyIntent,
         dt: f32,
     ) -> VitaOutput {
-        self.mind
-            .tick(&self.percept, sensors, life, body, base_intent, dt)
+        let output = self
+            .mind
+            .tick(&self.percept, sensors, life, body, base_intent, dt);
+        let felt = self.companion_last_felt;
+        let brain = CompanionBrainContext {
+            episode_id: self.interaction_turn.episode_id,
+            valence: life.affect.valence,
+            arousal: life.affect.arousal,
+            fatigue: felt.sleep_pressure.max(self.mind.state.mood.fatigue),
+            play_readiness: felt.play_readiness,
+            curiosity: life.drives.curiosity.max(felt.exploration_readiness),
+            frustration: life.affect.frustration,
+            pain_like: felt.pain_like,
+            social_safety: felt.social_safety,
+            contact_pleasantness: felt.contact_pleasantness,
+            agency_match: felt.agency_match,
+            user_available: self.percept.user_available,
+        };
+        let events = self.companion_events.drain(..).collect::<Vec<_>>();
+        let _ = self.companion.tick(events, brain, dt);
+        self.mind.state.companion_social = self.companion.memory.clone();
+        output
     }
 
     /// Produces exactly one final semantic body intent. Classic preserves the
@@ -685,6 +759,22 @@ impl VitaRuntime {
             self.active_interaction_plan = None;
             self.interaction_turn = InteractionTurnRuntime::default();
         }
+        let quality = match event {
+            FeedbackEvent::PettingStarted => 0.90,
+            FeedbackEvent::PlayStarted => 0.78,
+            FeedbackEvent::RespondedAfterSound => 0.45,
+            FeedbackEvent::CursorApproached | FeedbackEvent::Observed => 0.25,
+            FeedbackEvent::Reward(value) if *value > 0.0 => value.clamp(0.0, 1.0),
+            _ => 0.0,
+        };
+        if quality > 0.0 {
+            self.companion.record_outcome(CompanionOutcome {
+                quality,
+                duration: 1.0,
+                clear_direct_user_cause: false,
+            });
+            self.mind.state.companion_social = self.companion.memory.clone();
+        }
         self.mind.apply_feedback(event);
     }
 
@@ -740,6 +830,11 @@ impl VitaRuntime {
             _ => 0.0,
         };
         immediate_typing.max(immediate_scroll).max(sustained)
+    }
+
+    #[must_use]
+    pub const fn companion_intent(&self) -> CompanionIntentFrame {
+        self.companion.current()
     }
 
     #[must_use]
@@ -906,6 +1001,37 @@ mod tests {
     use lifecore::{ExpressionState, Genome, LifeCore, LocomotionMode, PoseIntent};
 
     use super::*;
+
+    #[test]
+    fn merged_motor_context_receives_companion_intent_and_preserves_focus() {
+        let mut life = LifeCore::new(Genome::from_seed(17), 19);
+        life.state.focus_mode = true;
+        let mut vita = VitaRuntime::new(17, None);
+        let body = pet_body::ProceduralBody::generate(&life.state.genome).unwrap();
+        let nervous = crate::NervousSystemRuntime::default();
+        let sensors = SensorFrame::default();
+        let intent = life
+            .tick(&sensors, &body.simulation.feedback, 0.05)
+            .body_intent;
+        vita.observe(&sensors, &body.simulation.feedback, 0.05);
+        vita.companion_last_felt.pain_like = 0.5;
+        let _ = vita.think(
+            &life.state,
+            &sensors,
+            &body.simulation.feedback,
+            &intent,
+            0.05,
+        );
+        let companion = vita.companion_intent();
+        assert_eq!(companion.primary, lifecore::PrimaryIntent::GuardPain);
+        assert_eq!(companion.confidence, 1.0);
+        let context = crate::motor_context::from_frames(
+            &nervous, &vita, &body, &life, &sensors, &intent, None,
+        );
+        assert_eq!(context.companion_intent, companion.primary);
+        assert_eq!(context.companion_confidence, companion.confidence);
+        assert!(context.focus_mode);
+    }
 
     #[test]
     fn semantic_expression_survives_final_nervous_packet_and_focus_cancels_turn() {

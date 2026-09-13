@@ -1,5 +1,5 @@
 use glam::Vec2;
-use lifecore::{ActionId, BehaviorGoalFrame, EmbodiedGestureKind};
+use lifecore::{ActionId, BehaviorGoalFrame, EmbodiedGestureKind, PrimaryIntent};
 
 use crate::{
     BehaviorContextFrame, BehaviorProgramId, BehaviorTarget, CompletionReason, MotorCause,
@@ -172,6 +172,36 @@ pub fn choose_program(
 
     if active_program.is_some() && !active_readable {
         return None;
+    }
+
+    if context.companion_confidence >= 0.46 {
+        let companion_program = match context.companion_intent {
+            PrimaryIntent::AcceptContact => Some(P::TouchLeanIntoStroke),
+            PrimaryIntent::Nuzzle => Some(P::SocialRubNuzzleCursor),
+            PrimaryIntent::InviteContact => Some(P::SocialPettingSolicitation),
+            PrimaryIntent::InvitePlay => Some(P::PlayPlayBowAnalog),
+            PrimaryIntent::Chase | PrimaryIntent::Intercept => Some(P::PlayCursorChaseBout),
+            PrimaryIntent::Inspect => Some(P::MoveInspectPauseScan),
+            PrimaryIntent::Orient | PrimaryIntent::SocialCheckIn => {
+                Some(P::MoveCheckBackSocialReference)
+            }
+            PrimaryIntent::QuietCompanionship => Some(P::SocialQuietCompanionship),
+            PrimaryIntent::RejectContact => Some(P::DefenseStrainBraceAndRelease),
+            PrimaryIntent::StartleFreeze => Some(P::DefenseStartleOrientFreeze),
+            PrimaryIntent::GuardPain => Some(P::DefenseLocalPainGuard),
+            PrimaryIntent::EscapePressure => Some(P::DefenseOverpressureBoundary),
+            PrimaryIntent::SettleAfterStress => Some(P::DefensePostStressShakeOff),
+            _ => None,
+        };
+        if let Some(program) = companion_program
+            && eligible(program)
+        {
+            return Some(ProgramDecision {
+                program,
+                cause: MotorCause::BrainAction,
+                priority: definition(program).priority,
+            });
+        }
     }
 
     let world_program = match (context.world_event, context.world_goal) {

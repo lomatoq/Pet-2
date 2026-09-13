@@ -65,6 +65,7 @@ pub struct SavedEcologyRng {
 
 impl SavedEcologyRng {
     #[must_use]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     pub fn for_seed(identity_seed: u64) -> Self {
         let mut seed = [0_u8; 32];
         let mut value = identity_seed;

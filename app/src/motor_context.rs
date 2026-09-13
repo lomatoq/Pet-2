@@ -34,6 +34,8 @@ pub fn from_frames(
         pet_touched: sensors.pet_touched,
         pet_dragged: sensors.pet_dragged,
         selected_salience: vita.visual_attention_target().map_or(0.0, |t| t.score),
+        companion_intent: vita.companion_intent().primary,
+        companion_confidence: vita.companion_intent().confidence,
         gesture: gesture.kind,
         gesture_confidence: gesture.confidence,
         gesture_ended: gesture.ended,

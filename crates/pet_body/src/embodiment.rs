@@ -339,13 +339,28 @@ impl EmbodiedRuntime {
             dt,
         );
         self.update_attention_face_pose(mode, mind, feedback);
-        self.update_blink(mode, intent, affect, expression, dt);
-        // Explicit physiological closure may be held; it must not become a
-        // repeating blink that briefly exposes the iris between envelopes.
-        self.pose.blink_left = self.pose.blink_left.max(expression.blink_left);
-        self.pose.blink_right = self.pose.blink_right.max(expression.blink_right);
-        self.pose.eye_aperture = expression.eye_aperture.clamp(0.0, 1.0);
-        self.pose.eye_scale = expression.eye_scale.clamp(0.88, 1.18);
+        let authored_blink = expression.blink_left.max(expression.blink_right);
+        if authored_blink > 0.02 {
+            self.pose.blink_left = expression.blink_left.clamp(0.0, 1.0);
+            self.pose.blink_right = expression.blink_right.clamp(0.0, 1.0);
+        } else {
+            self.update_blink(mode, intent, affect, expression, dt);
+        }
+        self.pose.eye_aperture = smooth(
+            self.pose.eye_aperture,
+            expression.eye_aperture.clamp(0.0, 1.0),
+            16.0,
+            dt,
+        );
+        self.pose.eye_scale = smooth(
+            self.pose.eye_scale,
+            expression.eye_scale.clamp(0.88, 1.18),
+            12.0,
+            dt,
+        );
+        let aperture_closure = 1.0 - self.pose.eye_aperture;
+        self.pose.blink_left = self.pose.blink_left.max(aperture_closure);
+        self.pose.blink_right = self.pose.blink_right.max(aperture_closure);
         self.update_pupil(mode, intent, sensors, mind, expression, face_tuning, dt);
         self.update_soft_body(genome, intent, feedback, affect, dt);
 
