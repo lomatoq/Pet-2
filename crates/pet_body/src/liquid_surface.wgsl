@@ -56,6 +56,7 @@ struct Globals {
     face_brows: array<vec4<f32>, 2>,
     face_mouth: vec4<f32>,
     face_eye: vec4<f32>,
+    face_eye_scales: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -419,11 +420,14 @@ fn face_space(point: vec2<f32>) -> vec2<f32> {
         / max(globals.face_frame_b.zw, vec2<f32>(0.01));
 }
 
-fn eye_radii() -> vec2<f32> {
+fn neutral_eye_radii() -> vec2<f32> {
     let size = globals.face_shape.x;
-    // A semantic eye disk stays very slightly wider than tall. Material strain is
-    // carried by the face frame's pose, never by an anisotropic eye scale.
     return vec2<f32>(0.057 + size * 0.245, 0.054 + size * 0.225);
+}
+
+fn eye_radii(side: f32) -> vec2<f32> {
+    let shape = select(globals.face_eye_scales.zw, globals.face_eye_scales.xy, side < 0.0);
+    return neutral_eye_radii() * shape;
 }
 
 fn eye_center(side: f32) -> vec2<f32> {
@@ -435,9 +439,16 @@ fn lid_aperture(local_eye: vec2<f32>, blink: f32, squint: f32, side: f32) -> f32
     let shape = globals.face_lids[select(1u, 0u, side < 0.0)];
     let x2 = local_eye.x * local_eye.x;
     let inner_to_outer = clamp(local_eye.x * side * 0.5 + 0.5, 0.0, 1.0);
-    let upper = 1.02 - x2 * (0.12 + shape.w * 0.12)
-        + mix(shape.x, shape.y, inner_to_outer) * 0.5 - blink * 1.65 - squint * 0.2 - (1.0 - globals.face_eye.x) * 1.7;
-    let lower = -0.98 + x2 * 0.12 + shape.z * 0.95 + blink * 0.72 + squint * 0.16;
+    // Independent upper/lower arcs meet at shared canthi, not two halves of
+    // a scaled oval. Cheek recruitment lifts only the lower arc; unequal upper
+    // controls shift its crest toward the inner/outer corner.
+    let span = sqrt(max(1.0 - x2, 0.0));
+    let canthus = (shape.y - shape.x) * local_eye.x * side * 0.12;
+    // Neutral rests partly over the eye; positive recruitment has visible
+    // headroom to uncover it without magnifying the eyeball or iris.
+    let upper = canthus + span * (0.58 + mix(shape.x, shape.y, inner_to_outer) * 0.9
+        - shape.w * 0.08 - blink * 1.65 - squint * 0.2 - (1.0 - globals.face_eye.x) * 1.7);
+    let lower = canthus + span * (-0.86 + shape.z * 0.95 + blink * 0.72 + squint * 0.16);
     let aa = max(fwidth(local_eye.y), 0.035);
     let upper_open = 1.0 - smoothstep(upper - aa, upper + aa, local_eye.y);
     let lower_open = smoothstep(lower - aa, lower + aa, local_eye.y);
@@ -452,7 +463,7 @@ fn eye_layer(
     glow_color: vec3<f32>,
     highlight_shift: vec2<f32>,
 ) -> vec4<f32> {
-    let local = (point - eye_center(side)) / eye_radii();
+    let local = (point - eye_center(side)) / eye_radii(side);
     let eye_distance = length(local);
     let eye_edge_footprint = max(fwidth(eye_distance), 0.004);
     let eye_mask = 1.0 - smoothstep(0.95, 1.02, eye_distance);
@@ -465,7 +476,10 @@ fn eye_layer(
         vec2<f32>(0.34),
     );
     let iris_scale = globals.eye_detail.x * select(1.0, 1.14, CINEMATIC);
-    let iris_local = (local - gaze) / max(iris_scale, 0.01);
+    // Lids/sclera reveal the eye; they must not zoom/stretch the iris, pupil,
+    // gaze displacement and corneal reflections along with the opening.
+    let corneal_local = (point - eye_center(side)) / neutral_eye_radii();
+    let iris_local = (corneal_local - gaze) / max(iris_scale, 0.01);
     let iris_distance = length(iris_local);
     let iris_angle = atan2(iris_local.y, iris_local.x);
     // Keep derivatives outside the non-uniform eye-mask branch, then skip the
@@ -482,8 +496,6 @@ fn eye_layer(
     let blink = select(globals.lids_brows.y, globals.lids_brows.x, side < 0.0);
     let aperture = lid_aperture(local, blink, globals.lids_brows.z, side);
     let visible = eye_mask * aperture;
-    let lid_presence = smoothstep(0.02, 0.18, max(blink, globals.lids_brows.z * 0.48));
-    let lid = eye_mask * (1.0 - aperture) * lid_presence;
     let iris = visible * (1.0 - smoothstep(0.92, 1.01, iris_distance));
     let autonomic_pupil = clamp(
         globals.gaze_pupil.w + side * globals.cinematic_i.w,
@@ -580,12 +592,12 @@ fn eye_layer(
     let highlight = visible * (1.0 - smoothstep(
         0.03 * highlight_scale,
         0.10 * highlight_scale,
-        length(local - highlight_center),
+        length(corneal_local - highlight_center),
     ));
     let micro_highlight = visible * (1.0 - smoothstep(
         0.012,
         0.042,
-        length(local - (vec2<f32>(0.055, 0.12) + highlight_shift * 0.65)),
+        length(corneal_local - (vec2<f32>(0.055, 0.12) + highlight_shift * 0.65)),
     ));
     let wet_highlight_color = select(
         vec3<f32>(1.15),
@@ -601,15 +613,28 @@ fn eye_layer(
             + micro_highlight * select(0.0, 0.46, CINEMATIC))
         * globals.physiology_b.w
         * globals.visual_detail.y;
-    color = mix(color, body_color, lid);
-    return vec4<f32>(color, max(visible, lid));
+    // The closed eye retains a curved seam, not a circular socket or nothing.
+    let shape = globals.face_lids[select(1u, 0u, side < 0.0)];
+    let center_gap = 1.44 + (shape.x + shape.y) * 0.45 - shape.w * 0.08
+        - shape.z * 0.95 - blink * 2.37 - globals.lids_brows.z * 0.36
+        - (1.0 - globals.face_eye.x) * 1.7;
+    let closed = 1.0 - smoothstep(0.01, 0.14, center_gap);
+    let seam_y = -0.16 + local.x * local.x * 0.22
+        + (shape.y - shape.x) * local.x * side * 0.12;
+    let seam_aa = max(fwidth(local.y), 0.018);
+    let seam = closed * (1.0 - smoothstep(0.80, 0.96, abs(local.x)))
+        * (1.0 - smoothstep(0.028, 0.028 + seam_aa, abs(local.y - seam_y)));
+    let seam_color = mix(body_color, vec3<f32>(0.42, 0.44, 0.45), 0.70);
+    return vec4<f32>(mix(color, seam_color, seam), max(visible, seam));
 }
 
 fn eye_socket_relief(point: vec2<f32>, side: f32) -> vec2<f32> {
-    let local = (point - eye_center(side)) / eye_radii();
+    let local = (point - eye_center(side)) / eye_radii(side);
     let radius = length(local);
+    let blink = select(globals.lids_brows.y, globals.lids_brows.x, side < 0.0);
     let ring = smoothstep(0.94, 1.015, radius)
-        * (1.0 - smoothstep(1.03, 1.20, radius));
+        * (1.0 - smoothstep(1.03, 1.20, radius))
+        * lid_aperture(local, blink, globals.lids_brows.z, side);
     let lower_shadow = ring * smoothstep(-0.18, 0.88, -local.y + local.x * 0.12);
     let upper_wet = ring * smoothstep(-0.35, 0.82, local.y - local.x * 0.18);
     return vec2<f32>(lower_shadow, upper_wet);
@@ -621,22 +646,43 @@ fn segment_distance(point: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     return length(point - (a + segment * t));
 }
 
+fn cubic_height(t: f32, a: f32, b: f32, c: f32, d: f32) -> f32 {
+    let s = 1.0 - t;
+    return s * s * s * a + 3.0 * s * s * t * b + 3.0 * s * t * t * c + t * t * t * d;
+}
+
 fn brow_distance(point: vec2<f32>, side: f32) -> f32 {
     let center = eye_center(side);
-    let radii = eye_radii();
+    let radii = eye_radii(side);
     let shape = globals.face_brows[select(1u, 0u, side < 0.0)];
     let raise = globals.lids_brows.w * 0.028;
-    let base = center.y + radii.y * 1.12 + raise;
+    let base = center.y + radii.y * 1.12 + raise - 0.018;
+    let inner = base + shape.x * 0.055;
+    let outer = base + shape.y * 0.055;
+    // Four material controls: independently raised inner/outer endpoints and
+    // unequal shoulders. The inner/outer differential moves the expressive
+    // knee rather than tilting one fixed parabola like a rigid sticker.
+    let knee = clamp((shape.x - shape.y) * 0.35, -0.32, 0.32);
+    let shoulder_inner = mix(inner, outer, 0.28) + shape.z * (0.045 + knee * 0.025);
+    let shoulder_outer = mix(inner, outer, 0.72) + shape.z * (0.045 - knee * 0.025);
     var distance = 10.0;
-    var previous = vec2<f32>(center.x - side * radii.x * 0.8, base + shape.x * 0.045);
+    var previous = vec2<f32>(center.x - side * radii.x * 0.8, inner);
     for (var i = 1u; i <= 8u; i += 1u) {
         let t = f32(i) / 8.0;
         let next = vec2<f32>(center.x + side * radii.x * mix(-0.8, 0.8, t),
-            base + mix(shape.x, shape.y, t) * 0.045 + shape.z * 0.035 * 4.0 * t * (1.0 - t));
-        distance = min(distance, segment_distance(point, previous, next));
+            cubic_height(t, inner, shoulder_inner, shoulder_outer, outer));
+        // A slim, tapered ribbon keeps the independent brow arc readable without
+        // the old constant-width sausage silhouette. Use closest curve position,
+        // not fragment X, so taper follows raised and tilted brows as well.
+        let span = next - previous;
+        let along = clamp(dot(point - previous, span) / max(dot(span, span), 0.000001), 0.0, 1.0);
+        let curve_t = (f32(i - 1u) + along) / 8.0;
+        let taper = mix(0.42, 0.12, curve_t)
+            + 0.72 * pow(max(4.0 * curve_t * (1.0 - curve_t), 0.0), 0.62);
+        distance = min(distance, segment_distance(point, previous, next) / (0.72 * taper));
         previous = next;
     }
-    return distance / shape.w;
+    return distance / max(shape.w, 0.08);
 }
 
 fn brow_mask(point: vec2<f32>, side: f32) -> f32 {
@@ -647,31 +693,53 @@ fn expressive_mouth_y(normalized_x: f32, curve: f32, tension: f32) -> f32 {
     let x = clamp(normalized_x, -1.0, 1.0);
     let center_arc = -curve * 0.048 * (1.0 - x * x);
     let corner_lift = curve * 0.010 * smoothstep(0.56, 1.0, abs(x));
-    let pressed_center = tension * 0.004 * (1.0 - abs(x));
+    let pressed_center = tension * 0.004 * (1.0 - x * x);
     return center_arc + corner_lift + pressed_center
-        + mix(globals.face_mouth.y, globals.face_mouth.z, x * 0.5 + 0.5) * 0.035 * abs(x);
+        + mix(globals.face_mouth.y, globals.face_mouth.z, x * 0.5 + 0.5) * 0.035 * x * x;
 }
 
 fn expressive_mouth_distance(local: vec2<f32>, width: f32, curve: f32, tension: f32) -> f32 {
-    // Six short spans approximate a smooth expressive arc while retaining clear,
-    // independently moving center, shoulder, and corner silhouettes.
-    let p0 = vec2<f32>(-width, expressive_mouth_y(-1.0, curve, tension));
-    let p1 = vec2<f32>(-width * 0.67, expressive_mouth_y(-0.67, curve, tension));
-    let p2 = vec2<f32>(-width * 0.33, expressive_mouth_y(-0.33, curve, tension));
-    let p3 = vec2<f32>(0.0, expressive_mouth_y(0.0, curve, tension));
-    let p4 = vec2<f32>(width * 0.33, expressive_mouth_y(0.33, curve, tension));
-    let p5 = vec2<f32>(width * 0.67, expressive_mouth_y(0.67, curve, tension));
-    let p6 = vec2<f32>(width, expressive_mouth_y(1.0, curve, tension));
-    return min(
-        min(
-            min(segment_distance(local, p0, p1), segment_distance(local, p1, p2)),
-            segment_distance(local, p2, p3),
-        ),
-        min(
-            segment_distance(local, p3, p4),
-            min(segment_distance(local, p4, p5), segment_distance(local, p5, p6)),
-        ),
-    );
+    // Smooth center derivatives and a bounded subdivision avoid the old visible
+    // central V at small pet sizes, including asymmetric pressed smiles.
+    var previous = vec2<f32>(-width, expressive_mouth_y(-1.0, curve, tension));
+    var distance = 100.0;
+    for (var i = 1; i <= 16; i += 1) {
+        let x = -1.0 + f32(i) * 0.125;
+        let next = vec2<f32>(width * x, expressive_mouth_y(x, curve, tension));
+        distance = min(distance, segment_distance(local, previous, next));
+        previous = next;
+    }
+    return distance;
+}
+
+// Independent upper/lower lips with shared sealed corners. This is a bounded
+// cubic patch (constant cost), not a vertically warped ellipse. Jaw opening
+// mostly lowers the lower contour; tension flattens the upper lip separately.
+fn mouth_lip_contours(x: f32, height: f32, curve: f32, tension: f32, open: f32) -> vec2<f32> {
+    let t = clamp(x * 0.5 + 0.5, 0.0, 1.0);
+    let left = expressive_mouth_y(-1.0, curve, tension);
+    let right = expressive_mouth_y(1.0, curve, tension);
+    let bias = clamp((globals.face_mouth.z - globals.face_mouth.y) * 0.20, -0.25, 0.25);
+    let left_base = mix(left, right, 1.0 / 3.0) - curve * 0.064;
+    let right_base = mix(left, right, 2.0 / 3.0) - curve * 0.064;
+    let upper_lift = height * (0.42 + 0.30 * (1.0 - tension));
+    let lower_drop = height * (1.18 + 0.38 * open);
+    let upper = cubic_height(t, left,
+        left_base + upper_lift * (1.0 - bias),
+        right_base + upper_lift * (1.0 + bias), right);
+    let lower = cubic_height(t, left,
+        left_base - lower_drop * (1.0 + bias),
+        right_base - lower_drop * (1.0 - bias), right);
+    // Rounded phonation/startle needs vertical sides, not the pointed oval made
+    // by two height cubics meeting at their extreme x. Keep independent jaw/lip
+    // participation while blending to a round cross-section for narrow mouths.
+    let rounded = (1.0 - smoothstep(0.65, 1.05, globals.face_mouth.x))
+        * (1.0 - smoothstep(0.15, 0.60, abs(curve)));
+    let section = sqrt(max(0.0, 1.0 - x * x));
+    let middle = mix(left, right, t) - curve * 0.048 * (1.0 - x * x);
+    let round_upper = middle + upper_lift * 0.75 * section * (1.0 + bias * x);
+    let round_lower = middle - lower_drop * 0.75 * section * (1.0 - bias * x);
+    return mix(vec2<f32>(upper, lower), vec2<f32>(round_upper, round_lower), rounded);
 }
 
 fn mouth_layer(
@@ -680,26 +748,41 @@ fn mouth_layer(
     secondary: vec3<f32>,
     glow_color: vec3<f32>,
 ) -> vec4<f32> {
-    let center = vec2<f32>(0.0, -0.115);
     let open = globals.brow_mouth.z;
+    // Explicit actual-playback activity; a wide yawn or silent grimace cannot
+    // masquerade as a shout. Grow mainly below the eyes.
+    let shout = globals.face_eye.y;
+    let center = vec2<f32>(0.0, -0.100 - shout * 0.035);
     let curve = globals.brow_mouth.w;
     let tension = globals.mouth_voice.x;
     let voice = globals.mouth_voice.z;
-    let width = (0.065 + tension * 0.020) * globals.face_mouth.x;
-    let height = (0.010 + open * 0.065 + voice * 0.010) * (1.0 - globals.face_mouth.w * 0.65);
+    let width = (0.065 + tension * 0.020) * globals.face_mouth.x * (1.0 + shout * 0.20);
+    let height = (0.010 + open * 0.065 + voice * 0.010) * (1.0 - globals.face_mouth.w * 0.65) * (1.0 + shout * 1.30);
     let local = point - center;
     let normalized_x = clamp(local.x / width, -1.0, 1.0);
     let expressive_y = expressive_mouth_y(normalized_x, curve, tension);
     let deformed_local = vec2<f32>(local.x, local.y - expressive_y);
-    let ellipse = length(deformed_local / vec2<f32>(width, max(height, 0.006)));
+    let lips = mouth_lip_contours(normalized_x, height, curve, tension, open);
+    let upper_limit = -0.095 - center.y;
+    let upper_delta = lips.x - upper_limit;
+    // Smooth bounded minimum avoids a flat clipped lip with two sharp corners.
+    let rounded_upper = 0.5 * (lips.x + upper_limit
+        - sqrt(upper_delta * upper_delta + 0.0009));
+    let safe_upper = mix(lips.x, rounded_upper, shout);
+    let upper_distance = local.y - safe_upper;
+    let lower_distance = lips.y - local.y;
+    let cavity_distance = max(abs(local.x) - width, max(upper_distance, lower_distance));
+    let cavity_aa = max(fwidth(cavity_distance), 0.002);
+    let cavity_half_height = max((lips.x - lips.y) * 0.5, 0.002);
+    let cavity_edge_coordinate = 1.0 + cavity_distance / cavity_half_height;
     let open_gate = smoothstep(0.025, 0.13, open);
     let closed_gate = 1.0 - open_gate;
-    let open_mask = (1.0 - smoothstep(0.88, 1.02, ellipse)) * open_gate;
+    let open_mask = (1.0 - smoothstep(-cavity_aa, cavity_aa, cavity_distance)) * open_gate;
     let line_distance = expressive_mouth_distance(local, width, curve, tension);
     let line_aa = max(fwidth(line_distance), 0.003);
     let line_mask = (1.0 - smoothstep(0.010 - line_aa, 0.010 + line_aa, line_distance)) * closed_gate;
     let feature_mask = max(open_mask, line_mask);
-    let open_distance = (ellipse - 1.0) * min(width, max(height, 0.006));
+    let open_distance = cavity_distance;
     let closed_distance = line_distance - 0.010;
     let feature_distance = mix(
         closed_distance,
@@ -711,8 +794,8 @@ fn mouth_layer(
         * smoothstep(-0.55, 0.72, -deformed_local.y / max(height, 0.006));
     let dark_jelly = mix(body_color, secondary, 0.10) * 0.19;
     var color = mix(secondary * (0.40 - crease_shadow * relief * 0.12), dark_jelly, open_mask);
-    let lip_edge = open_mask * smoothstep(0.62, 0.93, ellipse);
-    let upper_lip = lip_edge * smoothstep(-0.32, 0.82, deformed_local.y / max(height, 0.006));
+    let lip_edge = open_mask * smoothstep(0.62, 0.93, cavity_edge_coordinate);
+    let upper_lip = lip_edge * (1.0 - smoothstep(0.001, 0.010, abs(upper_distance)));
     let ridge_distance = expressive_mouth_distance(
         local - vec2<f32>(0.0, 0.005),
         width,
@@ -1193,7 +1276,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             * globals.cinematic_h.x
             * 0.30;
     }
-    let cheek_y = eye_center(-1.0).y - eye_radii().y * 0.86;
+    let cheek_y = eye_center(-1.0).y - eye_radii(-1.0).y * 0.86;
     let cheek_left = length(
         (face_point - vec2<f32>(eye_center(-1.0).x, cheek_y)) / vec2<f32>(0.066, 0.038),
     );
@@ -1245,7 +1328,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     color = mix(
         color,
         brow_color,
-        brow * select(0.52 + globals.brow_mouth.x * 0.18, 0.72, CINEMATIC),
+        brow * 0.70 * select(0.52 + globals.brow_mouth.x * 0.18, 0.72, CINEMATIC),
     );
     let mouth = mouth_layer(face_point, body_face_color, secondary, glow_color);
     color = mix(color, mouth.rgb, mouth.a * coverage * globals.face_tuning.x);

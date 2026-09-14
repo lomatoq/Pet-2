@@ -339,6 +339,7 @@ impl EcologyRenderer {
         {
             return false;
         }
+        let region_changed = self.background_uv_rect != background_uv_rect;
         self.background_uv_rect = background_uv_rect;
         let background_resized = self.background_size != (width, height);
         if background_resized {
@@ -353,6 +354,7 @@ impl EcologyRenderer {
         }
         let expected_length = bytes_per_row as usize * height as usize;
         if background_resized
+            || region_changed
             || self.background_bytes_per_row != bytes_per_row
             || self.smoothed_background_bgra.len() != expected_length
         {
@@ -712,9 +714,8 @@ fn temporally_stabilize_background(
     bytes_per_row: u32,
     exclusion: Option<EcologyCaptureExclusion>,
 ) {
-    // A one-pole 1:1 causal blend removes capture timing jitter without the
-    // visible multi-frame drag of the former 3:1 history at 30 Hz. Capture now
-    // targets 60 Hz; the procedural optical field remains render-rate smooth.
+    // Clean captures replace history directly. The legacy exclusion path keeps
+    // its one-pole blend, but must not be used as a live source-clean capture.
     // Only live BGRA pixels are touched; row padding remains irrelevant.
     let exclusion = exclusion.map(|region| {
         let center = region.center_normalized.clamp(Vec2::ZERO, Vec2::ONE)
@@ -729,7 +730,9 @@ fn temporally_stabilize_background(
         let history_row = &mut history[row_start..live_row_end];
         let incoming_row = &incoming[row_start..live_row_end];
         let Some((center, radius, outer_radius)) = exclusion else {
-            blend_background_bytes(history_row, incoming_row);
+            // A source-clean frame is already the correct current desktop.
+            // Blending old letters/windows into it makes visible double images.
+            history_row.copy_from_slice(incoming_row);
             continue;
         };
 
@@ -1138,12 +1141,12 @@ mod tests {
     }
 
     #[test]
-    fn captured_background_changes_are_temporally_bounded_and_converge() {
+    fn clean_background_replaces_old_scene_without_ghosts_and_preserves_padding() {
         let mut history = vec![0_u8; 512];
         let incoming = vec![255_u8; 512];
         temporally_stabilize_background(&mut history, &incoming, 2, 2, 256, None);
-        assert!(history[..8].iter().all(|channel| *channel == 128));
-        assert!(history[256..264].iter().all(|channel| *channel == 128));
+        assert!(history[..8].iter().all(|channel| *channel == 255));
+        assert!(history[256..264].iter().all(|channel| *channel == 255));
         assert!(history[8..256].iter().all(|channel| *channel == 0));
         assert!(history[264..].iter().all(|channel| *channel == 0));
         for _ in 0..24 {

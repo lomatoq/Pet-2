@@ -187,6 +187,11 @@ pub fn step_den_attraction(
             distance_px,
         );
     let inward = toward_center / distance.max(f32::EPSILON);
+    // A deliberate fast outward throw escapes the field instead of being
+    // immediately reeled back in. Slow placement still settles into the den.
+    if object.velocity.dot(inward) < -0.65 {
+        return false;
+    }
     let tangent_sign = if object.id & 1 == 0 { 1.0 } else { -1.0 };
     let tangent = Vec2::new(-inward.y, inward.x) * tangent_sign;
     let curve = (distance_px / DEN_ATTRACTION_RADIUS_PX).clamp(0.0, 1.0) * 0.12;

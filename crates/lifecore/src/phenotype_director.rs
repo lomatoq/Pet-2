@@ -97,7 +97,9 @@ impl BodyPhenotypeDirector {
             if safety || (self.pose_candidate_seconds >= 0.15 && self.pose_held_seconds >= 0.65) {
                 self.pose_held_seconds = 0.0;
             } else {
-                raw.expression = self.output.expression;
+                // Hold only the diagnostic label, not every continuous muscle
+                // target until the winner switches and releases a whole mask.
+                raw.expression.face_pose = self.output.expression.face_pose;
             }
         }
         if !self.fast_couplings_enabled {
@@ -276,6 +278,55 @@ const fn default_true() -> bool {
     true
 }
 
+#[allow(clippy::field_reassign_with_default)]
+fn mixed_expression_geometry(scores: [f32; 7]) -> crate::FaceGeometry {
+    let neutral = crate::FaceGeometry::default();
+    let weights = scores.map(|score| unit(score).powi(2));
+    let total = weights.iter().sum::<f32>().max(1.0);
+    let mut result = neutral;
+    for (pose, weight) in [
+        crate::FacePose::Curious,
+        crate::FacePose::Playful,
+        crate::FacePose::Affectionate,
+        crate::FacePose::Tired,
+        crate::FacePose::Confused,
+        crate::FacePose::Startled,
+        crate::FacePose::Boundary,
+    ]
+    .into_iter()
+    .zip(weights)
+    {
+        let geometry = pose.expression().geometry;
+        for ((value, base), target) in result
+            .lids
+            .iter_mut()
+            .flatten()
+            .chain(result.brows.iter_mut().flatten())
+            .chain(result.mouth.iter_mut())
+            .zip(
+                neutral
+                    .lids
+                    .iter()
+                    .flatten()
+                    .chain(neutral.brows.iter().flatten())
+                    .chain(neutral.mouth.iter()),
+            )
+            .zip(
+                geometry
+                    .lids
+                    .iter()
+                    .flatten()
+                    .chain(geometry.brows.iter().flatten())
+                    .chain(geometry.mouth.iter()),
+            )
+        {
+            *value += (target - base) * weight / total;
+        }
+    }
+    result.sanitized()
+}
+
+// Keep independently documented coupling formulas adjacent to their channels.
 #[allow(clippy::field_reassign_with_default)]
 fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> FastPhenotypeActuation {
     let d = i.derived;
@@ -472,12 +523,16 @@ fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> Fast
             + 0.16 * f.startle
             + 0.16 * f.physical_load,
     );
-    // A categorical geometry carrier plus a bounded secondary modifier.
+    // The label is diagnostic; geometry below blends continuous affect scores.
     // These are readouts of existing felt state, never another emotion owner.
-    let has_target = source.perception.attention_target_position.is_some()
-        && source.perception.attention_confidence >= 0.3;
+    let attention_weight = if source.perception.attention_target_position.is_some() {
+        let t = ((unit(source.perception.attention_confidence) - 0.15) / 0.30).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    } else {
+        0.0
+    };
     let scores = [
-        if has_target { e.interest } else { 0.0 },
+        e.interest * attention_weight,
         e.playfulness,
         e.affection,
         d.fatigue,
@@ -509,17 +564,8 @@ fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> Fast
             crate::FacePose::Boundary,
         ][dominant_expression]
     };
-    let mut canonical = pose.expression();
-    if pose == crate::FacePose::Startled && f.startle < 0.2 {
-        canonical.mouth_open = 0.0;
-        canonical.mouth_curve = -0.18;
-    }
-    // Geometry has one owner; arousal remains a bounded physiological pupil channel.
-    let pupil_size = expression.pupil_size;
-    let body_glow = expression.body_glow;
-    expression = canonical;
-    expression.pupil_size = pupil_size;
-    expression.body_glow = body_glow;
+    expression.face_pose = pose;
+    expression.geometry = mixed_expression_geometry(scores);
     out.expression = expression;
 
     out.visual_physiology = VisualPhysiologyActuation {
@@ -2125,6 +2171,54 @@ fn alpha(rise: f32, fall: f32, current: f32, target: f32, dt: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::{BodyInteroceptionDirector, Genome, VitaSomaticFrame};
+
+    #[test]
+    fn uncertain_attention_does_not_switch_full_curiosity_geometry() {
+        let mut source = source();
+        source.perception.attention_target_position = Some(glam::Vec2::splat(0.5));
+        let mut snapshot = InteroceptionSnapshot::default();
+        snapshot.emotions.interest = 1.0;
+        source.perception.attention_confidence = 0.299;
+        let before = raw_targets(&source, snapshot).expression.geometry;
+        source.perception.attention_confidence = 0.301;
+        let after = raw_targets(&source, snapshot).expression.geometry;
+        assert!(before.maximum_error(after) < 0.02);
+        source.perception.attention_confidence = 0.0;
+        let zero = raw_targets(&source, snapshot).expression.geometry;
+        source.perception.attention_target_position = None;
+        assert_eq!(zero, raw_targets(&source, snapshot).expression.geometry);
+    }
+
+    #[test]
+    fn geometry_mix_has_no_winner_threshold_jump_and_supports_mixed_affect() {
+        let below = mixed_expression_geometry([0.3, 0.0, 0.0, 0.4, 0.0, 0.349, 0.0]);
+        let above = mixed_expression_geometry([0.3, 0.0, 0.0, 0.4, 0.0, 0.351, 0.0]);
+        assert!(below.maximum_error(above) < 0.003);
+        let mut distinct = std::collections::HashSet::new();
+        for interest in 0..5 {
+            for affection in 0..5 {
+                for confusion in 0..5 {
+                    for anger in 0..5 {
+                        let geometry = mixed_expression_geometry([
+                            interest as f32 * 0.25,
+                            0.0,
+                            affection as f32 * 0.25,
+                            0.0,
+                            confusion as f32 * 0.25,
+                            0.0,
+                            anger as f32 * 0.25,
+                        ]);
+                        assert_eq!(geometry, geometry.sanitized());
+                        distinct.insert(serde_json::to_string(&geometry).unwrap());
+                    }
+                }
+            }
+        }
+        assert!(
+            distinct.len() > 500,
+            "independent geometry combinations, not behavior count"
+        );
+    }
 
     fn source() -> EmbodimentSourceFrame {
         let genome = Genome::from_seed(42);

@@ -146,6 +146,12 @@ pub fn apply_interaction_forces(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ObjectContactForce {
+    pub applied_world: Vec2,
+    pub impact_world: Vec2,
+}
+
 pub fn apply_external_contact_forces(
     particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
     count: usize,
@@ -154,9 +160,10 @@ pub fn apply_external_contact_forces(
     world_to_body_scale: Vec2,
     environment: &EmbodiedEnvironmentFrame,
     support_radius: f32,
-) {
+) -> ObjectContactForce {
     let count = count.min(MAX_LIQUID_PARTICLES);
     let support_radius = support_radius.max(KERNEL_RADIUS).max(1.0e-4);
+    let mut applied_object_force_world = ObjectContactForce::default();
     for contact in
         &environment.contacts[..environment.contact_count.min(environment.contacts.len())]
     {
@@ -170,6 +177,58 @@ pub fn apply_external_contact_forces(
             body_origin + (contact.point_world - body_world_position) * world_to_body_scale;
         let normal_local =
             (contact.normal_world * world_to_body_scale.signum()).normalize_or_zero();
+        if contact.source == pet_ecology::ContactSource::Orb {
+            // This is already reciprocal J / ecology_dt, not an impulse to
+            // replay each PBF substep. Particle.force is local acceleration;
+            // the ordinary solver integrates it using its own substep dt².
+            if !contact.body_force_world.is_finite()
+                || !world_to_body_scale.is_finite()
+                || world_to_body_scale.abs().min_element() < 1.0e-4
+            {
+                continue;
+            }
+            let total_mass: f32 = particles[..count]
+                .iter()
+                .filter(|p| p.inverse_mass.is_finite() && p.inverse_mass > 0.0)
+                .map(|p| 1.0 / p.inverse_mass)
+                .sum();
+            let mut weights = [0.0; MAX_LIQUID_PARTICLES];
+            for (weight, p) in weights[..count].iter_mut().zip(&particles[..count]) {
+                let u = (1.0 - p.position.distance(point_local) / support_radius).clamp(0.0, 1.0);
+                *weight = u * u * (3.0 - 2.0 * u);
+            }
+            let weighted_mass: f32 = particles[..count]
+                .iter()
+                .zip(&weights)
+                .filter(|(p, _)| p.inverse_mass.is_finite() && p.inverse_mass > 0.0)
+                .map(|(p, w)| w / p.inverse_mass)
+                .sum();
+            if weighted_mass < 1.0e-6 || total_mass < 1.0e-6 {
+                continue;
+            }
+            // The physical toy body has mass3, independently of tessellation.
+            let local_force = contact.body_force_world * world_to_body_scale;
+            for (particle, weight) in particles[..count].iter_mut().zip(weights) {
+                if particle.inverse_mass <= 0.0 || !particle.inverse_mass.is_finite() {
+                    continue;
+                }
+                let acceleration = (local_force * (weight * total_mass / (3.0 * weighted_mass)))
+                    .clamp_length_max(36.0);
+                particle.force += acceleration;
+                let toy_particle_mass = 3.0 / (particle.inverse_mass * total_mass);
+                let delivered = acceleration / world_to_body_scale * toy_particle_mass;
+                applied_object_force_world.applied_world += delivered;
+                // The ecology hold contact has ZERO relative velocity, even
+                // for a heavy orb. Load alone must never become startle.
+                if contact.relative_velocity_px.is_finite()
+                    && contact.relative_velocity_px.length() > 10.0
+                {
+                    applied_object_force_world.impact_world += delivered;
+                }
+            }
+            // No intensity/penetration heuristic stacked onto true orb mass.
+            continue;
+        }
         let impact = if contact.relative_velocity_px.is_finite() {
             (contact.relative_velocity_px.length() / 1_200.0).clamp(0.0, 1.0)
         } else {
@@ -194,6 +253,7 @@ pub fn apply_external_contact_forces(
             }
         }
     }
+    applied_object_force_world
 }
 
 impl MaterialGrab {
@@ -457,6 +517,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reciprocal_orb_force_is_mass_normalized_and_static_load_is_not_impact() {
+        for count in [12, 48, 96] {
+            let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+            for p in &mut particles[..count] {
+                p.inverse_mass = 1.0;
+            }
+            let mut environment = EmbodiedEnvironmentFrame::default();
+            environment.push_contact(ExternalContact {
+                source: ContactSource::Orb,
+                point_world: Vec2::splat(0.5),
+                normal_world: Vec2::Y,
+                body_force_world: Vec2::Y * 0.6,
+                ..Default::default()
+            });
+            let applied = apply_external_contact_forces(
+                &mut particles,
+                count,
+                Vec2::ZERO,
+                Vec2::splat(0.5),
+                Vec2::new(2.0, -2.0),
+                &environment,
+                0.3,
+            );
+            assert!((applied.applied_world.y - 0.6).abs() < 1.0e-5);
+            assert_eq!(applied.impact_world, Vec2::ZERO);
+            for p in &particles[..count] {
+                assert!((p.force.y + 0.4).abs() < 1.0e-5);
+            }
+        }
+    }
+
+    #[test]
     fn external_contact_is_local_bounded_and_does_not_push_distant_material() {
         let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
         particles[0].position = Vec2::ZERO;
@@ -469,6 +561,7 @@ mod tests {
             penetration_px: 24.0,
             relative_velocity_px: Vec2::new(-360.0, 0.0),
             intensity: 0.8,
+            body_force_world: Vec2::ZERO,
         });
         apply_external_contact_forces(
             &mut particles,

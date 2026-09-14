@@ -12,6 +12,7 @@ mod mutation;
 mod noise;
 mod nonphonated;
 mod phonation;
+mod phrase_variation;
 mod prosody;
 mod ring;
 mod tract;
@@ -25,6 +26,7 @@ pub use motif::*;
 pub use mutation::*;
 pub use nonphonated::*;
 pub use phonation::PhonationRegime;
+pub use phrase_variation::PhraseVariationState;
 pub use ring::SpscRing;
 pub use visual_feedback::{
     AudioCallbackLevels, AudioVisualBridge, AudioVisualFeedback, global_visual_bridge,

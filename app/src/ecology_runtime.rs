@@ -15,13 +15,20 @@ use pet_ecology::{
     GestureSignature, MAX_OBJECT_SPEED, MorselProfile, ObjectCommand, ObjectId, ObjectKind,
     ObjectLifecycle, ObjectPhysicsConfig, PhysicalGrabFrame, REFERENCE_DESKTOP_HEIGHT_PX,
     RhythmSignature, WindowAffordanceFrame, WorldObject, orb_is_inside_den_latch,
-    resolve_object_body_contact, step_den_attraction, step_object_with_windows,
+    resolve_soft_object_body_contact_measured, step_compliant_grip, step_den_attraction,
+    step_object_with_windows,
 };
 use pet_motor::MotorWorldEvent;
 
 /// Application integration boundary for the portable habitat. Native input,
 /// rendering and body physics stay in their existing owners.
 pub struct EcologyRuntime {
+    adaptation_sequence: u64,
+    placement_learning_attempt: Option<f32>,
+    measured_orb_contact: Option<(PhysicalGrabFrame, f32)>,
+    pet_grips: Vec<PetObjectGrip>,
+    release_grace: Vec<(ObjectId, f32)>,
+    last_body_position: Vec2,
     state: EcologyState,
     director: EpisodeDirector,
     pointer_down: bool,
@@ -52,6 +59,13 @@ pub struct EcologyRuntime {
     episode_tick_microseconds: f64,
     object_physics_microseconds: f64,
     desktop_aspect: f32,
+}
+
+struct PetObjectGrip {
+    object_id: ObjectId,
+    target: Vec2,
+    body_origin: Vec2,
+    strength: f32,
 }
 
 fn morph_object_priority(
@@ -200,8 +214,14 @@ impl EcologyRuntime {
                 .unwrap_or_else(|| EcologyState::new(identity_seed))
         };
         Ok(Self {
+            pet_grips: Vec::new(),
+            measured_orb_contact: None,
+            release_grace: Vec::new(),
+            last_body_position: Vec2::ZERO,
             state,
             director: EpisodeDirector::default(),
+            adaptation_sequence: 0,
+            placement_learning_attempt: None,
             pointer_down: false,
             grabbed_object: None,
             grab_press_position: None,
@@ -249,6 +269,7 @@ impl EcologyRuntime {
             dt,
             orb_physical,
         } = frame;
+        self.last_body_position = body.world_position;
         let frame = EcologyBehaviorFrame {
             social_contact,
             selected_action,
@@ -348,7 +369,8 @@ impl EcologyRuntime {
             ) * viewport_height
         };
         let current_center = to_pixels(orb.position);
-        let previous_orb = orb.position - orb.velocity * dt.max(0.0);
+        let previous_orb =
+            orb.position - Vec2::new(orb.velocity.x / aspect, orb.velocity.y) * dt.max(0.0);
         let previous_body = feedback.world_position - feedback.velocity * dt.max(0.0);
         let previous_center = Vec2::new(
             (previous_orb.x - previous_body.x) * aspect,
@@ -390,6 +412,11 @@ impl EcologyRuntime {
         }
     }
 
+    /// One physics tick only: the body supplies its visible gel contour.
+    pub fn set_measured_orb_contact(&mut self, frame: PhysicalGrabFrame, viewport_height: f32) {
+        self.measured_orb_contact = Some((frame, viewport_height.max(1.0)));
+    }
+
     pub fn fixed_update(
         &mut self,
         desktop_aspect: f32,
@@ -416,6 +443,7 @@ impl EcologyRuntime {
                 continue;
             }
             self.environment.push_contact(ExternalContact {
+                body_force_world: Vec2::ZERO,
                 source: ContactSource::Window,
                 point_world: window.nearest_edge_point,
                 normal_world: window.nearest_edge_normal,
@@ -462,7 +490,50 @@ impl EcologyRuntime {
                     })
             });
         let mut captured_orb = None;
+        self.release_grace
+            .iter_mut()
+            .for_each(|(_, remaining)| *remaining -= dt.max(0.0));
+        self.release_grace.retain(|(_, remaining)| *remaining > 0.0);
+        self.pet_grips.retain(|grip| {
+            self.state.objects.iter().any(|object| {
+                object.id == grip.object_id && object.lifecycle == ObjectLifecycle::CarriedByPet
+            })
+        });
+        self.last_body_position = body.world_position;
+        let measured_orb = self.measured_orb_contact.take();
         for object in &mut self.state.objects {
+            if let Some(grip) = self
+                .pet_grips
+                .iter()
+                .find(|grip| grip.object_id == object.id)
+            {
+                let target = grip.target + body.world_position - grip.body_origin;
+                let previous_velocity = object.velocity;
+                step_compliant_grip(object, target, grip.strength, config, dt);
+                if dt.is_finite()
+                    && dt > 0.0
+                    && object.mass.is_finite()
+                    && measured_orb.is_some_and(|(frame, _)| frame.contact)
+                    && desktop_distance(object.position, target, config.desktop_aspect) < 0.05
+                {
+                    let mass = object.mass.clamp(0.05, 8.0);
+                    let acceleration = (object.velocity - previous_velocity) / dt.min(1.0 / 30.0);
+                    let reaction =
+                        (Vec2::Y * pet_ecology::ORB_SCREEN_GRAVITY - acceleration) * mass;
+                    self.environment.push_contact(ExternalContact {
+                        source: ContactSource::Orb,
+                        point_world: target,
+                        normal_world: reaction.normalize_or_zero(),
+                        penetration_px: 0.0,
+                        relative_velocity_px: Vec2::ZERO,
+                        intensity: (reaction.length() / 4.32).clamp(0.0, 1.0),
+                        body_force_world: Vec2::new(
+                            reaction.x / config.desktop_aspect.clamp(0.25, 8.0),
+                            reaction.y,
+                        ),
+                    });
+                }
+            }
             let contacts_before = self.environment.contact_count;
             step_object_with_windows(object, config, windows, dt, &mut self.environment);
             let window_contact_count = self.environment.contacts[contacts_before
@@ -489,14 +560,37 @@ impl EcologyRuntime {
                 && window_contact_count >= 2
                 && has_opposing_normals
                 && object.velocity.length() < 0.15;
-            resolve_object_body_contact(
-                object,
-                body.world_position,
-                body.velocity,
-                config,
-                &mut self.environment,
-            );
-            if step_den_attraction(object, den_anchor, config, dt)
+            // A den handoff must not fight the body's separation solver; a
+            // freshly thrown object also needs time to clear the soft socket.
+            let handing_off =
+                object.home_slot.is_some() && orb_is_inside_den_latch(object, den_anchor, config);
+            if !handing_off && !self.release_grace.iter().any(|(id, _)| *id == object.id) {
+                let contact = measured_orb
+                    .filter(|(frame, _)| frame.contact && object.kind == ObjectKind::Orb)
+                    .map(|(frame, height)| ExternalContact {
+                        source: ContactSource::Orb,
+                        point_world: frame.body_surface_position,
+                        normal_world: -frame.normal_world,
+                        penetration_px: frame.penetration_px * config.reference_height_px / height,
+                        relative_velocity_px: (object.velocity
+                            - Vec2::new(body.velocity.x * config.desktop_aspect, body.velocity.y))
+                            * config.reference_height_px,
+                        intensity: 0.0,
+                        body_force_world: Vec2::ZERO,
+                    });
+                resolve_soft_object_body_contact_measured(
+                    object,
+                    body.velocity,
+                    config,
+                    &mut self.environment,
+                    dt,
+                    contact,
+                );
+            }
+            // A deliberate release needs time to physically leave the latch.
+            // Otherwise the first substep erases its impulse at the den center.
+            if !self.release_grace.iter().any(|(id, _)| *id == object.id)
+                && step_den_attraction(object, den_anchor, config, dt)
                 && let Some(slot) = orb_slot
             {
                 object.lifecycle = ObjectLifecycle::StoredInDen;
@@ -692,6 +786,64 @@ impl EcologyRuntime {
             .observe_explicit_refusal(&mut self.state, timestamp)
     }
 
+    pub fn observe_game_adaptation(&mut self, accepted: bool) -> Option<u16> {
+        let episode = *self.director.active_episode()?;
+        let goal = episode.goal;
+        if !matches!(goal, EpisodeGoal::OfferOrb | EpisodeGoal::SoloOrbPlay) {
+            return None;
+        }
+        self.director
+            .observe_game_response(episode.id | (1u64 << 63), goal, accepted)
+    }
+
+    pub fn observe_placement_adaptation(&mut self, output: &EcologyOutput) -> Option<u16> {
+        let orb = self
+            .state
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Orb)?;
+        if output.debug.active_goal == Some(EpisodeGoal::CarryOrbHome)
+            && self.placement_learning_attempt.is_none()
+            && orb.lifecycle == ObjectLifecycle::CarriedByPet
+        {
+            let delta = self.last_body_position - self.state.den.anchor;
+            let side = if matches!(
+                self.state.den.edge,
+                pet_ecology::DenEdge::Left | pet_ecology::DenEdge::Right
+            ) {
+                delta.y
+            } else {
+                delta.x
+            };
+            if side.abs() > 0.01 {
+                self.placement_learning_attempt = Some(side.signum());
+            }
+        }
+        let success = orb.lifecycle == ObjectLifecycle::StoredInDen;
+        let failed = output.outcomes[..output.outcome_count]
+            .iter()
+            .any(|outcome| {
+                matches!(
+                    outcome,
+                    EcologyOutcome::EpisodeAborted(
+                        EpisodeGoal::CarryOrbHome,
+                        pet_ecology::EpisodeReason::TimedOut
+                    )
+                )
+            });
+        if success || failed {
+            let side = self.placement_learning_attempt.take()?;
+            self.adaptation_sequence = self.adaptation_sequence.saturating_add(1);
+            return self
+                .director
+                .observe_placement_result(self.adaptation_sequence, side, success);
+        }
+        if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
+            self.placement_learning_attempt = None;
+        }
+        None
+    }
+
     pub fn learn_signature(
         &mut self,
         signature: ActionSignature,
@@ -810,12 +962,7 @@ impl EcologyRuntime {
         effect.bounded()
     }
 
-    fn apply_object_commands(&mut self, output: &EcologyOutput, dt: f32) {
-        let dt = if dt.is_finite() {
-            dt.clamp(0.0, 0.25)
-        } else {
-            0.0
-        };
+    fn apply_object_commands(&mut self, output: &EcologyOutput, _dt: f32) {
         for command in output
             .object_commands
             .iter()
@@ -840,6 +987,12 @@ impl EcologyRuntime {
             match command {
                 ObjectCommand::None => {}
                 ObjectCommand::ApplyImpulse { object_id, impulse } => {
+                    if !impulse.is_finite() {
+                        continue;
+                    }
+                    self.pet_grips.retain(|grip| grip.object_id != object_id);
+                    self.release_grace.retain(|(id, _)| *id != object_id);
+                    self.release_grace.push((object_id, 0.25));
                     self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
@@ -848,6 +1001,7 @@ impl EcologyRuntime {
                         .find(|object| object.id == object_id)
                     {
                         object.lifecycle = ObjectLifecycle::Free;
+                        object.home_slot = None;
                         object.velocity += impulse / object.mass.max(0.05);
                         if object.velocity.length_squared() > MAX_OBJECT_SPEED * MAX_OBJECT_SPEED {
                             object.velocity =
@@ -867,16 +1021,17 @@ impl EcologyRuntime {
                         .iter_mut()
                         .find(|object| object.id == object_id)
                     {
-                        let alpha = 1.0 - (-speed.clamp(0.0, 12.0) * dt).exp();
-                        let previous = object.position;
-                        object.position = object
-                            .position
-                            .lerp(target.clamp(Vec2::ZERO, Vec2::ONE), alpha);
-                        object.velocity = if dt > f32::EPSILON {
-                            (object.position - previous) / dt
-                        } else {
-                            Vec2::ZERO
-                        };
+                        if !target.is_finite() || !speed.is_finite() {
+                            continue;
+                        }
+                        self.pet_grips.retain(|grip| grip.object_id != object_id);
+                        self.pet_grips.push(PetObjectGrip {
+                            object_id,
+                            target: target.clamp(Vec2::ZERO, Vec2::ONE),
+                            body_origin: self.last_body_position,
+                            strength: speed,
+                        });
+                        object.home_slot = None;
                         object.lifecycle = ObjectLifecycle::CarriedByPet;
                     }
                 }
@@ -884,6 +1039,12 @@ impl EcologyRuntime {
                     object_id,
                     velocity,
                 } => {
+                    if !velocity.is_finite() {
+                        continue;
+                    }
+                    self.pet_grips.retain(|grip| grip.object_id != object_id);
+                    self.release_grace.retain(|(id, _)| *id != object_id);
+                    self.release_grace.push((object_id, 0.25));
                     self.clear_den_slot_references(object_id);
                     if let Some(object) = self
                         .state
@@ -892,6 +1053,7 @@ impl EcologyRuntime {
                         .find(|object| object.id == object_id)
                     {
                         object.lifecycle = ObjectLifecycle::Free;
+                        object.home_slot = None;
                         object.velocity =
                             if velocity.length_squared() > MAX_OBJECT_SPEED * MAX_OBJECT_SPEED {
                                 velocity.normalize_or_zero() * MAX_OBJECT_SPEED
@@ -926,7 +1088,10 @@ impl EcologyRuntime {
                     // center before the slot becomes authoritative.
                     object.lifecycle = ObjectLifecycle::Free;
                     object.home_slot = Some(slot);
-                    object.velocity = Vec2::ZERO;
+                    object.velocity = object.velocity.clamp_length_max(0.16);
+                    self.pet_grips.retain(|grip| grip.object_id != object_id);
+                    self.release_grace.retain(|(id, _)| *id != object_id);
+                    self.release_grace.push((object_id, 0.35));
                 }
                 ObjectCommand::Retrieve {
                     object_id,
@@ -1292,6 +1457,30 @@ mod tests {
         }
         let support_px = body.liquid_physical_support_pixels(Vec2::X, viewport_height);
         let radius_px = 31.0 * viewport_height / REFERENCE_DESKTOP_HEIGHT_PX;
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::Free;
+        runtime.state.objects[0].position = feedback.world_position
+            + Vec2::new(
+                (support_px.x + radius_px + 8.0) / (viewport_height * aspect),
+                support_px.y / viewport_height,
+            );
+        runtime.state.objects[0].velocity = Vec2::ZERO;
+        let outside = runtime.orb_physical_frame(&body, &feedback, viewport_height, 1.0 / 120.0);
+        assert!(
+            !outside.contact,
+            "eight visible pixels of air must not deform the body"
+        );
+        runtime.set_measured_orb_contact(outside, viewport_height);
+        runtime.fixed_update(
+            aspect,
+            &WindowAffordanceFrame::default(),
+            &feedback,
+            1.0 / 120.0,
+        );
+        assert!(
+            !runtime.environment.contacts[..runtime.environment.contact_count]
+                .iter()
+                .any(|contact| contact.source == ContactSource::Orb)
+        );
         runtime.state.objects[0].position = feedback.world_position
             + Vec2::new(
                 (support_px.x + radius_px * 0.50) / (viewport_height * aspect),
@@ -1406,6 +1595,162 @@ mod tests {
         assert!(runtime.state.objects[0].position.y >= radius - 1.0e-6);
         assert!(runtime.state.objects[0].velocity.is_finite());
         runtime.state.validate().unwrap();
+    }
+
+    #[test]
+    fn gentle_tap_leaves_den_before_capture_is_reenabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 74, true).unwrap();
+        let mut life = lifecore::LifeCore::new(lifecore::Genome::from_seed(74), 74);
+        let intent = life
+            .tick(&SensorFrame::default(), &BodyFeedback::default(), 0.05)
+            .body_intent;
+        let mut output = runtime.director.tick_passthrough(intent, false);
+        let start = Vec2::new(0.6, 0.6);
+        runtime.state.den.anchor = start;
+        let id = runtime.state.objects[0].id;
+        runtime.state.objects[0].position = start;
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
+        runtime.state.objects[0].home_slot = Some(0);
+        runtime.state.den.slots[0] = Some(id);
+        output.object_command_count = 1;
+        output.object_commands[0] = ObjectCommand::ApplyImpulse {
+            object_id: id,
+            impulse: Vec2::new(0.068, -0.005),
+        };
+        runtime.apply_object_commands(&output, 0.05);
+        assert_eq!(runtime.state.objects[0].position, start);
+        let body = BodyFeedback::default();
+        let windows = WindowAffordanceFrame::default();
+        for _ in 0..24 {
+            runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+            assert_eq!(runtime.state.objects[0].lifecycle, ObjectLifecycle::Free);
+        }
+        assert!(runtime.state.objects[0].position.distance(start) > 0.005);
+        for _ in 0..12 {
+            runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+        }
+        assert!(runtime.release_grace.is_empty());
+        runtime.state.objects[0].position = start;
+        runtime.state.objects[0].velocity = Vec2::ZERO;
+        runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
+        assert_eq!(
+            runtime.state.objects[0].lifecycle,
+            ObjectLifecycle::StoredInDen
+        );
+    }
+
+    #[test]
+    fn compliant_pickup_is_continuous_and_fast_release_escapes_den() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 74, true).unwrap();
+        let mut life = lifecore::LifeCore::new(lifecore::Genome::from_seed(74), 74);
+        let intent = life
+            .tick(&SensorFrame::default(), &BodyFeedback::default(), 0.05)
+            .body_intent;
+        let mut output = runtime.director.tick_passthrough(intent, false);
+        output.object_command_count = 1;
+        let aspect = 2.4;
+        runtime.desktop_aspect = aspect;
+        runtime.state.den.anchor = Vec2::new(0.8, 0.8);
+        let start = runtime.state.den.anchor;
+        let id = runtime.state.objects[0].id;
+        runtime.state.objects[0].position = start;
+        runtime.state.objects[0].velocity = Vec2::new(-0.08, 0.0);
+        runtime.state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
+        let body = BodyFeedback {
+            world_position: start,
+            ..Default::default()
+        };
+        runtime.last_body_position = start;
+        output.object_commands[0] = ObjectCommand::MoveToward {
+            object_id: id,
+            target: start - Vec2::new(0.06, 0.0),
+            speed: 5.0,
+        };
+        runtime.apply_object_commands(&output, 0.05);
+        assert_eq!(
+            runtime.state.objects[0].position, start,
+            "cognition must not teleport the orb"
+        );
+        assert_eq!(
+            runtime.state.objects[0].velocity,
+            Vec2::new(-0.08, 0.0),
+            "pickup preserves momentum"
+        );
+        let mut previous = start;
+        let mut previous_velocity = runtime.state.objects[0].velocity;
+        for _ in 0..120 {
+            runtime.fixed_update(
+                aspect,
+                &WindowAffordanceFrame::default(),
+                &body,
+                1.0 / 120.0,
+            );
+            let orb = &runtime.state.objects[0];
+            let step = Vec2::new(
+                (orb.position.x - previous.x) * aspect,
+                orb.position.y - previous.y,
+            );
+            assert!(step.length() < 0.01);
+            assert!((orb.velocity - previous_velocity).length() <= 6.0 / 120.0 + 1e-5);
+            previous = orb.position;
+            previous_velocity = orb.velocity;
+        }
+        assert!((runtime.state.objects[0].position.x - (start.x - 0.06)).abs() < 0.003);
+        output.object_commands[0] = ObjectCommand::Release {
+            object_id: id,
+            velocity: Vec2::new(-1.2, 0.0),
+        };
+        runtime.apply_object_commands(&output, 0.05);
+        let released = runtime.state.objects[0].position;
+        for _ in 0..30 {
+            runtime.fixed_update(
+                aspect,
+                &WindowAffordanceFrame::default(),
+                &body,
+                1.0 / 120.0,
+            );
+        }
+        assert!(runtime.state.objects[0].position.x < released.x - 0.06);
+        assert_ne!(
+            runtime.state.objects[0].lifecycle,
+            ObjectLifecycle::CarriedByPet
+        );
+    }
+
+    #[test]
+    fn gentle_den_handoff_does_not_fight_body_contact() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 74, true).unwrap();
+        runtime.state.den.anchor = Vec2::new(0.8, 0.8);
+        let body = BodyFeedback {
+            world_position: runtime.state.den.anchor,
+            ..Default::default()
+        };
+        let orb = &mut runtime.state.objects[0];
+        orb.position = body.world_position - Vec2::new(0.025, 0.0);
+        orb.velocity = Vec2::ZERO;
+        orb.lifecycle = ObjectLifecycle::Free;
+        orb.home_slot = Some(0);
+        for _ in 0..600 {
+            runtime.fixed_update(2.4, &WindowAffordanceFrame::default(), &body, 1.0 / 120.0);
+            assert!(
+                runtime.environment.contacts[..runtime.environment.contact_count]
+                    .iter()
+                    .all(|c| c.source != ContactSource::Orb)
+            );
+            if runtime.state.objects[0].lifecycle == ObjectLifecycle::StoredInDen {
+                break;
+            }
+        }
+        assert_eq!(
+            runtime.state.objects[0].lifecycle,
+            ObjectLifecycle::StoredInDen
+        );
     }
 
     #[test]

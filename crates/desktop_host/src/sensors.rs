@@ -221,7 +221,11 @@ impl SensorNormalizer {
                 rect: normalize_rect(topology, surface.bounds),
             })
             .collect();
-        let time_of_day_01 = local_time_01.rem_euclid(1.0);
+        let time_of_day_01 = if local_time_01.is_finite() {
+            local_time_01.rem_euclid(1.0)
+        } else {
+            0.5
+        };
         SensorFrame {
             embodied_interaction: Default::default(),
             interaction_actuation: Default::default(),
@@ -320,5 +324,29 @@ fn day_phase(time: f32) -> DayPhase {
         value if value < 0.75 => DayPhase::Day,
         value if value < 0.88 => DayPhase::Evening,
         _ => DayPhase::Night,
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    #[test]
+    fn normalization_preserves_supplied_local_clock_and_rejects_nonfinite_time() {
+        let mut normalizer = SensorNormalizer::default();
+        for (time, expected, phase) in [
+            (23.0 / 24.0, 23.0 / 24.0, DayPhase::Night),
+            (0.5, 0.5, DayPhase::Day),
+            (f32::NAN, 0.5, DayPhase::Day),
+        ] {
+            let result = normalizer.normalize(
+                &DesktopSnapshot::unavailable(0.0, 0),
+                &DisplayTopology::default(),
+                Vec2::splat(0.5),
+                PointerState::default(),
+                time,
+            );
+            assert!((result.time_of_day_01 - expected).abs() < 1.0e-6);
+            assert_eq!(result.day_phase, phase);
+        }
     }
 }

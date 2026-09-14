@@ -300,6 +300,7 @@ fn derive_felt(
     let intent = b.efference_copy;
     let physical_load = unit(
         0.24 * b.contact.pressure
+            + 0.30 * b.motion.object_load
             + 0.20 * b.shape.deformation_energy
             + 0.24 * b.shape.maximum_strain
             + 0.10 * b.shape.neck_tension
@@ -649,6 +650,39 @@ mod tests {
             perception: crate::PerceptionSelectionV1::default(),
             soft_touch_pressure_max: 0.42,
         }
+    }
+
+    #[test]
+    fn object_load_defaults_for_old_feedback_and_sanitizes_invalid_input() {
+        let old: crate::BodyMotionFeedbackV2 = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.object_load, 0.0);
+        let mut body = crate::BodyFeedbackV2::default();
+        body.motion.object_load = f32::NAN;
+        body.sanitize();
+        assert_eq!(body.motion.object_load, 0.0);
+        body.motion.object_load = 10.0;
+        body.sanitize();
+        assert_eq!(body.motion.object_load, 1.0);
+    }
+
+    #[test]
+    fn object_load_is_effort_not_user_touch_or_an_impact() {
+        let neutral = source();
+        let mut carried = neutral.clone();
+        carried.body.motion.object_load = 0.8;
+        let mut neutral_director = BodyInteroceptionDirector::default();
+        let mut carried_director = BodyInteroceptionDirector::default();
+        for _ in 0..120 {
+            let _ = neutral_director.tick(&neutral, 0.05);
+            let _ = carried_director.tick(&carried, 0.05);
+        }
+        let a = neutral_director.tick(&neutral, 0.05).felt;
+        let b = carried_director.tick(&carried, 0.05).felt;
+        assert!(b.physical_load > a.physical_load + 0.20);
+        assert!((b.pain_like - a.pain_like).abs() < 1e-6);
+        assert!((b.contact_pleasantness - a.contact_pleasantness).abs() < 1e-6);
+        assert!((b.startle - a.startle).abs() < 1e-6);
+        assert!((b.restraint - a.restraint).abs() < 1e-6);
     }
 
     #[test]

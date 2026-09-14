@@ -147,7 +147,9 @@ fn elliptical_metric(
     }
     let metric_perpendicular = Vec2::new(-metric_axis.y, metric_axis.x);
     let aspect = if flight_aspect.is_finite() {
-        flight_aspect.clamp(1.0, 1.34)
+        // Flight requests remain capped at 1.34 upstream; measured support may
+        // flatten the same physical well further and then release continuously.
+        flight_aspect.clamp(1.0, 2.4)
     } else {
         1.0
     };

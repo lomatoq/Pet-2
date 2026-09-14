@@ -39,6 +39,8 @@ pub struct VoiceVisualState {
     pub syllable_index: u8,
     pub envelope: f32,
     pub mouth_open: f32,
+    /// Actual playback shout activity, not an affect/intent guess.
+    pub shout: f32,
     pub pitch_normalized: f32,
     pub noisiness: f32,
     pub purr: f32,
@@ -64,11 +66,13 @@ pub struct EmbodiedPose {
     pub squint: f32,
     pub eye_aperture: f32,
     pub eye_scale: f32,
+    pub eye_scales: [Vec2; 2],
     pub brow_raise: f32,
     pub brow_tension: f32,
     pub brow_asymmetry: f32,
     pub mouth_open: f32,
     pub mouth_curve: f32,
+    pub mouth_shout: f32,
     pub mouth_tension: f32,
     pub mouth_compression: f32,
     pub mouth_asymmetry: f32,
@@ -88,6 +92,10 @@ pub struct EmbodiedPose {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbodiedRuntime {
+    /// Live R14 owns the blink timeline; legacy standalone previews use fallback.
+    pub managed_blink: bool,
+    /// Host-selected nearby object/floor fixation, never a replacement world target.
+    pub near_attention: bool,
     pub pose: EmbodiedPose,
     pub physiology: VisualPhysiologyRuntime,
     pub droplets: DropletRuntime,
@@ -96,10 +104,13 @@ pub struct EmbodiedRuntime {
     seed_phase: f32,
     seed: u64,
     elapsed: f32,
+    breath_phase: f32,
     fixation_elapsed: f32,
     fixation_duration: f32,
     gaze_target: Vec2,
     base_gaze: Vec2,
+    authored_lids: [[f32; 4]; 2],
+    shout_activity: f32,
     gaze_velocity: Vec2,
     saccade_strength: f32,
     microsaccade_from: Vec2,
@@ -154,6 +165,7 @@ impl EmbodiedRuntime {
         let seed_phase = (seed as u32 as f32 / u32::MAX as f32) * std::f32::consts::TAU;
         Self {
             pose: EmbodiedPose {
+                eye_scales: [Vec2::ONE; 2],
                 pupil_size: 0.52,
                 eye_aperture: 1.0,
                 eye_scale: 1.0,
@@ -168,10 +180,13 @@ impl EmbodiedRuntime {
             seed_phase,
             seed,
             elapsed: 0.0,
+            breath_phase: 0.0,
             fixation_elapsed: 0.0,
             fixation_duration: 0.35 + seed_phase.sin().abs() * 0.45,
             gaze_target: Vec2::ZERO,
             base_gaze: Vec2::ZERO,
+            authored_lids: [[0.0; 4]; 2],
+            shout_activity: 0.0,
             gaze_velocity: Vec2::ZERO,
             saccade_strength: 0.0,
             microsaccade_from: Vec2::ZERO,
@@ -193,6 +208,8 @@ impl EmbodiedRuntime {
             luminance_history: [LuminanceSample::default(); LUMINANCE_HISTORY],
             luminance_history_count: 0,
             luminance_history_cursor: 0,
+            managed_blink: false,
+            near_attention: false,
             blink_phase: 0.0,
             blink_kind: BlinkKind::None,
             blink_clock: 0.0,
@@ -290,6 +307,7 @@ impl EmbodiedRuntime {
             0.0
         };
         self.present_gaze(dt);
+        self.present_gaze_lids();
         self.liquid.presentation_update(dt);
     }
 
@@ -320,7 +338,11 @@ impl EmbodiedRuntime {
         self.slow_blink_cooldown = (self.slow_blink_cooldown - dt).max(0.0);
         self.wink_cooldown = (self.wink_cooldown - dt).max(0.0);
 
-        let mode = gaze_mode(intent, affect);
+        let mode = if self.managed_blink {
+            managed_gaze_mode(intent)
+        } else {
+            gaze_mode(intent, affect)
+        };
         let desired_gaze = desired_gaze(
             mode,
             intent,
@@ -340,7 +362,10 @@ impl EmbodiedRuntime {
         );
         self.update_attention_face_pose(mode, mind, feedback);
         let authored_blink = expression.blink_left.max(expression.blink_right);
-        if authored_blink > 0.02 {
+        if self.managed_blink || authored_blink > 0.02 {
+            self.blink_kind = BlinkKind::None;
+            self.blink_phase = 0.0;
+            self.blink_clock = 0.0;
             self.pose.blink_left = expression.blink_left.clamp(0.0, 1.0);
             self.pose.blink_right = expression.blink_right.clamp(0.0, 1.0);
         } else {
@@ -358,6 +383,8 @@ impl EmbodiedRuntime {
             12.0,
             dt,
         );
+        // Emotion changes lid contours, never magnifies the eyeball/iris.
+        self.pose.eye_scales = [Vec2::ONE; 2];
         let aperture_closure = 1.0 - self.pose.eye_aperture;
         self.pose.blink_left = self.pose.blink_left.max(aperture_closure);
         self.pose.blink_right = self.pose.blink_right.max(aperture_closure);
@@ -365,11 +392,33 @@ impl EmbodiedRuntime {
         self.update_soft_body(genome, intent, feedback, affect, dt);
 
         let voice_mouth = voice_mouth_target(voice);
+        let shout_target = if voice.active && voice.shout.is_finite() {
+            voice.shout.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let shout_rate = if shout_target > self.shout_activity {
+            28.0
+        } else {
+            7.0
+        };
+        self.shout_activity = smooth(self.shout_activity, shout_target, shout_rate, dt);
+        self.pose.mouth_shout = self.shout_activity;
         // Silent O/smile is semantic geometry. Only actual playback adds articulation.
-        self.pose.geometry = expression.geometry.sanitized();
-        let mouth_target = expression.mouth_open.clamp(0.0, 1.0).max(voice_mouth);
+        self.pose.geometry = expressive_asymmetric_geometry(expression);
+        self.pose.geometry.mouth[0] += (1.60 - self.pose.geometry.mouth[0]) * self.shout_activity;
+        self.pose.geometry.mouth[3] *= 1.0 - self.shout_activity;
+        self.authored_lids = self.pose.geometry.lids;
+        self.present_gaze_lids();
+        let mouth_target = expression
+            .mouth_open
+            .clamp(0.0, 1.0)
+            .max(voice_mouth)
+            .max(self.shout_activity);
         self.pose.mouth_open = smooth(self.pose.mouth_open, mouth_target, 22.0, dt);
-        self.pose.mouth_curve = expression.mouth_curve.clamp(-1.0, 1.0);
+        self.pose.mouth_curve = expression.mouth_curve.clamp(-1.0, 1.0)
+            * (1.0 - self.shout_activity)
+            - self.shout_activity * 0.08;
         self.pose.mouth_tension = expression.mouth_tension.clamp(0.0, 1.0);
         self.pose.brow_raise = expression.brow_raise.clamp(-1.0, 1.0);
         self.pose.brow_tension = expression.brow_tension.clamp(0.0, 1.0);
@@ -452,11 +501,17 @@ impl EmbodiedRuntime {
         dt: f32,
     ) {
         self.fixation_elapsed += dt;
+        let desired =
+            if self.managed_blink && self.near_attention && mode == GazeMode::TrackWorldTarget {
+                nearby_gaze_transfer(desired)
+            } else {
+                desired
+            };
         let target_distance = desired.distance(self.gaze_target);
         let should_saccade = target_distance > 0.065
             || self.fixation_elapsed >= self.fixation_duration
             || self.pose.gaze_mode != mode;
-        if should_saccade && desired.is_finite() {
+        if (should_saccade || self.managed_blink) && desired.is_finite() {
             self.gaze_target = desired.clamp(Vec2::splat(-0.92), Vec2::splat(0.92));
             self.fixation_elapsed = 0.0;
             let attention_hold = mind.attention_commitment * 0.20;
@@ -475,7 +530,7 @@ impl EmbodiedRuntime {
             && ((mind.attention_confidence >= 0.72 && mind.attention_commitment >= 0.35)
                 || expression.pupil_focus >= 0.82);
         self.fixation_locked = sleep_lock || strong_fixation;
-        if sleep_lock {
+        if sleep_lock || self.managed_blink {
             let decay = 1.0 - (-18.0 * dt).exp();
             self.microsaccade_offset = self.microsaccade_offset.lerp(Vec2::ZERO, decay);
             if self.microsaccade_offset.length_squared() < 1.0e-8 {
@@ -579,7 +634,9 @@ impl EmbodiedRuntime {
             0.0
         };
         let flight_direction = local_flight_velocity.normalize_or_zero();
-        let flight_drive = if mode == GazeMode::Sleep {
+        let flight_drive = if mode == GazeMode::Sleep
+            || (self.managed_blink && (feedback.grounded || feedback.clinging))
+        {
             0.0
         } else {
             smoothstep(0.045, 0.42, flight_speed) * 0.90
@@ -635,6 +692,27 @@ impl EmbodiedRuntime {
                 .clamp(-0.15, 0.15);
     }
 
+    fn present_gaze_lids(&mut self) {
+        // Use presented pupil motion, never the newly selected saccade target.
+        // Recompose from authored controls each frame, avoiding accumulated drift.
+        let vertical = if self.pose.gaze.is_finite() {
+            self.pose.gaze.y.clamp(-0.95, 0.95)
+        } else {
+            0.0
+        };
+        self.pose.geometry.lids = self.authored_lids;
+        for (eye, blink) in [self.pose.blink_left, self.pose.blink_right]
+            .into_iter()
+            .enumerate()
+        {
+            let visible = (1.0 - blink.clamp(0.0, 1.0)).powi(2);
+            self.pose.geometry.lids[eye][0] += vertical * 0.30 * visible;
+            self.pose.geometry.lids[eye][1] += vertical * 0.26 * visible;
+            self.pose.geometry.lids[eye][2] += vertical * 0.08 * visible;
+        }
+        self.pose.geometry = self.pose.geometry.sanitized();
+    }
+
     fn present_gaze(&mut self, dt: f32) {
         let presented_gaze_before = if self.pose.gaze.is_finite() {
             self.pose.gaze
@@ -646,7 +724,11 @@ impl EmbodiedRuntime {
         } else {
             self.gaze_target
         };
-        let frequency = 36.0 + self.saccade_strength * 48.0;
+        let frequency = if self.managed_blink {
+            24.0
+        } else {
+            36.0 + self.saccade_strength * 48.0
+        };
         // The explicit spring used by the soft-body presentation can overshoot
         // or become unstable during a frame hitch. Gaze uses the closed-form
         // critically damped solution and recovers to the last presented value,
@@ -905,11 +987,84 @@ impl EmbodiedRuntime {
         );
         let breathing_rate =
             1.2 + affect.arousal * 1.8 + voice_breath_boost(self.pose.audio_envelope);
-        let breath_target = 0.5 + 0.5 * (self.elapsed * breathing_rate + self.seed_phase).sin();
+        // Integrate frequency: elapsed * changing_rate jumps phase as arousal
+        // changes, with discontinuities growing throughout a long session.
+        self.breath_phase =
+            (self.breath_phase + breathing_rate * dt).rem_euclid(std::f32::consts::TAU);
+        let breath_target = 0.5 + 0.5 * (self.breath_phase + self.seed_phase).sin();
         self.pose.breath = smooth(self.pose.breath, breath_target, 3.0, dt);
         self.modal_dynamics.update(softness, feedback, dt);
         self.pose.morph = self.modal_dynamics.deformation;
     }
+}
+
+fn expressive_asymmetric_geometry(expression: lifecore::ExpressionState) -> lifecore::FaceGeometry {
+    // The shader consumes independent curve points, not the legacy asymmetry
+    // scalars. Compose once from the smoothed expression (never from last frame)
+    // so an authored pose cannot erase asymmetry or accumulate it over time.
+    let mut geometry = expression.geometry.sanitized();
+    let signed = |value: f32| {
+        if value.is_finite() {
+            value.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let brow = signed(expression.brow_asymmetry);
+    let knit = signed(expression.brow_tension).max(0.0);
+    let concern = (-signed(expression.mouth_curve)).max(0.0) * (1.0 - knit);
+    for (index, side) in [1.0, -1.0].into_iter().enumerate() {
+        // Local action correctives, not rotation of a rigid brow: inner worry
+        // lift and corrugator-like knitting compete; an inquisitive side raises
+        // its inner section/arch while the other side changes its outer section.
+        let unilateral = side * brow;
+        geometry.lids[index][0] += unilateral * 0.18;
+        geometry.lids[index][1] += unilateral * 0.06;
+        geometry.lids[index][2] += (-unilateral).max(0.0) * 0.12;
+        geometry.brows[index][0] +=
+            concern * 0.55 - knit * 0.30 + unilateral * if unilateral > 0.0 { 0.90 } else { 0.65 };
+        geometry.brows[index][1] += -concern * 0.18
+            + knit * 0.12
+            + unilateral * if unilateral > 0.0 { -0.12 } else { 0.32 };
+        geometry.brows[index][2] +=
+            concern * 0.20 - knit * 0.24 + unilateral * if unilateral > 0.0 { 0.34 } else { 0.10 };
+    }
+    let mouth = signed(expression.mouth_asymmetry);
+    let open = signed(expression.mouth_open).max(0.0);
+    let smile = signed(expression.mouth_curve).max(0.0);
+    let compression = signed(expression.mouth_compression).max(0.0);
+    let effort = signed(expression.effort).max(0.0);
+    // A smile recruits the lower lid/cheek rather than merely opening a mouth
+    // below otherwise neutral eyes. Bracing/compression inhibits this synergy.
+    let cheek_raise = smile
+        * 0.22
+        * (1.0 - compression)
+        * (1.0 - signed(expression.mouth_tension).max(0.0) * 0.5);
+    for lid in &mut geometry.lids {
+        lid[2] += cheek_raise;
+    }
+    // Stylized muscle synergies, driven only by already-smoothed expression:
+    // jaw lowering rounds a neutral opening, smiling stretches its corners,
+    // and lip compression closes the aperture independently of jaw activation.
+    // These channels previously existed in intent but never shaped the mouth.
+    geometry.mouth[0] *=
+        (1.0 + smile * 0.32 + effort * 0.10 - open * (1.0 - smile) * 0.24 - compression * 0.14)
+            .clamp(0.65, 1.40);
+    geometry.mouth[3] = geometry.mouth[3].max(compression);
+    // A unilateral corner pull is not a rigid mouth tilt: the opposing corner
+    // participates less, especially while the jaw is open.
+    let counter_pull = 0.62 + open * 0.18;
+    geometry.mouth[1] += if mouth >= 0.0 {
+        mouth
+    } else {
+        mouth * counter_pull
+    };
+    geometry.mouth[2] -= if mouth <= 0.0 {
+        mouth
+    } else {
+        mouth * counter_pull
+    };
+    geometry.sanitized()
 }
 
 fn voice_mouth_target(voice: VoiceVisualState) -> f32 {
@@ -924,6 +1079,21 @@ fn voice_mouth_target(voice: VoiceVisualState) -> f32 {
     // phonation visibly articulated instead of multiplying the tract aperture
     // by raw near-zero PCM energy.
     articulated_aperture * (0.30 + activity * 0.70)
+}
+
+// The companion director already selects a meaningful target. Legacy mood-based
+// scan/side-eye rules must not replace that target downstream, and a missing
+// target means neutral gaze rather than tracking an unrelated distant cursor.
+fn managed_gaze_mode(intent: &BodyIntent) -> GazeMode {
+    // Live final gaze owner publishes None for actual sleep. A cosmetic pose
+    // nomination must not countermand an already reconciled awake fixation.
+    if intent.gaze_target.is_some_and(|target| target.is_finite()) {
+        GazeMode::TrackWorldTarget
+    } else if intent.pose == PoseIntent::Sleeping {
+        GazeMode::Sleep
+    } else {
+        GazeMode::DirectViewer
+    }
 }
 
 fn gaze_mode(intent: &BodyIntent, affect: AffectState) -> GazeMode {
@@ -982,6 +1152,14 @@ fn desired_gaze(
                 .clamp(Vec2::splat(-0.88), Vec2::splat(0.88))
         }
     }
+}
+
+fn nearby_gaze_transfer(desired: Vec2) -> Vec2 {
+    // Continuous radial magnification; finite slope <=3 near zero, no direction
+    // normalization/dead zone. Real close targets become legible while distant
+    // targets and the existing bounded presentation filter retain their limits.
+    let gain = 1.0 + 2.0 / (1.0 + desired.length_squared() / 0.09);
+    (desired * gain).clamp(Vec2::splat(-0.88), Vec2::splat(0.88))
 }
 
 fn blink_envelope(phase: f32, slow: bool) -> f32 {
@@ -1068,6 +1246,26 @@ fn deterministic_unit(seed: u64, sequence: u64, salt: u64) -> f32 {
 mod tests {
     use super::*;
     use lifecore::{BodyIntent, Genome, LocomotionMode, PoseIntent};
+
+    #[test]
+    fn managed_asymmetry_reaches_independent_rendered_curves_without_drift() {
+        let mut expression = lifecore::FacePose::Curious.expression();
+        expression.brow_asymmetry = 0.4;
+        expression.mouth_asymmetry = 0.24;
+        let geometry = expressive_asymmetric_geometry(expression);
+        assert!(geometry.brows[0][0] - geometry.brows[1][0] > 0.5);
+        assert!(geometry.mouth[1] - geometry.mouth[2] > 0.35);
+        assert!(geometry.lids[0][0] > geometry.lids[1][0]);
+        for _ in 0..300 {
+            assert_eq!(expressive_asymmetric_geometry(expression), geometry);
+        }
+        expression.brow_asymmetry = 0.0;
+        expression.mouth_asymmetry = 0.0;
+        let symmetric = expressive_asymmetric_geometry(expression);
+        assert_eq!(symmetric.brows[0], symmetric.brows[1]);
+        assert_eq!(symmetric.mouth[1], expression.geometry.mouth[1]);
+        assert_eq!(symmetric.mouth[2], expression.geometry.mouth[2]);
+    }
 
     fn intent() -> BodyIntent {
         BodyIntent {
@@ -1198,6 +1396,164 @@ mod tests {
         }
         assert_eq!(runtime.pose.gaze_mode, GazeMode::DirectViewer);
         assert!(runtime.pose.gaze.length() < 0.08);
+    }
+
+    #[test]
+    fn managed_gaze_does_not_scan_or_side_eye_when_mood_and_pose_flicker() {
+        let genome = Genome::from_seed(913);
+        let traits = DerivedVisualTraits::from_genome(&genome);
+        let mut runtime = EmbodiedRuntime::new(genome.identity_seed, &traits);
+        runtime.managed_blink = true;
+        let mut display = intent();
+        display.gaze_target = Some(Vec2::new(0.6, 0.55));
+        let mut previous = Vec2::ZERO;
+        for tick in 0..600 {
+            display.pose = if tick % 2 == 0 {
+                PoseIntent::Curious
+            } else {
+                PoseIntent::Display
+            };
+            let mode = managed_gaze_mode(&display);
+            assert_eq!(mode, GazeMode::TrackWorldTarget);
+            let desired = desired_gaze(
+                mode,
+                &display,
+                &SensorFrame::default(),
+                Vec2::splat(0.5),
+                tick as f32 / 60.0,
+                0.0,
+            );
+            runtime.update_gaze(
+                mode,
+                desired,
+                AffectState::default(),
+                VisualMindInput::default(),
+                display.expression,
+                FaceTuning::default(),
+                1.0 / 60.0,
+            );
+            runtime.present_gaze(1.0 / 60.0);
+            assert!(runtime.pose.gaze.distance(previous) < 0.04);
+            if tick > 60 {
+                assert!(runtime.pose.gaze.distance(Vec2::new(0.22, -0.11)) < 0.0001);
+            }
+            previous = runtime.pose.gaze;
+        }
+        display.gaze_target = None;
+        for _ in 0..120 {
+            let mode = managed_gaze_mode(&display);
+            let desired = desired_gaze(
+                mode,
+                &display,
+                &SensorFrame::default(),
+                Vec2::splat(0.5),
+                0.0,
+                0.0,
+            );
+            runtime.update_gaze(
+                mode,
+                desired,
+                AffectState::default(),
+                VisualMindInput::default(),
+                display.expression,
+                FaceTuning::default(),
+                1.0 / 60.0,
+            );
+            runtime.present_gaze(1.0 / 60.0);
+        }
+        assert!(runtime.pose.gaze.length() < 0.0001);
+    }
+
+    #[test]
+    fn nearby_attention_is_legible_continuous_and_opt_in_at_all_frame_rates() {
+        let genome = Genome::from_seed(914);
+        let traits = DerivedVisualTraits::from_genome(&genome);
+        for hz in [30, 60, 120] {
+            for enabled in [false, true] {
+                let mut runtime = EmbodiedRuntime::new(genome.identity_seed, &traits);
+                runtime.managed_blink = true;
+                runtime.near_attention = enabled;
+                let target = Vec2::new(0.0, -0.066);
+                for _ in 0..hz * 2 {
+                    runtime.update_gaze(
+                        GazeMode::TrackWorldTarget,
+                        target,
+                        AffectState::default(),
+                        VisualMindInput::default(),
+                        lifecore::ExpressionState::default(),
+                        FaceTuning::default(),
+                        1.0 / hz as f32,
+                    );
+                    runtime.present_gaze(1.0 / hz as f32);
+                }
+                let expected = if enabled {
+                    nearby_gaze_transfer(target)
+                } else {
+                    target
+                };
+                assert!(runtime.pose.gaze.distance(expected) < 0.001);
+                if enabled {
+                    assert!(runtime.pose.gaze.y < -0.18);
+                }
+            }
+        }
+        assert_eq!(nearby_gaze_transfer(Vec2::ZERO), Vec2::ZERO);
+        for delta in [0.000001, 0.0001, 0.001] {
+            let a = nearby_gaze_transfer(Vec2::new(delta, 0.0));
+            let b = nearby_gaze_transfer(Vec2::new(-delta, 0.0));
+            assert!(a.distance(b) <= 6.0 * delta + 1.0e-7);
+            assert_eq!(a, -b);
+        }
+    }
+
+    #[test]
+    fn managed_supported_face_does_not_bob_from_contact_velocity() {
+        let genome = Genome::from_seed(914);
+        let traits = DerivedVisualTraits::from_genome(&genome);
+        let mut runtime = EmbodiedRuntime::new(genome.identity_seed, &traits);
+        runtime.managed_blink = true;
+        for tick in 0..240 {
+            let feedback = BodyFeedback {
+                grounded: true,
+                velocity: Vec2::new(0.0, if tick % 2 == 0 { 0.02 } else { -0.02 }),
+                ..BodyFeedback::default()
+            };
+            runtime.update_attention_face_pose(
+                GazeMode::TrackWorldTarget,
+                VisualMindInput::default(),
+                &feedback,
+            );
+            assert_eq!(runtime.pose.face_attention_offset, Vec2::ZERO);
+            assert_eq!(runtime.pose.face_attention_roll, 0.0);
+        }
+    }
+
+    #[test]
+    fn breathing_rate_changes_do_not_rephase_long_sessions() {
+        let genome = Genome::from_seed(914);
+        let traits = DerivedVisualTraits::from_genome(&genome);
+        let mut fresh = EmbodiedRuntime::new(genome.identity_seed, &traits);
+        let mut old = fresh.clone();
+        old.elapsed = 30_000.0;
+        for frame in 0..240 {
+            let affect = AffectState {
+                arousal: if frame % 2 == 0 { 0.1 } else { 0.9 },
+                ..AffectState::default()
+            };
+            for runtime in [&mut fresh, &mut old] {
+                let before = runtime.breath_phase;
+                runtime.update_soft_body(
+                    &genome.body,
+                    &intent(),
+                    &BodyFeedback::default(),
+                    affect,
+                    1.0 / 60.0,
+                );
+                let delta = (runtime.breath_phase - before).rem_euclid(std::f32::consts::TAU);
+                assert!(delta <= 0.06);
+            }
+            assert_eq!(fresh.pose.breath, old.pose.breath);
+        }
     }
 
     fn settled_pupil(

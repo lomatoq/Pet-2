@@ -2,7 +2,7 @@ use std::{
     fs::File,
     io::{self, Write},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -16,6 +16,86 @@ use crate::{
 };
 
 const ERROR_CAPACITY: usize = 8;
+
+#[test]
+fn sleep_breath_uses_real_queue_renderer_without_phonation() {
+    let voice = lifecore::Genome::from_seed(42).voice;
+    let command = prepare_nonphonated(
+        &voice,
+        crate::NonPhonatedRequest {
+            kind: crate::NonPhonatedKind::SleepBreath,
+            intensity: 0.25,
+            pan: 0.0,
+            seed: 414,
+        },
+    );
+    let render = || render_prepared_command(command, 24_000, 1, OfflineSampleFormat::F32);
+    let first = render();
+    assert_eq!(first, render());
+    let OfflinePcm::F32(samples) = first.pcm else {
+        panic!("float PCM expected")
+    };
+    assert!(samples.iter().all(|s| s.is_finite() && s.abs() < 0.02));
+    assert!(samples.iter().any(|s| s.abs() > 0.000001));
+    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+    assert!((0.0002..0.003).contains(&rms), "quiet breath RMS {rms}");
+    assert!(samples[29_000..].iter().all(|s| *s == 0.0));
+    assert_eq!(command.motif_id, 0);
+    let queue = Arc::new(SpscRing::new());
+    queue.push(command).unwrap();
+    let feedback = Arc::new(AudioVisualBridge::default());
+    let mut synth = SynthVoice::with_bridges(
+        queue,
+        24_000,
+        Arc::clone(&feedback),
+        Arc::new(BodyVoiceBridge::default()),
+    );
+    for _ in 0..12_000 {
+        let _ = synth.next_stereo_frame();
+    }
+    assert!(feedback.snapshot().active);
+    assert_eq!(feedback.snapshot().glottal_openness, 0.0);
+    assert_eq!(feedback.snapshot().shout, 0.0);
+    for _ in 0..18_000 {
+        let _ = synth.next_stereo_frame();
+    }
+    assert!(!feedback.snapshot().active);
+}
+
+/// Prepare an airflow-only command for the existing bounded output queue.
+pub fn prepare_nonphonated(
+    voice: &VoiceGenome,
+    request: crate::NonPhonatedRequest,
+) -> VoiceCommand {
+    let motif = lifecore::generate_initial_motifs(voice).remove(0);
+    let vocal = VocalRequest {
+        motif_id: 0,
+        performance_seed: request.seed,
+        gain: 0.12,
+        pan: request.pan,
+        pitch_scale: 1.0,
+        tempo_scale: 1.0,
+        stress: 0.0,
+        purr: false,
+        gesture: lifecore::VoiceGesture::ReliefExhale,
+        priority: 0,
+        style: lifecore::VocalStyle::ContentMurmur,
+        valence: 0.0,
+        arousal: 0.0,
+        fatigue: 0.0,
+        confidence: 1.0,
+        attachment: 0.0,
+        rhythm_intervals: [0.0; 8],
+        phenotype: Default::default(),
+    };
+    let mut command = VoiceCommand::prepare(voice, &motif, &vocal);
+    command.motif_id = 0; // No learned vocal motif receives breath-event credit.
+    command.nonphonated = Some(request);
+    command.syllable_count = 1;
+    command.syllables[0].duration_ms = 1300.0;
+    command.syllables[0].gap_after_ms = 0.0;
+    command
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeSampleFormat {
@@ -103,9 +183,20 @@ pub struct AudioEngine {
     commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
     errors: Arc<SpscRing<AudioRuntimeEvent, ERROR_CAPACITY>>,
     feedback: Arc<AudioVisualBridge>,
+    phrase_variation: Mutex<crate::PhraseVariationState>,
 }
 
 impl AudioEngine {
+    /// Caller retains quiet-mode, event admission and cooldown ownership.
+    pub fn enqueue_nonphonated(
+        &self,
+        voice: &VoiceGenome,
+        request: crate::NonPhonatedRequest,
+    ) -> Result<(), AudioError> {
+        self.commands
+            .push(prepare_nonphonated(voice, request))
+            .map_err(|_| AudioError::CommandQueueFull)
+    }
     pub fn default_output_device_name() -> Result<String, AudioError> {
         let host = cpal::default_host();
         let device = host
@@ -231,6 +322,7 @@ impl AudioEngine {
             commands,
             errors,
             feedback,
+            phrase_variation: Mutex::new(crate::PhraseVariationState::default()),
         })
     }
 
@@ -240,9 +332,19 @@ impl AudioEngine {
         motif: &VocalMotif,
         request: &VocalRequest,
     ) -> Result<(), AudioError> {
+        // This lock/allocation is exclusively on the producer thread, never in
+        // the audio callback. Failed queue admission does not consume history.
+        let mut state = self
+            .phrase_variation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut next = state.clone();
+        let command = next.prepare(voice, motif, request);
         self.commands
-            .push(VoiceCommand::prepare(voice, motif, request))
-            .map_err(|_| AudioError::CommandQueueFull)
+            .push(command)
+            .map_err(|_| AudioError::CommandQueueFull)?;
+        *state = next;
+        Ok(())
     }
 
     #[must_use]
@@ -348,6 +450,36 @@ pub fn render_motif_with_body_timeline(
     format: OfflineSampleFormat,
 ) -> OfflineRender {
     let command = VoiceCommand::prepare(voice, motif, request);
+    render_prepared_with_body_timeline(
+        command,
+        body_timeline,
+        body_frame_rate_hz,
+        sample_rate,
+        channels,
+        format,
+    )
+}
+
+/// Renders the exact prepared command accepted by production enqueue, including
+/// structural phrase variation. Uses the same SynthVoice/callback sample path.
+#[must_use]
+pub fn render_prepared_command(
+    command: VoiceCommand,
+    sample_rate: u32,
+    channels: u16,
+    format: OfflineSampleFormat,
+) -> OfflineRender {
+    render_prepared_with_body_timeline(command, &[], 100, sample_rate, channels, format)
+}
+
+fn render_prepared_with_body_timeline(
+    command: VoiceCommand,
+    body_timeline: &[BodyVoiceFrame],
+    body_frame_rate_hz: u32,
+    sample_rate: u32,
+    channels: u16,
+    format: OfflineSampleFormat,
+) -> OfflineRender {
     let commands = Arc::new(SpscRing::new());
     commands
         .push(command)

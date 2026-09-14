@@ -9,6 +9,56 @@ const EMBEDDED_WINDOW_MOTION_THRESHOLD_PX_PER_SECOND: f32 = 8.0;
 /// It is intentionally authored in physical height space so ultrawide layouts
 /// do not change the fall or bounce.
 pub const ORB_SCREEN_GRAVITY: f32 = 0.72;
+
+/// A carried object is integrated at physics cadence, never repositioned by
+/// the 20 Hz decision loop. Velocities use desktop-height units on both axes.
+pub fn step_compliant_grip(
+    object: &mut WorldObject,
+    target: Vec2,
+    strength: f32,
+    config: ObjectPhysicsConfig,
+    dt: f32,
+) {
+    if object.lifecycle != ObjectLifecycle::CarriedByPet
+        || !target.is_finite()
+        || !dt.is_finite()
+        || dt <= 0.0
+    {
+        return;
+    }
+    let dt = dt.min(1.0 / 30.0);
+    let aspect = config.desktop_aspect.clamp(0.25, 8.0);
+    let radius =
+        (object.radius_px_at_reference / config.reference_height_px.max(64.0)).clamp(0.001, 0.2);
+    let minimum = Vec2::splat(radius);
+    let maximum = Vec2::new(aspect - radius, 1.0 - radius);
+    let mut position = Vec2::new(object.position.x * aspect, object.position.y);
+    let target = Vec2::new(target.x * aspect, target.y).clamp(minimum, maximum);
+    let omega = 5.0 + strength.clamp(0.0, 12.0) * 1.6;
+    let mass = if object.mass.is_finite() {
+        object.mass.clamp(0.05, 8.0)
+    } else {
+        0.72
+    };
+    let stiffness = omega * omega * 0.72;
+    let damping = 2.0 * (stiffness * mass).sqrt();
+    let grip_force =
+        ((target - position) * stiffness - object.velocity * damping).clamp_length_max(4.32);
+    let acceleration = (grip_force / mass + Vec2::Y * ORB_SCREEN_GRAVITY).clamp_length_max(6.0);
+    object.velocity = (object.velocity + acceleration * dt).clamp_length_max(MAX_OBJECT_SPEED);
+    position = (position + object.velocity * dt).clamp(minimum, maximum);
+    object.position = Vec2::new(position.x / aspect, position.y);
+    if (position.x <= minimum.x && object.velocity.x < 0.0)
+        || (position.x >= maximum.x && object.velocity.x > 0.0)
+    {
+        object.velocity.x = 0.0;
+    }
+    if (position.y <= minimum.y && object.velocity.y < 0.0)
+        || (position.y >= maximum.y && object.velocity.y > 0.0)
+    {
+        object.velocity.y = 0.0;
+    }
+}
 const FLOOR_REST_SPEED: f32 = 0.055;
 const FLOOR_TANGENTIAL_FRICTION: f32 = 0.82;
 
@@ -29,6 +79,9 @@ pub struct ExternalContact {
     pub penetration_px: f32,
     pub relative_velocity_px: Vec2,
     pub intensity: f32,
+    /// Total reciprocal force on the pet, toy mass * normalized desktop XY/s².
+    /// Already divided by ecology dt; body substeps integrate it, not replay it.
+    pub body_force_world: Vec2,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -325,6 +378,7 @@ pub fn step_object_with_windows(
         }
         object.lifecycle = ObjectLifecycle::Free;
         environment.push_contact(ExternalContact {
+            body_force_world: Vec2::ZERO,
             source: ContactSource::Window,
             point_world: surface_point_world,
             normal_world: normal,
@@ -419,6 +473,7 @@ pub fn resolve_object_body_contact(
     object.lifecycle = ObjectLifecycle::Free;
     let normal_world = Vec2::new(normal.x / aspect, normal.y).normalize_or_zero();
     environment.push_contact(ExternalContact {
+        body_force_world: Vec2::ZERO,
         source: ContactSource::Orb,
         point_world: (body_position + normal_world * body_radius).clamp(Vec2::ZERO, Vec2::ONE),
         normal_world: -normal_world,
@@ -426,6 +481,99 @@ pub fn resolve_object_body_contact(
         relative_velocity_px: relative_velocity * reference_height,
         intensity: (relative_velocity.length() * 0.45 + penetration * 12.0).clamp(0.0, 1.0),
     });
+    true
+}
+
+/// Compliant finite-mass contact. The legacy geometric query supplies the same
+/// feasible contact normal, but its teleport and infinite-mass bounce are not
+/// applied. Orb momentum change is returned as reciprocal mean body force.
+pub fn resolve_soft_object_body_contact(
+    object: &mut WorldObject,
+    body_position: Vec2,
+    body_velocity: Vec2,
+    config: ObjectPhysicsConfig,
+    environment: &mut EmbodiedEnvironmentFrame,
+    dt: f32,
+) -> bool {
+    if !dt.is_finite() || dt <= 0.0 || !object.mass.is_finite() {
+        return false;
+    }
+    let dt = dt.min(1.0 / 30.0);
+    let mut probe = object.clone();
+    let mut measured = EmbodiedEnvironmentFrame::default();
+    if !resolve_object_body_contact(
+        &mut probe,
+        body_position,
+        body_velocity,
+        config,
+        &mut measured,
+    ) {
+        return false;
+    }
+    resolve_soft_object_body_contact_measured(
+        object,
+        body_velocity,
+        config,
+        environment,
+        dt,
+        Some(measured.contacts[0]),
+    )
+}
+
+/// Native gel-contour contact. None explicitly means no contact; the nominal
+/// portable radius must not create a second invisible collision boundary.
+pub fn resolve_soft_object_body_contact_measured(
+    object: &mut WorldObject,
+    body_velocity: Vec2,
+    config: ObjectPhysicsConfig,
+    environment: &mut EmbodiedEnvironmentFrame,
+    dt: f32,
+    contact: Option<ExternalContact>,
+) -> bool {
+    let Some(mut contact) = contact else {
+        return false;
+    };
+    if !dt.is_finite()
+        || dt <= 0.0
+        || !object.mass.is_finite()
+        || !contact.normal_world.is_finite()
+        || !contact.penetration_px.is_finite()
+        || !matches!(
+            object.lifecycle,
+            ObjectLifecycle::Free | ObjectLifecycle::Sleeping
+        )
+    {
+        return false;
+    }
+    let dt = dt.min(1.0 / 30.0);
+    let aspect = config.desktop_aspect.clamp(0.25, 8.0);
+    let normal =
+        -Vec2::new(contact.normal_world.x * aspect, contact.normal_world.y).normalize_or_zero();
+    let mass = object.mass.clamp(0.05, 8.0);
+    let pet_mass = 3.0;
+    let relative = object.velocity - Vec2::new(body_velocity.x * aspect, body_velocity.y);
+    let incoming = relative.dot(normal);
+    let depth = contact.penetration_px / config.reference_height_px.max(64.0);
+    let separation_speed = (depth * 8.0).min(0.16);
+    let target_impulse =
+        ((separation_speed - incoming * 1.08) / (mass.recip() + 1.0 / pet_mass)).max(0.0);
+    // Fixed force budget, not an acceleration multiplier: heavier objects move
+    // less under the same soft push. Restitution .08 represents yielding tissue.
+    let normal_impulse = target_impulse.min(4.0 * dt);
+    let tangent = relative - normal * incoming;
+    let impulse = normal * normal_impulse
+        - tangent.normalize_or_zero() * (tangent.length() * mass).min(normal_impulse * 0.18);
+    let previous_velocity = object.velocity;
+    object.velocity = (object.velocity + impulse / mass).clamp_length_max(MAX_OBJECT_SPEED);
+    let actual_impulse = (object.velocity - previous_velocity) * mass;
+    contact.body_force_world = -Vec2::new(actual_impulse.x / aspect, actual_impulse.y) / dt;
+    contact.intensity = (actual_impulse.length() / dt / 4.0).clamp(0.0, 1.0);
+    // Small bounded drift correction, never the old full-radius teleport.
+    let correction = normal * depth.min(0.08 * dt);
+    object.position += Vec2::new(correction.x / aspect, correction.y);
+    object.position = object.position.clamp(Vec2::ZERO, Vec2::ONE);
+    object.lifecycle = ObjectLifecycle::Free;
+    environment.push_contact(contact);
     true
 }
 
@@ -548,6 +696,57 @@ fn swept_point_aabb(start: Vec2, delta: Vec2, minimum: Vec2, maximum: Vec2) -> O
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn soft_orb_contact_has_reciprocal_momentum_and_no_teleport() {
+        for hz in [30, 60, 120] {
+            let config = ObjectPhysicsConfig::default();
+            for mass in [0.36, 0.72, 1.44] {
+                let mut orb = WorldObject::canonical_orb(42, Vec2::splat(0.5));
+                orb.mass = mass;
+                orb.position = Vec2::new(0.54, 0.5);
+                orb.velocity = Vec2::new(-0.3, 0.0);
+                let before = orb.clone();
+                let dt = 1.0 / hz as f32;
+                let mut environment = EmbodiedEnvironmentFrame::default();
+                assert!(resolve_soft_object_body_contact(
+                    &mut orb,
+                    Vec2::splat(0.5),
+                    Vec2::ZERO,
+                    config,
+                    &mut environment,
+                    dt
+                ));
+                let force = environment.contacts[0].body_force_world;
+                let body_impulse = Vec2::new(force.x * config.desktop_aspect, force.y) * dt;
+                assert!((body_impulse + (orb.velocity - before.velocity) * mass).length() < 1.0e-6);
+                assert!((orb.position - before.position).length() <= 0.08 * dt + 1.0e-6);
+                assert!(orb.velocity.x - before.velocity.x <= 4.0 * dt / mass + 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn mass_aware_grip_sags_under_weight_without_frame_rate_instability() {
+        let mut finals = Vec::new();
+        for hz in [30, 60, 120] {
+            let config = ObjectPhysicsConfig::default();
+            let target = Vec2::splat(0.5);
+            let mut orb = WorldObject::canonical_orb(42, target);
+            orb.lifecycle = ObjectLifecycle::CarriedByPet;
+            orb.position = Vec2::new(0.45, 0.5);
+            orb.mass = 1.44;
+            for _ in 0..hz * 4 {
+                let before = orb.position;
+                step_compliant_grip(&mut orb, target, 5.0, config, 1.0 / hz as f32);
+                assert!(orb.position.is_finite() && orb.velocity.is_finite());
+                assert!((orb.position - before).length() < 0.03);
+            }
+            assert!(orb.position.y > target.y + 0.003);
+            assert!(orb.position.distance(target) < 0.025);
+            finals.push(orb.position);
+        }
+        assert!(finals.iter().all(|p| p.distance(finals[0]) < 0.001));
+    }
     use crate::{
         DenState, NormalizedRect, WindowAffordance, WindowAffordanceFrame, WindowId, WorldObject,
     };
@@ -705,6 +904,46 @@ mod tests {
         assert!(orb.velocity.is_finite());
         assert!(orb.velocity.length() <= MAX_OBJECT_SPEED + 1.0e-5);
         assert_eq!(environment.contact_count, 1);
+    }
+    #[test]
+    fn measured_gel_contact_does_not_fall_back_to_nominal_118_pixel_halo() {
+        let den = DenState::for_seed(10);
+        let mut orb = WorldObject::canonical_orb(10, den.anchor);
+        orb.lifecycle = ObjectLifecycle::Free;
+        orb.position = Vec2::new(0.52, 0.5);
+        orb.velocity = Vec2::new(-0.1, 0.0);
+        let before = orb.clone();
+        let mut environment = EmbodiedEnvironmentFrame::default();
+        assert!(!resolve_soft_object_body_contact_measured(
+            &mut orb,
+            Vec2::ZERO,
+            ObjectPhysicsConfig::default(),
+            &mut environment,
+            1.0 / 120.0,
+            None
+        ));
+        assert_eq!(orb.position, before.position);
+        assert_eq!(orb.velocity, before.velocity);
+        assert_eq!(environment.contact_count, 0);
+        let contact = ExternalContact {
+            source: ContactSource::Orb,
+            point_world: Vec2::new(0.51, 0.5),
+            normal_world: Vec2::NEG_X,
+            penetration_px: 1.0,
+            relative_velocity_px: Vec2::new(-108.0, 0.0),
+            intensity: 0.0,
+            body_force_world: Vec2::ZERO,
+        };
+        assert!(resolve_soft_object_body_contact_measured(
+            &mut orb,
+            Vec2::ZERO,
+            ObjectPhysicsConfig::default(),
+            &mut environment,
+            1.0 / 120.0,
+            Some(contact)
+        ));
+        assert!(orb.velocity.x > before.velocity.x);
+        assert!(environment.contacts[0].body_force_world.x < 0.0);
     }
 
     #[test]

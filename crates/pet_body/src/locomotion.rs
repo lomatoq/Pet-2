@@ -169,9 +169,11 @@ impl BodySimulation {
         // Let it modulate actuator effort as well as the face so high arousal is
         // physically quicker while low energy remains visibly heavier.
         let expression_effort = 0.82 + expression_energy * 0.28;
-        let speed_cap = base_speed_cap * expression_effort;
-        let desired_speed =
-            (intent.desired_speed * BODY_MOVEMENT_TEMPO).clamp(0.0, speed_cap) * reference_span;
+        let cruise = distance_cruise(intent, position.distance(target) / reference_span);
+        let speed_cap = base_speed_cap * expression_effort * cruise;
+        let desired_speed = (intent.desired_speed * BODY_MOVEMENT_TEMPO * cruise)
+            .clamp(0.0, speed_cap)
+            * reference_span;
         match intent.locomotion {
             LocomotionMode::Hover => {
                 target += Vec2::new(self.wander_phase.cos(), (self.wander_phase * 1.31).sin())
@@ -279,6 +281,7 @@ impl BodySimulation {
         if matches!(
             intent.locomotion,
             LocomotionMode::Hover
+                | LocomotionMode::Seek
                 | LocomotionMode::Wander
                 | LocomotionMode::Arrive
                 | LocomotionMode::SurfaceApproach
@@ -374,6 +377,52 @@ impl BodySimulation {
 
 fn direction(from: Vec2, to: Vec2) -> Vec2 {
     (to - from).normalize_or_zero()
+}
+
+fn distance_cruise(intent: &BodyIntent, distance_in_spans: f32) -> f32 {
+    // Only unencumbered purposeful flight. Low-speed precision/grip approaches,
+    // support, orbit, sleep and escape keep their existing control envelopes.
+    if !matches!(
+        intent.locomotion,
+        LocomotionMode::Seek | LocomotionMode::Wander
+    ) || intent.interaction_target.is_some()
+        || intent.desired_speed < 0.20
+        || !distance_in_spans.is_finite()
+    {
+        return 1.0;
+    }
+    let t = ((distance_in_spans - 0.20) / 0.50).clamp(0.0, 1.0);
+    1.0 + 1.2 * t * t * (3.0 - 2.0 * t)
+}
+
+#[test]
+fn distance_cruise_preserves_precision_and_support() {
+    let mut intent = BodyIntent {
+        locomotion: LocomotionMode::Seek,
+        desired_speed: 0.7,
+        target_position: Vec2::ONE,
+        target_surface: None,
+        facing_direction: 1.0,
+        gaze_target: None,
+        pose: lifecore::PoseIntent::Curious,
+        expression: lifecore::ExpressionState::default(),
+        interaction_target: None,
+    };
+    assert_eq!(distance_cruise(&intent, 0.1), 1.0);
+    assert!((distance_cruise(&intent, 1.0) - 2.2).abs() < 0.001);
+    intent.desired_speed = 0.1;
+    assert_eq!(distance_cruise(&intent, 1.0), 1.0);
+    intent.desired_speed = 0.7;
+    for mode in [
+        LocomotionMode::Landing,
+        LocomotionMode::SurfaceApproach,
+        LocomotionMode::EdgeCling,
+        LocomotionMode::Sleep,
+        LocomotionMode::Orbit,
+    ] {
+        intent.locomotion = mode;
+        assert_eq!(distance_cruise(&intent, 1.0), 1.0);
+    }
 }
 
 fn arrive(position: Vec2, target: Vec2, speed: f32, arrival_radius: f32) -> Vec2 {
@@ -791,7 +840,7 @@ mod tests {
         let purposeful_speed = (purposeful.feedback.velocity * physical_scale).length();
         assert!(purposeful_speed > ambient_speed * 2.5);
         assert!(
-            (540.0..=620.0).contains(&purposeful_speed),
+            (900.0..=1250.0).contains(&purposeful_speed),
             "2x purposeful seek speed={purposeful_speed} px/s"
         );
     }
@@ -818,6 +867,9 @@ mod tests {
         ultrawide_seek.feedback.world_position = Vec2::new(0.08, 0.50);
         regular_seek.set_motion_space_pixels(regular_scale);
         ultrawide_seek.set_motion_space_pixels(ultrawide_scale);
+        // Equal physical travel distance: cruise is intentionally distance-aware.
+        let mut ultrawide_intent = base_intent.clone();
+        ultrawide_intent.target_position.x = 0.08 + 0.84 * regular_scale.x / ultrawide_scale.x;
         for _ in 0..150 {
             regular_seek.fixed_update(
                 &genome.body,
@@ -827,7 +879,7 @@ mod tests {
             );
             ultrawide_seek.fixed_update(
                 &genome.body,
-                &base_intent,
+                &ultrawide_intent,
                 &SensorFrame::default(),
                 1.0 / 120.0,
             );
@@ -835,7 +887,7 @@ mod tests {
         let seek_speed = (regular_seek.feedback.velocity * regular_scale).length();
         let ultrawide_seek_speed = (ultrawide_seek.feedback.velocity * ultrawide_scale).length();
         assert!(
-            (540.0..=620.0).contains(&seek_speed),
+            (900.0..=1300.0).contains(&seek_speed),
             "2x seek={seek_speed} px/s"
         );
         assert!((seek_speed - ultrawide_seek_speed).abs() < 0.75);

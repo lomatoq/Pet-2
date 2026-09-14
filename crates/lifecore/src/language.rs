@@ -672,6 +672,14 @@ pub struct VocalArbiter {
 }
 
 impl VocalArbiter {
+    /// A non-phonated breath shares voice admission and never bypasses quiet.
+    pub fn reserve_body_breath(&mut self, now_seconds: f64, quiet_preferred: bool) -> bool {
+        if quiet_preferred || !now_seconds.is_finite() || now_seconds < self.next_allowed_seconds {
+            return false;
+        }
+        self.next_allowed_seconds = now_seconds + 1.5;
+        true
+    }
     #[must_use]
     pub fn admit(
         &mut self,
@@ -751,6 +759,16 @@ const fn expression_shape(intent: SocialIntent) -> (f32, f32, f32, f32, f32, f32
 mod tests {
     use super::*;
     use crate::{InteractionExpressionTarget, VocalTrigger};
+
+    #[test]
+    fn body_breath_respects_quiet_and_shared_voice_reservation() {
+        let mut arbiter = VocalArbiter::default();
+        assert!(!arbiter.reserve_body_breath(2.0, true));
+        assert!(!arbiter.reserve_body_breath(f64::NAN, false));
+        assert!(arbiter.reserve_body_breath(2.0, false));
+        assert!(!arbiter.reserve_body_breath(2.5, false));
+        assert!(arbiter.reserve_body_breath(3.5, false));
+    }
 
     fn plan(reason: InteractionReasonCode, trigger: VocalTrigger) -> InteractionResponsePlan {
         InteractionResponsePlan {

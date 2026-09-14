@@ -104,6 +104,7 @@ struct Globals {
     face_brows: [[f32; 4]; 2],
     face_mouth: [f32; 4],
     face_eye: [f32; 4],
+    face_eye_scales: [f32; 4],
 }
 
 #[repr(C)]
@@ -241,6 +242,8 @@ pub struct RenderParameters {
     pub geometry: lifecore::FaceGeometry,
     pub eye_aperture: f32,
     pub mouth_open: f32,
+    pub mouth_shout: f32,
+    pub eye_scales: [Vec2; 2],
     pub mouth_curve: f32,
     pub mouth_tension: f32,
     pub cheek_glow: f32,
@@ -3259,6 +3262,8 @@ impl Default for RenderParameters {
             geometry: lifecore::FaceGeometry::default(),
             eye_aperture: 1.0,
             mouth_open: 0.0,
+            mouth_shout: 0.0,
+            eye_scales: [Vec2::ONE; 2],
             mouth_curve: 0.1,
             mouth_tension: 0.0,
             cheek_glow: 0.0,
@@ -3434,12 +3439,18 @@ fn globals_for_resolved(
         }
     });
     Globals {
+        face_eye_scales: [
+            bounded(parameters.eye_scales[0].x, 0.85, 1.28, 1.0),
+            bounded(parameters.eye_scales[0].y, 0.75, 1.45, 1.0),
+            bounded(parameters.eye_scales[1].x, 0.85, 1.28, 1.0),
+            bounded(parameters.eye_scales[1].y, 0.75, 1.45, 1.0),
+        ],
         face_lids: parameters.geometry.sanitized().lids,
         face_brows: parameters.geometry.sanitized().brows,
         face_mouth: parameters.geometry.sanitized().mouth,
         face_eye: [
             bounded(parameters.eye_aperture, 0.0, 1.0, 1.0),
-            0.0,
+            bounded(parameters.mouth_shout, 0.0, 1.0, 0.0),
             0.0,
             0.0,
         ],
@@ -4107,6 +4118,12 @@ mod tests {
     fn globals_layout_is_wgsl_uniform_safe() {
         assert_eq!(align_of::<Globals>(), 4);
         let shader = naga::front::wgsl::parse_str(include_str!("liquid_surface.wgsl")).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&shader)
+        .expect("production face/material shader must validate, not merely parse");
         let shader_size = shader
             .types
             .iter()

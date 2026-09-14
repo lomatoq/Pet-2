@@ -21,7 +21,26 @@ pub fn choose_program(
     active_readable: bool,
     cooldowns: &[f32; PROGRAM_COUNT],
 ) -> Option<ProgramDecision> {
+    choose_program_with_rest_commitment(
+        goal,
+        context,
+        active_program,
+        active_readable,
+        cooldowns,
+        false,
+    )
+}
+
+pub(crate) fn choose_program_with_rest_commitment(
+    goal: &BehaviorGoalFrame,
+    context: &BehaviorContextFrame,
+    active_program: Option<BehaviorProgramId>,
+    active_readable: bool,
+    cooldowns: &[f32; PROGRAM_COUNT],
+    rest_committed: bool,
+) -> Option<ProgramDecision> {
     use BehaviorProgramId as P;
+    let rest_requested = rest_committed || supported_rest_requested(goal, context);
     let eligible = |program: P| {
         if program.requests_user_attention()
             && (context.focus_mode || context.boundary_violation >= 0.18)
@@ -34,7 +53,7 @@ pub fn choose_program(
             // readable approach/landing bout may be repeated immediately
             // while Sleep is committed; a generic cooldown must not create a
             // locomotion gap before physical support is actually established.
-            || (goal.action == ActionId::Sleep
+            || (rest_requested
                 && matches!(
                     program,
                     P::RestSurfaceRoostSearch
@@ -174,80 +193,16 @@ pub fn choose_program(
         return None;
     }
 
-    if context.companion_confidence >= 0.46 {
-        let companion_program = match context.companion_intent {
-            PrimaryIntent::AcceptContact => Some(P::TouchLeanIntoStroke),
-            PrimaryIntent::Nuzzle => Some(P::SocialRubNuzzleCursor),
-            PrimaryIntent::InviteContact => Some(P::SocialPettingSolicitation),
-            PrimaryIntent::InvitePlay => Some(P::PlayPlayBowAnalog),
-            PrimaryIntent::Chase | PrimaryIntent::Intercept => Some(P::PlayCursorChaseBout),
-            PrimaryIntent::Inspect => Some(P::MoveInspectPauseScan),
-            PrimaryIntent::Orient | PrimaryIntent::SocialCheckIn => {
-                Some(P::MoveCheckBackSocialReference)
-            }
-            PrimaryIntent::QuietCompanionship => Some(P::SocialQuietCompanionship),
-            PrimaryIntent::RejectContact => Some(P::DefenseStrainBraceAndRelease),
-            PrimaryIntent::StartleFreeze => Some(P::DefenseStartleOrientFreeze),
-            PrimaryIntent::GuardPain => Some(P::DefenseLocalPainGuard),
-            PrimaryIntent::EscapePressure => Some(P::DefenseOverpressureBoundary),
-            PrimaryIntent::SettleAfterStress => Some(P::DefensePostStressShakeOff),
-            _ => None,
-        };
-        if let Some(program) = companion_program
-            && eligible(program)
-        {
-            return Some(ProgramDecision {
-                program,
-                cause: MotorCause::BrainAction,
-                priority: definition(program).priority,
-            });
-        }
-    }
-
-    let world_program = match (context.world_event, context.world_goal) {
-        (_, MotorWorldGoal::OfferOrb) => Some(P::PlayOrbCarryOffer),
-        (
-            MotorWorldEvent::DenFieldEntered
-            | MotorWorldEvent::OrbCaptureStarted
-            | MotorWorldEvent::OrbCaptureAcceleration
-            | MotorWorldEvent::OrbStored
-            | MotorWorldEvent::CaptureFailed,
-            _,
-        )
-        | (
-            _,
-            MotorWorldGoal::ReturnHome
-            | MotorWorldGoal::CarryOrbHome
-            | MotorWorldGoal::ReturnOrb
-            | MotorWorldGoal::RetrieveOrb,
-        ) => Some(P::HomeDenReturnEscort),
-        // Once LifeCore has actually selected Sleep, the rest controller owns
-        // the approach, landing, support verification, and sleep stages.  The
-        // den goal remains useful while travelling home, but must not keep
-        // restarting the generic escort program after the sleep action begins.
-        (_, MotorWorldGoal::SleepInDen) if goal.action != ActionId::Sleep => {
-            Some(P::HomeDenReturnEscort)
-        }
-        _ => None,
-    };
-    if let Some(program) = world_program
-        && eligible(program)
-    {
-        return Some(ProgramDecision {
-            program,
-            cause: MotorCause::WorldEvent,
-            priority: definition(program).priority,
-        });
-    }
-
-    if matches!(goal.action, ActionId::Sleep | ActionId::LandOnWindow) {
-        let program = if goal.action == ActionId::Sleep && context.has_bottom_screen_edge() {
+    if rest_requested {
+        let program = if context.has_bottom_screen_edge() && goal.action != ActionId::LandOnWindow {
             // Bottom-edge sleep is one measured physical sequence:
             // fast approach (>8 px) -> soft landing (<=8 px) -> 300 ms real
             // contact dwell -> short loaded settle -> NREM. The self-generated
             // PBF support constraint is deliberately not an acceptance signal.
             if context.screen_edge_supported {
-                if context.screen_edge_support_stable_seconds < 0.90 {
+                if goal.action != ActionId::Sleep
+                    || context.screen_edge_support_stable_seconds < 0.90
+                {
                     P::RestSitSettle
                 } else {
                     P::RestNremSleep
@@ -292,6 +247,72 @@ pub fn choose_program(
                 } else {
                     MotorCause::BrainAction
                 },
+                priority: definition(program).priority,
+            });
+        }
+    }
+
+    let world_program = match (context.world_event, context.world_goal) {
+        (_, MotorWorldGoal::OfferOrb) => Some(P::PlayOrbCarryOffer),
+        (
+            MotorWorldEvent::DenFieldEntered
+            | MotorWorldEvent::OrbCaptureStarted
+            | MotorWorldEvent::OrbCaptureAcceleration
+            | MotorWorldEvent::OrbStored
+            | MotorWorldEvent::CaptureFailed,
+            _,
+        )
+        | (
+            _,
+            MotorWorldGoal::ReturnHome
+            | MotorWorldGoal::CarryOrbHome
+            | MotorWorldGoal::ReturnOrb
+            | MotorWorldGoal::RetrieveOrb,
+        ) => Some(P::HomeDenReturnEscort),
+        // Once LifeCore has actually selected Sleep, the rest controller owns
+        // the approach, landing, support verification, and sleep stages.  The
+        // den goal remains useful while travelling home, but must not keep
+        // restarting the generic escort program after the sleep action begins.
+        (_, MotorWorldGoal::SleepInDen) if goal.action != ActionId::Sleep => {
+            Some(P::HomeDenReturnEscort)
+        }
+        _ => None,
+    };
+    if let Some(program) = world_program
+        && eligible(program)
+    {
+        return Some(ProgramDecision {
+            program,
+            cause: MotorCause::WorldEvent,
+            priority: definition(program).priority,
+        });
+    }
+
+    if context.companion_confidence >= 0.46 {
+        let companion_program = match context.companion_intent {
+            PrimaryIntent::AcceptContact => Some(P::TouchLeanIntoStroke),
+            PrimaryIntent::Nuzzle => Some(P::SocialRubNuzzleCursor),
+            PrimaryIntent::InviteContact => Some(P::SocialPettingSolicitation),
+            PrimaryIntent::InvitePlay => Some(P::PlayPlayBowAnalog),
+            PrimaryIntent::Chase | PrimaryIntent::Intercept => Some(P::PlayCursorChaseBout),
+            PrimaryIntent::Inspect => Some(P::MoveInspectPauseScan),
+            PrimaryIntent::Orient | PrimaryIntent::SocialCheckIn => {
+                Some(P::MoveCheckBackSocialReference)
+            }
+            PrimaryIntent::QuietCompanionship => Some(P::SocialQuietCompanionship),
+            PrimaryIntent::RejectContact => Some(P::DefenseStrainBraceAndRelease),
+            PrimaryIntent::StartleFreeze => Some(P::DefenseStartleOrientFreeze),
+            PrimaryIntent::GuardPain => Some(P::DefenseLocalPainGuard),
+            PrimaryIntent::EscapePressure => Some(P::DefenseOverpressureBoundary),
+            PrimaryIntent::SettleAfterStress => Some(P::DefensePostStressShakeOff),
+            _ => None,
+        };
+        if let Some(program) = companion_program
+            && eligible(program)
+        {
+            return Some(ProgramDecision {
+                program,
+                cause: MotorCause::BrainAction,
                 priority: definition(program).priority,
             });
         }
@@ -496,6 +517,47 @@ pub fn choose_program(
     None
 }
 
+pub(crate) fn supported_rest_requested(
+    goal: &BehaviorGoalFrame,
+    context: &BehaviorContextFrame,
+) -> bool {
+    if matches!(goal.action, ActionId::Sleep | ActionId::LandOnWindow) {
+        return true;
+    }
+    if context.pet_touched || context.pet_dragged || goal.affect.stress > 0.35 {
+        return false;
+    }
+    if !matches!(
+        context.world_goal,
+        MotorWorldGoal::None | MotorWorldGoal::ReturnHome | MotorWorldGoal::SleepInDen
+    ) {
+        return false;
+    }
+    let near_home = context
+        .den_anchor
+        .is_some_and(|den| den.distance(context.body.motion.world_position) < 0.16);
+    let quiet_action = matches!(
+        goal.action,
+        ActionId::IdleHover
+            | ActionId::ObserveCursor
+            | ActionId::ObserveUserActivity
+            | ActionId::SilentStare
+    );
+    let quiet_intent = matches!(
+        context.companion_intent,
+        PrimaryIntent::Rest | PrimaryIntent::QuietCompanionship
+    );
+    let explicit_rest =
+        context.companion_intent == PrimaryIntent::Rest && context.companion_confidence >= 0.46;
+    quiet_action
+        && (explicit_rest
+            || (near_home
+                && (context.focus_mode
+                    || quiet_intent
+                    || goal.affect.arousal < 0.55
+                    || context.screen_edge_supported)))
+}
+
 #[must_use]
 pub fn lock_target(
     program: BehaviorProgramId,
@@ -510,7 +572,7 @@ pub fn lock_target(
         | P::RestSitSettle
         | P::RestNremSleep
         | P::RestRemDreamWake => {
-            if goal.action == ActionId::Sleep {
+            if supported_rest_requested(goal, context) && goal.action != ActionId::LandOnWindow {
                 rank_surface(context, true, false).map(BehaviorTarget::Surface)
             } else {
                 remembered_surface

@@ -29,14 +29,15 @@ pub use droplets::{
 pub use ecology_render::{EcologyCaptureExclusion, EcologyRenderer};
 pub use embodiment::{EmbodiedPose, EmbodiedRuntime, GazeMode, VoiceVisualState};
 pub use expression::ExpressionRuntime;
+pub use gaze_controller::GazeMode as FixationGazeMode;
 pub use gaze_controller::*;
 pub use graph::{BodyGraph, BodyNode, BodyPart};
 pub use liquid::{
     BODY_MATERIAL_SNAPSHOT_SCHEMA_VERSION, BodyMaterialSnapshot, BodySnapshotError,
     BubbleRenderState, LiquidDiagnostics, LiquidMorphRuntime, LiquidRenderState,
     MAX_IDLE_FRAGMENTS, MAX_PARTICLES, ParticleRenderState, SavedComponentLifecycle,
-    SavedLiquidParticle, SavedTrackedComponent, SavedViscoelasticBond,
-    liquid_structural_tuning_hash,
+    SavedLiquidParticle, SavedTrackedComponent, SavedViscoelasticBond, contact_surface_bounds,
+    contact_surface_min_y, liquid_structural_tuning_hash,
 };
 pub use locomotion::BodySimulation;
 pub use mesh::{MeshError, MeshVertex, ProceduralMesh, ProjectedHitShape};
@@ -202,6 +203,7 @@ pub struct ProceduralBody {
     occlusion_edge: f32,
     ecology_visual_effect: EcologyVisualEffect,
     fast_phenotype: FastPhenotypeActuation,
+    contact_surface_cache: std::cell::Cell<Option<(u64, Vec2, Vec2)>>,
 }
 
 impl ProceduralBody {
@@ -231,6 +233,7 @@ impl ProceduralBody {
             occlusion_edge: 0.0,
             ecology_visual_effect: EcologyVisualEffect::default(),
             fast_phenotype: FastPhenotypeActuation::default(),
+            contact_surface_cache: std::cell::Cell::new(None),
         };
         body.apply_tuning_profile(tuning)
             .expect("the built-in liquid tuning profile is valid");
@@ -298,11 +301,13 @@ impl ProceduralBody {
     /// Installs bounded state multipliers for the next body tick. Authored
     /// profile and structural solver settings remain untouched.
     pub fn set_fast_phenotype_actuation(&mut self, actuation: FastPhenotypeActuation) {
+        let previous_projection = self.projection_scale();
         self.fast_phenotype = if actuation.is_finite() {
             actuation
         } else {
             FastPhenotypeActuation::default()
         };
+        self.preserve_projection_anchor(previous_projection);
         self.embodiment
             .liquid
             .set_runtime_actuation(self.fast_phenotype.pbf);
@@ -454,10 +459,12 @@ impl ProceduralBody {
                     .clamp_length_max(1.0),
                 grounded: legacy.grounded,
                 clinging: legacy.clinging,
+                object_load: diagnostics.object_load,
                 collision_impulse: legacy
                     .collision
                     .as_ref()
-                    .map_or(0.0, |event| unit(event.intensity)),
+                    .map_or(0.0, |event| unit(event.intensity))
+                    .max(diagnostics.object_contact_impulse),
             },
             efference_copy: EfferenceCopyV2 {
                 intended_velocity,
@@ -514,6 +521,7 @@ impl ProceduralBody {
                 pitch_normalized: audio.pitch_normalized,
                 noisiness: audio.noisiness,
                 purr: audio.purr,
+                shout: audio.shout,
             },
             dt,
         );
@@ -540,11 +548,12 @@ impl ProceduralBody {
             .expression
             .blink_left
             .max(presented_intent.expression.blink_right);
-        let procedural_blink = if authored_blink > 0.02 {
+        let procedural_blink = if self.embodiment.managed_blink || authored_blink > 0.02 {
             0.0
         } else {
             self.animation.blink
         };
+        self.expression.managed_actions = self.embodiment.managed_blink;
         self.expression
             .update(presented_intent.expression, procedural_blink, dt);
         let mut effective_traits = self.visual_traits;
@@ -689,7 +698,9 @@ impl ProceduralBody {
     /// wider deformation guard band and a larger on-screen Pet.
     pub fn set_presentation_scale(&mut self, scale: f32) {
         if scale.is_finite() && scale > 0.0 {
+            let previous_projection = self.projection_scale();
             self.presentation_scale = scale.clamp(0.50, 3.0);
+            self.preserve_projection_anchor(previous_projection);
         }
     }
 
@@ -829,13 +840,64 @@ impl ProceduralBody {
         let feather = self.tuning.compositor.shadow_feather.clamp(2.0, 128.0);
         minimum = minimum.min(organism_minimum + shadow_offset - Vec2::splat(feather));
         maximum = maximum.max(organism_maximum + shadow_offset + Vec2::splat(feather));
-        main_minimum -= Vec2::splat(rim_bloom_padding);
-        main_maximum += Vec2::splat(rim_bloom_padding);
+        // Screen contact belongs to material, not its halo. Keep all-particle
+        // main bounds unpadded; only compositor bounds include glow and shadow.
         LiquidVisualBounds {
             minimum,
             maximum,
             main_minimum,
             main_maximum,
+        }
+    }
+
+    /// Visible material contact at the density isosurface, in screen pixels.
+    /// All real particles contribute, including detached material. The raw
+    /// density boundary excludes halo/AA; conservative splats remain the fallback.
+    /// Cache by complete kernel geometry so repeated host queries in one physics
+    /// frame do not reconstruct the contour again.
+    #[must_use]
+    pub fn liquid_contact_bounds_pixels(&self, viewport_height: f32) -> LiquidPhysicalHull {
+        if !viewport_height.is_finite() || viewport_height <= 0.0 {
+            return LiquidPhysicalHull::default();
+        }
+        use std::hash::{Hash, Hasher};
+        let liquid = self.embodiment.liquid.render_state();
+        let particles = &liquid.particles[..liquid.particle_count];
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        self.tuning.pbf.iso_threshold.to_bits().hash(&mut hash);
+        for p in particles {
+            for value in [
+                p.position.x,
+                p.position.y,
+                p.axis_major.x,
+                p.axis_major.y,
+                p.major_radius,
+                p.minor_radius,
+                p.density,
+            ] {
+                value.to_bits().hash(&mut hash);
+            }
+        }
+        let key = hash.finish();
+        let cached = self.contact_surface_cache.get();
+        let bounds = match cached {
+            Some((old_key, min, max)) if old_key == key => Some((min, max)),
+            _ => contact_surface_bounds(particles, self.tuning.pbf.iso_threshold, Vec2::ZERO),
+        };
+        if let Some((min, max)) = bounds {
+            self.contact_surface_cache.set(Some((key, min, max)));
+            let scale = viewport_height / (2.0 * self.projection_scale().max(1.0e-5));
+            return LiquidPhysicalHull {
+                minimum: Vec2::new(min.x, -max.y) * scale,
+                maximum: Vec2::new(max.x, -min.y) * scale,
+                particle_count: particles.len(),
+            };
+        }
+        let fallback = self.liquid_visual_bounds_pixels(viewport_height);
+        LiquidPhysicalHull {
+            minimum: fallback.main_minimum,
+            maximum: fallback.main_maximum,
+            particle_count: particles.len(),
         }
     }
 
@@ -894,44 +956,20 @@ impl ProceduralBody {
         }
         let liquid = self.embodiment.liquid.render_state();
         let pixels_per_local = viewport_height / (2.0 * self.projection_scale().max(1.0e-5));
-        let segment = circle_center - previous_circle_center;
-        let segment_length_squared = segment.length_squared();
-        let mut best: Option<(f32, LiquidPhysicalContact)> = None;
-        for particle in liquid.particles[..liquid.particle_count]
-            .iter()
-            .filter(|particle| particle.main_component)
-        {
-            let center = Vec2::new(particle.position.x, -particle.position.y) * pixels_per_local;
-            let body_radius = particle.major_radius.max(particle.minor_radius) * pixels_per_local;
-            let t = if segment_length_squared > 1.0e-6 {
-                ((center - previous_circle_center).dot(segment) / segment_length_squared)
-                    .clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            let swept_center = previous_circle_center + segment * t;
-            let delta = swept_center - center;
-            let distance = delta.length();
-            let combined_radius = body_radius + circle_radius_px;
-            if distance > combined_radius {
-                continue;
-            }
-            let normal = delta.normalize_or(circle_center.normalize_or(Vec2::new(1.0, 0.0)));
-            let contact = LiquidPhysicalContact {
-                normal,
-                body_point: center + normal * body_radius,
-                penetration_px: (combined_radius - distance).max(0.0),
-                swept: t < 1.0 - 1.0e-4,
-            };
-            let score = combined_radius - distance;
-            if best
-                .as_ref()
-                .is_none_or(|(best_score, _)| score > *best_score)
-            {
-                best = Some((score, contact));
-            }
-        }
-        best.map(|(_, contact)| contact)
+        let flip = Vec2::new(1.0, -1.0);
+        liquid::contact_surface_circle(
+            &liquid.particles[..liquid.particle_count],
+            self.tuning.pbf.iso_threshold,
+            previous_circle_center * flip / pixels_per_local,
+            circle_center * flip / pixels_per_local,
+            circle_radius_px / pixels_per_local,
+        )
+        .map(|(point, normal, depth, swept)| LiquidPhysicalContact {
+            body_point: point * flip * pixels_per_local,
+            normal: normal * flip,
+            penetration_px: depth * pixels_per_local,
+            swept,
+        })
     }
 
     /// Finds the main-liquid support point in a screen-space direction.
@@ -943,24 +981,36 @@ impl ProceduralBody {
         let direction = direction.normalize_or(Vec2::new(1.0, 0.0));
         let liquid = self.embodiment.liquid.render_state();
         let pixels_per_local = viewport_height / (2.0 * self.projection_scale().max(1.0e-5));
-        liquid.particles[..liquid.particle_count]
-            .iter()
-            .filter(|particle| particle.main_component)
-            .map(|particle| {
-                let center =
-                    Vec2::new(particle.position.x, -particle.position.y) * pixels_per_local;
-                let radius = particle.major_radius.max(particle.minor_radius) * pixels_per_local;
-                center + direction * radius
-            })
-            .max_by(|left, right| left.dot(direction).total_cmp(&right.dot(direction)))
-            .unwrap_or(Vec2::ZERO)
+        let flip = Vec2::new(1.0, -1.0);
+        liquid::contact_surface_support(
+            &liquid.particles[..liquid.particle_count],
+            self.tuning.pbf.iso_threshold,
+            direction * flip,
+        )
+        .unwrap_or(Vec2::ZERO)
+            * flip
+            * pixels_per_local
     }
 
     fn projection_scale(&self) -> f32 {
         renderer::projection_scale(
             renderer::organism_scale(&self.mesh),
             self.tuning.render_mode,
-        ) * self.presentation_scale
+        ) * self.effective_presentation_scale()
+    }
+
+    fn effective_presentation_scale(&self) -> f32 {
+        // Exact same bounded divisor as renderer::globals_for_resolved. Omitting
+        // the apparent scale moved both the body and its floor toward the host
+        // center, despite a reported zero contact gap.
+        (self.presentation_scale * self.fast_phenotype.apparent_scale).clamp(0.50, 3.0)
+    }
+
+    fn preserve_projection_anchor(&mut self, previous_projection: f32) {
+        let ratio = self.projection_scale() / previous_projection.max(1.0e-5);
+        self.presentation_offset *= ratio;
+        self.embodiment
+            .set_world_to_body_scale(self.embodiment.world_to_body_scale() * ratio);
     }
 
     #[must_use]
@@ -996,7 +1046,7 @@ impl ProceduralBody {
         RenderParameters {
             render_mode: profile.render_mode,
             render_scale: profile.compositor.render_scale,
-            presentation_scale: self.presentation_scale * fast.apparent_scale,
+            presentation_scale: self.effective_presentation_scale(),
             presentation_offset: self.presentation_offset,
             debug_view: DebugView::Material,
             time: self.animation.time,
@@ -1019,9 +1069,8 @@ impl ProceduralBody {
                 BODY_LAB_EYE_SIZE
             } else {
                 genome.body.eye_size
-            } * profile.face.eye_size_scale
-                * fast.face.scale_multiplier
-                * pose.eye_scale.clamp(0.88, 1.18),
+            } * profile.face.eye_size_scale,
+            eye_scales: pose.eye_scales,
             eye_spacing: if cinematic {
                 BODY_LAB_EYE_SPACING
             } else {
@@ -1060,6 +1109,7 @@ impl ProceduralBody {
             eye_aperture: pose.eye_aperture,
             mouth_open: pose.mouth_open,
             mouth_curve: pose.mouth_curve,
+            mouth_shout: pose.mouth_shout,
             mouth_tension: pose.mouth_tension,
             cheek_glow: pose.cheek_glow,
             audio_envelope: pose.audio_envelope,
@@ -1231,6 +1281,118 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn apparent_scale_shader_projection_preserves_desktop_anchor() {
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.tuning.render_mode = BodyRenderMode::ParticlePbf;
+        let height = 1_440.0;
+        let anchor = Vec2::new(780.0, 620.0);
+        body.set_render_aspect(3_440.0 / height);
+        body.set_presentation_offset_pixels(anchor, height);
+        let initial_world_scale = body.embodiment.world_to_body_scale();
+        let initial_projection = body.projection_scale();
+        for presentation in [1.0, 1.845, 3.0, 0.5] {
+            body.set_presentation_scale(presentation);
+            for apparent in [1.0, 1.023_029, 1.05, 0.98] {
+                body.set_fast_phenotype_actuation(FastPhenotypeActuation {
+                    apparent_scale: apparent,
+                    ..FastPhenotypeActuation::default()
+                });
+                let params = body.render_parameters(&genome, 0.0);
+                // Independent forward mapping from the density shader's uniforms,
+                // not the CPU inverse/hit-test implementation under test.
+                let shader_divisor = renderer::projection_scale(
+                    renderer::organism_scale(&body.mesh),
+                    params.render_mode,
+                ) * params.presentation_scale.clamp(0.5, 3.0);
+                let shader_offset =
+                    Vec2::new(params.presentation_offset.x, -params.presentation_offset.y)
+                        * (height / (2.0 * shader_divisor));
+                assert!(
+                    (shader_offset - anchor).length() < 0.002,
+                    "presentation={presentation} apparent={apparent} offset={shader_offset:?}"
+                );
+                assert!((body.projection_scale() - shader_divisor).abs() < 1.0e-6);
+                let expected_world_scale =
+                    initial_world_scale * shader_divisor / initial_projection;
+                assert!(
+                    (body.embodiment.world_to_body_scale() - expected_world_scale).length()
+                        < 0.0001
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apparent_scale_supported_iso_contour_projects_to_actual_screen_floor() {
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.tuning.render_mode = BodyRenderMode::ParticlePbf;
+        let height = 1_440.0;
+        body.set_render_aspect(3_440.0 / height);
+        for apparent in [1.023_029, 1.05, 0.98] {
+            body.set_fast_phenotype_actuation(FastPhenotypeActuation {
+                apparent_scale: apparent,
+                ..FastPhenotypeActuation::default()
+            });
+            let hull = body.liquid_contact_bounds_pixels(height);
+            let center_y = height - hull.maximum.y;
+            body.set_presentation_offset_pixels(Vec2::new(780.0, center_y - height * 0.5), height);
+            let params = body.render_parameters(&genome, 0.0);
+            let shader_divisor = renderer::projection_scale(
+                renderer::organism_scale(&body.mesh),
+                params.render_mode,
+            ) * params.presentation_scale.clamp(0.5, 3.0);
+            let (minimum, _) = contact_surface_bounds(
+                &params.liquid.particles[..params.liquid.particle_count],
+                params.liquid_iso_threshold,
+                Vec2::ZERO,
+            )
+            .unwrap();
+            let rendered_bottom = height * 0.5
+                - (minimum.y + params.presentation_offset.y) * height / (2.0 * shader_divisor);
+            assert!(
+                (rendered_bottom - height).abs() < 0.002,
+                "apparent={apparent} rendered bottom={rendered_bottom} floor={height}"
+            );
+        }
+    }
+
+    #[test]
+    fn screen_contact_hull_ignores_halo_width() {
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.tuning.material.edge_light_width = 2.0;
+        let narrow = body.liquid_visual_bounds_pixels(360.0);
+        body.tuning.material.edge_light_width = 32.0;
+        let wide = body.liquid_visual_bounds_pixels(360.0);
+        assert_eq!(narrow.main_minimum, wide.main_minimum);
+        assert_eq!(narrow.main_maximum, wide.main_maximum);
+        let physical = body.liquid_physical_hull_pixels(360.0);
+        assert_eq!(wide.main_minimum, physical.minimum);
+        assert_eq!(wide.main_maximum, physical.maximum);
+        assert!(wide.maximum.y > wide.main_maximum.y);
+    }
+
+    #[test]
+    fn visible_contact_cache_tracks_geometry_and_ignores_cosmetics() {
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        let first = body.liquid_contact_bounds_pixels(360.0);
+        let key = body.contact_surface_cache.get().unwrap().0;
+        assert_eq!(body.liquid_contact_bounds_pixels(360.0), first);
+        body.tuning.material.edge_light_width = 32.0;
+        assert_eq!(body.liquid_contact_bounds_pixels(360.0), first);
+        assert_eq!(body.contact_surface_cache.get().unwrap().0, key);
+        body.tuning.pbf.iso_threshold = 0.70;
+        let tighter = body.liquid_contact_bounds_pixels(360.0);
+        assert_ne!(body.contact_surface_cache.get().unwrap().0, key);
+        assert!(tighter.maximum.y < first.maximum.y);
+        let double = body.liquid_contact_bounds_pixels(720.0);
+        assert!((double.maximum - tighter.maximum * 2.0).length() < 0.001);
+    }
+
     fn intent(mode: LocomotionMode, target: Vec2) -> BodyIntent {
         BodyIntent {
             locomotion: mode,
@@ -1370,7 +1532,8 @@ mod tests {
         assert!(!liquid_surface.contains("clamp(color"));
         assert!(liquid_surface.contains("fiber_prefilter"));
         assert!(liquid_surface.contains("expressive_mouth_distance"));
-        assert!(liquid_surface.contains("let p6"));
+        assert!(liquid_surface.contains("fn mouth_lip_contours"));
+        assert!(liquid_surface.contains("expressive_mouth_y(x, curve, tension)"));
         assert!(liquid_surface.contains("let cheek_left"));
         assert!(!liquid_surface.contains("globals.viewport_time.y * 0.03"));
         let renderer_source = include_str!("renderer.rs");

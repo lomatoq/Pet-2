@@ -37,6 +37,10 @@ pub struct NervousSystemRuntime {
     previous_voice_energy: f32,
     voice_mouth_open: f32,
     companion_expression: Option<CompanionExpressionDirector>,
+    blink_owner: pet_body::BlinkOwner,
+    ordinary_blink_active: bool,
+    pub observed_ordinary_blinks: u64,
+    final_gaze: pet_body::GazeController,
     gesture: GestureFrameV1,
     gesture_age: f32,
     episode: EpisodeContextV1,
@@ -63,6 +67,10 @@ impl Default for NervousSystemRuntime {
             previous_voice_energy: 0.0,
             voice_mouth_open: 0.0,
             companion_expression: None,
+            blink_owner: pet_body::BlinkOwner::Physiological,
+            ordinary_blink_active: false,
+            observed_ordinary_blinks: 0,
+            final_gaze: pet_body::GazeController::default(),
             gesture: GestureFrameV1::default(),
             gesture_age: 0.0,
             episode: EpisodeContextV1::default(),
@@ -80,6 +88,21 @@ impl Default for NervousSystemRuntime {
 }
 
 impl NervousSystemRuntime {
+    /// Recipes nominate a blink; they never own or reset eyelid animation.
+    pub fn request_repertoire_blink(&mut self, request: pet_motor::RepertoireBlinkRequest) {
+        if let Some(director) = &mut self.companion_expression {
+            director.request_blink(pet_body::BlinkRequest {
+                owner: if request.sleep_check {
+                    pet_body::BlinkOwner::SleepCheck
+                } else {
+                    pet_body::BlinkOwner::Social
+                },
+                strength: request.strength,
+                duration: request.duration_seconds,
+            });
+        }
+    }
+
     /// Publishes the completed authoritative body state. The previous packet is
     /// passed back only to derive temporal quantities such as jerk.
     pub fn observe_body(
@@ -303,6 +326,7 @@ impl NervousSystemRuntime {
         motor: Option<MotorActuationFrame<'_>>,
         dt: f32,
     ) {
+        body.embodiment.managed_blink = true;
         let tuning = body.tuning_profile();
         let calibration = tuning.nervous.for_live_runtime();
         let mut phenotype = self.resolve_actuation(
@@ -317,12 +341,28 @@ impl NervousSystemRuntime {
             calibration,
             dt,
         );
+        // resolve_actuation has already arbitrated companion physiology and
+        // authored motor closures. Legacy phenotype/scene/VITA projection below
+        // preserves or replaces old intent blinks, so retain the managed owner
+        // separately and restore it at the final face boundary.
+        let managed_blinks = [
+            phenotype.expression.blink_left,
+            phenotype.expression.blink_right,
+        ];
+        let managed_asymmetry = [
+            phenotype.expression.brow_asymmetry,
+            phenotype.expression.mouth_asymmetry,
+        ];
         let protective = motor.as_ref().is_some_and(|m| {
             m.packet.regime.primary == pet_motor::SomaticRegime::Threatened
                 || m.packet
                     .program
                     .is_some_and(|p| p.family() == pet_motor::ProgramFamily::DefenseIntegrity)
         });
+        // Capture causal sleep BEFORE phenotype/VITA/scene writers change the
+        // render pose. A transient Sleeping pose must not reset fixation state.
+        let final_gaze_mode =
+            causal_gaze_mode(motor.as_ref(), life.state.current_action, protective);
         calibration.apply(&mut phenotype);
         if let Some(motor) = &motor
             && let Some(pose) = motor.scene_pose
@@ -354,6 +394,32 @@ impl NervousSystemRuntime {
                     && vita.interaction_turn().elapsed_seconds >= plan.onset_seconds
             })
             .map(|plan| plan.response_id);
+        restore_managed_blinks(&mut intent.expression, managed_blinks);
+        if self.blink_owner == pet_body::BlinkOwner::SleepCheck && !protective {
+            // Only the actual sleep owner may briefly inspect a contact. Keep
+            // locomotion asleep; avoid scene aperture masking its one-eye check.
+            intent.expression.eye_aperture = 1.0;
+        }
+        restore_managed_asymmetry(&mut intent.expression, managed_asymmetry);
+        // Motor/VITA may overwrite the director's already-filtered gaze above.
+        // Reconcile the selected attention AFTER every writer, so no raw cursor
+        // or body-center target can bypass fixation continuity on presentation.
+        let selected_gaze = self
+            .perception
+            .attention_target_position
+            .or(intent.gaze_target)
+            .or(Some(body.simulation.feedback.world_position));
+        let gaze = self.final_gaze.tick(
+            pet_body::GazePlan {
+                primary_target: selected_gaze,
+                mode: final_gaze_mode,
+                acquire_tau: 0.12,
+                confidence: 1.0,
+                ..pet_body::GazePlan::default()
+            },
+            dt,
+        );
+        intent.gaze_target = gaze.target;
         phenotype.expression = intent.expression;
         phenotype.face.gaze_target = intent.gaze_target;
         sensors.interaction_actuation = phenotype.interaction;
@@ -567,8 +633,19 @@ impl NervousSystemRuntime {
             dt,
         );
         apply_companion_expression(&mut actuation, companion);
+        self.blink_owner = companion.blink_owner;
+        let ordinary_active = companion.blink_owner == pet_body::BlinkOwner::Physiological
+            && companion.blink_left > 0.05;
+        if ordinary_active && !self.ordinary_blink_active {
+            self.observed_ordinary_blinks = self.observed_ordinary_blinks.saturating_add(1);
+        }
+        self.ordinary_blink_active = ordinary_active;
         // Motor physiology and defensive ownership must survive R14's face layer.
         SomaticActuationBus::compose(&mut actuation, motor_actuation);
+        if companion.blink_owner == pet_body::BlinkOwner::SleepCheck {
+            actuation.expression.blink_left = companion.blink_left;
+            actuation.expression.blink_right = companion.blink_right;
+        }
         self.actuation = actuation.clone();
         actuation
     }
@@ -629,6 +706,54 @@ impl NervousSystemRuntime {
         apply_input_sensitivity(&mut source, calibration);
         source
     }
+}
+
+fn causal_gaze_mode(
+    motor: Option<&MotorActuationFrame<'_>>,
+    action: lifecore::ActionId,
+    protective: bool,
+) -> pet_body::FixationGazeMode {
+    let sleeping = motor.map_or(action == lifecore::ActionId::Sleep, |motor| {
+        // Support validity is already owned by motor selection; do not reset
+        // the eyes on individual noisy physical-contact samples here.
+        motor.packet.locomotion.pose == pet_motor::MotorPoseIntent::SupportedSleep
+            && (motor.packet.program == Some(pet_motor::BehaviorProgramId::RestNremSleep)
+                || motor.context.companion_intent == lifecore::PrimaryIntent::Sleep
+                || action == lifecore::ActionId::Sleep)
+    });
+    if protective {
+        pet_body::FixationGazeMode::AvoidantCheck
+    } else if sleeping {
+        pet_body::FixationGazeMode::Sleep
+    } else {
+        pet_body::FixationGazeMode::Track
+    }
+}
+
+fn restore_managed_blinks(expression: &mut lifecore::ExpressionState, blinks: [f32; 2]) {
+    expression.blink_left = if blinks[0].is_finite() {
+        blinks[0].clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    expression.blink_right = if blinks[1].is_finite() {
+        blinks[1].clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+}
+
+fn restore_managed_asymmetry(expression: &mut lifecore::ExpressionState, asymmetry: [f32; 2]) {
+    expression.brow_asymmetry = if asymmetry[0].is_finite() {
+        asymmetry[0].clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    expression.mouth_asymmetry = if asymmetry[1].is_finite() {
+        asymmetry[1].clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
 }
 
 fn apply_companion_expression(
@@ -778,6 +903,208 @@ fn merge_interaction(phenotype: &mut InteractionBodyActuation, vita: Interaction
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_asymmetry_survives_scene_without_replacing_geometry() {
+        let mut expression = lifecore::FacePose::Curious.expression();
+        let geometry = expression.geometry;
+        restore_managed_asymmetry(&mut expression, [-0.18, 0.12]);
+        assert_eq!(expression.brow_asymmetry, -0.18);
+        assert_eq!(expression.mouth_asymmetry, 0.12);
+        assert_eq!(expression.geometry, geometry);
+    }
+
+    #[test]
+    fn managed_physiological_blinks_survive_legacy_and_scene_projection() {
+        let mut scheduler = pet_body::BlinkController::new(913);
+        let mut smoothed = pet_body::ExpressionRuntime::default();
+        let mut intent = LifeCore::new(lifecore::Genome::from_seed(7), 11)
+            .tick(
+                &SensorFrame::default(),
+                &lifecore::BodyFeedback::default(),
+                1.0 / 60.0,
+            )
+            .body_intent;
+        let mut peaks = 0;
+        let mut closed = false;
+        for _ in 0..60 * 30 {
+            let blink = scheduler.tick(1.0 / 60.0, false, false, 0.2);
+            let mut phenotype = FastPhenotypeActuation::default();
+            phenotype.expression.blink_left = blink.left;
+            phenotype.expression.blink_right = blink.right;
+            let managed = [
+                phenotype.expression.blink_left,
+                phenotype.expression.blink_right,
+            ];
+            // This is the actual scene replacement + legacy projection which
+            // previously discarded every managed physiological blink.
+            phenotype.expression = lifecore::FacePose::Awake.expression();
+            intent.expression.blink_left = 0.0;
+            intent.expression.blink_right = 0.0;
+            phenotype.apply_to_intent(&mut intent, &SensorFrame::default(), glam::Vec2::splat(0.5));
+            assert_eq!(intent.expression.blink_left, 0.0);
+            restore_managed_blinks(&mut intent.expression, managed);
+            smoothed.update(intent.expression, 0.0, 1.0 / 60.0);
+            let now_closed =
+                smoothed.current.blink_left > 0.5 && smoothed.current.blink_right > 0.5;
+            if now_closed && !closed {
+                peaks += 1;
+            }
+            closed = now_closed;
+        }
+        assert!((3..=7).contains(&peaks), "managed blink peaks={peaks}");
+        restore_managed_blinks(&mut intent.expression, [0.0, 0.0]);
+        assert_eq!(
+            intent.expression.blink_left, 0.0,
+            "opening must not latch prior closure"
+        );
+    }
+
+    #[test]
+    fn causal_gaze_sleep_cannot_be_inferred_from_rest_or_scene_pose() {
+        let context = pet_motor::BehaviorContextFrame::default();
+        let mut packet = SomaticActuationPacket {
+            program: Some(pet_motor::BehaviorProgramId::RestSitSettle),
+            ..Default::default()
+        };
+        packet.locomotion.pose = pet_motor::MotorPoseIntent::SupportedRest;
+        let target = glam::Vec2::new(0.3523256, 0.7131944);
+        let mut gaze = pet_body::GazeController::default();
+        for tick in 0..100 {
+            // Both scene expression and a changing high-level sleep nomination
+            // must leave an awake supported-rest motor performance tracking.
+            let motor = MotorActuationFrame {
+                packet: &packet,
+                context: &context,
+                scene_pose: if tick % 2 == 0 {
+                    Some(lifecore::FacePose::Tired)
+                } else {
+                    None
+                },
+            };
+            let mode = causal_gaze_mode(
+                Some(&motor),
+                if tick % 2 == 0 {
+                    lifecore::ActionId::Sleep
+                } else {
+                    lifecore::ActionId::IdleHover
+                },
+                false,
+            );
+            assert_eq!(mode, pet_body::FixationGazeMode::Track);
+            let output = gaze.tick(
+                pet_body::GazePlan {
+                    primary_target: Some(target),
+                    mode,
+                    acquire_tau: 0.12,
+                    confidence: 1.0,
+                    ..Default::default()
+                },
+                0.05,
+            );
+            assert!(output.target.is_some(), "rest must never reset fixation");
+            if tick > 30 {
+                assert!(output.target.unwrap().distance(target) < 0.001);
+            }
+        }
+        packet.program = Some(pet_motor::BehaviorProgramId::RestNremSleep);
+        packet.locomotion.pose = pet_motor::MotorPoseIntent::SupportedSleep;
+        let motor = MotorActuationFrame {
+            packet: &packet,
+            context: &context,
+            scene_pose: None,
+        };
+        assert_eq!(
+            causal_gaze_mode(Some(&motor), lifecore::ActionId::Sleep, false),
+            pet_body::FixationGazeMode::Sleep
+        );
+        assert_eq!(
+            causal_gaze_mode(Some(&motor), lifecore::ActionId::Sleep, true),
+            pet_body::FixationGazeMode::AvoidantCheck
+        );
+    }
+
+    #[test]
+    fn final_gaze_owner_survives_motor_writes_through_rendered_pupils() {
+        let mut nervous = NervousSystemRuntime::default();
+        let mut life = LifeCore::new(lifecore::Genome::from_seed(7), 11);
+        let vita = VitaRuntime::new(7, None);
+        let morph = MorphBrain::new(7, None).unwrap();
+        let mut body = ProceduralBody::generate(&life.state.genome).unwrap();
+        let mut sensors = SensorFrame::default();
+        let mut intent = life
+            .tick(&sensors, &lifecore::BodyFeedback::default(), 0.05)
+            .body_intent;
+        let context = pet_motor::BehaviorContextFrame::default();
+        let mut packet = SomaticActuationPacket::default();
+        for tick in 0..180 {
+            let target = if tick < 20 {
+                glam::Vec2::splat(0.5)
+            } else if tick < 100 {
+                glam::Vec2::new(if tick % 2 == 0 { 0.08 } else { 0.92 }, 0.5)
+            } else {
+                glam::Vec2::new(0.7, 0.5)
+            };
+            packet.expression.gaze_target = Some(target);
+            nervous.set_attention(
+                Some(target),
+                lifecore::AttentionTargetKind::ObjectGoal,
+                None,
+                1.0,
+            );
+            nervous.apply_motor_actuation(
+                &mut life,
+                &vita,
+                &morph,
+                &mut body,
+                &mut sensors,
+                &mut intent,
+                Some(MotorActuationFrame {
+                    packet: &packet,
+                    context: &context,
+                    scene_pose: None,
+                }),
+                0.05,
+            );
+            // Simulate a legacy scene/VITA render-pose writer after the causal
+            // final gaze owner. The body must not reinterpret this as sleep.
+            if tick >= 100 {
+                intent.pose = if tick % 2 == 0 {
+                    lifecore::PoseIntent::Sleeping
+                } else {
+                    lifecore::PoseIntent::Compact
+                };
+            }
+            nervous.commit_intent(&mut life, &mut body, &sensors, &intent);
+            body.embodied_update(
+                &intent,
+                &sensors,
+                life.state.affect,
+                pet_body::VisualMindInput::default(),
+                pet_body::VoiceVisualState::default(),
+                0.05,
+            );
+            body.presentation_update(0.05);
+            if (20..100).contains(&tick) {
+                assert!(
+                    body.embodiment.pose.gaze.length() < 0.005,
+                    "raw motor gaze bypassed final owner: tick={tick} gaze={:?}",
+                    body.embodiment.pose.gaze
+                );
+            }
+            if tick > 140 {
+                assert!(
+                    body.embodiment.pose.gaze.x > 0.35,
+                    "render-pose flicker reset causal gaze at {tick}: {:?}",
+                    body.embodiment.pose.gaze
+                );
+            }
+        }
+        assert!(
+            body.embodiment.pose.gaze.x > 0.35,
+            "stable target must still be followed"
+        );
+    }
 
     #[test]
     fn only_measured_ecology_outcomes_supply_motor_credit_and_survive_stale_gestures() {

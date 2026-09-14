@@ -125,6 +125,9 @@ pub struct BodyMotionFeedbackV2 {
     pub grounded: bool,
     pub clinging: bool,
     pub collision_impulse: f32,
+    /// Measured normalized external-object load, separate from user touch.
+    /// Zero for old snapshots and when no object force reaches the body.
+    pub object_load: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -233,6 +236,7 @@ impl BodyFeedbackV2 {
         self.motion.acceleration = finite_vec2(self.motion.acceleration).clamp_length_max(1.0);
         self.motion.jerk = finite_vec2(self.motion.jerk).clamp_length_max(1.0);
         self.motion.collision_impulse = unit(self.motion.collision_impulse);
+        self.motion.object_load = unit(self.motion.object_load);
         self.efference_copy.intended_velocity =
             finite_vec2(self.efference_copy.intended_velocity).clamp_length_max(1.0);
         self.efference_copy.intended_turn = bounded_signed(self.efference_copy.intended_turn);

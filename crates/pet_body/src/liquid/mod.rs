@@ -4,6 +4,10 @@ mod body_snapshot;
 mod collisions;
 mod component_lifecycle;
 mod components;
+mod contact_surface;
+pub use contact_surface::{
+    contact_surface_bounds, contact_surface_circle, contact_surface_min_y, contact_surface_support,
+};
 mod density;
 mod face_frame;
 mod interaction;
@@ -60,7 +64,7 @@ use self::{
         solve_bonds, update_bonds,
     },
     viscosity::apply_xsph_viscosity,
-    xpbd::{DensityConstraintParameters, solve_density_constraints},
+    xpbd::{DensityConstraintParameters, SupportPlane, solve_density_constraints},
 };
 
 pub const MAX_IDLE_FRAGMENTS: usize = 24;
@@ -193,6 +197,14 @@ pub struct BubbleRenderState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LiquidDiagnostics {
+    /// Applied object force / nominal body mass3, in desktop-height units/s².
+    pub object_load: f32,
+    /// Short envelope of integrated impact impulse above ordinary toy weight.
+    pub object_contact_impulse: f32,
+    /// Measured physical surface load driving the permanent well, zero in air.
+    pub support_field_load: f32,
+    /// Area-preserving aspect of the physical character well, not render squash.
+    pub permanent_field_aspect: f32,
     pub particle_count: usize,
     pub component_count: usize,
     pub main_mass: f32,
@@ -261,6 +273,7 @@ pub struct LiquidMorphRuntime {
     rest_density: f32,
     body_origin: Vec2,
     elapsed: f32,
+    material_breath_phase: f32,
     seed_phase: f32,
     components: ComponentSummary,
     face_frame: FaceFrameRuntime,
@@ -301,6 +314,11 @@ pub struct LiquidMorphRuntime {
     support_key: u64,
     support_stable_seconds: f32,
     supported_seconds: f32,
+    measured_support_load: f32,
+    object_load: f32,
+    object_contact_impulse: f32,
+    /// Shared kernel-to-wall clearance, calibrated once per physical contact.
+    support_plane_clearance: Option<(u64, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -322,6 +340,27 @@ struct SomaticStepMetrics {
 
 #[allow(dead_code)]
 impl LiquidMorphRuntime {
+    fn update_object_load(&mut self, force: collisions::ObjectContactForce, scale: Vec2, dt: f32) {
+        let height_force =
+            if force.applied_world.is_finite() && scale.is_finite() && scale.y.abs() > 1.0e-4 {
+                (force.applied_world * scale / scale.y.abs()).length()
+            } else {
+                0.0
+            };
+        self.object_load = (height_force / 3.0).clamp(0.0, 1.0);
+        // Integrate delivered momentum, not derivative-of-force sampled once
+        // per host frame. Ecology marks hold with zero relative contact speed;
+        // even a heavy sustained load must not masquerade as an impact.
+        let target =
+            if force.impact_world.is_finite() && scale.is_finite() && scale.y.abs() > 1.0e-4 {
+                (force.impact_world * scale / scale.y.abs()).length() * 0.3
+            } else {
+                0.0
+            };
+        let decay = (-dt.max(0.0) / 0.15).exp();
+        self.object_contact_impulse =
+            (self.object_contact_impulse * decay + target * 0.15 * (1.0 - decay)).clamp(0.0, 1.0);
+    }
     #[must_use]
     pub fn new(seed: u64) -> Self {
         Self::new_with_tuning(seed, PbfTuning::default())
@@ -365,6 +404,7 @@ impl LiquidMorphRuntime {
             rest_density,
             body_origin: Vec2::ZERO,
             elapsed: 0.0,
+            material_breath_phase: 0.0,
             seed_phase: seed as u32 as f32 / u32::MAX as f32 * TAU,
             components,
             face_frame: FaceFrameRuntime::default(),
@@ -403,6 +443,10 @@ impl LiquidMorphRuntime {
             support_key: 0,
             support_stable_seconds: 0.0,
             supported_seconds: 0.0,
+            measured_support_load: 0.0,
+            object_load: 0.0,
+            object_contact_impulse: 0.0,
+            support_plane_clearance: None,
         };
         runtime.snap_render_proxies();
         runtime
@@ -456,6 +500,7 @@ impl LiquidMorphRuntime {
             let mut replacement = Self::new_with_tuning(self.seed, tuning);
             replacement.body_origin = body_origin;
             replacement.elapsed = elapsed;
+            replacement.material_breath_phase = self.material_breath_phase;
             replacement.navigation_anchor_strength = navigation_anchor_strength;
             replacement.local_containment_bounds = local_containment_bounds;
             replacement.face_frame = face_frame;
@@ -676,6 +721,7 @@ impl LiquidMorphRuntime {
             );
         }
         self.elapsed = (self.elapsed + dt).rem_euclid(3_600.0);
+        self.advance_material_breath_phase(dt);
         if self.body_origin.length() > 16.0 {
             let rebase = self.body_origin;
             for particle in &mut self.particles[..self.particle_count] {
@@ -721,7 +767,11 @@ impl LiquidMorphRuntime {
         let effective_density_compliance = self.effective_density_compliance();
         let spacing = PARTICLE_SPACING * self.tuning.spacing_scale;
         let kernel_radius = KERNEL_RADIUS * self.tuning.kernel_radius_scale;
-        self.update_flight_field_shape(motion, dt);
+        let measured_load = self.measured_surface_load(motion, feedback.world_position);
+        self.measured_support_load = measured_load.map_or(0.0, |(_, load)| load);
+        self.update_field_shape(motion, dt, measured_load);
+        let support_plane =
+            self.measured_support_plane(motion, feedback.world_position, measured_load.is_some());
         let field_scale = self.tuning.character_field_radius_scale;
         apply_character_field(
             &mut self.particles,
@@ -732,7 +782,18 @@ impl LiquidMorphRuntime {
                 radii: Vec2::new(0.35, 0.43) * field_scale,
                 // Preserve the authored v15 return-strength feel while changing
                 // its meaning from a component servo to a continuous well.
-                well_acceleration: parameters.character_field_strength * (3.0 / 0.34),
+                // Loaded posture needs its own physical authority: a soft
+                // authored fragment-return setting must not disable sitting.
+                // Only measured contact can drive aspect above the flight
+                // ceiling. Use that continuous state for release as well, so
+                // loss of the support flag cannot switch the force abruptly.
+                well_acceleration: {
+                    let authored = parameters.character_field_strength * (3.0 / 0.34);
+                    let supported = smoothstep01(
+                        ((self.flight_field_aspect - 1.34) / (2.4 - 1.34)).clamp(0.0, 1.0),
+                    );
+                    authored + (3.0 - authored).max(0.0) * supported
+                },
                 inertia_scale: effective_flight_inertia,
                 maximum_inertial_acceleration: 6.0,
                 velocity_damping: (effective_flight_damping * 0.75).clamp(0.0, 3.5),
@@ -740,6 +801,11 @@ impl LiquidMorphRuntime {
                 flight_aspect: self.flight_field_aspect,
             },
         );
+        let supported_softness =
+            smoothstep01(((self.flight_field_aspect - 1.34) / (2.4 - 1.34)).clamp(0.0, 1.0));
+        let supported_tension = parameters.surface_tension
+            + (parameters.surface_tension.min(0.62) - parameters.surface_tension)
+                * supported_softness;
         let cooperative_separation_scale = if sensors.interaction_actuation.allow_intentional_bud {
             0.35
         } else {
@@ -750,7 +816,7 @@ impl LiquidMorphRuntime {
             self.particle_count,
             kernel_radius,
             self.rest_density,
-            parameters.surface_tension
+            supported_tension
                 * (1.0 + sensors.interaction_actuation.cohesion_delta).clamp(0.75, 1.25)
                 * cooperative_separation_scale,
         );
@@ -796,7 +862,7 @@ impl LiquidMorphRuntime {
             self.components.main_com,
             dt,
         );
-        apply_external_contact_forces(
+        let applied_object_force = apply_external_contact_forces(
             &mut self.particles,
             self.particle_count,
             self.body_origin,
@@ -805,6 +871,7 @@ impl LiquidMorphRuntime {
             &self.environment,
             grab_parameters.support_radius * 2.2,
         );
+        self.update_object_load(applied_object_force, motion.world_to_body_scale, dt);
         self.component_lifecycle.apply_recovery_field(
             &mut self.particles,
             self.particle_count,
@@ -829,6 +896,7 @@ impl LiquidMorphRuntime {
             feedback.world_position,
             motion.world_to_body_scale,
             &self.somatic_actuation,
+            support_plane,
             dt,
         );
         somatic_step.local_energy += posture_energy;
@@ -905,6 +973,7 @@ impl LiquidMorphRuntime {
                 iterations: self.tuning.density_iterations,
                 dt,
                 containment_bounds,
+                support_plane,
             },
         );
         if self.interaction_tuning.topology_mode == TopologyConstraintMode::Viscoelastic {
@@ -939,6 +1008,10 @@ impl LiquidMorphRuntime {
                 )
             }
         };
+
+        // Bond/topology corrections may follow the density pass; the wall
+        // remains authoritative after those writers and before velocity commit.
+        xpbd::project_support_plane(&mut self.particles, self.particle_count, support_plane);
 
         // This is a circuit breaker, not normal material behavior. Acceptance
         // requires the counter to stay at zero in every replay.
@@ -1201,7 +1274,7 @@ impl LiquidMorphRuntime {
                 self.components.main_com,
                 sub_dt,
             );
-            apply_external_contact_forces(
+            let applied_object_force = apply_external_contact_forces(
                 &mut self.particles,
                 self.particle_count,
                 self.body_origin,
@@ -1210,6 +1283,7 @@ impl LiquidMorphRuntime {
                 &self.environment,
                 grab_parameters.support_radius * 2.2,
             );
+            self.update_object_load(applied_object_force, motion.world_to_body_scale, sub_dt);
             apply_homeostatic_return(
                 &mut self.particles,
                 self.particle_count,
@@ -1334,6 +1408,7 @@ impl LiquidMorphRuntime {
         let mut replacement = Self::new_with_tuning(self.seed, tuning);
         replacement.body_origin = body_origin;
         replacement.elapsed = elapsed;
+        replacement.material_breath_phase = self.material_breath_phase;
         replacement.navigation_anchor_strength = navigation_anchor_strength;
         replacement.local_containment_bounds = local_containment_bounds;
         replacement.cinematic_features = cinematic_features;
@@ -1379,7 +1454,95 @@ impl LiquidMorphRuntime {
     /// Continuously reshapes the one permanent field into a slightly flattened,
     /// area-preserving flight silhouette. No particle position is affinely
     /// transformed and no component or topology state participates.
+    #[cfg(test)]
     fn update_flight_field_shape(&mut self, motion: DropletMotion, dt: f32) {
+        self.update_field_shape(motion, dt, None);
+    }
+
+    fn measured_surface_load(
+        &self,
+        motion: DropletMotion,
+        body_world_position: Vec2,
+    ) -> Option<(Vec2, f32)> {
+        let support = self.somatic_actuation.support.as_ref()?;
+        if support.load_fraction <= 0.0 {
+            return None;
+        }
+        let scale = motion.world_to_body_scale;
+        let normal = (support.normal * scale.signum()).normalize_or_zero();
+        let tangent = (support.tangent * scale.signum()).normalize_or_zero();
+        if normal.length_squared() < 0.5 || tangent.length_squared() < 0.5 {
+            return None;
+        }
+        let anchor = (support.anchor_point - body_world_position) * scale;
+        let render = self.render_state();
+        // The host places the density iso-contour against its support plane.
+        // A zero-density kernel skirt is not load-bearing material. Query a
+        // small real contour patch rather than reconstructing full bounds here.
+        contact_surface::surface_patch_contacts_plane(
+            &render.particles[..render.particle_count],
+            self.tuning.iso_threshold,
+            anchor,
+            normal,
+            tangent,
+            0.025,
+        )
+        .then_some((tangent, support.load_fraction))
+    }
+
+    fn measured_support_plane(
+        &mut self,
+        motion: DropletMotion,
+        body_world_position: Vec2,
+        measured: bool,
+    ) -> Option<SupportPlane> {
+        let Some(support) = self
+            .somatic_actuation
+            .support
+            .as_ref()
+            .filter(|support| measured && support.surface_id.0 == "screen:bottom_edge")
+        else {
+            self.support_plane_clearance = None;
+            return None;
+        };
+        let normal = (support.normal * motion.world_to_body_scale.signum()).normalize_or_zero();
+        let point = self.body_origin
+            + (support.anchor_point - body_world_position) * motion.world_to_body_scale;
+        if !point.is_finite() || !normal.is_finite() || normal.length_squared() < 0.5 {
+            self.support_plane_clearance = None;
+            return None;
+        }
+        let key = stable_text_hash(&support.surface_id.0);
+        if self
+            .support_plane_clearance
+            .is_none_or(|(previous, _)| previous != key)
+        {
+            // Rendering has a finite kernel skirt. Calibrate one common center
+            // plane at acquisition, never a separate plane for each particle,
+            // and never chase the changing lowest particle during the bout.
+            let clearance = self.particles[..self.particle_count]
+                .iter()
+                .filter(|p| p.component_id == self.components.main_component)
+                .map(|p| (p.position - point).dot(normal))
+                .fold(f32::INFINITY, f32::min);
+            if !clearance.is_finite() || clearance < 0.0 {
+                return None;
+            }
+            self.support_plane_clearance = Some((key, clearance));
+        }
+        Some(SupportPlane {
+            point,
+            normal,
+            clearance: self.support_plane_clearance?.1,
+        })
+    }
+
+    fn update_field_shape(
+        &mut self,
+        motion: DropletMotion,
+        dt: f32,
+        measured_load: Option<(Vec2, f32)>,
+    ) {
         let speed_drive = smoothstep01(((motion.velocity.length() - 0.12) / 0.88).clamp(0.0, 1.0));
         let acceleration_drive =
             smoothstep01(((motion.acceleration.length() - 0.16) / 1.34).clamp(0.0, 1.0));
@@ -1390,8 +1553,20 @@ impl LiquidMorphRuntime {
         let travel_direction = (velocity_direction * speed_drive
             + acceleration_direction * acceleration_drive * 0.46)
             .normalize_or_zero();
-        if travel_direction.length_squared() > 1.0e-8 {
-            let mut target_axis = Vec2::new(-travel_direction.y, travel_direction.x);
+        // Rest changes the physical well, not rendered particle positions.
+        // A support request alone is insufficient: the previous solver tick
+        // must have measured an actual loaded surface patch.
+        let rest_axis = measured_load.map(|(axis, _)| axis);
+        let requested_axis =
+            rest_axis.unwrap_or_else(|| Vec2::new(-travel_direction.y, travel_direction.x));
+        // A departing loaded pancake must first release its large support
+        // anisotropy. Turning the field at6.5/s while independently relaxing
+        // aspect2.4 rotated a still-flat body17deg in the first30Hz frame.
+        // This sequences field shape only: no particle orientation projection,
+        // no root lock. The ordinary modest flight ellipse remains free to turn.
+        let releasing_loaded_shape = measured_load.is_none() && self.flight_field_aspect > 1.36;
+        if requested_axis.length_squared() > 1.0e-8 && !releasing_loaded_shape {
+            let mut target_axis = requested_axis;
             if target_axis.dot(self.flight_field_axis) < 0.0 {
                 target_axis = -target_axis;
             }
@@ -1403,8 +1578,15 @@ impl LiquidMorphRuntime {
         }
 
         let authored_stretch = self.effective_flight_stretch().clamp(0.0, 2.0);
-        let target_aspect = (1.0 + drive * authored_stretch * 0.36).clamp(1.0, 1.34);
-        let aspect_rate = 3.5 + drive * 3.5;
+        let target_aspect = measured_load.map_or_else(
+            || (1.0 + drive * authored_stretch * 0.36).clamp(1.0, 1.34),
+            |(_, load)| 1.0 + (load * 3.5).clamp(0.0, 1.4),
+        );
+        let aspect_rate = if measured_load.is_some() {
+            2.5
+        } else {
+            3.5 + drive * 3.5
+        };
         self.flight_field_aspect +=
             (target_aspect - self.flight_field_aspect) * (1.0 - (-aspect_rate * dt).exp());
         if !self.flight_field_axis.is_finite() || !self.flight_field_aspect.is_finite() {
@@ -1415,7 +1597,9 @@ impl LiquidMorphRuntime {
             if self.flight_field_axis.length_squared() <= 1.0e-8 {
                 self.flight_field_axis = Vec2::Y;
             }
-            self.flight_field_aspect = self.flight_field_aspect.clamp(1.0, 1.34);
+            // Only measured support can request >1.34. Retain the wider safety
+            // range during release so departure relaxes rather than snaps.
+            self.flight_field_aspect = self.flight_field_aspect.clamp(1.0, 2.4);
         }
     }
 
@@ -1626,6 +1810,12 @@ impl LiquidMorphRuntime {
         }
     }
 
+    fn advance_material_breath_phase(&mut self, dt: f32) {
+        self.material_breath_phase = (self.material_breath_phase
+            + dt * 0.92 * self.effective_idle_breath_speed())
+        .rem_euclid(TAU);
+    }
+
     fn apply_idle_breathing(&mut self, breath: f32, external_drive: f32, _dt: f32) {
         let amplitude = self.effective_idle_breath_amplitude();
         if amplitude <= 1.0e-5 || self.material_grab.is_active() {
@@ -1639,10 +1829,8 @@ impl LiquidMorphRuntime {
         // The material mode owns the deliberately slow 5–8 s silhouette cycle;
         // physiology only phase-modulates it so emotion remains causal without
         // turning calm breathing into a fast global scale pulse.
-        let material_wave = (self.elapsed * 0.92 * self.effective_idle_breath_speed()
-            + self.seed_phase * 1.9
-            + pose_wave * 0.16)
-            .sin();
+        let material_wave =
+            (self.material_breath_phase + self.seed_phase * 1.9 + pose_wave * 0.16).sin();
         let breath_wave = material_wave * 0.78 + pose_wave * 0.22;
         let mut proposed = [Vec2::ZERO; MAX_LIQUID_PARTICLES];
         let mut total = Vec2::ZERO;
@@ -2827,6 +3015,10 @@ impl LiquidMorphRuntime {
             .into_iter()
             .all(f32::is_finite);
         self.diagnostics = LiquidDiagnostics {
+            object_load: self.object_load,
+            object_contact_impulse: self.object_contact_impulse,
+            support_field_load: self.measured_support_load,
+            permanent_field_aspect: self.flight_field_aspect,
             particle_count: self.particle_count,
             component_count: self.components.component_count,
             main_mass: self.components.main_mass,
@@ -2870,6 +3062,7 @@ fn apply_somatic_actuation(
     body_world_position: Vec2,
     world_to_body_scale: Vec2,
     packet: &SomaticActuationPacket,
+    support_plane: Option<SupportPlane>,
     dt: f32,
 ) -> SomaticStepMetrics {
     let mut metrics = SomaticStepMetrics::default();
@@ -2982,23 +3175,58 @@ fn apply_somatic_actuation(
             if particle.component_id != components.main_component {
                 continue;
             }
+            if support_plane.is_some() {
+                // Weight is transmitted through the whole supported mass;
+                // adhesion alone pulls a small toe out of a floating ball.
+                // The unilateral wall reaction and density solve redistribute
+                // this load laterally instead of moving a render silhouette.
+                let weight = -normal * support.load_fraction.clamp(0.0, 1.0) * 0.25;
+                particle.force += weight;
+                metrics.total_field_energy += weight.length() * safe_dt;
+            }
             let offset = particle.position - anchor;
             let tangent_distance = offset.dot(tangent).abs();
-            let normal_distance = offset.dot(normal);
-            let tangent_weight = (1.0 - tangent_distance / band_radius).clamp(0.0, 1.0);
+            let normal_distance = offset.dot(normal) - support_plane.map_or(0.0, |p| p.clearance);
+            let wetting = support_plane.is_some();
+            let tangent_weight = if wetting {
+                // A uniform solid patch must not pull its center more strongly
+                // than its sides: that reconstructs the same rounded toe.
+                1.0 - smoothstep01(((tangent_distance / band_radius - 0.75) / 0.25).clamp(0.0, 1.0))
+            } else {
+                (1.0 - tangent_distance / band_radius).clamp(0.0, 1.0)
+            };
             if tangent_weight <= 0.0 {
                 continue;
             }
             let proximity = (1.0 - normal_distance.abs() / (contact_depth * 3.0)).clamp(0.0, 1.0);
             let normal_error = normal_distance.clamp(-contact_depth * 2.0, contact_depth * 2.0);
-            let normal_force = -normal * normal_error * (5.0 - support.normal_compliance * 2.4);
+            let normal_force = -normal
+                * normal_error
+                * if wetting {
+                    40.0 + support.adhesion * 64.0
+                } else {
+                    5.0 - support.normal_compliance * 2.4
+                };
             let friction =
                 -tangent * particle.velocity.dot(tangent) * support.tangent_friction * 0.65;
-            let load = -normal * support.load_fraction * 0.72;
+            // The bottom layer receives the wall reaction, not a persistent
+            // downward pull that the host cancels by lifting the whole pet.
+            let load = -normal
+                * support.load_fraction
+                * 0.72
+                * if wetting {
+                    (normal_distance / contact_depth).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
             let adhesion = -normal * normal_distance.max(0.0) * support.adhesion * 2.2;
             let force = ((normal_force + friction + load + adhesion)
                 * tangent_weight
-                * proximity.max(0.18))
+                * if wetting {
+                    proximity
+                } else {
+                    proximity.max(0.18)
+                })
             .clamp_length_max(2.8);
             particle.force += force;
             let energy = force.length() * safe_dt;
@@ -3266,6 +3494,57 @@ mod flight_field_tests {
     }
 
     #[test]
+    fn material_frame_angle_is_not_the_physical_mass_principal_axis() {
+        fn principal_axis(runtime: &LiquidMorphRuntime) -> f32 {
+            let mut covariance = glam::Vec3::ZERO;
+            for p in &runtime.particles[..runtime.particle_count] {
+                let r = p.position - runtime.components.main_com;
+                covariance += glam::Vec3::new(r.x * r.x, r.x * r.y, r.y * r.y);
+            }
+            0.5 * (2.0 * covariance.y).atan2(covariance.x - covariance.z)
+        }
+        let mut runtime = LiquidMorphRuntime::new(42);
+        let physical_before = principal_axis(&runtime);
+        let material_before = runtime.main_component_orientation();
+        let rotation = Vec2::from_angle(0.4);
+        for particle in &mut runtime.particles[..runtime.particle_count] {
+            particle.rest_position = rotate_vector(particle.rest_position, rotation);
+        }
+        // No particle moved: a rest-label fit can report a large angle while
+        // the actual material footprint/principal axis is exactly unchanged.
+        assert!((principal_axis(&runtime) - physical_before).abs() < 1.0e-6);
+        assert!((runtime.main_component_orientation() - material_before).abs() > 0.35);
+    }
+
+    #[test]
+    fn released_supported_well_loses_loaded_anisotropy_before_turning() {
+        for hz in [30, 60, 120] {
+            let mut runtime = LiquidMorphRuntime::new(42);
+            let dt = 1.0 / hz as f32;
+            for _ in 0..hz * 4 {
+                runtime.update_field_shape(DropletMotion::default(), dt, Some((Vec2::X, 0.4)));
+            }
+            assert!(runtime.flight_field_aspect > 2.39);
+            for frame in 0..hz {
+                runtime.update_field_shape(motion(Vec2::X * 1.4, Vec2::ZERO), dt, None);
+                let angle = runtime
+                    .flight_field_axis
+                    .y
+                    .atan2(runtime.flight_field_axis.x);
+                if runtime.flight_field_aspect > 1.36 {
+                    assert!(
+                        angle.abs() < 0.01,
+                        "hz{hz} frame{frame}: loaded aspect{} rotates to{angle}",
+                        runtime.flight_field_aspect
+                    );
+                }
+            }
+            assert!(runtime.flight_field_axis.y.abs() > 0.95);
+            assert!(runtime.flight_field_aspect < 1.35);
+        }
+    }
+
+    #[test]
     fn flight_field_flattens_continuously_and_relaxes_without_axis_flip() {
         let mut runtime = LiquidMorphRuntime::new(0x00F1_1E1D);
         let dt = 1.0 / 120.0;
@@ -3314,6 +3593,78 @@ mod flight_field_tests {
         assert!(at_60.0.distance(at_144.0) < 1.0e-5);
         assert!((at_30.1 - at_60.1).abs() < 1.0e-5);
         assert!((at_60.1 - at_144.1).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn support_request_without_a_physical_patch_does_not_flatten_the_well() {
+        let mut runtime = LiquidMorphRuntime::new(42);
+        let support = pet_motor::SurfaceAttachmentCommand {
+            surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
+            anchor_point: Vec2::new(0.5, 1.0),
+            load_fraction: 0.4,
+            normal: Vec2::NEG_Y,
+            tangent: Vec2::X,
+            target_contact_fraction: 0.36,
+            normal_compliance: 0.25,
+            tangent_friction: 0.6,
+            adhesion: 0.2,
+            break_force: 0.75,
+            release_half_life: 0.3,
+        };
+        runtime.somatic_actuation.support = Some(support);
+        let stationary = DropletMotion {
+            world_to_body_scale: Vec2::new(10.0, -10.0),
+            ..DropletMotion::default()
+        };
+        for _ in 0..240 {
+            let measured = runtime.measured_surface_load(stationary, Vec2::new(0.5, 0.5));
+            assert!(measured.is_none());
+            runtime.update_field_shape(stationary, 1.0 / 60.0, measured);
+        }
+        assert_eq!(runtime.flight_field_aspect, 1.0);
+        let render = runtime.render_state();
+        let (minimum, _) = contact_surface_bounds(
+            &render.particles[..render.particle_count],
+            runtime.tuning.iso_threshold,
+            Vec2::ZERO,
+        )
+        .unwrap();
+        runtime
+            .somatic_actuation
+            .support
+            .as_mut()
+            .unwrap()
+            .anchor_point =
+            Vec2::splat(0.5) + Vec2::new(0.0, minimum.y) / stationary.world_to_body_scale;
+        let measured = runtime.measured_surface_load(stationary, Vec2::splat(0.5));
+        assert!(
+            measured.is_some(),
+            "host iso-contour contact must be recognized by physical load"
+        );
+        for _ in 0..240 {
+            runtime.update_field_shape(stationary, 1.0 / 60.0, measured);
+        }
+        assert!((runtime.flight_field_aspect - 2.4).abs() < 0.001);
+        let before_release = runtime.flight_field_aspect;
+        runtime.update_field_shape(stationary, 1.0 / 60.0, None);
+        assert!(
+            runtime.flight_field_aspect > 1.34,
+            "release must not snap to flight cap"
+        );
+        assert!((runtime.flight_field_aspect - before_release).abs() < 0.09);
+    }
+
+    #[test]
+    fn breathing_speed_change_does_not_rephase_old_elapsed_time() {
+        let mut runtime = LiquidMorphRuntime::new(42);
+        runtime.elapsed = 2400.0;
+        runtime.material_breath_phase = 0.7;
+        let before = runtime.material_breath_phase;
+        runtime.runtime_actuation.idle_breath_speed_multiplier = 0.4;
+        let expected = 0.92 * runtime.effective_idle_breath_speed() / 120.0;
+        runtime.advance_material_breath_phase(1.0 / 120.0);
+        assert!((runtime.material_breath_phase - before - expected).abs() < 0.00001);
+        assert!((runtime.material_breath_phase.sin() - before.sin()).abs() < 0.01);
     }
 
     #[test]
@@ -3409,6 +3760,7 @@ mod flight_field_tests {
             Vec2::splat(0.5),
             Vec2::ONE,
             &packet,
+            None,
             1.0 / 120.0,
         );
         let affected = runtime.particles[..runtime.particle_count]

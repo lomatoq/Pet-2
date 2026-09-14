@@ -6,6 +6,48 @@ use super::{
     particles::{LiquidParticle, MAX_LIQUID_PARTICLES},
 };
 
+/// A single particle-space half-plane, not a per-particle rest silhouette.
+/// Normal points into the allowed region; all movable points share clearance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SupportPlane {
+    pub point: Vec2,
+    pub normal: Vec2,
+    pub clearance: f32,
+}
+
+impl SupportPlane {
+    fn normalized(self) -> Option<Self> {
+        let length = self.normal.length();
+        if !self.point.is_finite()
+            || !self.normal.is_finite()
+            || !length.is_finite()
+            || length <= f32::EPSILON
+            || !self.clearance.is_finite()
+            || self.clearance < 0.0
+        {
+            return None;
+        }
+        Some(Self {
+            normal: self.normal / length,
+            ..self
+        })
+    }
+
+    fn project(self, position: Vec2) -> Vec2 {
+        let penetration = self.clearance - (position - self.point).dot(self.normal);
+        if penetration.is_finite() && penetration > 0.0 {
+            let projected = position + self.normal * penetration;
+            if projected.is_finite() {
+                projected
+            } else {
+                position
+            }
+        } else {
+            position
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DensityConstraintParameters {
     pub rest_density: f32,
@@ -19,6 +61,26 @@ pub struct DensityConstraintParameters {
     /// Absolute particle-space bounds. Containment is a unilateral positional
     /// constraint in the same projection loop, with no restitution impulse.
     pub containment_bounds: Option<(Vec2, Vec2)>,
+    /// Optional unilateral plane projected after every density iteration. The
+    /// caller owns support evidence and a consistent plane/containment domain.
+    pub support_plane: Option<SupportPlane>,
+}
+
+/// Reapply the same contact after any subsequent bond/topology positional
+/// constraints and before deriving velocities. No restitution or tangential force.
+pub(super) fn project_support_plane(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    plane: Option<SupportPlane>,
+) {
+    let Some(plane) = plane.and_then(SupportPlane::normalized) else {
+        return;
+    };
+    for particle in &mut particles[..count.min(MAX_LIQUID_PARTICLES)] {
+        if particle.inverse_mass.is_finite() && particle.inverse_mass > f32::EPSILON {
+            particle.predicted_position = plane.project(particle.predicted_position);
+        }
+    }
 }
 
 pub fn solve_density_constraints(
@@ -36,16 +98,19 @@ pub fn solve_density_constraints(
         iterations,
         dt,
         containment_bounds,
+        support_plane,
     } = parameters;
     let count = count.min(MAX_LIQUID_PARTICLES);
     if count == 0
         || iterations == 0
+        || !dt.is_finite()
         || dt <= f32::EPSILON
         || kernel_radius <= f32::EPSILON
         || rest_density <= f32::EPSILON
     {
         return;
     }
+    let support_plane = support_plane.and_then(SupportPlane::normalized);
 
     // XPBD multipliers persist only across the iterations of this solve. Carrying
     // them into the next fixed tick stores stale pressure and produces a large
@@ -136,6 +201,7 @@ pub fn solve_density_constraints(
                 particle.predicted_position = particle.predicted_position.clamp(minimum, maximum);
             }
         }
+        project_support_plane(particles, count, support_plane);
     }
     update_density_and_surface(particles, count, kernel_radius);
 }
@@ -147,6 +213,158 @@ mod tests {
         density::{calibrate_rest_density, mean_density_error},
         particles::{KERNEL_RADIUS, initialize_particles_with},
     };
+
+    #[test]
+    fn support_plane_is_unilateral_normal_only_and_iteration_independent() {
+        for normal in [Vec2::Y * 3.0, Vec2::new(3.0, -4.0)] {
+            let unit = normal.normalize();
+            let tangent = Vec2::new(-unit.y, unit.x);
+            let point = Vec2::new(0.12, -0.04);
+            let plane = SupportPlane {
+                point,
+                normal,
+                clearance: 0.025,
+            };
+            for iterations in [1, 4, 12] {
+                let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+                for (index, distance) in [-0.09, 0.01, 0.13].into_iter().enumerate() {
+                    particles[index].inverse_mass = 1.0;
+                    particles[index].predicted_position =
+                        point + unit * distance + tangent * index as f32;
+                }
+                let before = particles;
+                solve_density_constraints(
+                    &mut particles,
+                    3,
+                    DensityConstraintParameters {
+                        rest_density: 1000.0,
+                        kernel_radius: 0.1,
+                        compliance: 0.0,
+                        scorr_k: 0.0,
+                        scorr_q_ratio: 0.2,
+                        scorr_power: 4,
+                        iterations,
+                        dt: 1.0 / 120.0,
+                        containment_bounds: None,
+                        support_plane: Some(plane),
+                    },
+                );
+                for index in 0..3 {
+                    let position = particles[index].predicted_position;
+                    assert!((position - point).dot(unit) >= plane.clearance - 1.0e-6);
+                    let delta = position - before[index].predicted_position;
+                    assert!(delta.dot(tangent).abs() < 1.0e-6);
+                    let penetration = (plane.clearance
+                        - (before[index].predicted_position - point).dot(unit))
+                    .max(0.0);
+                    assert!((delta.length() - penetration).abs() < 1.0e-6);
+                }
+                assert_eq!(
+                    particles[2].predicted_position,
+                    before[2].predicted_position
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn support_plane_absent_inactive_and_invalid_preserve_density_solution_exactly() {
+        let (reference, count) = initialize_particles_with(42, 48, 1.0);
+        let parameters = DensityConstraintParameters {
+            rest_density: calibrate_rest_density(&reference, count, KERNEL_RADIUS),
+            kernel_radius: KERNEL_RADIUS,
+            compliance: 8.0e-6,
+            scorr_k: 0.005,
+            scorr_q_ratio: 0.2,
+            scorr_power: 4,
+            iterations: 6,
+            dt: 1.0 / 120.0,
+            containment_bounds: None,
+            support_plane: None,
+        };
+        let mut baseline = reference;
+        solve_density_constraints(&mut baseline, count, parameters);
+        for plane in [
+            SupportPlane {
+                point: Vec2::new(0.0, -100.0),
+                normal: Vec2::Y,
+                clearance: 0.0,
+            },
+            SupportPlane {
+                point: Vec2::ZERO,
+                normal: Vec2::ZERO,
+                clearance: 0.0,
+            },
+            SupportPlane {
+                point: Vec2::splat(f32::NAN),
+                normal: Vec2::Y,
+                clearance: 0.0,
+            },
+            SupportPlane {
+                point: Vec2::ZERO,
+                normal: Vec2::Y,
+                clearance: f32::INFINITY,
+            },
+        ] {
+            let mut particles = reference;
+            solve_density_constraints(
+                &mut particles,
+                count,
+                DensityConstraintParameters {
+                    support_plane: Some(plane),
+                    ..parameters
+                },
+            );
+            for index in 0..count {
+                assert_eq!(
+                    particles[index].predicted_position,
+                    baseline[index].predicted_position
+                );
+                assert_eq!(particles[index].lambda, baseline[index].lambda);
+                assert_eq!(particles[index].density, baseline[index].density);
+            }
+        }
+    }
+
+    #[test]
+    fn support_plane_survives_dense_pack_projection_and_ignores_pinned_points() {
+        let (mut particles, count) = initialize_particles_with(71, 48, 1.0);
+        let rest_density = calibrate_rest_density(&particles, count, KERNEL_RADIUS);
+        for particle in &mut particles[..count] {
+            particle.predicted_position *= 0.7;
+        }
+        let plane = SupportPlane {
+            point: Vec2::new(0.0, -0.2),
+            normal: Vec2::Y,
+            clearance: 0.03,
+        };
+        particles[0].inverse_mass = 0.0;
+        particles[0].predicted_position = Vec2::new(0.0, -0.3);
+        solve_density_constraints(
+            &mut particles,
+            count,
+            DensityConstraintParameters {
+                rest_density,
+                kernel_radius: KERNEL_RADIUS,
+                compliance: 8.0e-6,
+                scorr_k: 0.005,
+                scorr_q_ratio: 0.2,
+                scorr_power: 4,
+                iterations: 6,
+                dt: 1.0 / 120.0,
+                containment_bounds: None,
+                support_plane: Some(plane),
+            },
+        );
+        assert_eq!(particles[0].predicted_position, Vec2::new(0.0, -0.3));
+        for particle in &particles[1..count] {
+            assert!(particle.predicted_position.is_finite());
+            assert!(
+                (particle.predicted_position - plane.point).dot(plane.normal)
+                    >= plane.clearance - 1.0e-6
+            );
+        }
+    }
 
     #[test]
     fn density_projection_is_zero_mean_and_nearly_stationary_on_the_calibrated_pack() {
@@ -175,6 +393,7 @@ mod tests {
                 iterations: 6,
                 dt: 1.0 / 240.0,
                 containment_bounds: None,
+                support_plane: None,
             },
         );
         let after_center = particles[..count]
@@ -225,6 +444,7 @@ mod tests {
                 iterations: 6,
                 dt: 1.0 / 120.0,
                 containment_bounds: None,
+                support_plane: None,
             },
         );
         let after_peak = compressed[..count]
@@ -264,6 +484,7 @@ mod tests {
                 iterations: 6,
                 dt: 1.0 / 120.0,
                 containment_bounds: None,
+                support_plane: None,
             },
         );
         assert_eq!(isolated[0].predicted_position, before[0]);
@@ -290,6 +511,7 @@ mod tests {
             iterations: 6,
             dt: 1.0 / 120.0,
             containment_bounds: Some((Vec2::splat(-0.05), Vec2::splat(0.05))),
+            support_plane: None,
         };
         solve_density_constraints(&mut particles, 2, parameters);
         assert!(particles[..2].iter().any(|particle| particle.lambda < 0.0));

@@ -2,6 +2,8 @@ use lifecore::ExpressionState;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ExpressionRuntime {
+    /// Managed motor/director input owns actions; diagnostic pose labels do not.
+    pub managed_actions: bool,
     pub current: ExpressionState,
     pub desired_geometry: lifecore::FaceGeometry,
     pub geometry_age_seconds: f32,
@@ -9,6 +11,10 @@ pub struct ExpressionRuntime {
     pub geometry_saturated: bool,
     initial_geometry_error: f32,
     procedural_suppression: f32,
+    was_tired: bool,
+    yawn_elapsed: Option<f32>,
+    yawn_cooldown: f32,
+    geometry_velocity: [f32; 20],
 }
 
 impl ExpressionRuntime {
@@ -27,17 +33,68 @@ impl ExpressionRuntime {
             self.initial_geometry_error = self.current.geometry.maximum_error(geometry);
         }
         self.geometry_age_seconds += dt.clamp(0.0, 0.1);
-        if target.face_pose == lifecore::FacePose::Tired && self.geometry_age_seconds < 0.8 {
-            // One transition yawn; holding the same pose never restarts it.
-            let phase = (self.geometry_age_seconds / 0.8).clamp(0.0, 1.0);
+        self.yawn_cooldown = (self.yawn_cooldown - dt).max(0.0);
+        let tired = target.face_pose == lifecore::FacePose::Tired;
+        if !self.managed_actions && tired && !self.was_tired && self.yawn_cooldown <= 0.0 {
+            self.yawn_elapsed = Some(0.0);
+            self.yawn_cooldown = 8.0;
+        }
+        self.was_tired = tired;
+        if self.managed_actions || !tired {
+            self.yawn_elapsed = None;
+        }
+        if let Some(elapsed) = self.yawn_elapsed {
+            // A yawn belongs to a pose-entry event, not the geometry clock:
+            // independent brow/lid motion must never restart the mouth cycle.
+            let elapsed = elapsed + dt;
+            self.yawn_elapsed = (elapsed < 0.8).then_some(elapsed);
+            let phase = (elapsed / 0.8).clamp(0.0, 1.0);
             target.mouth_open = target
                 .mouth_open
                 .max((phase * std::f32::consts::PI).sin() * 0.6);
         }
         self.current.face_pose = target.face_pose;
-        self.current
+        // Separate tissue recruitment/relaxation, preserving velocity through
+        // retargets. A pose switch must not restart one identical crossfade for
+        // every point of both eyelids, brows and lips.
+        for (index, (current, desired)) in self
+            .current
             .geometry
-            .approach(target.geometry, 1.0 - (-dt.clamp(0.0, 0.1) / 0.08).exp());
+            .lids
+            .iter_mut()
+            .flatten()
+            .chain(self.current.geometry.brows.iter_mut().flatten())
+            .chain(self.current.geometry.mouth.iter_mut())
+            .zip(
+                geometry
+                    .lids
+                    .iter()
+                    .flatten()
+                    .chain(geometry.brows.iter().flatten())
+                    .chain(geometry.mouth.iter()),
+            )
+            .enumerate()
+        {
+            let omega = if index < 8 {
+                if desired > current { 13.0 } else { 9.0 }
+            } else if index < 16 {
+                if desired.abs() > current.abs() {
+                    9.0
+                } else {
+                    6.5
+                }
+            } else if desired.abs() > current.abs() {
+                11.0
+            } else {
+                8.0
+            };
+            let displacement = *current - desired;
+            let j = self.geometry_velocity[index] + omega * displacement;
+            let decay = (-omega * dt).exp();
+            *current = desired + (displacement + j * dt) * decay;
+            self.geometry_velocity[index] =
+                (self.geometry_velocity[index] - omega * j * dt) * decay;
+        }
         if self.geometry_90_seconds.is_none()
             && self.current.geometry.maximum_error(geometry)
                 <= self.initial_geometry_error * 0.1 + 1.0e-5
@@ -104,7 +161,7 @@ impl ExpressionRuntime {
             (
                 &mut self.current.mouth_open,
                 target.mouth_open,
-                0.040,
+                0.16,
                 0.0,
                 1.0,
             ),
@@ -187,4 +244,76 @@ fn follow(current: f32, target: f32, dt: f32, tau: f32, low: f32, high: f32) -> 
     let current = finite(current, 0.0).clamp(low, high);
     let target = finite(target, current).clamp(low, high);
     current + (target - current) * (1.0 - (-dt / tau.max(0.001)).exp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_diagnostic_tired_label_cannot_generate_yawns() {
+        for hz in [30, 60, 120] {
+            let mut runtime = ExpressionRuntime {
+                managed_actions: true,
+                ..Default::default()
+            };
+            for tick in 0..hz * 30 {
+                let target = if (tick / (hz * 2)) % 2 == 0 {
+                    lifecore::FacePose::Tired.expression()
+                } else {
+                    lifecore::FacePose::Awake.expression()
+                };
+                runtime.update(target, 0.0, 1.0 / hz as f32);
+                assert!(runtime.current.mouth_open < 0.001);
+            }
+            let mut authored_yawn = lifecore::FacePose::Tired.expression();
+            authored_yawn.mouth_open = 0.8;
+            for _ in 0..hz {
+                runtime.update(authored_yawn, 0.0, 1.0 / hz as f32);
+            }
+            assert!(runtime.current.mouth_open > 0.79);
+        }
+    }
+
+    #[test]
+    fn semantic_mouth_flicker_is_bounded_but_a_held_expression_arrives() {
+        for hz in [30, 60, 120] {
+            let mut runtime = ExpressionRuntime::default();
+            let mut previous = 0.0;
+            for tick in 0..hz * 4 {
+                let mut target = lifecore::FacePose::Awake.expression();
+                // Alternating 50 ms semantic states, independent of render Hz.
+                target.mouth_open = if (tick * 20 / hz) % 2 == 0 { 1.0 } else { 0.0 };
+                target.geometry.mouth[1] = target.mouth_open;
+                runtime.update(target, 0.0, 1.0 / hz as f32);
+                assert!((runtime.current.mouth_open - previous).abs() < 0.20);
+                if tick > hz {
+                    assert!(runtime.current.mouth_open > 0.25 && runtime.current.mouth_open < 0.75);
+                }
+                previous = runtime.current.mouth_open;
+            }
+            let mut held = lifecore::FacePose::Awake.expression();
+            held.mouth_open = 1.0;
+            held.geometry.mouth[1] = 1.0;
+            for _ in 0..hz {
+                runtime.update(held, 0.0, 1.0 / hz as f32);
+            }
+            assert!(runtime.current.mouth_open > 0.99);
+            assert!(runtime.current.geometry.mouth[1] > 0.99);
+        }
+    }
+
+    #[test]
+    fn moving_tired_brows_cannot_restart_yawn() {
+        let mut runtime = ExpressionRuntime::default();
+        for tick in 0..600 {
+            let mut target = lifecore::FacePose::Tired.expression();
+            target.mouth_open = 0.0;
+            target.geometry.brows[0][0] = (tick as f32 * 0.1).sin() * 0.1;
+            runtime.update(target, 0.0, 1.0 / 60.0);
+            if tick > 150 {
+                assert!(runtime.current.mouth_open < 0.001, "tick={tick}");
+            }
+        }
+    }
 }

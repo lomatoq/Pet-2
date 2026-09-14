@@ -6,10 +6,34 @@ use crate::{
     ActivePerformance, BehaviorContextFrame, BehaviorProgramId, BehaviorTarget, BoutStyle,
     CompletionReason, MotorReadabilityTuning, MotorTraceRecord, PROGRAM_COUNT, PhaseAdvance,
     PhaseId, RegimeBlend, SomaticActuationPacket, SomaticRegime, SurfaceTarget, advance_phase,
-    choose_program, definition, lock_target, phase_clock_scale, phase_name, phase_progress,
+    definition, lock_target, phase_clock_scale, phase_name, phase_progress,
 };
 
 const TRACE_CAPACITY: usize = 256;
+
+fn is_committed_rest(program: BehaviorProgramId) -> bool {
+    matches!(
+        program,
+        BehaviorProgramId::RestSurfaceRoostSearch
+            | BehaviorProgramId::HomeLowEnergyRecharge
+            | BehaviorProgramId::RestLandingSoftTouchdown
+            | BehaviorProgramId::RestSitSettle
+            | BehaviorProgramId::RestNremSleep
+    )
+}
+
+fn rest_can_continue(goal: &BehaviorGoalFrame, context: &BehaviorContextFrame) -> bool {
+    use lifecore::ActionId as A;
+    !context.pet_touched && !context.pet_dragged && !context.orb_user_held
+        && context.boundary_violation <= 0.18
+        && matches!(context.world_goal, crate::MotorWorldGoal::None
+            | crate::MotorWorldGoal::ReturnHome | crate::MotorWorldGoal::SleepInDen)
+        // Ambient expression/exploration may fluctuate; explicit departures,
+        // cursor interaction and object tasks never inherit a rest lease.
+        && matches!(goal.action, A::IdleHover | A::ObserveCursor | A::ObserveUserActivity
+            | A::SilentStare | A::ExploreScreen | A::SelfPlay | A::HappyDisplay
+            | A::Chirp | A::Purr | A::Sleep | A::LandOnWindow)
+}
 
 #[derive(Debug, Clone)]
 pub struct BehaviorPerformanceRuntime {
@@ -23,6 +47,8 @@ pub struct BehaviorPerformanceRuntime {
     previous_gesture: lifecore::EmbodiedGestureKind,
     previous_salience: f32,
     previous_orb_user_held: bool,
+    rest_commit_seconds: f32,
+    rest_support_seen: bool,
     identity_seed: u64,
     next_bout_id: u64,
     active: Option<ActivePerformance>,
@@ -36,6 +62,11 @@ pub struct BehaviorPerformanceRuntime {
     recent_motion_signatures: VecDeque<u8>,
     last_completion: CompletionReason,
     last_packet: SomaticActuationPacket,
+    pending_convention_tempo: Option<(BehaviorProgramId, f32, f32)>,
+    active_convention_tempo: f32,
+    active_expression_gain: f32,
+    last_ornamental_attention:
+        Option<(lifecore::ActionId, lifecore::PrimaryIntent, glam::Vec2, f32)>,
 }
 
 impl BehaviorPerformanceRuntime {
@@ -52,6 +83,8 @@ impl BehaviorPerformanceRuntime {
             previous_gesture: lifecore::EmbodiedGestureKind::Unknown,
             previous_salience: 0.0,
             previous_orb_user_held: false,
+            rest_commit_seconds: 0.0,
+            rest_support_seen: false,
             identity_seed,
             next_bout_id: 1,
             active: None,
@@ -65,6 +98,10 @@ impl BehaviorPerformanceRuntime {
             recent_motion_signatures: VecDeque::with_capacity(2),
             last_completion: CompletionReason::None,
             last_packet: SomaticActuationPacket::default(),
+            pending_convention_tempo: None,
+            active_convention_tempo: 1.0,
+            active_expression_gain: 1.0,
+            last_ornamental_attention: None,
         }
     }
 
@@ -76,6 +113,22 @@ impl BehaviorPerformanceRuntime {
 
     pub fn await_gesture_repetition(&mut self) {
         self.ambiguity_seconds = 3.5;
+    }
+
+    /// One recognized, positively learned gesture may shape only its next
+    /// matching physical bout. Human wait/hold phases retain real seconds.
+    pub fn nominate_convention_tempo(&mut self, gesture: lifecore::EmbodiedGestureKind, rate: f32) {
+        use lifecore::EmbodiedGestureKind as G;
+        let program = match gesture {
+            G::CircularTwist => BehaviorProgramId::TouchCircularStirCooperate,
+            G::RhythmicTouch => BehaviorProgramId::TouchRhythmicTouchSync,
+            G::PullAndRelease => BehaviorProgramId::TouchPullReleaseRebound,
+            G::FragmentHelp => BehaviorProgramId::DefenseFragmentTrackAndRemerge,
+            _ => return,
+        };
+        if rate.is_finite() {
+            self.pending_convention_tempo = Some((program, rate.clamp(0.8, 1.2), 2.0));
+        }
     }
 
     pub fn set_tuning(&mut self, tuning: MotorReadabilityTuning) {
@@ -156,6 +209,12 @@ impl BehaviorPerformanceRuntime {
         for cooldown in &mut self.cooldowns {
             *cooldown = (*cooldown - dt).max(0.0);
         }
+        if let Some((_, _, age)) = &mut self.pending_convention_tempo {
+            *age -= dt;
+            if *age <= 0.0 {
+                self.pending_convention_tempo = None;
+            }
+        }
         if self.previous_world_goal == crate::MotorWorldGoal::PetMore
             && context.world_goal != self.previous_world_goal
             && self
@@ -218,8 +277,67 @@ impl BehaviorPerformanceRuntime {
             self.ambiguity_seconds = 0.0;
         }
 
+        let was_rest = self
+            .active
+            .as_ref()
+            .is_some_and(|a| is_committed_rest(a.program));
+        self.rest_commit_seconds = (self.rest_commit_seconds - dt).max(0.0);
+        if was_rest && context.support_confirmed() && !self.rest_support_seen {
+            self.rest_commit_seconds = self.rest_commit_seconds.max(8.0);
+            self.rest_support_seen = true;
+        }
+        let rest_committed =
+            was_rest && self.rest_commit_seconds > 0.0 && rest_can_continue(goal, context);
         if let Some(active) = &mut self.active {
-            match advance_phase(active, context, dt) {
+            // Authored preparation is accelerated, physical travel is not.
+            // Without this gate the 2.2 s approach times out after 0.55 real
+            // seconds, restarting orient/rank forever before reaching support.
+            let approaching_support = rest_committed
+                && active.program == BehaviorProgramId::RestSurfaceRoostSearch
+                && phase_name(active.program, active.phase.index) == "approach_commit"
+                && !context.support_confirmed()
+                && active.locked_target.as_ref().is_some_and(|target| {
+                    if let crate::BehaviorTarget::Surface(surface) = target {
+                        if surface.surface_id.0 == "screen:bottom_edge" {
+                            context.screen_edge_gap_px > 8.0
+                        } else {
+                            target.world_position().is_some_and(|point| {
+                                point.distance(context.body.motion.world_position) > 0.045
+                            })
+                        }
+                    } else {
+                        false
+                    }
+                });
+            let holding_rest = context.support_confirmed()
+                && (rest_committed || crate::selector::supported_rest_requested(goal, context))
+                && ((active.program == BehaviorProgramId::RestSitSettle
+                    && phase_name(active.program, active.phase.index) == "rest_hold")
+                    || (active.program == BehaviorProgramId::RestNremSleep
+                        && goal.action == lifecore::ActionId::Sleep
+                        && phase_name(active.program, active.phase.index) == "nrem_hold"));
+            let advance = if approaching_support {
+                let spec = &definition(active.program).phases[usize::from(active.phase.index)];
+                let performed_dt = dt * phase_clock_scale(active.program, spec.name);
+                active.phase_time = (active.phase_time + performed_dt).min(spec.maximum_seconds);
+                active.total_time += performed_dt;
+                active.minimum_readability_reached |= active.phase_time >= spec.minimum_seconds;
+                PhaseAdvance::Hold
+            } else if holding_rest {
+                PhaseAdvance::Hold
+            } else {
+                let scale = if phase_clock_scale(
+                    active.program,
+                    phase_name(active.program, active.phase.index),
+                ) > 1.0
+                {
+                    self.active_convention_tempo
+                } else {
+                    1.0
+                };
+                advance_phase(active, context, dt * scale)
+            };
+            match advance {
                 PhaseAdvance::Hold | PhaseAdvance::Advanced => {}
                 PhaseAdvance::Finished(reason) => {
                     let touch_bid = self.active.as_ref().is_some_and(|a| {
@@ -243,17 +361,25 @@ impl BehaviorPerformanceRuntime {
         if allow_selection {
             let current_program = self.active.as_ref().map(|active| active.program);
             let current_readable = self.active.as_ref().is_none_or(|active| {
-                active.minimum_readability_reached
-                    && !crate::response_phase(phase_name(active.program, active.phase.index))
-                    && active.social_bid.is_none()
-                    && active.program != BehaviorProgramId::SocialPettingSolicitation
+                (self.rest_support_seen
+                    && is_committed_rest(active.program)
+                    && !context.support_confirmed()
+                    && matches!(
+                        active.program,
+                        BehaviorProgramId::RestSitSettle | BehaviorProgramId::RestNremSleep
+                    ))
+                    || (active.minimum_readability_reached
+                        && !crate::response_phase(phase_name(active.program, active.phase.index))
+                        && active.social_bid.is_none()
+                        && active.program != BehaviorProgramId::SocialPettingSolicitation)
             });
-            if let Some(decision) = choose_program(
+            if let Some(decision) = crate::selector::choose_program_with_rest_commitment(
                 goal,
                 context,
                 current_program,
                 current_readable,
                 &self.cooldowns,
+                rest_committed,
             ) {
                 let should_start = match self.active.as_ref() {
                     None => true,
@@ -266,13 +392,57 @@ impl BehaviorPerformanceRuntime {
                             || current_readable
                     }
                 };
-                if should_start {
+                let ornamental = matches!(
+                    decision.program,
+                    BehaviorProgramId::MoveInspectPauseScan
+                        | BehaviorProgramId::MoveCheckBackSocialReference
+                ) && matches!(
+                    goal.action,
+                    lifecore::ActionId::IdleHover
+                        | lifecore::ActionId::ObserveCursor
+                        | lifecore::ActionId::ObserveUserActivity
+                        | lifecore::ActionId::SilentStare
+                ) && context.world_goal == crate::MotorWorldGoal::None;
+                let target = goal
+                    .body_intent
+                    .gaze_target
+                    .unwrap_or(context.cursor_position);
+                let stale_ornament = ornamental
+                    && self.last_ornamental_attention.is_some_and(
+                        |(action, primary, point, salience)| {
+                            action == goal.action
+                                && primary == context.companion_intent
+                                && point.distance(target) < 0.08
+                                && context.selected_salience <= salience + 0.2
+                        },
+                    );
+                if should_start && !stale_ornament {
+                    if ornamental {
+                        self.last_ornamental_attention = Some((
+                            goal.action,
+                            context.companion_intent,
+                            target,
+                            context.selected_salience,
+                        ));
+                    }
                     if self.active.is_some() {
                         self.finish_active(CompletionReason::Interrupted);
                     }
                     self.start(decision.program, decision.cause, goal, context);
                 }
             }
+        }
+
+        let now_rest = self
+            .active
+            .as_ref()
+            .is_some_and(|a| is_committed_rest(a.program));
+        if now_rest && !was_rest {
+            self.rest_support_seen = context.support_confirmed();
+            self.rest_commit_seconds = 8.0;
+        } else if !now_rest {
+            self.rest_commit_seconds = 0.0;
+            self.rest_support_seen = false;
         }
 
         let mut packet = SomaticActuationPacket {
@@ -290,8 +460,16 @@ impl BehaviorPerformanceRuntime {
             packet.phase_name = name.to_owned();
             packet.phase_progress = progress;
             packet.cause = active.cause;
-            let phase_started =
-                active.phase_time <= dt * phase_clock_scale(active.program, name) + 1.0e-6;
+            let clock = phase_clock_scale(active.program, name);
+            let phase_started = active.phase_time
+                <= dt
+                    * clock
+                    * if clock > 1.0 {
+                        self.active_convention_tempo
+                    } else {
+                        1.0
+                    }
+                    + 1.0e-6;
             super::programs::apply_program(
                 &mut packet,
                 active,
@@ -302,6 +480,15 @@ impl BehaviorPerformanceRuntime {
                 context,
                 self.tuning,
             );
+            // Scale only already-authored facial effort, never invent a blink,
+            // gaze shift, voice command or change grip/support constraints.
+            let gain = self.active_expression_gain;
+            packet.expression.mouth_open = (packet.expression.mouth_open * gain).clamp(0.0, 1.0);
+            packet.expression.eye_aperture_delta =
+                (packet.expression.eye_aperture_delta * gain).clamp(-1.0, 1.0);
+            packet.expression.squint_delta =
+                (packet.expression.squint_delta * gain).clamp(-1.0, 1.0);
+            packet.expression.relief = (packet.expression.relief * gain).clamp(0.0, 1.0);
             // Global physical tempo is owned by `pet_body::locomotion`. Keeping
             // it out of the authored packet preserves the relative timing and
             // braking envelopes shared by all 64 programs instead of stacking
@@ -423,6 +610,26 @@ impl BehaviorPerformanceRuntime {
             program,
             &self.recent_motion_signatures,
         );
+        let variable = program.family() != crate::ProgramFamily::DefenseIntegrity
+            && program != BehaviorProgramId::MoveOrientReflex;
+        let load = goal
+            .felt
+            .physical_load
+            .max(goal.felt.sleep_pressure)
+            .clamp(0.0, 1.0);
+        let freedom = if variable { 1.0 - load * 0.8 } else { 0.0 };
+        self.active_convention_tempo = 1.0 + (sampled_style.tempo - 1.0) * 0.6 * freedom;
+        self.active_expression_gain = 1.0 + (sampled_style.amplitude - 1.0) * 0.5 * freedom;
+        sampled_style.amplitude = 1.0 + (sampled_style.amplitude - 1.0) * freedom;
+        sampled_style.asymmetry = 0.86 + (sampled_style.asymmetry - 0.86) * freedom;
+        if variable
+            && cause == crate::MotorCause::UserGesture
+            && let Some((matching, rate, _)) = self.pending_convention_tempo
+            && matching == program
+        {
+            self.active_convention_tempo = (self.active_convention_tempo * rate).clamp(0.8, 1.2);
+            self.pending_convention_tempo = None;
+        }
         if program == BehaviorProgramId::SocialPresentTouchSide
             && context.preferred_touch_side != 0.0
         {
@@ -754,8 +961,13 @@ mod tests {
                     "{program:?} continued after refusal"
                 );
                 assert!(runtime.active().is_none());
-                let selected =
-                    choose_program(&goal, &context, Some(program), false, &[0.0; PROGRAM_COUNT]);
+                let selected = crate::choose_program(
+                    &goal,
+                    &context,
+                    Some(program),
+                    false,
+                    &[0.0; PROGRAM_COUNT],
+                );
                 assert!(selected.is_none_or(|d| !d.program.requests_user_attention()));
             }
         }
@@ -789,6 +1001,121 @@ mod tests {
             attachment: 0.2,
             recent_outcome: None,
         }
+    }
+
+    #[test]
+    fn repeated_bouts_have_stable_replayable_context_bounded_actual_timing() {
+        fn run(load: f32) -> Vec<(f32, f32)> {
+            let mut runtime = BehaviorPerformanceRuntime::new(73);
+            let mut goal = goal(ActionId::IdleHover, Vec2::splat(0.5));
+            goal.felt.physical_load = load;
+            let context = BehaviorContextFrame::default();
+            let mut output = Vec::new();
+            for _ in 0..12 {
+                runtime.start(
+                    BehaviorProgramId::TouchCircularStirCooperate,
+                    crate::MotorCause::LabFixture,
+                    &goal,
+                    &context,
+                );
+                let fixed = (
+                    runtime.active_convention_tempo,
+                    runtime.active_expression_gain,
+                );
+                let _ = runtime.tick_lab_fixture(&goal, &context, 0.01);
+                let actual_time = runtime.active().unwrap().phase_time;
+                let _ = runtime.tick_lab_fixture(&goal, &context, 0.01);
+                assert_eq!(
+                    fixed,
+                    (
+                        runtime.active_convention_tempo,
+                        runtime.active_expression_gain
+                    )
+                );
+                assert!((0.94..=1.06).contains(&fixed.0));
+                assert!((0.94..=1.06).contains(&fixed.1));
+                output.push((actual_time, fixed.1));
+            }
+            runtime.start(
+                BehaviorProgramId::DefenseStartleOrientFreeze,
+                crate::MotorCause::BodyIntegrity,
+                &goal,
+                &context,
+            );
+            assert_eq!(runtime.active_convention_tempo, 1.0);
+            assert_eq!(runtime.active_expression_gain, 1.0);
+            output
+        }
+        let free = run(0.0);
+        assert_eq!(free, run(0.0));
+        assert!(free.windows(2).all(|pair| pair[0] != pair[1]));
+        let loaded = run(1.0);
+        let spread = |values: &[(f32, f32)]| {
+            values.iter().map(|v| v.0).fold(f32::NEG_INFINITY, f32::max)
+                - values.iter().map(|v| v.0).fold(f32::INFINITY, f32::min)
+        };
+        assert!(spread(&loaded) < spread(&free) * 0.3);
+    }
+
+    #[test]
+    fn unchanged_observation_does_not_restart_ornamental_bouts_for_200_seconds() {
+        for action in [ActionId::ObserveCursor, ActionId::ObserveUserActivity] {
+            let mut runtime = BehaviorPerformanceRuntime::new(42);
+            let mut context = BehaviorContextFrame::default();
+            context.body.motion.world_position = Vec2::splat(0.5);
+            context.companion_intent = lifecore::PrimaryIntent::Inspect;
+            context.companion_confidence = 0.9;
+            let mut goal = goal(action, Vec2::new(0.7, 0.5));
+            goal.drives.safety = 0.0;
+            let mut bouts = std::collections::BTreeSet::new();
+            for _ in 0..4_000 {
+                let packet = runtime.tick(&goal, &context, 0.05);
+                if packet.program == Some(BehaviorProgramId::MoveInspectPauseScan) {
+                    bouts.insert(packet.source_bout_id);
+                }
+            }
+            assert_eq!(bouts.len(), 1);
+            goal.body_intent.gaze_target = Some(Vec2::new(0.2, 0.5));
+            let packet = runtime.tick(&goal, &context, 0.05);
+            assert_eq!(
+                packet.program,
+                Some(BehaviorProgramId::MoveInspectPauseScan)
+            );
+            assert!(
+                !bouts.contains(&packet.source_bout_id),
+                "new actual target permits inspection"
+            );
+        }
+    }
+
+    #[test]
+    fn learned_gesture_tempo_changes_only_matching_bout_and_is_bounded() {
+        let mut slow = BehaviorPerformanceRuntime::new(42);
+        let mut fast = BehaviorPerformanceRuntime::new(42);
+        let goal = goal(ActionId::IdleHover, Vec2::splat(0.5));
+        let context = BehaviorContextFrame::default();
+        slow.nominate_convention_tempo(lifecore::EmbodiedGestureKind::CircularTwist, 0.01);
+        fast.nominate_convention_tempo(lifecore::EmbodiedGestureKind::CircularTwist, 100.0);
+        for runtime in [&mut slow, &mut fast] {
+            runtime.start(
+                BehaviorProgramId::TouchCircularStirCooperate,
+                crate::MotorCause::UserGesture,
+                &goal,
+                &context,
+            );
+            let _ = runtime.tick_lab_fixture(&goal, &context, 0.01);
+        }
+        assert!((0.8..=1.2).contains(&slow.active_convention_tempo));
+        assert!((0.8..=1.2).contains(&fast.active_convention_tempo));
+        assert!(fast.active().unwrap().phase_time / slow.active().unwrap().phase_time > 1.35);
+        fast.start(
+            BehaviorProgramId::MoveInspectPauseScan,
+            crate::MotorCause::UserGesture,
+            &goal,
+            &context,
+        );
+        assert!((0.94..=1.06).contains(&fast.active_convention_tempo));
+        assert!(fast.pending_convention_tempo.is_none());
     }
 
     #[test]

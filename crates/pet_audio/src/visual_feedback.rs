@@ -21,10 +21,13 @@ pub fn global_visual_feedback() -> AudioVisualFeedback {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AudioVisualFeedback {
+    pub shout: f32,
     pub active: bool,
     pub request_id: u64,
     pub motif_id: u64,
     pub syllable_index: u8,
+    /// Actual performed segments, not the stored learned motif length.
+    pub syllable_count: u8,
     pub emitted_energy: f32,
     pub breath_pressure: f32,
     pub glottal_openness: f32,
@@ -48,6 +51,7 @@ pub struct AudioCallbackLevels {
 
 #[derive(Default)]
 pub struct AudioVisualBridge {
+    shout: AtomicU32,
     state: AtomicU32,
     request_id: AtomicU64,
     motif_id: AtomicU64,
@@ -76,8 +80,10 @@ impl AudioVisualBridge {
         // observed state always includes the fields written before it.
         let state = self.state.load(Ordering::Acquire);
         AudioVisualFeedback {
+            shout: load_f32(&self.shout),
             active: state & 1 != 0,
             syllable_index: ((state >> 8) & 0xff) as u8,
+            syllable_count: ((state >> 16) & 0xff) as u8,
             request_id: self.request_id.load(Ordering::Relaxed),
             motif_id: self.motif_id.load(Ordering::Relaxed),
             emitted_energy: load_f32(&self.emitted_energy),
@@ -121,6 +127,7 @@ impl AudioVisualBridge {
     }
 
     pub(crate) fn publish(&self, feedback: AudioVisualFeedback) {
+        store_f32(&self.shout, feedback.shout);
         self.request_id
             .store(feedback.request_id, Ordering::Relaxed);
         self.motif_id.store(feedback.motif_id, Ordering::Relaxed);
@@ -138,11 +145,14 @@ impl AudioVisualBridge {
             .store(u32::from(feedback.phonation_regime), Ordering::Relaxed);
         store_f32(&self.noisiness, feedback.noisiness);
         store_f32(&self.purr, feedback.purr);
-        let state = u32::from(feedback.active) | (u32::from(feedback.syllable_index) << 8);
+        let state = u32::from(feedback.active)
+            | (u32::from(feedback.syllable_index) << 8)
+            | (u32::from(feedback.syllable_count) << 16);
         self.state.store(state, Ordering::Release);
     }
 
     pub(crate) fn clear(&self) {
+        store_f32(&self.shout, 0.0);
         store_f32(&self.emitted_energy, 0.0);
         store_f32(&self.breath_pressure, 0.0);
         store_f32(&self.glottal_openness, 0.0);
@@ -184,12 +194,14 @@ mod tests {
             request_id: 0x00A1_1D10,
             motif_id: 44,
             syllable_index: 3,
+            syllable_count: 5,
             emitted_energy: 0.72,
             breath_pressure: 0.63,
             glottal_openness: 0.51,
             mouth_aperture: 0.61,
             envelope: 0.72,
             mouth_open: 0.61,
+            shout: 0.0,
             pitch_normalized: 1.14,
             aspiration: 0.22,
             body_resonance_energy: 0.31,
@@ -212,12 +224,14 @@ mod tests {
             request_id: 0x51A7_E001,
             motif_id: 0x00A1_1D10,
             syllable_index: 5,
+            syllable_count: 6,
             emitted_energy: 0.83,
             breath_pressure: 0.72,
             glottal_openness: 0.62,
             mouth_aperture: 0.74,
             envelope: 0.83,
             mouth_open: 0.74,
+            shout: 0.8,
             pitch_normalized: 1.21,
             aspiration: 0.19,
             body_resonance_energy: 0.28,

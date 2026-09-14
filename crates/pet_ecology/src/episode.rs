@@ -140,6 +140,9 @@ pub enum ExpectedOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ActivityEpisode {
+    /// Affect sampled once for this bout's delivery; safety inputs remain live.
+    pub bout_play_drive: f32,
+    pub bout_fatigue: f32,
     pub id: u64,
     pub goal: EpisodeGoal,
     pub phase: EpisodePhase,
@@ -309,8 +312,39 @@ enum EpisodeStep {
 
 /// The sole ecology behavior writer. With no active episode this boundary is a
 /// strict pass-through and therefore preserves every existing brain mode.
+#[derive(Clone, Debug, Default)]
+struct EpisodeAdaptation {
+    placement: [f32; 2],
+    placement_failures: [u8; 2],
+    game: [f32; 2],
+    game_refusals: [u8; 2],
+    recent: [u64; 16],
+    cursor: usize,
+}
+
+impl EpisodeAdaptation {
+    fn accept(&mut self, id: u64) -> bool {
+        if id == 0 || self.recent.contains(&id) {
+            return false;
+        }
+        self.recent[self.cursor] = id;
+        self.cursor = (self.cursor + 1) % self.recent.len();
+        true
+    }
+    fn placement_side(&self) -> f32 {
+        if self.placement[0] >= 3.0 && self.placement[0] > self.placement[1] + 0.5 {
+            -1.0
+        } else if self.placement[1] >= 3.0 && self.placement[1] > self.placement[0] + 0.5 {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EpisodeDirector {
+    adaptation: EpisodeAdaptation,
     active: Option<ActivityEpisode>,
     tick: u64,
     visual_episode_cooldown: f32,
@@ -326,6 +360,7 @@ pub struct EpisodeDirector {
 impl Default for EpisodeDirector {
     fn default() -> Self {
         Self {
+            adaptation: EpisodeAdaptation::default(),
             active: None,
             tick: 0,
             visual_episode_cooldown: 0.0,
@@ -341,6 +376,81 @@ impl Default for EpisodeDirector {
 }
 
 impl EpisodeDirector {
+    /// Measured latch result, never a Store command acknowledgement. Repeated
+    /// event identities cannot reinforce a preference multiple times.
+    pub fn observe_placement_result(
+        &mut self,
+        event_id: u64,
+        side: f32,
+        success: bool,
+    ) -> Option<u16> {
+        if !side.is_finite() || side.abs() < 0.1 || !self.adaptation.accept(event_id) {
+            return None;
+        }
+        let index = usize::from(side > 0.0);
+        let score = &mut self.adaptation.placement[index];
+        let old = *score;
+        self.adaptation.placement_failures[index] = if success {
+            0
+        } else {
+            self.adaptation.placement_failures[index].saturating_add(1)
+        };
+        let delta = if success {
+            1.0
+        } else if self.adaptation.placement_failures[index] >= 2 {
+            -1.4
+        } else {
+            0.0
+        };
+        *score = (*score + delta).clamp(-4.0, 8.0);
+        if success && old < 3.0 && *score >= 3.0 {
+            Some(191)
+        } else if !success && old >= 3.0 && self.adaptation.placement_failures[index] == 2 {
+            Some(192)
+        } else {
+            None
+        }
+    }
+
+    /// Only explicit acceptance/refusal of this named variant is evidence.
+    /// Inactivity, closing a window and timeout are deliberately not refusal.
+    pub fn observe_game_response(
+        &mut self,
+        event_id: u64,
+        variant: EpisodeGoal,
+        accepted: bool,
+    ) -> Option<u16> {
+        let index = match variant {
+            EpisodeGoal::OfferOrb => 0,
+            EpisodeGoal::SoloOrbPlay => 1,
+            _ => return None,
+        };
+        if !self.adaptation.accept(event_id) {
+            return None;
+        }
+        let old = self.adaptation.game[index];
+        self.adaptation.game[index] = (old + if accepted { 1.0 } else { -1.5 }).clamp(-6.0, 8.0);
+        self.adaptation.game_refusals[index] = if accepted {
+            0
+        } else {
+            self.adaptation.game_refusals[index].saturating_add(1)
+        };
+        if !accepted {
+            let cooldown = 45.0 + 15.0 * f32::from(self.adaptation.game_refusals[index].min(5));
+            if index == 0 {
+                self.orb_bid_cooldown = self.orb_bid_cooldown.max(cooldown);
+            } else {
+                self.endogenous_play_cooldown = self.endogenous_play_cooldown.max(cooldown);
+            }
+        }
+        if accepted && old < 3.0 && self.adaptation.game[index] >= 3.0 {
+            Some(195)
+        } else if !accepted && self.adaptation.game_refusals[index] == 2 {
+            Some(196)
+        } else {
+            None
+        }
+    }
     #[must_use]
     pub const fn active_episode(&self) -> Option<&ActivityEpisode> {
         self.active.as_ref()
@@ -559,6 +669,8 @@ impl EpisodeDirector {
                 commitment_remaining: 7.0,
                 attempts: 0,
                 prediction_confidence: 0.52,
+                bout_play_drive: frame.play_drive.clamp(0.0, 1.0),
+                bout_fatigue: frame.social_contact.fatigue.clamp(0.0, 1.0),
                 contact_side: self.touch_side,
                 expected_outcome: ExpectedOutcome::UserTouchesPet,
             });
@@ -571,8 +683,19 @@ impl EpisodeDirector {
             );
         }
         if self.active.is_none()
-            && let Some((goal, reason, object_id)) = select_episode(state, frame)
+            && let Some((mut goal, mut reason, object_id)) = select_episode(state, frame)
         {
+            if goal == EpisodeGoal::SoloOrbPlay
+                && reason == EpisodeReason::AutonomousPlay
+                && frame.user_available > 0.65
+                && !frame.focus_mode
+                && self.orb_bid_cooldown <= 0.0
+                && self.adaptation.game[0] >= 3.0
+                && self.adaptation.game[0] > self.adaptation.game[1] + 0.5
+            {
+                goal = EpisodeGoal::OfferOrb;
+                reason = EpisodeReason::UserEngaged;
+            }
             let id = state.episode_stats.next_episode_id;
             state.episode_stats.next_episode_id = id.saturating_add(1).max(1);
             state.episode_stats.started[goal.index()] =
@@ -589,6 +712,8 @@ impl EpisodeDirector {
                 commitment_remaining: commitment_for(goal),
                 attempts: 0,
                 prediction_confidence: 0.52,
+                bout_play_drive: frame.play_drive.clamp(0.0, 1.0),
+                bout_fatigue: frame.social_contact.fatigue.clamp(0.0, 1.0),
                 contact_side: 0.0,
                 expected_outcome: expected_outcome_for(goal),
             });
@@ -609,6 +734,30 @@ impl EpisodeDirector {
         active.commitment_remaining = (active.commitment_remaining - dt).max(0.0);
         let previous_goal = active.goal;
         let step = drive_episode(state, frame, &mut active, &mut output, dt);
+        if active.goal == EpisodeGoal::CarryOrbHome {
+            let side = self.adaptation.placement_side();
+            let delta = frame.pet_position - state.den.anchor;
+            // Learned approach affects a distant waypoint only. Final physical
+            // latch position, grip socket and close-range contact remain exact.
+            if side != 0.0
+                && desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect)
+                    > 0.14
+            {
+                let tangent =
+                    if matches!(state.den.edge, crate::DenEdge::Left | crate::DenEdge::Right) {
+                        Vec2::Y
+                    } else {
+                        Vec2::X
+                    };
+                if delta.dot(tangent) * side >= 0.06 {
+                    active.contact_side = side;
+                }
+                if active.contact_side != side && delta.dot(tangent) * side < 0.06 {
+                    output.body_intent.target_position = (state.den.anchor + tangent * side * 0.10)
+                        .clamp(Vec2::splat(0.03), Vec2::splat(0.97));
+                }
+            }
+        }
         if previous_goal == EpisodeGoal::OfferOrb && active.goal != previous_goal {
             self.orb_bid_cooldown = 20.0;
         }
@@ -647,7 +796,12 @@ impl EpisodeDirector {
                         };
                 }
                 if active.goal == EpisodeGoal::SoloOrbPlay {
-                    self.endogenous_play_cooldown = self.endogenous_play_cooldown.max(8.0);
+                    let rest = if self.adaptation.game[1] >= 3.0 {
+                        6.0
+                    } else {
+                        8.0
+                    };
+                    self.endogenous_play_cooldown = self.endogenous_play_cooldown.max(rest);
                 }
             }
             EpisodeStep::Abort(reason) => {
@@ -814,9 +968,9 @@ fn select_episode(
             EpisodeReason::UserEngaged,
             Some(orb.id),
         )),
-        ActionId::SelfPlay if orb.novelty > 0.12 => Some((
+        ActionId::SelfPlay if orb.lifecycle != ObjectLifecycle::GrabbedByUser => Some((
             EpisodeGoal::SoloOrbPlay,
-            EpisodeReason::ObjectNovelty,
+            EpisodeReason::AutonomousPlay,
             Some(orb.id),
         )),
         ActionId::LandOnWindow if frame.nearest_window_edge.is_some() => {
@@ -1192,6 +1346,130 @@ fn drive_episode(
             };
             let orb_distance =
                 desktop_distance(frame.pet_position, orb.position, frame.desktop_aspect);
+            if active.goal == EpisodeGoal::SoloOrbPlay && active.phase == EpisodePhase::Evaluate {
+                output.body_intent.target_position = orb.position;
+                output.body_intent.locomotion = LocomotionMode::Arrive;
+                output.body_intent.desired_speed = 0.10;
+                if active.phase_elapsed_seconds < 0.35 {
+                    return EpisodeStep::Continue;
+                }
+                if active.attempts == 1
+                    && orb.velocity.length() < 0.03
+                    && frame.orb_physical.contact
+                {
+                    active.attempts = 2; // Exactly one recovery, never retry indefinitely.
+                    set_phase(active, EpisodePhase::Manipulate);
+                    push_command(
+                        output,
+                        ObjectCommand::MoveToward {
+                            object_id: orb.id,
+                            target: frame.orb_physical.socket_position,
+                            speed: 1.0,
+                        },
+                    );
+                    return EpisodeStep::Continue;
+                }
+            }
+            if active.goal == EpisodeGoal::SoloOrbPlay
+                && matches!(
+                    active.phase,
+                    EpisodePhase::Manipulate | EpisodePhase::Prepare
+                )
+            {
+                if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
+                    return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+                }
+                output.body_intent.target_position = frame.pet_position;
+                output.body_intent.desired_speed = 0.0;
+                output.body_intent.locomotion = LocomotionMode::Hover;
+                output.body_intent.interaction_target = Some(InteractionTarget::ProceduralOrb);
+                let held = frame.orb_physical.contact
+                    && desktop_distance(
+                        orb.position,
+                        frame.orb_physical.socket_position,
+                        frame.desktop_aspect,
+                    ) < 0.04
+                    && (orb.velocity - frame.pet_velocity * Vec2::new(frame.desktop_aspect, 1.0))
+                        .length()
+                        < 0.05;
+                if active.phase == EpisodePhase::Manipulate
+                    && held
+                    && active.phase_elapsed_seconds >= 0.18
+                {
+                    active.target_position = Some(
+                        frame
+                            .cursor_position
+                            .clamp(Vec2::splat(0.05), Vec2::splat(0.95)),
+                    );
+                    set_phase(active, EpisodePhase::Prepare);
+                }
+                let plan = orb_throw_plan_for_episode(
+                    orb.position,
+                    active.target_position.unwrap_or(frame.cursor_position),
+                    frame.desktop_aspect,
+                    active.bout_play_drive,
+                    active.id,
+                );
+                let preparation =
+                    (if plan.strong { 0.48 } else { 0.25 }) * bout_scale(active.id, 1);
+                if active.phase == EpisodePhase::Prepare
+                    && held
+                    && active.phase_elapsed_seconds >= preparation
+                {
+                    push_command(
+                        output,
+                        ObjectCommand::Release {
+                            object_id: orb.id,
+                            velocity: plan.velocity,
+                        },
+                    );
+                    active.attempts = active.attempts.saturating_add(1);
+                    set_phase(active, EpisodePhase::Evaluate);
+                } else {
+                    push_command(
+                        output,
+                        ObjectCommand::MoveToward {
+                            object_id: orb.id,
+                            target: Vec2::new(
+                                frame
+                                    .orb_physical
+                                    .socket_position
+                                    .x
+                                    .clamp(0.065, 0.935)
+                                    .clamp(
+                                        frame.orb_physical.socket_position.x - 0.025,
+                                        frame.orb_physical.socket_position.x + 0.025,
+                                    ),
+                                frame.orb_physical.socket_position.y,
+                            ),
+                            speed: 2.0
+                                + 3.0
+                                    * (active.phase_elapsed_seconds / preparation).clamp(0.0, 1.0),
+                        },
+                    );
+                }
+                if active.phase_elapsed_seconds > 1.8 {
+                    return EpisodeStep::Abort(EpisodeReason::TimedOut);
+                }
+                return EpisodeStep::Continue;
+            }
+            if active.goal == EpisodeGoal::SoloOrbPlay
+                && active.attempts == 0
+                && frame.play_drive > 0.5
+                && frame.orb_physical.contact
+                && orb.lifecycle != ObjectLifecycle::GrabbedByUser
+            {
+                set_phase(active, EpisodePhase::Manipulate);
+                push_command(
+                    output,
+                    ObjectCommand::MoveToward {
+                        object_id: orb.id,
+                        target: frame.orb_physical.socket_position,
+                        speed: 2.0,
+                    },
+                );
+                return EpisodeStep::Continue;
+            }
             output.body_intent.target_position = orb.position;
             output.body_intent.gaze_target = Some(orb.position);
             // An earlier VITA stage may have selected direct viewer contact.
@@ -1230,7 +1508,12 @@ fn drive_episode(
                 active.expected_outcome = ExpectedOutcome::ObjectMoves;
                 return EpisodeStep::Continue;
             }
-            if frame.orb_physical.contact && orb.lifecycle != ObjectLifecycle::GrabbedByUser {
+            if frame.orb_physical.contact
+                && orb.lifecycle != ObjectLifecycle::GrabbedByUser
+                && (active.attempts == 0
+                    || active.phase_elapsed_seconds
+                        >= (0.65 + active.bout_fatigue * 1.5) * bout_scale(active.id, 2))
+            {
                 let contact_axis = (orb.position - frame.pet_position).normalize_or_zero();
                 let authored_tap = Vec2::new(
                     if active.attempts.is_multiple_of(2) {
@@ -1241,21 +1524,37 @@ fn drive_episode(
                     -0.50,
                 )
                 .normalize();
-                let direction = if contact_axis.length_squared() > 1.0e-6 {
+                let mut direction = if contact_axis.length_squared() > 1.0e-6 {
                     contact_axis.lerp(authored_tap, 0.76).normalize_or_zero()
                 } else {
                     authored_tap
                 };
+                let wall_distance = orb.position.x.min(1.0 - orb.position.x) * frame.desktop_aspect;
+                let floor_distance = 1.0 - orb.position.y;
+                let mut strength =
+                    0.18 + frame.user_activity * 0.06 + active.bout_play_drive * 0.05;
+                if wall_distance < 0.07 {
+                    // One weak probe of a nearby desktop wall; observe its real
+                    // rebound instead of injecting another impulse every tick.
+                    direction =
+                        Vec2::new(if orb.position.x < 0.5 { -1.0 } else { 1.0 }, -0.08).normalize();
+                    strength = 0.065;
+                } else if floor_distance < 0.06 {
+                    // Roll into the longer clear desktop interval.
+                    direction = Vec2::new(if orb.position.x < 0.5 { 1.0 } else { -1.0 }, 0.0);
+                    strength = 0.10;
+                }
+                strength *= bout_scale(active.id, 3);
                 push_command(
                     output,
                     ObjectCommand::ApplyImpulse {
                         object_id: orb.id,
-                        impulse: direction
-                            * (0.18 + frame.user_activity * 0.06 + frame.play_drive * 0.05),
+                        impulse: direction * strength,
                     },
                 );
                 push_outcome(output, EcologyOutcome::ObjectContact(orb.id));
                 active.attempts = active.attempts.saturating_add(1);
+                active.phase_elapsed_seconds = 0.0;
                 active.phase = EpisodePhase::Execute;
             }
             let complete = if active.goal == EpisodeGoal::SoloOrbPlay {
@@ -1381,11 +1680,11 @@ fn drive_episode(
             if active.elapsed_seconds >= 10.0 {
                 return EpisodeStep::Abort(EpisodeReason::TimedOut);
             }
-            // Storage is a handoff, never a teleport: both carrier and object
-            // must physically arrive at the den before the slot can close.
-            if desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect) <= 0.04
-                && desktop_distance(orb_position, state.den.anchor, frame.desktop_aspect)
-                    <= DEN_HANDOFF_DISTANCE
+            // The held object must reach the latch, not the carrier's centre:
+            // a full-sized body cannot overlap an edge-mounted den.
+            // The runtime additionally verifies carried ownership before storing.
+            if desktop_distance(orb_position, state.den.anchor, frame.desktop_aspect)
+                <= DEN_HANDOFF_DISTANCE
             {
                 let slot = state
                     .den
@@ -1522,10 +1821,7 @@ fn drive_episode(
             if matches!(active.phase, EpisodePhase::Orient | EpisodePhase::Approach) {
                 output.body_intent.target_position = state.den.anchor;
                 output.body_intent.locomotion = LocomotionMode::Arrive;
-                if desktop_distance(frame.pet_position, state.den.anchor, frame.desktop_aspect)
-                    <= 0.045
-                    && frame.orb_physical.contact
-                {
+                if frame.orb_physical.contact {
                     active.target_position = Some(den_exit_target(
                         state.den.anchor,
                         state.den.edge,
@@ -2053,6 +2349,84 @@ fn set_phase(active: &mut ActivityEpisode, phase: EpisodePhase) {
     active.phase_elapsed_seconds = 0.0;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OrbThrowPlan {
+    pub velocity: Vec2,
+    pub strong: bool,
+    pub clearance_limited: bool,
+}
+
+/// A short pass or energetic throw, capped by the actual desktop flight corridor.
+pub fn orb_throw_plan(position: Vec2, target: Vec2, aspect: f32, play_drive: f32) -> OrbThrowPlan {
+    orb_throw_plan_scaled(position, target, aspect, play_drive, 1.0)
+}
+
+/// Bout identity varies delivery once; measured clearance still caps the result.
+pub fn orb_throw_plan_for_episode(
+    position: Vec2,
+    target: Vec2,
+    aspect: f32,
+    play_drive: f32,
+    episode_id: u64,
+) -> OrbThrowPlan {
+    orb_throw_plan_scaled(
+        position,
+        target,
+        aspect,
+        play_drive,
+        bout_scale(episode_id, 4),
+    )
+}
+
+fn bout_scale(episode_id: u64, channel: u64) -> f32 {
+    let mut bits = episode_id ^ channel.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    bits = (bits ^ (bits >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    bits = (bits ^ (bits >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    bits ^= bits >> 31;
+    0.92 + 0.16 * (bits >> 40) as f32 / 16_777_215.0
+}
+
+fn orb_throw_plan_scaled(
+    position: Vec2,
+    target: Vec2,
+    aspect: f32,
+    play_drive: f32,
+    magnitude_scale: f32,
+) -> OrbThrowPlan {
+    if !position.is_finite()
+        || !target.is_finite()
+        || !aspect.is_finite()
+        || !play_drive.is_finite()
+    {
+        return OrbThrowPlan {
+            velocity: Vec2::ZERO,
+            strong: false,
+            clearance_limited: true,
+        };
+    }
+    let scale = Vec2::new(aspect.clamp(0.1, 10.0), 1.0);
+    let mut axis = ((target - position) * scale).normalize_or_zero();
+    if axis.length_squared() < 0.5 {
+        axis = Vec2::new(if position.x < 0.5 { 1.0 } else { -1.0 }, -0.25).normalize();
+    }
+    let mut clearance = f32::INFINITY;
+    for index in 0..2 {
+        if axis[index].abs() > 0.001 {
+            let edge = if axis[index] > 0.0 { 0.96 } else { 0.04 };
+            clearance =
+                clearance.min(((edge - position[index]) * scale[index] / axis[index]).max(0.0));
+        }
+    }
+    let strong = play_drive > 0.75;
+    let requested = (if strong { 0.48 } else { 0.20 }) * magnitude_scale;
+    let safe_speed = (clearance * 0.9).clamp(0.035, requested);
+    OrbThrowPlan {
+        velocity: axis * safe_speed,
+        strong,
+        clearance_limited: safe_speed < requested - 0.005,
+    }
+}
+
 fn commitment_for(goal: EpisodeGoal) -> f32 {
     match goal {
         EpisodeGoal::OfferOrb => 6.5,
@@ -2389,6 +2763,7 @@ mod tests {
         let mut state = EcologyState::new(42);
         let orb = state.objects[0].clone();
         let mut director = EpisodeDirector {
+            adaptation: EpisodeAdaptation::default(),
             active: Some(ActivityEpisode {
                 id: 9,
                 goal: EpisodeGoal::OfferOrb,
@@ -2401,6 +2776,8 @@ mod tests {
                 commitment_remaining: 4.0,
                 attempts: 0,
                 prediction_confidence: 0.6,
+                bout_play_drive: 0.5,
+                bout_fatigue: 0.0,
                 contact_side: 0.0,
                 expected_outcome: ExpectedOutcome::UserTouchesObject,
             }),
@@ -2453,7 +2830,7 @@ mod tests {
         for tick in 0..100 {
             let mut frame = behavior_frame(ActionId::IdleHover);
             frame.timestamp = tick as f64 * 0.05;
-            frame.play_drive = 0.78;
+            frame.play_drive = 0.48; // This fixture exercises the tap branch, not gripping/throwing.
             frame.curiosity_drive = 0.52;
             frame.pet_position = orb_position;
             frame.orb_physical = PhysicalGrabFrame {
@@ -2477,6 +2854,152 @@ mod tests {
         assert!(saw_contact_command);
         assert!(saw_orb_attention_owner);
         assert!(state.episode_stats.started[EpisodeGoal::SoloOrbPlay.index()] > 0);
+    }
+
+    #[test]
+    fn familiar_orb_play_has_real_spaced_impulses_and_fatigue_rest() {
+        for fatigue in [0.0, 0.9] {
+            let mut state = EcologyState::new(9101);
+            state.objects[0].novelty = 0.0;
+            state.objects[0].familiarity = 1.0;
+            let mut director = EpisodeDirector::default();
+            let mut hits = Vec::new();
+            for tick in 0..45 {
+                let mut frame = behavior_frame(ActionId::SelfPlay);
+                frame.pet_position = state.objects[0].position;
+                frame.orb_physical.contact = true;
+                frame.social_contact.fatigue = fatigue;
+                let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+                if output.object_commands[..output.object_command_count]
+                    .iter()
+                    .any(|c| matches!(c, ObjectCommand::ApplyImpulse { .. }))
+                {
+                    hits.push(tick);
+                }
+            }
+            assert!(!hits.is_empty(), "familiar orb remains playable");
+            let minimum_ticks = if fatigue > 0.5 { 36 } else { 12 };
+            assert!(
+                hits.windows(2).all(|w| w[1] - w[0] >= minimum_ticks),
+                "{hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn solo_throw_requires_measured_hold_and_has_clearance_limited_plan() {
+        for (held, aspect) in [(false, 1.0), (true, 0.5), (true, 1.0), (true, 3.0)] {
+            let mut state = EcologyState::new(9101);
+            state.objects[0].novelty = 0.0;
+            let mut director = EpisodeDirector::default();
+            let mut releases = 0;
+            let mut saw_prepare = false;
+            for tick in 0..25 {
+                let mut frame = behavior_frame(ActionId::SelfPlay);
+                frame.play_drive = 0.9;
+                frame.desktop_aspect = aspect;
+                frame.pet_velocity = Vec2::new(0.1, 0.0);
+                frame.pet_position = state.objects[0].position;
+                frame.orb_physical.contact = held || tick == 0;
+                frame.orb_physical.socket_position = state.objects[0].position;
+                state.objects[0].velocity = frame.pet_velocity * Vec2::new(aspect, 1.0);
+                let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+                saw_prepare |= output.debug.active_phase == Some(EpisodePhase::Prepare);
+                for command in &output.object_commands[..output.object_command_count] {
+                    if matches!(command, ObjectCommand::MoveToward { .. }) {
+                        state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
+                    }
+                    if let ObjectCommand::Release { velocity, .. } = command {
+                        assert!(velocity.length() <= 0.519);
+                        releases += 1;
+                        state.objects[0].lifecycle = ObjectLifecycle::Free;
+                    }
+                }
+            }
+            if held {
+                assert!(saw_prepare && releases >= 1);
+            } else {
+                assert_eq!(releases, 0);
+            }
+        }
+        let short = orb_throw_plan(Vec2::new(0.90, 0.5), Vec2::new(0.98, 0.5), 1.0, 0.9);
+        let long = orb_throw_plan(Vec2::new(0.2, 0.5), Vec2::new(0.9, 0.5), 1.0, 0.9);
+        assert!(short.clearance_limited && short.velocity.length() < long.velocity.length());
+        assert!(!orb_throw_plan(Vec2::splat(0.5), Vec2::new(0.9, 0.5), 1.0, 0.6).strong);
+    }
+
+    #[test]
+    fn adaptation_needs_repeated_actual_outcomes_and_respects_refusal() {
+        let mut director = EpisodeDirector::default();
+        assert_eq!(director.observe_placement_result(1, -1.0, true), None);
+        assert_eq!(director.observe_placement_result(1, -1.0, true), None);
+        assert_eq!(director.adaptation.placement_side(), 0.0);
+        director.observe_placement_result(2, -1.0, true);
+        assert_eq!(director.observe_placement_result(3, -1.0, true), Some(191));
+        assert_eq!(director.adaptation.placement_side(), -1.0);
+        director.observe_placement_result(4, -1.0, false);
+        assert_eq!(director.observe_placement_result(5, -1.0, false), Some(192));
+        assert_eq!(director.adaptation.placement_side(), 0.0);
+        for id in 10..12 {
+            assert_eq!(
+                director.observe_game_response(id, EpisodeGoal::OfferOrb, true),
+                None
+            );
+        }
+        assert_eq!(
+            director.observe_game_response(12, EpisodeGoal::OfferOrb, true),
+            Some(195)
+        );
+        let mut state = EcologyState::new(22);
+        let mut frame = behavior_frame(ActionId::SelfPlay);
+        frame.user_available = 1.0;
+        let selected = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(selected.debug.active_goal, Some(EpisodeGoal::OfferOrb));
+        director.observe_game_response(13, EpisodeGoal::OfferOrb, false);
+        let first_cooldown = director.orb_bid_cooldown;
+        assert_eq!(
+            director.observe_game_response(14, EpisodeGoal::OfferOrb, false),
+            Some(196)
+        );
+        assert!(director.orb_bid_cooldown > first_cooldown);
+        assert!(director.orb_bid_cooldown <= 120.0);
+    }
+
+    #[test]
+    fn object_bout_variation_is_deterministic_stable_and_clearance_dominates() {
+        let mut speeds = std::collections::BTreeSet::new();
+        for id in 1..128 {
+            for channel in 1..=4 {
+                let sample = bout_scale(id, channel);
+                assert!((0.92..=1.08).contains(&sample));
+                for _frame in 0..120 {
+                    assert_eq!(sample, bout_scale(id, channel));
+                }
+            }
+            let plan =
+                orb_throw_plan_for_episode(Vec2::new(0.2, 0.5), Vec2::new(0.9, 0.5), 1.0, 0.9, id);
+            speeds.insert((plan.velocity.length() * 10000.0).round() as u32);
+            assert!(plan.velocity.length() <= 0.519);
+            let restricted =
+                orb_throw_plan_for_episode(Vec2::new(0.9, 0.5), Vec2::new(0.98, 0.5), 1.0, 0.9, id);
+            assert!(restricted.clearance_limited);
+            assert!((restricted.velocity.length() - 0.054).abs() < 0.00001);
+        }
+        assert!(speeds.len() > 100);
+        let mut state = EcologyState::new(23);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::SelfPlay);
+        frame.play_drive = 0.6;
+        frame.social_contact.fatigue = 0.3;
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        let original = *director.active_episode().unwrap();
+        frame.play_drive = 0.9;
+        frame.social_contact.fatigue = 0.8;
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        let continued = director.active_episode().unwrap();
+        assert_eq!(continued.id, original.id);
+        assert_eq!(continued.bout_play_drive, original.bout_play_drive);
+        assert_eq!(continued.bout_fatigue, original.bout_fatigue);
     }
 
     #[test]
@@ -2578,10 +3101,11 @@ mod tests {
     }
 
     #[test]
-    fn carried_orb_is_stored_when_pet_reaches_den() {
+    fn carried_orb_handoff_uses_object_arrival_not_body_centre() {
         let mut state = EcologyState::new(93);
         let orb_id = state.objects[0].id;
         let mut director = EpisodeDirector {
+            adaptation: EpisodeAdaptation::default(),
             active: Some(ActivityEpisode {
                 id: 1,
                 goal: EpisodeGoal::CarryOrbHome,
@@ -2594,6 +3118,8 @@ mod tests {
                 commitment_remaining: 3.0,
                 attempts: 0,
                 prediction_confidence: 0.5,
+                bout_play_drive: 0.5,
+                bout_fatigue: 0.0,
                 contact_side: 0.0,
                 expected_outcome: ExpectedOutcome::ObjectReturnsHome,
             }),
@@ -2610,7 +3136,7 @@ mod tests {
         state.objects[0].position = state.den.anchor;
         state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
         let mut frame = behavior_frame(ActionId::BringProceduralOrb);
-        frame.pet_position = state.den.anchor;
+        frame.pet_position = state.den.anchor - Vec2::new(0.10, 0.08);
         let output = director.tick(&mut state, frame, representative_intent(), 0.05);
         assert!(output.object_commands[..output.object_command_count]
             .iter()
@@ -2686,14 +3212,14 @@ mod tests {
     }
 
     #[test]
-    fn stored_orb_selects_retrieve_instead_of_offer() {
+    fn stored_orb_retrieval_uses_real_surface_contact_not_body_centre() {
         let mut state = EcologyState::new(94);
         let orb_id = state.objects[0].id;
         state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
         state.objects[0].position = state.den.anchor;
         state.den.slots[0] = Some(orb_id);
         let mut frame = behavior_frame(ActionId::BringProceduralOrb);
-        frame.pet_position = state.den.anchor;
+        frame.pet_position = state.den.anchor - Vec2::new(0.10, 0.08);
         frame.orb_physical = PhysicalGrabFrame {
             contact: true,
             socket_position: frame.pet_position,

@@ -29,6 +29,20 @@ const MINIMUM_F0_HZ: f32 = 85.0;
 const MAXIMUM_F0_HZ: f32 = 1_600.0;
 const CONTROL_RATE_HZ: f32 = 400.0;
 
+// This is expressive alarm effort, not evidence of pain. Event admission remains
+// with the measured PhysicalStartle / ComponentDetached owner upstream.
+fn alarm_effort(request: &VocalRequest) -> f32 {
+    if request.style != VocalStyle::Startle
+        || !request.arousal.is_finite()
+        || !request.stress.is_finite()
+    {
+        return 0.0;
+    }
+    let drive = ((request.arousal - 0.65) / 0.35).clamp(0.0, 1.0)
+        * ((request.stress - 0.50) / 0.50).clamp(0.0, 1.0);
+    drive * drive * (3.0 - 2.0 * drive)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PreparedSyllable {
     pub duration_ms: f32,
@@ -130,7 +144,7 @@ impl PreparedSyllable {
                 + phenotype.roughness_delta.max(0.0) * 0.18)
                 .clamp(0.0, 1.0),
             click: value.click,
-            mouth_open: value.mouth_open,
+            mouth_open: value.mouth_open + (0.95 - value.mouth_open) * alarm_effort(request),
             trill_amount: (value.trill_amount + phenotype.trill_amount * 0.35).clamp(0.0, 1.0),
             vibrato_amount: (value.vibrato_amount
                 * phenotype.pitch_variation_multiplier.clamp(0.65, 1.35))
@@ -157,6 +171,9 @@ impl PreparedSyllable {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VoiceCommand {
+    pub breathy_airflow: f32,
+    pub nonphonated: Option<crate::NonPhonatedRequest>,
+    pub shout: f32,
     pub request_id: u64,
     pub motif_id: u64,
     pub seed: u64,
@@ -211,7 +228,12 @@ impl VoiceCommand {
             .unwrap_or(request.rhythm_intervals.len())
             .min(MAX_SYLLABLES.saturating_sub(1));
         let mut syllable_count = motif.syllables.len().min(MAX_SYLLABLES);
-        if rhythm_interval_count > 0 && !motif.syllables.is_empty() {
+        // Sensor click history is not an instruction to repeat that rhythm.
+        // Only an explicitly selected imitation may replace phrase structure.
+        if request.style == VocalStyle::RhythmMimic
+            && rhythm_interval_count > 0
+            && !motif.syllables.is_empty()
+        {
             syllable_count = rhythm_interval_count + 1;
             for (index, target) in syllables.iter_mut().enumerate().take(syllable_count) {
                 let source = &motif.syllables[index % motif.syllables.len()];
@@ -242,6 +264,9 @@ impl VoiceCommand {
             (anatomy.instability_susceptibility + phenotype.roughness_delta * 0.22).clamp(0.0, 1.0);
         Self {
             request_id: request.performance_seed,
+            shout: alarm_effort(request),
+            nonphonated: None,
+            breathy_airflow: phenotype.breathiness_delta.max(0.0).clamp(0.0, 0.5),
             motif_id: motif.id,
             seed: splitmix64(performance_seed),
             family: motif.family,
@@ -347,6 +372,7 @@ const fn identity_register(style: VocalStyle, gesture: VoiceGesture) -> Identity
 }
 
 pub struct SynthVoice {
+    nonphonated: Option<crate::NonPhonatedGesture>,
     commands: Arc<SpscRing<VoiceCommand, COMMAND_CAPACITY>>,
     feedback: Arc<AudioVisualBridge>,
     body_bridge: Arc<BodyVoiceBridge>,
@@ -439,6 +465,7 @@ impl SynthVoice {
             glottis: HybridLfGlottis::new(sample_rate),
             tract: DynamicTract::new(sample_rate),
             body_resonance: LiquidBodyResonance::new(sample_rate),
+            nonphonated: None,
             aspiration_noise: NoiseSource::new(1),
             constriction_noise: NoiseSource::new(2),
             cycle_noise: NoiseSource::new(3),
@@ -499,6 +526,35 @@ impl SynthVoice {
                 return [0.0; 2];
             };
             self.start_command(command);
+        }
+        if let Some(gesture) = &mut self.nonphonated {
+            let command = self.current.expect("nonphonated command active");
+            let frame = gesture.tick(self.body_current, 1.0 / self.sample_rate);
+            let finished = gesture.finished();
+            let mono = self.aspiration_noise.colored(0.12 + frame.nasal * 0.2)
+                * frame.airflow
+                * (0.25 + frame.turbulence)
+                * command.gain.min(0.12)
+                * 8.0;
+            // maximum_loudness is a ceiling, not a second attenuation stage.
+            let mono = mono.clamp(-0.02, 0.02);
+            self.publish_feedback(
+                mono.abs(),
+                frame.airflow,
+                0.0,
+                frame.mouth_open,
+                0.0,
+                frame.turbulence,
+                0.0,
+                0.0,
+                0,
+            );
+            if finished {
+                self.nonphonated = None;
+                self.current = None;
+                self.feedback.clear();
+            }
+            return pan(mono, command.pan);
         }
         if self.gap_frames_remaining > 0 {
             self.gap_frames_remaining -= 1;
@@ -595,7 +651,8 @@ impl SynthVoice {
                 .observe_cycle(glottal.f0_hz, glottal.regime);
         }
         self.last_glottal_openness = glottal.openness;
-        let aspiration = self.aspiration_noise.colored(command.brightness)
+        let airflow_noise = self.aspiration_noise.colored(command.brightness);
+        let aspiration = airflow_noise
             * (breath.aspiration * glottal.aspiration_gate
                 + purr_aspiration
                 + syllable.noisiness * breath.airflow * 0.08);
@@ -621,7 +678,12 @@ impl SynthVoice {
         let attack_position =
             (self.frame_in_syllable as f32 / attack_frames.max(1) as f32).clamp(0.0, 1.0);
         let attack_gain = attack_position * attack_position * (3.0 - 2.0 * attack_position);
-        let raw = (tract.output + body.signal)
+        // Breathy delivery must retain an unvoiced airflow path when the vocal
+        // folds never capture. Do not gate this noise on glottal oscillation.
+        // Expiration's finite envelope and the normal output gain still apply.
+        let unvoiced_air =
+            (airflow_noise * breath.airflow * command.breathy_airflow * 4.0).clamp(-0.02, 0.02);
+        let raw = (tract.output + body.signal + unvoiced_air)
             * command.gain
             * syllable.amplitude.clamp(0.0, 1.0)
             * 6.4
@@ -653,6 +715,7 @@ impl SynthVoice {
     fn start_command(&mut self, command: VoiceCommand) {
         self.feedback.publish_started_request(command.request_id);
         self.current = Some(command);
+        self.nonphonated = command.nonphonated.map(crate::NonPhonatedGesture::new);
         self.syllable_index = 0;
         self.frame_in_syllable = 0;
         self.gap_frames_remaining = 0;
@@ -931,6 +994,8 @@ impl SynthVoice {
             request_id: command.request_id,
             motif_id: command.motif_id,
             syllable_index: self.syllable_index.min(u8::MAX as usize) as u8,
+            syllable_count: command.syllable_count,
+            shout: command.shout * visual_envelope,
             emitted_energy: emitted_energy.clamp(0.0, 1.0),
             breath_pressure: breath_pressure.clamp(0.0, 1.0),
             glottal_openness: glottal_openness.clamp(0.0, 1.0),

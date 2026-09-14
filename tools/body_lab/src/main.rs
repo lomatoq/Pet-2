@@ -1414,6 +1414,7 @@ fn update_preview_bodies(runtime: &mut LabRuntime, dt: f32) {
             pitch_normalized: audio_feedback.pitch_normalized,
             noisiness: audio_feedback.noisiness,
             purr: audio_feedback.purr,
+            shout: audio_feedback.shout,
         },
         dt,
     );
