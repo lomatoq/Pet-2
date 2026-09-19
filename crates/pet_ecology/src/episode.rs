@@ -2025,7 +2025,13 @@ fn drive_episode(
                         &profile,
                         frame.window_pressure,
                     );
-                    let next_goal = if utility.total >= 0.08 {
+                    let offered_crumb = active
+                        .object_id
+                        .and_then(|id| state.objects.iter().find(|o| o.id == id))
+                        .is_some_and(|o| o.radius_px_at_reference <= 3.0);
+                    let next_goal = if (offered_crumb && state.metabolism.satiation < 0.9)
+                        || utility.total >= 0.08
+                    {
                         EpisodeGoal::EatMorsel
                     } else if utility.total <= -0.10 {
                         EpisodeGoal::RefuseMorsel

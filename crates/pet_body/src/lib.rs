@@ -1222,12 +1222,22 @@ impl ProceduralBody {
             droplets: self.embodiment.droplets.render_states(),
             liquid: {
                 let mut liquid = self.embodiment.liquid.render_state();
-                liquid.face_frame.origin += liquid.face_frame.axis_x
-                    * self.feeding_mouth_offset.x
-                    * liquid.face_frame.scale.x
+                let desired = liquid.face_frame.origin
+                    + liquid.face_frame.axis_x
+                        * self.feeding_mouth_offset.x
+                        * liquid.face_frame.scale.x
                     + liquid.face_frame.axis_y
                         * self.feeding_mouth_offset.y
                         * liquid.face_frame.scale.y;
+                liquid.face_frame.origin = liquid::contain_face_origin(
+                    &liquid.particles[..liquid.particle_count],
+                    self.tuning.pbf.iso_threshold,
+                    liquid.face_frame.origin,
+                    desired,
+                    liquid.face_frame.axis_x,
+                    liquid.face_frame.axis_y,
+                    liquid.face_frame.scale,
+                );
                 liquid
             },
             material_absorption: material.absorption,

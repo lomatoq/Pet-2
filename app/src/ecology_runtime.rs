@@ -510,12 +510,15 @@ impl EcologyRuntime {
         } else {
             relative.normalize_or(Vec2::Y)
         };
-        let support = body.liquid_physical_support_pixels(direction, height);
         let radius = food.radius_px_at_reference * height / REFERENCE_DESKTOP_HEIGHT_PX;
+        let hit = body.liquid_physical_circle_contact_pixels(relative, relative, radius, height);
+        let support = hit.map_or_else(
+            || body.liquid_physical_support_pixels(direction, height),
+            |c| c.body_point,
+        );
         let desired_center = food.position - (support + direction * radius * 0.35) / scale;
         // Require the actual mouth-side surface, not any distant point on the hull.
-        let touching =
-            (relative - support).length() <= radius + 9.0 || self.food_caught == Some(food.id);
+        let touching = hit.is_some() || self.food_caught == Some(food.id);
         let id = food.id;
         let catch = touching && !settled && food.lifecycle != ObjectLifecycle::GrabbedByUser;
         if catch {

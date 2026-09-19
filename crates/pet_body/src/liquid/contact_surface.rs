@@ -53,6 +53,80 @@ fn raw_density(kernels: &[Kernel], point: Vec2) -> f32 {
     density
 }
 
+/// Keep the complete face footprint in the dense main liquid component.
+/// Desired feeding translation is projected into that interior, not onto its rim.
+pub fn contain_face_origin(
+    particles: &[ParticleRenderState],
+    iso: f32,
+    origin: Vec2,
+    desired: Vec2,
+    axis_x: Vec2,
+    axis_y: Vec2,
+    scale: Vec2,
+) -> Vec2 {
+    let mut counts = [0usize; 256];
+    for p in particles {
+        counts[usize::from(p.component_id)] += 1;
+    }
+    let largest = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| **count)
+        .map_or(0, |(id, _)| id);
+    let main: Vec<_> = particles
+        .iter()
+        .copied()
+        .filter(|p| usize::from(p.component_id) == largest)
+        .collect();
+    let ks = kernels(&main);
+    if ks.is_empty() {
+        return origin;
+    }
+    let offsets = [
+        Vec2::ZERO,
+        Vec2::new(-0.24, 0.09),
+        Vec2::new(0.24, 0.09),
+        Vec2::new(-0.24, -0.04),
+        Vec2::new(0.24, -0.04),
+        Vec2::new(-0.10, -0.19),
+        Vec2::new(0.10, -0.19),
+        Vec2::new(0.0, 0.13),
+    ];
+    let clearance = |p: Vec2| {
+        offsets
+            .iter()
+            .map(|o| raw_density(&ks, p + axis_x * o.x * scale.x + axis_y * o.y * scale.y))
+            .fold(f32::INFINITY, f32::min)
+    };
+    let threshold = iso.max(0.01) * 1.20;
+    if clearance(desired) >= threshold {
+        return desired;
+    }
+    let mut anchor = origin;
+    if clearance(anchor) < threshold {
+        // The old region disappeared: find the broadest remaining volume.
+        let mut best = clearance(anchor);
+        for particle in main.iter().step_by(3) {
+            let candidate = particle.position;
+            let c = clearance(candidate);
+            if c > best {
+                best = c;
+                anchor = candidate;
+            }
+        }
+    }
+    let mut safe = anchor;
+    // Walk outward from the valid volume, stopping before an unsupported gap.
+    for step in 1..=16 {
+        let candidate = anchor.lerp(desired, step as f32 / 16.0);
+        if clearance(candidate) < threshold {
+            break;
+        }
+        safe = candidate;
+    }
+    safe
+}
+
 fn density(kernels: &[Kernel], point: Vec2, filter: Vec2) -> f32 {
     if filter == Vec2::ZERO {
         return raw_density(kernels, point);
@@ -322,6 +396,54 @@ mod tests {
             ..ParticleRenderState::default()
         }
     }
+    #[test]
+    fn feeding_face_stays_in_largest_volume_instead_of_chasing_food_outside() {
+        let mut ps = Vec::new();
+        for x in -3..=3 {
+            for y in -3..=3 {
+                let mut p = particle(
+                    Vec2::new(x as f32 * 0.09, y as f32 * 0.09),
+                    Vec2::X,
+                    Vec2::splat(0.18),
+                );
+                p.component_id = 2;
+                ps.push(p);
+            }
+        }
+        let mut detached = particle(Vec2::new(1.5, 0.0), Vec2::X, Vec2::splat(0.1));
+        detached.component_id = 1;
+        detached.main_component = true;
+        ps.push(detached);
+        let origin = contain_face_origin(
+            &ps,
+            0.18,
+            Vec2::ZERO,
+            Vec2::new(0.0, -1.0),
+            Vec2::X,
+            Vec2::Y,
+            Vec2::ONE,
+        );
+        assert!(origin.y > -0.2 && origin.x.abs() < 0.3);
+        let moved = contain_face_origin(
+            &ps,
+            0.18,
+            detached.position,
+            detached.position,
+            Vec2::X,
+            Vec2::Y,
+            Vec2::ONE,
+        );
+        assert!(moved.length() < 0.4);
+        let ks = kernels(&ps[..49]);
+        for offset in [
+            Vec2::new(-0.24, 0.09),
+            Vec2::new(0.24, 0.09),
+            Vec2::new(0.0, -0.19),
+        ] {
+            assert!(raw_density(&ks, origin + offset) >= 0.18);
+        }
+    }
+
     #[test]
     fn isolated_and_rotated_ellipse_match_analytic_iso_not_kernel_hull() {
         for angle in [0.0_f32, 0.4, 1.2] {
