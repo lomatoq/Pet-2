@@ -318,6 +318,7 @@ pub struct LiquidMorphRuntime {
     support_stable_seconds: f32,
     supported_seconds: f32,
     measured_support_load: f32,
+    compliant_support_load: f32,
     object_load: f32,
     object_contact_impulse: f32,
     /// Shared kernel-to-wall clearance, calibrated once per physical contact.
@@ -449,6 +450,7 @@ impl LiquidMorphRuntime {
             support_stable_seconds: 0.0,
             supported_seconds: 0.0,
             measured_support_load: 0.0,
+            compliant_support_load: 0.0,
             object_load: 0.0,
             object_contact_impulse: 0.0,
             support_plane_clearance: None,
@@ -855,8 +857,11 @@ impl LiquidMorphRuntime {
             },
         );
         let supported_softness =
-            smoothstep01(((self.flight_field_aspect - 1.34) / (2.4 - 1.34)).clamp(0.0, 1.0))
-                .max(self.measured_support_load.mul_add(2.5, 0.0).clamp(0.0, 1.0));
+            smoothstep01(((self.flight_field_aspect - 1.34) / (2.4 - 1.34)).clamp(0.0, 1.0)).max(
+                self.compliant_support_load
+                    .mul_add(2.5, 0.0)
+                    .clamp(0.0, 1.0),
+            );
         let supported_tension = parameters.surface_tension
             + (parameters.surface_tension.min(0.48) - parameters.surface_tension)
                 * supported_softness;
@@ -1100,8 +1105,8 @@ impl LiquidMorphRuntime {
             &mut self.particles,
             self.particle_count,
             kernel_radius,
-            parameters.numerical_xsph,
-            parameters.viscosity,
+            parameters.numerical_xsph * (1.0 - supported_softness * 0.30),
+            parameters.viscosity * (1.0 - supported_softness * 0.40),
             dt,
         );
         update_density_and_surface(&mut self.particles, self.particle_count, kernel_radius);
@@ -1575,7 +1580,11 @@ impl LiquidMorphRuntime {
                     support.surface_id.0.as_str(),
                     "screen:left_edge" | "screen:right_edge" | "screen:top_edge"
                 );
-            measured && (support.surface_id.0 == "screen:bottom_edge" || awake_cling)
+            measured
+                && (matches!(
+                    support.surface_id.0.as_str(),
+                    "screen:bottom_edge" | "voice:taskbar" | "food:taskbar"
+                ) || awake_cling)
         }) else {
             self.support_plane_clearance = None;
             return None;
@@ -1618,6 +1627,9 @@ impl LiquidMorphRuntime {
         dt: f32,
         measured_load: Option<(Vec2, f32)>,
     ) {
+        let contact_load = measured_load.map_or(0.0, |(_, load)| load);
+        self.compliant_support_load +=
+            (contact_load - self.compliant_support_load) * (1.0 - (-7.0 * dt).exp());
         let comet_drive = if measured_load.is_some() {
             0.0
         } else {
@@ -1666,8 +1678,9 @@ impl LiquidMorphRuntime {
         // Only contact flattens the well. The old cross-flight ellipse opposed
         // the longitudinal comet warp, creating a tilted pancake at speed.
         // Free flight now has one shape driver plus real particle inertia.
-        let target_aspect =
-            measured_load.map_or(1.0, |(_, load)| 1.0 + (load * 3.5).clamp(0.0, 1.4));
+        let target_aspect = measured_load.map_or(1.0, |_| {
+            1.0 + (self.compliant_support_load * 3.5).clamp(0.0, 1.4)
+        });
         let aspect_rate = if measured_load.is_some() {
             8.5
         } else {
@@ -3702,6 +3715,25 @@ mod flight_field_tests {
         assert!(at_60.0.distance(at_144.0) < 1.0e-5);
         assert!((at_30.1 - at_60.1).abs() < 1.0e-5);
         assert!((at_60.1 - at_144.1).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn measured_load_softens_continuously_instead_of_one_frame_squash() {
+        let mut runtime = LiquidMorphRuntime::new(42);
+        runtime.update_field_shape(
+            motion(Vec2::ZERO, Vec2::ZERO),
+            1.0 / 120.0,
+            Some((Vec2::X, 0.4)),
+        );
+        assert!(runtime.flight_field_aspect < 1.05);
+        for _ in 0..120 {
+            runtime.update_field_shape(
+                motion(Vec2::ZERO, Vec2::ZERO),
+                1.0 / 120.0,
+                Some((Vec2::X, 0.4)),
+            );
+        }
+        assert!(runtime.flight_field_aspect > 1.8);
     }
 
     #[test]

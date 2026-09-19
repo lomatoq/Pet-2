@@ -95,6 +95,10 @@ pub struct EcologyRenderer {
     den_tuning: DenVisualTuning,
     prepared_den_count: u32,
     prepared_count: u32,
+    prepared_foreground_start: u32,
+    orb_rotation: f32,
+    orb_angular_velocity: f32,
+    previous_orb_position: Option<Vec2>,
 }
 
 impl EcologyRenderer {
@@ -290,6 +294,10 @@ impl EcologyRenderer {
             den_tuning: DenVisualTuning::default(),
             prepared_den_count: 0,
             prepared_count: 0,
+            prepared_foreground_start: 0,
+            orb_rotation: 0.0,
+            orb_angular_velocity: 0.0,
+            previous_orb_position: None,
         }
     }
 
@@ -635,9 +643,36 @@ impl EcologyRenderer {
         };
         count += 1;
 
-        for object in &state.objects {
+        if let Some(orb) = state.objects.iter().find(|o| o.kind == ObjectKind::Orb) {
+            if let Some(previous) = self.previous_orb_position
+                && dt > 0.0
+            {
+                let distance = (orb.position.x - previous.x)
+                    * aspect
+                    * pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX;
+                let rolling =
+                    (distance / orb.radius_px_at_reference.max(1.0) / dt).clamp(-18.0, 18.0);
+                let rate = if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
+                    18.0
+                } else {
+                    5.0
+                };
+                self.orb_angular_velocity +=
+                    (rolling - self.orb_angular_velocity) * (1.0 - (-rate * dt).exp());
+                self.orb_rotation = (self.orb_rotation + self.orb_angular_velocity * dt)
+                    .rem_euclid(std::f32::consts::TAU);
+            }
+            self.previous_orb_position = Some(orb.position);
+        }
+        let mut ordered: Vec<_> = state.objects.iter().collect();
+        ordered.sort_by_key(|o| object_in_front(o.kind, o.lifecycle));
+        let mut foreground_start = None;
+        for object in ordered {
             if count >= MAX_ECOLOGY_INSTANCES || object.lifecycle == ObjectLifecycle::Consumed {
                 continue;
+            }
+            if object_in_front(object.kind, object.lifecycle) && foreground_start.is_none() {
+                foreground_start = Some(count as u32);
             }
             let stored_in_den = object.lifecycle == ObjectLifecycle::StoredInDen;
             let den_distance_px = Vec2::new(
@@ -680,7 +715,11 @@ impl EcologyRenderer {
                         2.0
                     },
                     (object.glow * (1.0 + den_visual_blend * 0.10)).clamp(0.0, 1.0),
-                    object.wear,
+                    if object.kind == ObjectKind::Orb {
+                        self.orb_rotation
+                    } else {
+                        object.wear
+                    },
                     time_seconds + (object.id % 997) as f32 * 0.013,
                 ],
                 den_surface: [0.0; 4],
@@ -696,6 +735,7 @@ impl EcologyRenderer {
         if count == 0 {
             self.prepared_den_count = 0;
             self.prepared_count = 0;
+            self.prepared_foreground_start = 0;
             return;
         }
         queue.write_buffer(
@@ -705,6 +745,7 @@ impl EcologyRenderer {
         );
         self.prepared_den_count = 1;
         self.prepared_count = count as u32;
+        self.prepared_foreground_start = foreground_start.unwrap_or(count as u32);
     }
 
     pub fn render_prepared_den(
@@ -724,6 +765,30 @@ impl EcologyRenderer {
             encoder,
             target,
             self.prepared_den_count..self.prepared_count,
+        );
+    }
+
+    pub fn render_background_objects(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+    ) {
+        self.render_prepared_range(
+            encoder,
+            target,
+            self.prepared_den_count..self.prepared_foreground_start,
+        );
+    }
+
+    pub fn render_foreground_objects(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+    ) {
+        self.render_prepared_range(
+            encoder,
+            target,
+            self.prepared_foreground_start..self.prepared_count,
         );
     }
 
@@ -756,6 +821,30 @@ impl EcologyRenderer {
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         pass.draw(0..6, instances);
     }
+}
+
+fn object_in_front(kind: ObjectKind, state: ObjectLifecycle) -> bool {
+    state == ObjectLifecycle::GrabbedByUser
+        || (kind == ObjectKind::Morsel && state == ObjectLifecycle::Free)
+}
+
+#[test]
+fn food_and_toy_layers_follow_physical_ownership() {
+    assert!(object_in_front(ObjectKind::Morsel, ObjectLifecycle::Free));
+    assert!(object_in_front(
+        ObjectKind::Orb,
+        ObjectLifecycle::GrabbedByUser
+    ));
+    for kind in [ObjectKind::Morsel, ObjectKind::Orb] {
+        for state in [
+            ObjectLifecycle::Sleeping,
+            ObjectLifecycle::CarriedByPet,
+            ObjectLifecycle::Consumed,
+        ] {
+            assert!(!object_in_front(kind, state));
+        }
+    }
+    assert!(!object_in_front(ObjectKind::Orb, ObjectLifecycle::Free));
 }
 
 fn temporally_stabilize_background(

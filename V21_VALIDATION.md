@@ -15,3 +15,7 @@ Learning limitation: local acoustic-template learning, not speech-to-text. Actua
 Research-informed behavior: contextual need accumulation, variable pauses, reduced repeat probability, existing composable repertoire and embodied actuation. Not a reproduction of Artificial Fishes or a trained options policy.
 
 Final native application scenarios and package hashes are stored under verification/ and release-manifest.json.
+
+Final refinements: desktop_host 42 passed (continuous name and negative batches through 40); load-ramp regression 1 passed; food/toy layer ownership regression 1 passed. Final workspace Clippy remains clean.
+Native support scenario recorded taskbar load 0.35 after Sit, dash peak 1405 px/s, 21 cue entries, training start/cancel successful, microphone listening with no dropped chunks/errors. Native feeding confirmed consumption and repeated sprinkle/cancel/restart. Cached menu reused the same native window in 0.203 seconds.
+User-recorded samples made while the verification menu was open were preserved in a backup and merged into the main saved hearing model; saved creature identity was not replaced.

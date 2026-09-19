@@ -223,6 +223,7 @@ struct LivePetMonitor {
     using_legacy: bool,
     previous_loaded: bool,
     current_bootstrapped: bool,
+    menu_only: bool,
     offset: u64,
     frames: VecDeque<Value>,
     frame_sizes: VecDeque<usize>,
@@ -743,7 +744,11 @@ impl ApplicationHandler for BodyLab {
             |store| store.paths.liquid_tuning.display().to_string(),
         );
         let now = Instant::now();
-        let audio_output_devices = AudioEngine::output_device_names().unwrap_or_default();
+        let audio_output_devices = if self.pet_menu {
+            Vec::new()
+        } else {
+            AudioEngine::output_device_names().unwrap_or_default()
+        };
         let (audio, audio_error) = if self.pet_menu {
             (None, None)
         } else {
@@ -756,9 +761,12 @@ impl ApplicationHandler for BodyLab {
             || "Default output".to_owned(),
             |engine| engine.device_name().to_owned(),
         );
-        let live_monitor = store
-            .as_ref()
-            .map(|store| LivePetMonitor::new(store, self.start_live));
+        let live_monitor = store.as_ref().map(|store| {
+            let mut m = LivePetMonitor::new(store, self.start_live);
+            m.menu_only = self.pet_menu;
+            m.previous_loaded = self.pet_menu;
+            m
+        });
         let ui = LabUi {
             section: LabSection::Body,
             json_buffer: serde_json::to_string_pretty(&profile).unwrap_or_default(),
@@ -860,6 +868,37 @@ impl ApplicationHandler for BodyLab {
         if now < runtime.next_frame {
             event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
             return;
+        }
+        if let Some(menu) = &mut runtime.pet_menu {
+            if let Some(store) = &self.store {
+                let request = store.paths.root.join("companion-menu-open");
+                if request.exists() {
+                    let _ = fs::remove_file(&request);
+                    menu.hidden = false;
+                    menu.close = false;
+                    menu.waiting_for_feed = false;
+                    runtime.window.set_visible(true);
+                    runtime.window.focus_window();
+                    if let Some(monitor) = &mut runtime.live_monitor {
+                        monitor.connect();
+                    }
+                }
+                if menu.hidden {
+                    let stopped = fs::read(store.paths.root.join("runtime-load-ack.json"))
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .is_some_and(|v| v["status"] == "stopped");
+                    if stopped {
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
+            if menu.hidden {
+                runtime.next_frame = now + Duration::from_millis(200);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
+                return;
+            }
         }
         let wall_dt = (now - runtime.last_update).as_secs_f32().clamp(0.0, 0.05);
         runtime.last_update = now;
@@ -1062,7 +1101,14 @@ impl ApplicationHandler for BodyLab {
                 .egui_state
                 .on_window_event(runtime.window.as_ref(), &event);
             match event {
-                WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::CloseRequested => {
+                    if let Some(menu) = &mut runtime.pet_menu {
+                        menu.hidden = true;
+                        runtime.window.set_visible(false);
+                    } else {
+                        event_loop.exit();
+                    }
+                }
                 WindowEvent::Resized(size) => {
                     runtime.renderer.resize(size);
                     let (background_width, background_height, background_stride, pixels) =
@@ -1636,8 +1682,13 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
             }
         }
     });
-    if runtime.pet_menu.as_ref().is_some_and(|menu| menu.close) {
-        event_loop.exit();
+    if let Some(menu) = &mut runtime.pet_menu
+        && menu.close
+    {
+        menu.close = false;
+        menu.hidden = true;
+        menu.waiting_for_feed = false;
+        runtime.window.set_visible(false);
     }
     runtime.panel = selected_panel;
     if runtime.ui.section != LabSection::Nervous {
@@ -1809,6 +1860,7 @@ impl LivePetMonitor {
             using_legacy: false,
             previous_loaded: false,
             current_bootstrapped: false,
+            menu_only: false,
             offset: 0,
             frames: VecDeque::with_capacity(LIVE_FRAME_HISTORY_CAP),
             frame_sizes: VecDeque::with_capacity(LIVE_FRAME_HISTORY_CAP),
@@ -2011,8 +2063,10 @@ impl LivePetMonitor {
     fn poll(&mut self) {
         self.advance_playback();
         self.expire_pending_control();
-        self.poll_canonical_evolution();
-        self.accelerated_learning.poll();
+        if !self.menu_only {
+            self.poll_canonical_evolution();
+            self.accelerated_learning.poll();
+        }
         self.maintain_connection();
         if self.last_poll.elapsed() < Duration::from_millis(80) {
             return;

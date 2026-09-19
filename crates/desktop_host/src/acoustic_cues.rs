@@ -396,8 +396,10 @@ impl CueTrainer {
         Ok(candidate)
     }
 
-    pub(crate) fn retry_last(&mut self) {
-        self.examples.pop();
+    pub(crate) fn retry_oldest(&mut self) {
+        if !self.examples.is_empty() {
+            self.examples.remove(0);
+        }
     }
 
     fn required(&self) -> usize {

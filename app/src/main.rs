@@ -4771,6 +4771,10 @@ impl ApplicationHandler for PetApplication {
                     .companion_menu
                     .as_mut()
                     .is_some_and(|child| child.try_wait().ok().flatten().is_none());
+                if running {
+                    let _ =
+                        std::fs::write(self.store.paths.root.join("companion-menu-open"), b"open");
+                }
                 if !running {
                     let executable = std::env::current_exe()
                         .ok()
@@ -4987,10 +4991,14 @@ impl ApplicationHandler for PetApplication {
                     |_device, _queue, encoder, view| {
                         if ecology_ready {
                             ecology_renderer.render_prepared_den(encoder, view);
-                            ecology_renderer.render_prepared_objects(encoder, view);
+                            ecology_renderer.render_background_objects(encoder, view);
                         }
                     },
-                    |_device, _queue, _encoder, _view| {},
+                    |_device, _queue, encoder, view| {
+                        if ecology_ready {
+                            ecology_renderer.render_foreground_objects(encoder, view);
+                        }
+                    },
                 );
                 runtime.render_microseconds = render_started.elapsed().as_secs_f64() * 1_000_000.0;
                 runtime

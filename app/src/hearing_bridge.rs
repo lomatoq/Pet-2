@@ -165,7 +165,7 @@ impl HearingBridge {
                 };
                 self.message = match self.input.begin_training(cue) {
                     Ok(()) => format!(
-                        "Записываю «{}»: пять повторов, после каждого пауза одну секунду.",
+                        "Записываю «{}»: повторы с паузами. Сохраняю каждые пять, продолжаю до 40 или кнопки Стоп.",
                         cue.label()
                     ),
                     Err(error) => format!("Could not start teaching: {error}"),
@@ -315,7 +315,9 @@ impl HearingBridge {
                     self.message = format!(
                         "«{}»: примеры сохранены. {}",
                         cue.label(),
-                        if model_ready {
+                        if self.training() {
+                            "Запись продолжается: следующая партия. Нажми Стоп, когда закончишь."
+                        } else if model_ready {
                             "Можно проверить или добавить ещё пять."
                         } else {
                             "Добавь пять посторонних слов для различения команд."

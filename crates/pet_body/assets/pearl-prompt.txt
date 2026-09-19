@@ -1,0 +1,5 @@
+Built-in image_gen edit mode. Reference: first generated pearl.
+
+Simplify this pearl into a clean charming game toy sprite. Keep the single round pearl silhouette on genuinely transparent background. Dramatically reduce detail: smooth creamy ivory surface, only broad very subtle mint and pale blue iridescence, one clean glossy highlight. No grain, no marbling, no complex reflections. Add one small softly embossed pale golden four-point star symbol centered on the sphere, readable but restrained. Cute simple stylized 3D mobile game asset, no face, no text, no cast shadow, no external sparkles. Sphere fills 86% of square canvas. Preserve transparent alpha.
+
+pearl-imagegen.png is the generated source. pearl-256.rgba is an RGBA8 256x256 upload buffer embedded in the game executable.

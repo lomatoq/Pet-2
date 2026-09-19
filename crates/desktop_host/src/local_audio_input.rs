@@ -616,6 +616,20 @@ fn build_typed_stream<T: InputSample>(
         .map_err(|error| error.to_string())
 }
 
+fn continuation_trainer(cue: TrainingCue, model: &CueModelV1) -> Option<CueTrainer> {
+    let count = match cue {
+        TrainingCue::Name => model.class(CueKind::Name).map_or(0, |c| c.examples.len()),
+        TrainingCue::Quiet => model.class(CueKind::Quiet).map_or(0, |c| c.examples.len()),
+        TrainingCue::Command(cue) => model.class(cue).map_or(0, |c| c.examples.len()),
+        TrainingCue::Other => model.other_examples.len(),
+    };
+    if count < 40 {
+        CueTrainer::begin(cue, model.clone()).ok()
+    } else {
+        None
+    }
+}
+
 struct AudioProcessor {
     model: Arc<Mutex<CueModelV1>>,
     dirty: Arc<AtomicBool>,
@@ -666,6 +680,8 @@ impl AudioProcessor {
     fn handle_command(&mut self, command: WorkerCommand, stopping: &mut bool) {
         match command {
             WorkerCommand::BeginTraining(cue) => {
+                self.endpoint = EndpointDetector::default();
+                self.pending.clear();
                 let base = lock_recover(&self.model).clone();
                 match CueTrainer::begin(cue, base) {
                     Ok(trainer) => {
@@ -805,9 +821,12 @@ impl AudioProcessor {
                         CueKind::ALL.into_iter().any(|cue| candidate.is_ready(cue))
                     }
                 };
+                self.trainer = continuation_trainer(progress.cue, &candidate);
                 *lock_recover(&self.model) = candidate;
                 self.dirty.store(true, Ordering::Release);
-                update_status(&self.status, |value| value.training = None);
+                update_status(&self.status, |value| {
+                    value.training = self.trainer.as_ref().map(CueTrainer::progress)
+                });
                 send_percept(
                     &self.percepts,
                     AudioPercept::TrainingComplete {
@@ -818,7 +837,7 @@ impl AudioProcessor {
             }
             Err(error) => {
                 let mut trainer = trainer;
-                trainer.retry_last();
+                trainer.retry_oldest();
                 update_status(&self.status, |value| {
                     value.training = Some(trainer.progress())
                 });
@@ -1013,6 +1032,26 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::{CueTemplateV1, SpectralFrameV1};
+
+    #[test]
+    fn name_and_negative_recording_continue_across_batches_until_forty() {
+        for cue in [TrainingCue::Name, TrainingCue::Other] {
+            let mut model = CueModelV1::new();
+            for batch in 0..8 {
+                let mut trainer = continuation_trainer(cue, &model).expect("record next batch");
+                for _ in 0..5 {
+                    trainer
+                        .accept_feature_segment(CueTemplateV1 {
+                            frames: vec![SpectralFrameV1 { values: [0.2; 24] }; 4],
+                            duration_ms: 300,
+                        })
+                        .unwrap();
+                }
+                model = trainer.finalize().unwrap();
+                assert_eq!(continuation_trainer(cue, &model).is_some(), batch < 7);
+            }
+        }
+    }
 
     #[test]
     fn integer_and_float_sample_formats_map_to_unit_float() {

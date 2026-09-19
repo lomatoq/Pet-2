@@ -572,7 +572,10 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return encode_surface_output(vec4<f32>(rgb * alpha, alpha));
     }
     // Generated nacre sprite: visual sphere and physical radius coincide.
-    let uv = input.local * vec2<f32>(0.43, -0.43) + vec2<f32>(0.5);
+    let c = cos(input.material.z);
+    let s = sin(input.material.z);
+    let rotated = vec2<f32>(c * input.local.x - s * input.local.y, s * input.local.x + c * input.local.y);
+    let uv = rotated * vec2<f32>(0.43, -0.43) + vec2<f32>(0.5);
     let pearl = textureSampleLevel(pearl_sprite, desktop_background_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
     let body = pearl.a * (1.0 - smoothstep(0.98, 1.03, radial_distance));
     let pulse = 0.5 + 0.5 * sin(input.material.w * 1.15);

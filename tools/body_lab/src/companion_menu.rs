@@ -6,8 +6,9 @@ use serde_json::Value;
 pub(super) struct MenuState {
     page: u8,
     selected: usize,
-    waiting_for_feed: bool,
+    pub waiting_for_feed: bool,
     pub close: bool,
+    pub hidden: bool,
     pub capture_done: bool,
 }
 pub(super) fn configure(ctx: &egui::Context) {
@@ -80,7 +81,7 @@ pub(super) fn show(
                 ui.label(format!("Сохранено {count} / 40 · {}",if learned { "можно произносить" } else { "ещё учимся" }));
                 ui.label(if cue==CueKind::Name { "Говори Benny или Бенни. Добавляй повторы с разной привычной интонацией и расстоянием. Имя отдельно вызывает сильное внимание." } else { "Произноси выбранную фразу. Команда работает сама по себе — имя перед ней не нужно. Для «Benny, сделай круг» обучай и такую фразу отдельно в этой же команде." });
                 ui.small("Одна партия — 5 повторов с секундной паузой. Старые примеры сохраняются. Можно добавить 30–40 примеров постепенно. Во время записи питомец молчит.");
-                if ui.add_enabled(!training,egui::Button::new("▶ Записать ещё 5 примеров")).clicked() { command=Some(LabControlCommand::Hearing { action:H::TrainCommand { cue } }); }
+                if ui.add_enabled(!training,egui::Button::new("▶ Добавлять примеры примеров")).clicked() { command=Some(LabControlCommand::Hearing { action:H::TrainCommand { cue } }); }
                 if training {
                     let n=hearing["training"]["accepted"].as_u64().unwrap_or(0);
                     ui.add(egui::ProgressBar::new(n as f32/5.0).text(format!("Принято {n} из 5")));
@@ -90,7 +91,7 @@ pub(super) fn show(
                 let others=hearing["other_examples"].as_u64().unwrap_or(0);
                 ui.label(format!("Посторонние слова: {others} примеров"));
                 ui.small("Нужны один раз для всех команд. Например: «лампа», «чашка», «сегодня», «окно», «книга». Не произноси здесь имя или команды.");
-                if ui.add_enabled(!training,egui::Button::new("Записать 5 посторонних слов")).clicked() { command=Some(LabControlCommand::Hearing { action:H::TrainOther }); }
+                if ui.add_enabled(!training,egui::Button::new("Записывать посторонние слова")).clicked() { command=Some(LabControlCommand::Hearing { action:H::TrainOther }); }
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(!training,egui::Button::new("Показать действие")).clicked() { command=Some(LabControlCommand::Hearing { action:H::Perform { cue } }); }
                     if ui.add_enabled(!training,egui::Button::new("Проверить голосом")).clicked() { command=Some(LabControlCommand::Hearing { action:H::Test }); }

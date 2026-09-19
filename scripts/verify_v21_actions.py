@@ -50,14 +50,17 @@ with (data/'stdout.log').open('w') as out,(data/'stderr.log').open('w') as err:
   send(dict(type='renew_session',lease_seconds=10));begin=len(rows)
   send(dict(type='hearing',action={'perform':{'cue':'jump'}}));sample(3)
   jump=rows[begin:];ys=[r['screen_body_center_px'][1] for r in jump];assert max(ys)-min(ys)>40,'no jump'
-  send(dict(type='hearing',action={'perform':{'cue':'sit'}}));sample(5)
+  sit_start=len(rows)
+  send(dict(type='hearing',action={'perform':{'cue':'sit'}}));sample(9)
+  sit_load=max(r['liquid'].get('support_field_load',0) for r in rows[sit_start:])
+  assert sit_load>.1, f'sit did not acquire physical support: {sit_load}'
   send(dict(type='renew_session',lease_seconds=10))
   send(dict(type='hearing',action={'train_command':{'cue':'name'}}));sample(1)
   assert rows[-1]['hearing']['training'] is not None,'training did not start'
   send(dict(type='hearing',action='cancel_training'));sample(.8)
   assert rows[-1]['hearing']['training'] is None,'training did not cancel'
   u.SetCursorPos(old.x,old.y)
-  report={'dash_peak_px_s':peak,'circle_span_px':[max(xs)-min(xs),max(r['screen_body_center_px'][1] for r in circle)-min(r['screen_body_center_px'][1] for r in circle)],'jump_span_px':max(ys)-min(ys),'catalog_count':len(rows[-1]['hearing']['cues']),'training_start_cancel':True,'hearing':rows[-1]['hearing']['status'],'fps_mean':sum(r['fps'] for r in rows)/len(rows)}
+  report={'sit_support_load':sit_load,'dash_peak_px_s':peak,'circle_span_px':[max(xs)-min(xs),max(r['screen_body_center_px'][1] for r in circle)-min(r['screen_body_center_px'][1] for r in circle)],'jump_span_px':max(ys)-min(ys),'catalog_count':len(rows[-1]['hearing']['cues']),'training_start_cancel':True,'hearing':rows[-1]['hearing']['status'],'fps_mean':sum(r['fps'] for r in rows)/len(rows)}
   (data/'trace.json').write_text(json.dumps(rows));(data/'verification.json').write_text(json.dumps(report,indent=2));print(json.dumps(report),flush=True)
 
  finally:
