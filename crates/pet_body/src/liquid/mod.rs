@@ -280,6 +280,7 @@ pub struct LiquidMorphRuntime {
     face_frame: FaceFrameRuntime,
     /// Unoriented major axis of the area-preserving character-field ellipse.
     flight_comet: Vec2,
+    exploratory_pressure: Vec2,
     flight_field_axis: Vec2,
     /// Ratio of major/minor field metric radii. One is the neutral field.
     flight_field_aspect: f32,
@@ -411,6 +412,7 @@ impl LiquidMorphRuntime {
             components,
             face_frame: FaceFrameRuntime::default(),
             flight_comet: Vec2::ZERO,
+            exploratory_pressure: Vec2::ZERO,
             flight_field_axis: Vec2::Y,
             flight_field_aspect: 1.0,
             diagnostics: LiquidDiagnostics::default(),
@@ -566,6 +568,47 @@ impl LiquidMorphRuntime {
 
     pub fn set_runtime_actuation(&mut self, actuation: PbfRuntimeActuation) {
         self.runtime_actuation = sanitize_runtime_actuation(actuation);
+    }
+
+    pub fn set_exploratory_pressure(&mut self, pressure: Vec2) {
+        self.exploratory_pressure = pressure.clamp_length_max(1.0);
+    }
+
+    /// Convert a real wall impact into an internal compression impulse. The
+    /// mass-weighted mean is removed, so this cannot propel or teleport the pet.
+    pub fn apply_wall_impact(&mut self, screen_normal: Vec2, intensity: f32) {
+        if !screen_normal.is_finite() || !intensity.is_finite() {
+            return;
+        }
+        let normal = (screen_normal * Vec2::new(1.0, -1.0)).normalize_or_zero();
+        let tangent = normal.perp();
+        let strength = intensity.clamp(0.0, 1.0) * 4.5;
+        let mut impulses = [Vec2::ZERO; MAX_LIQUID_PARTICLES];
+        let mut total = 0.0;
+        let mut mean = Vec2::ZERO;
+        for (i, p) in self.particles[..self.particle_count].iter().enumerate() {
+            if p.component_id != self.components.main_component || p.inverse_mass <= 0.0 {
+                continue;
+            }
+            let local = p.position - self.components.main_com;
+            impulses[i] =
+                (-normal * local.dot(normal) + tangent * local.dot(tangent) * 0.45) * strength;
+            let mass = p.inverse_mass.recip();
+            mean += impulses[i] * mass;
+            total += mass;
+        }
+        if total <= 0.0 {
+            return;
+        }
+        mean /= total;
+        for (p, impulse) in self.particles[..self.particle_count]
+            .iter_mut()
+            .zip(impulses)
+        {
+            if p.component_id == self.components.main_component && p.inverse_mass > 0.0 {
+                p.velocity += impulse - mean;
+            }
+        }
     }
 
     pub fn set_somatic_actuation(&mut self, mut actuation: SomaticActuationPacket) {
@@ -889,13 +932,25 @@ impl LiquidMorphRuntime {
             self.local_containment_bounds,
             self.interaction_tuning,
         );
-        let posture_energy = motor_field::apply_posture_field(
+        let mut posture_energy = motor_field::apply_posture_field(
             &mut self.particles,
             self.particle_count,
             self.components.main_com,
             self.somatic_actuation.shape,
             motion.world_to_body_scale,
             self.tuning.posture_gain,
+        );
+        posture_energy += motor_field::apply_posture_field(
+            &mut self.particles,
+            self.particle_count,
+            self.components.main_com,
+            pet_motor::ShapeIntent {
+                mode: pet_motor::ShapeMode::Reach,
+                axis: self.exploratory_pressure.normalize_or_zero(),
+                strength: self.exploratory_pressure.length(),
+            },
+            motion.world_to_body_scale,
+            self.tuning.posture_gain * 0.65,
         );
         let mut somatic_step = apply_somatic_actuation(
             &mut self.particles,
@@ -3513,6 +3568,29 @@ fn deterministic_unit(seed: u64, sequence: u64, salt: u64) -> f32 {
 mod flight_field_tests {
     use super::*;
 
+    #[test]
+    fn wall_impact_compresses_without_adding_net_momentum_or_moving_particles() {
+        let mut runtime = LiquidMorphRuntime::new(92);
+        let before = runtime.particles;
+        runtime.apply_wall_impact(Vec2::X, 0.8);
+        let mut momentum = Vec2::ZERO;
+        let mut compression = 0.0;
+        for (p, old) in runtime.particles[..runtime.particle_count]
+            .iter()
+            .zip(before)
+        {
+            assert_eq!(p.position, old.position);
+            assert_eq!(p.inverse_mass, old.inverse_mass);
+            if p.inverse_mass > 0.0 {
+                let delta = p.velocity - old.velocity;
+                momentum += delta / p.inverse_mass;
+                compression += delta.x * (p.position.x - runtime.components.main_com.x);
+            }
+        }
+        assert!(momentum.length() < 0.0001, "{momentum:?}");
+        assert!(compression < -0.01, "{compression}");
+    }
+
     fn motion(velocity: Vec2, acceleration: Vec2) -> DropletMotion {
         DropletMotion {
             velocity,
@@ -3991,6 +4069,7 @@ mod tests {
 
     use super::components::classify_render_components;
     use super::*;
+
     use crate::{DerivedVisualTraits, VisualPhysiologyRuntime};
 
     fn neutral_intent() -> BodyIntent {

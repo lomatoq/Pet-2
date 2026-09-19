@@ -15,3 +15,7 @@ Fixes found through native verification: fixed 176 px navigation margin made tas
 Previous user state backed up in backups/pre-v20-2026-09-19. Cold-start geometry is gathered without replaying stale velocities; per-particle mass/pigment and the companion's cognitive state are preserved.
 
 Final face-smoothing correction: containment is sampled in presentation_update, with persistent position and a critically damped spring (9/s, capped 0.65 local units/s). Render reads do not advance motion. Inner target margin and outer safety margin prevent repeated corrections at the same contour; boundary search is refined rather than quantized to 1/16 increments. Face tests: 39 passed including continuous target jumps at 30/60/120 Hz. Final workspace/all-target Clippy with warnings denied passed.
+
+Compositional motor extension: bounded pursuit braking hesitation, decaying impact caution, effort-dependent reach plus lateral correction, and a mass-neutral wall compression impulse. Physical screen-domain projection remains authoritative. Feeding, sleep and precision interactions do not enable exuberant pursuit. Tuning regression now checks the authored face target before the presentation containment layer; containment has independent footprint tests.
+
+Final compositional-physics checks: pet_body 235 passed / 3 ignored, screen-domain 6 passed, dedicated wall impulse regression passed (compression with unchanged positions/mass and zero net momentum), workspace/all-target Clippy with warnings denied passed.

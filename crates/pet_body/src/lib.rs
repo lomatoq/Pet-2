@@ -600,6 +600,9 @@ impl ProceduralBody {
             .clamp(0.0, 1.0);
         effective_traits.translucency =
             (effective_traits.translucency + effect.translucency_boost).clamp(0.0, 1.0);
+        self.embodiment
+            .liquid
+            .set_exploratory_pressure(self.simulation.exploratory_pressure);
         self.embodiment.update(
             &self.body_genome,
             &effective_traits,
@@ -1753,8 +1756,9 @@ mod tests {
         assert_eq!(parameters.shadow_feather, 67.0);
         assert_eq!(parameters.exposure, 1.37);
         assert!(
-            parameters
+            body.embodiment
                 .liquid
+                .render_state()
                 .face_frame
                 .origin
                 .distance(Vec2::new(0.08, 0.21))

@@ -49,6 +49,11 @@ pub struct BodySimulation {
     /// remains invariant across aspect ratios and monitor layouts.
     commanded_acceleration_px_s2: Vec2,
     diagnostics: LocomotionDiagnostics,
+    brake_hesitation: f32,
+    misstep_cooldown: f32,
+    contact_caution: f32,
+    blocked_effort: f32,
+    pub exploratory_pressure: Vec2,
 }
 
 impl BodySimulation {
@@ -62,6 +67,11 @@ impl BodySimulation {
             embodied_target: None,
             commanded_acceleration_px_s2: Vec2::ZERO,
             diagnostics: LocomotionDiagnostics::default(),
+            brake_hesitation: 0.0,
+            misstep_cooldown: 0.0,
+            contact_caution: 0.0,
+            blocked_effort: 0.0,
+            exploratory_pressure: Vec2::ZERO,
         }
     }
 
@@ -99,6 +109,12 @@ impl BodySimulation {
         let dt = dt.clamp(0.0, 1.0 / 30.0);
         let was_grounded = self.feedback.grounded;
         self.wander_phase += dt * 0.73;
+        if let Some(impact) = &self.feedback.collision {
+            self.contact_caution = self.contact_caution.max(impact.intensity);
+        }
+        self.contact_caution *= (-0.55 * dt).exp();
+        self.misstep_cooldown = (self.misstep_cooldown - dt).max(0.0);
+        self.brake_hesitation = (self.brake_hesitation - dt).max(0.0);
         self.feedback.collision = None;
         self.feedback.grounded = false;
         self.feedback.clinging = false;
@@ -308,6 +324,52 @@ impl BodySimulation {
             desired_velocity = desired_velocity.clamp_length_max(braking_speed);
         }
 
+        // Continuous motor imperfection: pursuit, obstruction and recent impact
+        // combine, rather than selecting an animation or a random mishap.
+        let exuberant = matches!(
+            intent.locomotion,
+            LocomotionMode::Seek | LocomotionMode::Flee | LocomotionMode::Orbit
+        ) && intent.desired_speed > 0.60
+            && intent.interaction_target.is_none()
+            && !sensors.pet_dragged;
+        let excitement =
+            ((intent.desired_speed - 0.60) / 0.40).clamp(0.0, 1.0) * (1.0 - self.contact_caution);
+        if exuberant
+            && excitement > 0.35
+            && velocity.length() > reference_span * 0.45
+            && desired_velocity.dot(velocity) < velocity.length_squared() * 0.60
+            && self.misstep_cooldown <= 0.0
+        {
+            self.brake_hesitation = 0.035 + excitement * 0.075;
+            self.misstep_cooldown = 7.0 + self.contact_caution * 5.0;
+        }
+        if exuberant && self.brake_hesitation > 0.0 {
+            desired_velocity = desired_velocity.lerp(velocity, 0.82);
+        }
+        let heading = (target - position).normalize_or_zero();
+        let blocked = exuberant
+            && position.distance(target) > reference_span * 0.10
+            && velocity.dot(heading) < reference_span * 0.045
+            && self.contact_caution > 0.015;
+        self.blocked_effort =
+            (self.blocked_effort + if blocked { dt } else { -dt * 1.8 }).clamp(0.0, 1.6);
+        let probe = (self.blocked_effort * 2.4).clamp(0.0, 1.0) * excitement;
+        // A brief push can overlap with a lateral route correction. The turn
+        // follows real target/cursor geometry, with a stable handedness for ties.
+        let cross = heading.perp_dot((sensors.cursor_position * scale) - position);
+        let side = if cross.abs() > 1.0 {
+            cross.signum()
+        } else {
+            1.0
+        };
+        let lateral = heading.perp() * side;
+        let yielding = (self.blocked_effort - 0.22).clamp(0.0, 0.8);
+        desired_velocity += lateral * yielding * excitement * reference_span * 0.16;
+        desired_velocity *= 1.0 - self.contact_caution * 0.28;
+        let pressure = heading * probe + lateral * probe * yielding;
+        self.exploratory_pressure = self
+            .exploratory_pressure
+            .lerp(pressure, 1.0 - (-7.0 * dt).exp());
         let velocity_response = 5.8 + purposeful_response * 3.2;
         self.motor_velocity = (desired_velocity / scale).clamp_length_max(1.0);
         let requested_motor_acceleration = (desired_velocity - velocity) * velocity_response;
@@ -531,6 +593,46 @@ mod tests {
     use lifecore::{ExpressionState, Genome, PoseIntent, Rect, SurfaceId};
 
     use super::*;
+
+    #[test]
+    fn exuberant_misstep_is_bounded_and_recent_contact_generates_then_releases_probe() {
+        let genome = Genome::from_seed(17);
+        let mut sim = BodySimulation::new(17);
+        sim.set_motion_space_pixels(Vec2::new(1920.0, 1080.0));
+        sim.feedback.world_position = Vec2::splat(0.5);
+        sim.feedback.velocity = Vec2::new(0.45, 0.0);
+        let mut intent = BodyIntent {
+            locomotion: LocomotionMode::Seek,
+            desired_speed: 0.95,
+            target_position: Vec2::new(0.1, 0.5),
+            target_surface: None,
+            facing_direction: -1.0,
+            gaze_target: None,
+            pose: PoseIntent::Curious,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+        sim.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        assert!(sim.brake_hesitation > 0.0 && sim.brake_hesitation < 0.12);
+        assert!(sim.misstep_cooldown >= 7.0);
+        for _ in 0..45 {
+            sim.feedback.velocity = Vec2::ZERO;
+            sim.feedback.collision = Some(lifecore::CollisionEvent {
+                normal: Vec2::X,
+                intensity: 0.4,
+            });
+            sim.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        assert!(sim.exploratory_pressure.length() > 0.02);
+        assert!(sim.brake_hesitation <= 0.0);
+        intent.locomotion = LocomotionMode::Sleep;
+        intent.desired_speed = 0.0;
+        for _ in 0..240 {
+            sim.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        assert!(sim.exploratory_pressure.length() < 0.0001);
+        assert!(sim.blocked_effort == 0.0);
+    }
 
     #[test]
     fn efference_includes_near_target_braking() {

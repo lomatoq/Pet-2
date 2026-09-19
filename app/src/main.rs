@@ -7593,6 +7593,9 @@ fn apply_screen_domain(
             physical_velocity.y = 0.0;
         }
         if !*was_in_contact && normal_speed > 36.0 {
+            body.embodiment
+                .liquid
+                .apply_wall_impact(-outward, (normal_speed / 900.0).clamp(0.0, 1.0));
             body.simulation.feedback.collision = Some(CollisionEvent {
                 normal: -outward,
                 intensity: (normal_speed / 900.0).clamp(0.0, 1.0),
