@@ -1,0 +1,15 @@
+# V22: contact, hearing, responsive motion
+
+Grounded feeding now navigates to the actual taskbar plane using the downward liquid contour. Only the mouth moves toward food; eyes retain their volume anchor. Mouth drawing and ingestion use the same constrained position. Ground food requires mouth contact before consumption. Root support follows the taskbar during flattening; approach aligns the resting mouth horizontally instead of chasing a changing extreme particle. Commanded fluid spreading is removed from the silhouette-based injury proxy while real bond strain and excess deformation remain visible. Crumbs have distinct launch directions and speeds, unchanged physical radii, and brighter slow halos.
+
+Face transport uses continuous total mass instead of discontinuous component labels. Both normal motion and containment recovery have a presentation speed bound. Supported deformation begins promptly with faster continuous load/axis response, retaining cohesion and collision gating.
+
+Locomotor anticipation is a short physical recoil field before a deliberate fast departure from rest. Its duration depends on requested speed and distance, and it yields to dragging, training, and recognition. It does not author a flight path. Contextual glance demand accumulates during cursor inactivity or settling, chooses bounded variable directions/durations, and yields to care, danger, and active motion.
+
+Recognition of a learned name releases an excitement impulse and expression modulation scaled by arousal, attachment, sleep drive and stress. Voice uses the existing social vocal arbitration, including quiet/cooldown rules. The display name is Бендер; recognition uses the owner's saved acoustic examples, not the text label.
+
+Positive-only enrollment is now usable after five coherent examples. Saved positive-only classes are recalibrated without rerecording. Negative examples remain optional refinements. Unrelated negative words no longer fail a positive-class cohesion check. Failed positive batches replace the most inconsistent recording, and inseparable classes stop with an explicit explanation instead of an endless 4/5 loop. Diagnostics record segment counts and batch rejection causes. This is acoustic template matching, not general speech recognition.
+
+Microphone selection is available in the care menu and saved independently of playback. The observed Nothing headset input is mono 16 kHz while the application output is stereo float 48 kHz. Bluetooth Classic can downgrade playback when its headset microphone is opened; selecting a separate mic or disabling listening avoids that path if the system supports it. No system audio defaults are changed automatically. Reference: https://learn.microsoft.com/en-us/windows-hardware/drivers/bluetooth/bluetooth-classic-audio
+
+Validation results are included with the delivered Windows package. macOS installation is not performed on this Windows host. User state, genome and recorded feature examples are preserved; test sessions use isolated target directories.

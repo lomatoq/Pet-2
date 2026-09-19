@@ -7,7 +7,7 @@ mod components;
 mod contact_surface;
 pub use contact_surface::{
     SmoothFaceOrigin, contact_surface_bounds, contact_surface_circle, contact_surface_min_y,
-    contact_surface_support, contain_face_origin,
+    contact_surface_support, contain_face_origin, contain_mouth_origin,
 };
 mod density;
 mod face_frame;
@@ -319,6 +319,7 @@ pub struct LiquidMorphRuntime {
     supported_seconds: f32,
     measured_support_load: f32,
     compliant_support_load: f32,
+    launch_preparation: (Vec2, f32),
     object_load: f32,
     object_contact_impulse: f32,
     /// Shared kernel-to-wall clearance, calibrated once per physical contact.
@@ -451,6 +452,7 @@ impl LiquidMorphRuntime {
             supported_seconds: 0.0,
             measured_support_load: 0.0,
             compliant_support_load: 0.0,
+            launch_preparation: (Vec2::ZERO, 0.0),
             object_load: 0.0,
             object_contact_impulse: 0.0,
             support_plane_clearance: None,
@@ -572,6 +574,10 @@ impl LiquidMorphRuntime {
         self.runtime_actuation = sanitize_runtime_actuation(actuation);
     }
 
+    pub fn set_launch_preparation(&mut self, axis: Vec2, strength: f32) {
+        self.launch_preparation = (axis, strength.clamp(0.0, 1.0));
+    }
+
     pub fn set_exploratory_pressure(&mut self, pressure: Vec2) {
         self.exploratory_pressure = pressure.clamp_length_max(1.0);
     }
@@ -634,7 +640,8 @@ impl LiquidMorphRuntime {
             ShapeMode::Guard => 0.05,
             ShapeMode::Recoil => 1.0 / 0.94 - 1.0,
         };
-        extension * self.somatic_actuation.shape.strength * self.tuning.posture_gain
+        (extension * self.somatic_actuation.shape.strength * self.tuning.posture_gain)
+            .max(self.flight_field_aspect - 1.0)
     }
 
     fn effective_material_parameters(&self) -> MaterialParameters {
@@ -823,6 +830,20 @@ impl LiquidMorphRuntime {
         let support_plane =
             self.measured_support_plane(motion, feedback.world_position, measured_load.is_some());
         let field_scale = self.tuning.character_field_radius_scale;
+        if self.launch_preparation.1 > 0.0 {
+            motor_field::apply_posture_field(
+                &mut self.particles,
+                self.particle_count,
+                self.components.main_com,
+                pet_motor::ShapeIntent {
+                    mode: pet_motor::ShapeMode::Recoil,
+                    axis: self.launch_preparation.0,
+                    strength: self.launch_preparation.1,
+                },
+                motion.world_to_body_scale,
+                1.5,
+            );
+        }
         apply_character_field(
             &mut self.particles,
             self.particle_count,
@@ -1158,6 +1179,19 @@ impl LiquidMorphRuntime {
         self.update_diagnostics(parameters, stress, motion.velocity.length());
         self.update_somatic_feedback(somatic_step, feedback, dt);
         let grab_readback = self.material_grab.readback();
+        // A fluid's commanded flattening is not an elastic neck injury.
+        // Keep bond strain and excess deformation fully visible to interoception.
+        let bond_strain = self
+            .bonds
+            .iter()
+            .filter(|b| b.active)
+            .map(|b| b.strain.max(0.0))
+            .fold(0.0_f32, f32::max);
+        let expected_aspect = self
+            .flight_field_aspect
+            .max(1.0 + self.intended_posture_extension());
+        let sensed_strain =
+            bond_strain.max((self.material_stretch_ratio() / expected_aspect - 1.0).max(0.0));
         self.interaction_probe.update(
             &self.particles,
             self.particle_count,
@@ -1167,7 +1201,7 @@ impl LiquidMorphRuntime {
             feedback.world_position,
             motion.world_to_body_scale,
             sensors.cursor_position,
-            observed_strain,
+            sensed_strain,
             self.diagnostics.density_error,
             self.interaction_tuning,
             self.topology_decision.budget_exhausted,
@@ -1629,7 +1663,7 @@ impl LiquidMorphRuntime {
     ) {
         let contact_load = measured_load.map_or(0.0, |(_, load)| load);
         self.compliant_support_load +=
-            (contact_load - self.compliant_support_load) * (1.0 - (-7.0 * dt).exp());
+            (contact_load - self.compliant_support_load) * (1.0 - (-28.0 * dt).exp());
         let comet_drive = if measured_load.is_some() {
             0.0
         } else {
@@ -1670,7 +1704,8 @@ impl LiquidMorphRuntime {
             }
             let current_angle = self.flight_field_axis.y.atan2(self.flight_field_axis.x);
             let target_angle = target_axis.y.atan2(target_axis.x);
-            let axis_blend = 1.0 - (-6.5 * dt).exp();
+            let axis_rate = if measured_load.is_some() { 20.0 } else { 6.5 };
+            let axis_blend = 1.0 - (-axis_rate * dt).exp();
             let next_angle = current_angle + wrap_angle(target_angle - current_angle) * axis_blend;
             self.flight_field_axis = Vec2::from_angle(next_angle);
         }
@@ -1682,7 +1717,7 @@ impl LiquidMorphRuntime {
             1.0 + (self.compliant_support_load * 3.5).clamp(0.0, 1.4)
         });
         let aspect_rate = if measured_load.is_some() {
-            8.5
+            20.0
         } else {
             3.5 + drive * 3.5
         };

@@ -2085,6 +2085,9 @@ struct PetRuntime {
     voice_motion: Option<voice_actions::VoiceMotion>,
     emotion_burst: voice_actions::EmotionBurst,
     activity_recovery: voice_actions::ActivityRecovery,
+    launch_preparation: voice_actions::LaunchPreparation,
+    context_glance: voice_actions::ContextGlance,
+    recognition_joy: f32,
     feeding_seconds: f32,
     food_click_cooldown: f32,
     companion_menu: Option<std::process::Child>,
@@ -2832,6 +2835,31 @@ impl PetApplication {
                         physical_to_virtual_normalized(&runtime.topology, target);
                 }
             }
+            runtime.recognition_joy *=
+                (-(1.2 + runtime.life.state.affect.arousal * 1.4) * body_dt).exp();
+            if runtime.recognition_joy > 0.02 && !runtime.sensors.pet_dragged {
+                let joy = runtime.recognition_joy;
+                runtime.intent.expression.mouth_curve =
+                    runtime.intent.expression.mouth_curve.max(joy * 0.8);
+                runtime.intent.expression.mouth_open =
+                    runtime.intent.expression.mouth_open.max(joy * 0.22);
+                runtime.intent.expression.eye_aperture =
+                    runtime.intent.expression.eye_aperture.max(0.8 + joy * 0.2);
+            }
+            let (launch_axis, launch_strength) = runtime.launch_preparation.apply(
+                &mut runtime.intent,
+                runtime.body.simulation.feedback.world_position,
+                runtime.body.simulation.feedback.velocity.length(),
+                runtime.sensors.pet_dragged
+                    || runtime.hearing.name_attention()
+                    || runtime.hearing.training(),
+                body_dt,
+            );
+            runtime
+                .body
+                .embodiment
+                .liquid
+                .set_launch_preparation(launch_axis, launch_strength);
             runtime.body.fixed_update(
                 &runtime.life.state.genome,
                 &runtime.intent,
@@ -2925,6 +2953,21 @@ impl PetApplication {
                 &mut runtime.screen_edge_contact,
                 body_dt,
             );
+            if !runtime.sensors.pet_dragged
+                && let Some(support) = runtime.ecology.feeding_support()
+            {
+                let hull = runtime
+                    .body
+                    .liquid_contact_bounds_pixels(runtime.window.inner_size().height as f32);
+                let floor =
+                    virtual_normalized_to_physical(&runtime.topology, support.anchor_point).y;
+                runtime.screen_body_center.y = floor - hull.maximum.y;
+                runtime.body.simulation.feedback.world_position =
+                    physical_to_virtual_normalized(&runtime.topology, runtime.screen_body_center);
+                runtime.body.simulation.feedback.velocity.y = 0.0;
+                runtime.body.simulation.feedback.grounded = true;
+                runtime.screen_velocity_px.y = 0.0;
+            }
             if runtime.body.simulation.feedback.collision.is_some() {
                 runtime.collision_impulse_count = runtime.collision_impulse_count.saturating_add(1);
             }
@@ -3337,6 +3380,19 @@ impl PetApplication {
                 motor_context.cursor_position = motor_context.body.motion.world_position;
             }
             if heard_name && !runtime.sensors.pet_dragged {
+                let affect = runtime.life.state.affect;
+                let wakefulness = (1.0 - runtime.life.state.drives.sleep * 0.6).clamp(0.25, 1.0);
+                runtime.recognition_joy = ((0.3 + affect.arousal * 0.4 + affect.attachment * 0.3)
+                    * wakefulness
+                    * (1.0 - affect.stress * 0.65))
+                    .clamp(0.12, 1.0);
+                // A small excitement impulse enters the normal motor physics;
+                // no canned flight path or override of an ongoing care action.
+                if runtime.ecology.feeding_navigation().is_none()
+                    && runtime.body.simulation.feedback.velocity.length() < 0.15
+                {
+                    runtime.body.simulation.feedback.velocity.y -= 0.07 * runtime.recognition_joy;
+                }
                 runtime
                     .motor
                     .acknowledge_recognition(runtime.body.simulation.feedback.world_position, 0.95);
@@ -3638,6 +3694,28 @@ impl PetApplication {
             } else {
                 (attention, kind)
             };
+            let scan = runtime.context_glance.target(
+                runtime.sensors.cursor_position,
+                runtime.body.simulation.feedback.world_position,
+                runtime.voice_motion.as_ref().is_some_and(|m| {
+                    matches!(
+                        m.cue,
+                        desktop_host::CueKind::Sit | desktop_host::CueKind::Sleep
+                    ) && m.elapsed < 5.0
+                }),
+                danger
+                    || runtime.sensors.pet_dragged
+                    || runtime.hearing.name_attention()
+                    || runtime.ecology.feeding_navigation().is_some()
+                    || runtime.body.simulation.feedback.velocity.length() > 0.15,
+                LIFE_DT,
+            );
+            let (attention, kind) = if let Some(target) = scan {
+                runtime.body.embodiment.near_attention = false;
+                (Some(target), lifecore::AttentionTargetKind::Visual)
+            } else {
+                (attention, kind)
+            };
             if danger {
                 motor_packet.expression.gaze_target = attention;
             }
@@ -3761,6 +3839,14 @@ impl PetApplication {
                     runtime.life.cancel_vocal_request(request.performance_seed);
                 }
                 output.vocal_request = request_ecology_voice(runtime, trigger);
+            }
+            if heard_name && !runtime.hearing.quiet_boundary() {
+                if let Some(request) = output.vocal_request.take() {
+                    runtime.life.cancel_vocal_request(request.performance_seed);
+                }
+                output.vocal_request = runtime
+                    .life
+                    .request_vocalization(VocalTrigger::SoftTouch, &runtime.sensors);
             }
             let vocal_nominated = output.vocal_request.is_some();
             if let Some(request) = output.vocal_request {
@@ -4322,7 +4408,7 @@ impl PetApplication {
                     "audio_accepted_requests": runtime.audio.accepted_requests,
                     "audio_rejected_requests": runtime.audio.rejected_requests,
                     "hearing": runtime.hearing.telemetry(),
-                    "feeding": { "enabled": runtime.feeding_seconds > 0.0, "seconds_remaining": runtime.feeding_seconds },
+                    "feeding": { "enabled": runtime.feeding_seconds > 0.0, "seconds_remaining": runtime.feeding_seconds, "mouth_tip_px": runtime.body.feeding_mouth_tip_pixels(runtime.window.inner_size().height as f32).to_array(), "navigation": runtime.ecology.feeding_navigation().map(|(p,c)| serde_json::json!({"target":p.to_array(),"mouth_contact":c})) },
                     "organic": runtime.organic.latest().map(|latest| serde_json::json!({
                         "trace":latest.regulation.trace,
                         "activation":latest.regulation.activation,
@@ -4582,6 +4668,9 @@ impl ApplicationHandler for PetApplication {
             voice_motion: None,
             emotion_burst: voice_actions::EmotionBurst::default(),
             activity_recovery: voice_actions::ActivityRecovery::default(),
+            launch_preparation: voice_actions::LaunchPreparation::default(),
+            context_glance: voice_actions::ContextGlance::default(),
+            recognition_joy: 0.0,
             lab_motor_program: None,
             lab_motor_restart: false,
             brain_mode: self.arguments.brain_mode,

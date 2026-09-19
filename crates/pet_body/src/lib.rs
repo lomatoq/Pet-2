@@ -322,16 +322,57 @@ impl ProceduralBody {
             let local =
                 p * Vec2::new(1.0, -1.0) * (2.0 * self.projection_scale() / height.max(1.0));
             let frame = self.embodiment.liquid.render_state().face_frame;
-            let delta = local - frame.origin;
+            let delta = local - self.contained_face.origin.unwrap_or(frame.origin);
             (Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
                 / frame.scale.max(Vec2::splat(0.01))
                 - Vec2::new(0.0, -0.1))
-            .clamp_length_max(0.65)
+            .clamp_length_max(1.8)
         });
         let alpha = 1.0 - (-12.0 * dt.max(0.0)).exp();
         self.feeding_mouth_offset = self.feeding_mouth_offset.lerp(target, alpha);
         self.feeding_mouth_activity +=
             (f32::from(surface_pixels.is_some()) - self.feeding_mouth_activity) * alpha;
+    }
+
+    /// The same constrained mouth center is used by drawing and food contact.
+    fn feeding_mouth_render_offset(&self) -> Vec2 {
+        if self.feeding_mouth_offset.length_squared() < 1e-8 {
+            return Vec2::ZERO;
+        }
+        let liquid = self.embodiment.liquid.render_state();
+        let frame = liquid.face_frame;
+        let origin = self.contained_face.origin.unwrap_or(frame.origin);
+        let base = origin - frame.axis_y * 0.1 * frame.scale.y;
+        let desired = base
+            + frame.axis_x * self.feeding_mouth_offset.x * frame.scale.x
+            + frame.axis_y * self.feeding_mouth_offset.y * frame.scale.y;
+        let mouth = liquid::contain_mouth_origin(
+            &liquid.particles[..liquid.particle_count],
+            self.tuning.pbf.iso_threshold,
+            base,
+            desired,
+            frame.axis_x * frame.scale.x,
+            frame.axis_y * frame.scale.y,
+        );
+        let delta = mouth - base;
+        Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
+            / frame.scale.max(Vec2::splat(0.01))
+    }
+
+    pub fn feeding_mouth_rest_pixels(&self, height: f32) -> Vec2 {
+        let frame = self.embodiment.liquid.render_state().face_frame;
+        let local =
+            self.contained_face.origin.unwrap_or(frame.origin) - frame.axis_y * 0.1 * frame.scale.y;
+        local * Vec2::new(1.0, -1.0) * (height.max(1.0) / (2.0 * self.projection_scale()))
+    }
+
+    pub fn feeding_mouth_tip_pixels(&self, height: f32) -> Vec2 {
+        let frame = self.embodiment.liquid.render_state().face_frame;
+        let offset = self.feeding_mouth_render_offset();
+        let local = self.contained_face.origin.unwrap_or(frame.origin)
+            + frame.axis_x * offset.x * frame.scale.x
+            + frame.axis_y * (offset.y - 0.135) * frame.scale.y;
+        local * Vec2::new(1.0, -1.0) * (height.max(1.0) / (2.0 * self.projection_scale()))
     }
 
     pub fn set_ecology_visual_effect(&mut self, effect: EcologyVisualEffect) {
@@ -673,10 +714,7 @@ impl ProceduralBody {
         let particles = &liquid.particles[..liquid.particle_count];
         let mut sum = Vec2::ZERO;
         let mut mass = 0.0;
-        for p in particles
-            .iter()
-            .filter(|p| p.main_component && p.position.is_finite())
-        {
+        for p in particles.iter().filter(|p| p.position.is_finite()) {
             let weight = p.density.max(0.0);
             sum += p.position * weight;
             mass += weight;
@@ -686,14 +724,14 @@ impl ProceduralBody {
             if let Some(old) = self.face_mass_anchor
                 && let Some(origin) = &mut self.contained_face.origin
             {
-                *origin += center - old;
+                // Topology labels may switch when a droplet detaches. Advect by
+                // continuous total mass, with a bound for snapshot/recovery changes.
+                *origin += (center - old).clamp_length_max(0.65 * dt.clamp(0.0, 0.05));
             }
             self.face_mass_anchor = Some(center);
         }
         let previous = self.contained_face.origin.unwrap_or(frame.origin);
-        let desired = frame.origin
-            + frame.axis_x * self.feeding_mouth_offset.x * frame.scale.x
-            + frame.axis_y * self.feeding_mouth_offset.y * frame.scale.y;
+        let desired = frame.origin;
         let particles = &liquid.particles[..liquid.particle_count];
         // Ignore small target ripples relative to the advected liquid mass.
         // Continuous deadband avoids a hold-then-jump threshold.
@@ -724,7 +762,8 @@ impl ProceduralBody {
         if supported.distance_squared(smooth) > 0.000001 {
             self.contained_face.velocity = Vec2::ZERO;
         }
-        self.contained_face.origin = Some(supported);
+        self.contained_face.origin =
+            Some(previous + (supported - previous).clamp_length_max(0.65 * dt.clamp(0.0, 0.05)));
     }
 
     #[must_use]
@@ -1248,7 +1287,7 @@ impl ProceduralBody {
             mouth_open: pose.mouth_open.max(
                 self.feeding_mouth_activity * (0.26 + pose.breath.abs().clamp(0.0, 1.0) * 0.22),
             ),
-            feeding_mouth_offset: Vec2::ZERO,
+            feeding_mouth_offset: self.feeding_mouth_render_offset(),
             mouth_curve: pose.mouth_curve,
             mouth_shout: pose.mouth_shout,
             mouth_tension: pose.mouth_tension,
@@ -1328,13 +1367,7 @@ impl ProceduralBody {
             droplets: self.embodiment.droplets.render_states(),
             liquid: {
                 let mut liquid = self.embodiment.liquid.render_state();
-                let desired = liquid.face_frame.origin
-                    + liquid.face_frame.axis_x
-                        * self.feeding_mouth_offset.x
-                        * liquid.face_frame.scale.x
-                    + liquid.face_frame.axis_y
-                        * self.feeding_mouth_offset.y
-                        * liquid.face_frame.scale.y;
+                let desired = liquid.face_frame.origin;
                 liquid.face_frame.origin = self.contained_face.origin.unwrap_or_else(|| {
                     liquid::contain_face_origin(
                         &liquid.particles[..liquid.particle_count],
@@ -1442,6 +1475,40 @@ mod tests {
     use lifecore::{BodyIntent, ExpressionState, Genome, LocomotionMode, PoseIntent, SensorFrame};
 
     use super::*;
+
+    #[test]
+    fn feeding_moves_only_mouth_and_keeps_its_tip_near_the_surface() {
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.presentation_update(1.0 / 60.0);
+        let before = body
+            .render_parameters(&genome, 0.3)
+            .liquid
+            .face_frame
+            .origin;
+        let support = body.liquid_physical_support_pixels(Vec2::Y, 1080.0);
+        for _ in 0..120 {
+            body.set_feeding_mouth(Some(support), 1080.0, 1.0 / 120.0);
+        }
+        let after = body.render_parameters(&genome, 0.3);
+        assert_eq!(before, after.liquid.face_frame.origin);
+        let tip = body.feeding_mouth_tip_pixels(1080.0);
+        assert!(
+            tip.distance(support) < 12.0,
+            "tip={tip:?}, support={support:?}"
+        );
+        assert!(after.feeding_mouth_offset.y < 0.0);
+    }
+
+    #[test]
+    fn face_recovery_cannot_jump_to_a_different_volume_in_one_frame() {
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.contained_face.origin = Some(Vec2::new(0.7, 0.0));
+        let old = body.contained_face.origin.unwrap();
+        body.presentation_update(1.0 / 60.0);
+        assert!(body.contained_face.origin.unwrap().distance(old) <= 0.65 / 60.0 + 1e-5);
+    }
 
     #[test]
     fn sustained_expression_relaxes_mouth_but_voice_can_open_it() {

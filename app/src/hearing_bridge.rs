@@ -16,6 +16,8 @@ struct HearingSave {
     enabled: bool,
     master_gain: f32,
     model: CueModelV1,
+    #[serde(default)]
+    input_device: Option<String>,
 }
 
 #[derive(Default)]
@@ -39,6 +41,8 @@ impl OutputReferenceCadence {
 
 pub struct HearingBridge {
     input: LocalAudioInput,
+    input_devices: Vec<String>,
+    input_device: Option<String>,
     path: PathBuf,
     enabled: bool,
     master_gain: f32,
@@ -92,9 +96,16 @@ impl HearingBridge {
         };
         let enabled = enable || loaded.as_ref().is_some_and(|s| s.enabled);
         let master_gain = loaded.as_ref().map_or(1.0, |s| s.master_gain);
+        let input_device = loaded.as_ref().and_then(|s| s.input_device.clone());
         let model = loaded.map_or_else(CueModelV1::new, |s| s.model);
-        let mut input = LocalAudioInput::new(AudioInputConfig::default(), model)
-            .expect("validated local hearing model");
+        let mut input = LocalAudioInput::new(
+            AudioInputConfig {
+                device_name: input_device.clone(),
+                ..AudioInputConfig::default()
+            },
+            model,
+        )
+        .expect("validated local hearing model");
         if enabled {
             message = match input.start() {
                 Ok(()) => "Слушаю. Выбери имя или команду и добавь примеры своего голоса.".into(),
@@ -103,6 +114,8 @@ impl HearingBridge {
         }
         pet_audio::AudioEngine::set_master_gain(master_gain);
         Self {
+            input_devices: desktop_host::available_input_devices(),
+            input_device,
             input,
             path,
             enabled,
@@ -129,6 +142,22 @@ impl HearingBridge {
 
     pub fn control(&mut self, action: HearingAction) {
         match action {
+            HearingAction::SelectInput { index } => {
+                let device = if index == 0 {
+                    None
+                } else {
+                    self.input_devices.get(index as usize - 1).cloned()
+                };
+                if index != 0 && device.is_none() {
+                    return;
+                }
+                self.message = match self.input.select_device(device.clone()) {
+                    Ok(()) => "Микрофон переключён. Проверь индикатор голоса.".into(),
+                    Err(error) => format!("Не удалось переключить микрофон: {error}"),
+                };
+                self.input_device = device;
+                self.dirty = true;
+            }
             HearingAction::Enable => {
                 self.enabled = true;
                 self.message = match self.input.start() {
@@ -381,7 +410,7 @@ impl HearingBridge {
     pub fn telemetry(&self) -> serde_json::Value {
         let status = self.input.status();
         let model = self.input.model();
-        serde_json::json!({"enabled":self.enabled,"device":status.device_name,
+        serde_json::json!({"enabled":self.enabled,"device":status.device_name,"input_devices":self.input_devices,"input_device":self.input_device,
             "message":status.last_error.as_ref().unwrap_or(&self.message),"input_level":status.rms,
             "status":status,"last_cue":self.last_cue,"master_gain":self.master_gain,
             "quiet_seconds":self.quiet_seconds,"test_seconds":self.test_seconds,
@@ -399,6 +428,7 @@ impl HearingBridge {
             return;
         }
         let save = HearingSave {
+            input_device: self.input_device.clone(),
             version: 1,
             enabled: self.enabled,
             master_gain: self.master_gain,
@@ -476,9 +506,9 @@ fn explain_training_error(reason: &str) -> &'static str {
     } else if reason.contains("output") {
         "Звучал голос питомца. Подожди тишины и повтори."
     } else if reason.contains("separable") {
-        "Фраза похожа на другую команду или посторонний пример. Используй отличающиеся слова; сохранённые команды не потеряны."
+        "Запись остановлена: фраза неотличима от другой команды или постороннего примера. Выбери другую фразу и начни снова; ранее сохранённые команды не потеряны."
     } else if reason.contains("held-out") || reason.contains("inconsistent") {
-        "Последний пример сильно отличается. Предыдущие четыре сохранены — повтори ещё один обычным голосом."
+        "Один из пяти примеров отличается: заменяю самый непохожий. Четыре остаются в текущей записи; повтори ещё раз с паузой."
     } else {
         "Не удалось выделить голос. Говори обычным голосом, делая паузу после фразы."
     }

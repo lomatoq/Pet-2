@@ -78,6 +78,9 @@ pub struct AudioInputStatus {
     pub retry_count: u8,
     pub last_error: Option<String>,
     pub training: Option<TrainingProgress>,
+    pub training_rejections: u64,
+    pub last_training_rejection: Option<String>,
+    pub segments_received: u64,
 }
 
 impl Default for AudioInputStatus {
@@ -95,6 +98,9 @@ impl Default for AudioInputStatus {
             retry_count: 0,
             last_error: None,
             training: None,
+            training_rejections: 0,
+            last_training_rejection: None,
+            segments_received: 0,
         }
     }
 }
@@ -194,8 +200,9 @@ pub struct LocalAudioInput {
 }
 
 impl LocalAudioInput {
-    pub fn new(config: AudioInputConfig, model: CueModelV1) -> Result<Self, LocalAudioError> {
+    pub fn new(config: AudioInputConfig, mut model: CueModelV1) -> Result<Self, LocalAudioError> {
         model.validate()?;
+        model.calibrate_missing_thresholds();
         Ok(Self {
             config,
             model: Arc::new(Mutex::new(model)),
@@ -239,6 +246,16 @@ impl LocalAudioInput {
         self.commands = Some(command_tx);
         self.percepts = Some(percept_rx);
         self.worker = Some(worker);
+        Ok(())
+    }
+
+    pub fn select_device(&mut self, device_name: Option<String>) -> Result<(), LocalAudioError> {
+        let enabled = self.worker.is_some();
+        self.stop();
+        self.config.device_name = device_name;
+        if enabled {
+            self.start()?;
+        }
         Ok(())
     }
 
@@ -740,6 +757,7 @@ impl AudioProcessor {
     }
 
     fn process_segment(&mut self, segment: SegmentEvidence) {
+        update_status(&self.status, |s| s.segments_received += 1);
         send_percept(
             &self.percepts,
             AudioPercept::Segment {
@@ -836,8 +854,23 @@ impl AudioProcessor {
                 );
             }
             Err(error) => {
+                update_status(&self.status, |s| {
+                    s.training_rejections += 1;
+                    s.last_training_rejection = Some(error.to_string());
+                });
+                if matches!(error, crate::EnrollmentError::NotSeparable) {
+                    update_status(&self.status, |s| s.training = None);
+                    send_percept(
+                        &self.percepts,
+                        AudioPercept::TrainingRejected {
+                            cue: progress.cue,
+                            reason: error.to_string(),
+                        },
+                    );
+                    return;
+                }
                 let mut trainer = trainer;
-                trainer.retry_oldest();
+                trainer.retry_outlier();
                 update_status(&self.status, |value| {
                     value.training = Some(trainer.progress())
                 });

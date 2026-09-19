@@ -377,3 +377,158 @@ mod recovery_tests {
         assert!((0..400).any(|_| recovery.update(0.0, 0.5, 0.5, true, 0.1)));
     }
 }
+
+/// Anticipation is attached to a locomotor decision, not a repeating idle animation.
+#[derive(Default)]
+pub struct LaunchPreparation {
+    remaining: f32,
+    duration: f32,
+    cooldown: f32,
+    target: Vec2,
+    axis: Vec2,
+}
+impl LaunchPreparation {
+    pub fn apply(
+        &mut self,
+        intent: &mut BodyIntent,
+        position: Vec2,
+        speed: f32,
+        blocked: bool,
+        dt: f32,
+    ) -> (Vec2, f32) {
+        self.cooldown = (self.cooldown - dt).max(0.0);
+        if blocked {
+            self.remaining = 0.0;
+            return (Vec2::ZERO, 0.0);
+        }
+        if self.remaining <= 0.0
+            && self.cooldown <= 0.0
+            && speed < 0.08
+            && intent.desired_speed >= 0.65
+            && intent.target_position.distance(position) > 0.09
+        {
+            self.duration = (0.10
+                + intent.desired_speed * 0.12
+                + intent.target_position.distance(position) * 0.12)
+                .clamp(0.14, 0.32);
+            self.remaining = self.duration;
+            self.cooldown = 2.5;
+            self.target = intent.target_position;
+            self.axis = (self.target - position).normalize_or_zero();
+        }
+        if self.remaining > 0.0 {
+            self.remaining = (self.remaining - dt).max(0.0);
+            if self.remaining > 0.0 {
+                intent.target_position = position;
+                intent.desired_speed = 0.0;
+                intent.pose = PoseIntent::Compact;
+                return (
+                    self.axis,
+                    (std::f32::consts::PI * (1.0 - self.remaining / self.duration)).sin(),
+                );
+            }
+            intent.target_position = self.target;
+            intent.desired_speed = 0.9;
+        }
+        (self.axis, 0.0)
+    }
+}
+
+#[derive(Default)]
+pub struct ContextGlance {
+    cursor: Vec2,
+    still: f32,
+    urge: f32,
+    remaining: f32,
+    target: Vec2,
+    entropy: u32,
+}
+impl ContextGlance {
+    fn variation(&mut self) -> f32 {
+        self.entropy = self.entropy.wrapping_mul(1664525).wrapping_add(1013904223);
+        (self.entropy >> 8) as f32 / 16_777_216.0
+    }
+    pub fn target(
+        &mut self,
+        cursor: Vec2,
+        position: Vec2,
+        resting: bool,
+        blocked: bool,
+        dt: f32,
+    ) -> Option<Vec2> {
+        if cursor.distance(self.cursor) > 0.004 {
+            self.still = 0.0;
+        } else {
+            self.still += dt;
+        }
+        self.cursor = cursor;
+        if blocked {
+            self.remaining = 0.0;
+            self.urge *= (-dt).exp();
+            return None;
+        }
+        let opportunity = if resting {
+            0.40
+        } else {
+            ((self.still - 4.0) / 25.0).clamp(0.0, 0.16)
+        };
+        self.urge += opportunity * dt;
+        if self.remaining > 0.0 {
+            self.remaining -= dt;
+            return Some(self.target);
+        }
+        if self.urge < 1.0 {
+            return None;
+        }
+        self.urge = self.variation() * 0.25;
+        self.remaining = 0.45 + self.variation() * 0.65;
+        let angle = self.variation() * std::f32::consts::TAU;
+        let reach = 0.06 + self.variation() * 0.09;
+        self.target = position + Vec2::from_angle(angle) * reach;
+        Some(self.target)
+    }
+}
+
+#[cfg(test)]
+mod contextual_tests {
+    use super::*;
+    #[test]
+    fn preparation_holds_then_releases_without_repeating_during_motion() {
+        let mut state = LaunchPreparation::default();
+        let mut intent = BodyIntent {
+            target_position: Vec2::new(0.7, 0.5),
+            desired_speed: 0.9,
+            locomotion: LocomotionMode::Arrive,
+            target_surface: None,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Neutral,
+            expression: lifecore::ExpressionState::default(),
+            interaction_target: None,
+        };
+        let origin = Vec2::splat(0.5);
+        assert!(state.apply(&mut intent, origin, 0.0, false, 0.02).1 > 0.0);
+        assert_eq!(intent.desired_speed, 0.0);
+        for _ in 0..20 {
+            state.apply(&mut intent, origin, 0.0, false, 0.02);
+        }
+        assert!(intent.target_position.x > 0.6);
+        assert_eq!(state.apply(&mut intent, origin, 0.5, false, 0.02).1, 0.0);
+    }
+    #[test]
+    fn looking_around_requires_an_opportunity_and_yields_to_engagement() {
+        let mut state = ContextGlance::default();
+        let mut glanced = false;
+        for _ in 0..1000 {
+            glanced |= state
+                .target(Vec2::ZERO, Vec2::splat(0.5), true, false, 0.02)
+                .is_some();
+        }
+        assert!(glanced);
+        assert!(
+            state
+                .target(Vec2::ZERO, Vec2::splat(0.5), true, true, 0.02)
+                .is_none()
+        );
+    }
+}

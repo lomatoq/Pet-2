@@ -224,6 +224,7 @@ impl LabControlCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HearingAction {
+    SelectInput { index: u16 },
     Enable,
     Disable,
     TrainCommand { cue: crate::CueKind },

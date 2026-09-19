@@ -453,7 +453,7 @@ impl EcologyRuntime {
     }
 
     pub fn feeding_support(&self) -> Option<pet_motor::SurfaceAttachmentCommand> {
-        let contact = self.food_physical.filter(|f| f.contact)?;
+        let contact = self.food_physical?;
         let id = self.director.active_episode()?.object_id?;
         let food = self
             .state
@@ -465,6 +465,9 @@ impl EcologyRuntime {
             .iter()
             .find(|(left, right, _)| food.position.x >= *left && food.position.x <= *right)?
             .2;
+        if (contact.body_surface_position.y - floor).abs() > 0.006 {
+            return None;
+        }
         Some(pet_motor::SurfaceAttachmentCommand {
             surface_id: lifecore::SurfaceId("food:taskbar".into()),
             anchor_point: Vec2::new(contact.body_surface_position.x, floor),
@@ -512,13 +515,34 @@ impl EcologyRuntime {
         };
         let radius = food.radius_px_at_reference * height / REFERENCE_DESKTOP_HEIGHT_PX;
         let hit = body.liquid_physical_circle_contact_pixels(relative, relative, radius, height);
-        let support = hit.map_or_else(
-            || body.liquid_physical_support_pixels(direction, height),
-            |c| c.body_point,
-        );
-        let desired_center = food.position - (support + direction * radius * 0.35) / scale;
-        // Require the actual mouth-side surface, not any distant point on the hull.
-        let touching = hit.is_some() || self.food_caught == Some(food.id);
+        let support = if settled {
+            body.liquid_physical_support_pixels(Vec2::Y, height)
+        } else {
+            hit.map_or_else(
+                || body.liquid_physical_support_pixels(direction, height),
+                |c| c.body_point,
+            )
+        };
+        let desired_center = if settled {
+            let floor = self
+                .food_floors
+                .iter()
+                .find(|(left, right, _)| food.position.x >= *left && food.position.x <= *right)
+                .map_or(food.position.y + radius / height, |f| f.2);
+            Vec2::new(
+                food.position.x - body.feeding_mouth_rest_pixels(height).x / scale.x,
+                floor - support.y / scale.y,
+            )
+        } else {
+            food.position - (support - direction * radius * 0.35) / scale
+        };
+        let mouth_contact =
+            (body.feeding_mouth_tip_pixels(height) - relative).length() <= radius + 3.0;
+        let touching = if settled {
+            hit.is_some() && mouth_contact
+        } else {
+            hit.is_some() || self.food_caught == Some(food.id)
+        };
         let id = food.id;
         let catch = touching && !settled && food.lifecycle != ObjectLifecycle::GrabbedByUser;
         if catch {
@@ -535,7 +559,11 @@ impl EcologyRuntime {
             body_surface_position: center + support / scale,
             ..PhysicalGrabFrame::default()
         });
-        ((relative - support).length() < 95.0).then_some(support * 0.92)
+        ((relative - support).length() < 120.0).then_some(if settled {
+            Vec2::new(body.feeding_mouth_rest_pixels(height).x, relative.y)
+        } else {
+            relative
+        })
     }
 
     pub fn fixed_update(
@@ -889,8 +917,14 @@ impl EcologyRuntime {
                 if let Some(ball) = self.state.objects.iter_mut().find(|o| o.id == id) {
                     ball.radius_px_at_reference = 2.4;
                     ball.mass = 0.05;
-                    ball.glow = 0.9;
-                    ball.velocity = Vec2::new(offset * 0.045, 0.055);
+                    ball.glow = 1.0;
+                    // Stable per-particle entropy: repeatable tests, distinct clicks and jets.
+                    let seed = (timestamp.to_bits() ^ id).wrapping_mul(0x9e3779b97f4a7c15);
+                    let unit = |shift| ((seed.rotate_left(shift) >> 40) as f32) / 16_777_216.0;
+                    let angle = -std::f32::consts::PI + unit(0) * std::f32::consts::PI;
+                    let speed = 0.065 + unit(23) * 0.15;
+                    ball.velocity =
+                        Vec2::new(angle.cos() / self.desktop_aspect, angle.sin()) * speed;
                 }
                 count += 1;
             }

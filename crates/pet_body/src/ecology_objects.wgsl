@@ -566,7 +566,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let pulse = 0.62 + 0.38 * sin(input.material.w * 1.65);
         let aa = max(fwidth(radial_distance), 0.03);
         let core = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, radial_distance);
-        let halo = exp(-radial_distance * radial_distance * 0.42) * (1.0 - core) * pulse * 0.26;
+        let halo = exp(-radial_distance * radial_distance * 0.25) * (1.0 - core) * pulse * 0.55;
         let alpha = clamp(core + halo, 0.0, 1.0);
         let rgb = mix(input.color.rgb, vec3<f32>(1.0, 0.96, 0.72), core * 0.65) * (0.72 + pulse * 0.28);
         return encode_surface_output(vec4<f32>(rgb * alpha, alpha));

@@ -67,6 +67,20 @@ pub(super) fn show(
                 if ui.button("Научить · имя и 20 команд").clicked() { state.page=1; }
                 if ui.button("⚡ Быстро перелететь к курсору").clicked() { command=Some(LabControlCommand::Hearing { action:H::Perform { cue:CueKind::Dash } }); }
                 ui.small("После нажатия перенеси курсор: через секунду он полетит к нему. Можно показать действие до обучения голосу.");
+                egui::ComboBox::from_id_salt("hearing_input").selected_text(hearing["input_device"].as_str().unwrap_or("Системный микрофон")).show_ui(ui, |ui| {
+                    if ui.selectable_label(hearing["input_device"].is_null(), "Системный микрофон").clicked() { command=Some(LabControlCommand::Hearing { action:H::SelectInput { index:0 } }); }
+                    if let Some(devices) = hearing["input_devices"].as_array() {
+                        for (i, device) in devices.iter().enumerate() {
+                            if let Some(name) = device.as_str()
+                                && ui.selectable_label(hearing["input_device"].as_str() == Some(name), name).clicked() {
+                                command = Some(LabControlCommand::Hearing { action: H::SelectInput { index: i as u16 + 1 } });
+                            }
+                        }
+                    }
+                });
+                if hearing["status"]["native_sample_rate"].as_u64().is_some_and(|r| r <= 24000) {
+                    ui.small("Микрофон работает в речевом режиме. Для чистого звука Bluetooth-наушников выбери отдельный микрофон или выключи слушание.");
+                }
                 if ui.button(if enabled { "Выключить микрофон" } else { "Включить микрофон" }).clicked() { command=Some(LabControlCommand::Hearing { action:if enabled { H::Disable } else { H::Enable } }); }
             } else {
                 if ui.button("‹ Назад").clicked() { state.page=0; }
@@ -79,9 +93,9 @@ pub(super) fn show(
                 let count = record.and_then(|r| r["examples"].as_u64()).unwrap_or(0);
                 let learned = record.and_then(|r| r["ready"].as_bool()).unwrap_or(false);
                 ui.label(format!("Сохранено {count} / 40 · {}",if learned { "можно произносить" } else { "ещё учимся" }));
-                ui.label(if cue==CueKind::Name { "Говори Benny или Бенни. Добавляй повторы с разной привычной интонацией и расстоянием. Имя отдельно вызывает сильное внимание." } else { "Произноси выбранную фразу. Команда работает сама по себе — имя перед ней не нужно. Для «Benny, сделай круг» обучай и такую фразу отдельно в этой же команде." });
+                ui.label(if cue==CueKind::Name { "Говори Бендер или Бенни. Добавляй повторы с разной привычной интонацией и расстоянием. Имя отдельно вызывает сильное внимание." } else { "Произноси выбранную фразу. Команда работает сама по себе — имя перед ней не нужно. Для «Бендер, сделай круг» обучай и такую фразу отдельно в этой же команде." });
                 ui.small("Одна партия — 5 повторов с секундной паузой. Старые примеры сохраняются. Можно добавить 30–40 примеров постепенно. Во время записи питомец молчит.");
-                if ui.add_enabled(!training,egui::Button::new("▶ Добавлять примеры примеров")).clicked() { command=Some(LabControlCommand::Hearing { action:H::TrainCommand { cue } }); }
+                if ui.add_enabled(!training,egui::Button::new("▶ Добавлять примеры")).clicked() { command=Some(LabControlCommand::Hearing { action:H::TrainCommand { cue } }); }
                 if training {
                     let n=hearing["training"]["accepted"].as_u64().unwrap_or(0);
                     ui.add(egui::ProgressBar::new(n as f32/5.0).text(format!("Принято {n} из 5")));
@@ -90,7 +104,7 @@ pub(super) fn show(
                 ui.separator();
                 let others=hearing["other_examples"].as_u64().unwrap_or(0);
                 ui.label(format!("Посторонние слова: {others} примеров"));
-                ui.small("Нужны один раз для всех команд. Например: «лампа», «чашка», «сегодня», «окно», «книга». Не произноси здесь имя или команды.");
+                ui.small("Необязательно: помогают отличать команды от обычной речи. Например: «лампа», «чашка», «сегодня», «окно», «книга». Не произноси здесь имя или команды.");
                 if ui.add_enabled(!training,egui::Button::new("Записывать посторонние слова")).clicked() { command=Some(LabControlCommand::Hearing { action:H::TrainOther }); }
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(!training,egui::Button::new("Показать действие")).clicked() { command=Some(LabControlCommand::Hearing { action:H::Perform { cue } }); }

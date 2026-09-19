@@ -75,7 +75,7 @@ impl CueKind {
     ];
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Name => "Имя · Benny",
+            Self::Name => "Имя · Бендер",
             Self::Quiet => "Тише",
             Self::Sit => "Сидеть",
             Self::Jump => "Прыгни",
@@ -223,8 +223,19 @@ impl CueModelV1 {
         self.class(cue).is_some_and(|class| {
             class.examples.len() >= REQUIRED_POSITIVE_EXAMPLES
                 && class.acceptance_distance.is_some()
-                && self.other_examples.len() >= REQUIRED_OTHER_EXAMPLES
         })
+    }
+
+    /// Upgrade saved positive-only enrollment without requiring the owner to repeat it.
+    pub fn calibrate_missing_thresholds(&mut self) {
+        for cue in CueKind::ALL {
+            if self
+                .class(cue)
+                .is_some_and(|c| c.acceptance_distance.is_none())
+            {
+                let _ = calibrate_model(self, Some(cue));
+            }
+        }
     }
 
     pub fn class(&self, cue: CueKind) -> Option<&CueClassModelV1> {
@@ -396,9 +407,24 @@ impl CueTrainer {
         Ok(candidate)
     }
 
-    pub(crate) fn retry_oldest(&mut self) {
-        if !self.examples.is_empty() {
-            self.examples.remove(0);
+    pub(crate) fn retry_outlier(&mut self) {
+        // Preserve the mutually consistent recordings, not an arbitrary four.
+        let index = (0..self.examples.len()).max_by(|&a, &b| {
+            let score = |i: usize| {
+                let mut distances: Vec<_> = self
+                    .examples
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, e)| dtw_distance(&self.examples[i], e))
+                    .collect();
+                distances.sort_by(f32::total_cmp);
+                distances[distances.len().saturating_sub(1) / 2]
+            };
+            score(a).total_cmp(&score(b))
+        });
+        if let Some(index) = index {
+            self.examples.remove(index);
         }
     }
 
@@ -549,9 +575,7 @@ fn calibrate_model(
         let Some(class) = model.class(cue) else {
             continue;
         };
-        if class.examples.len() < REQUIRED_POSITIVE_EXAMPLES
-            || model.other_examples.len() < REQUIRED_OTHER_EXAMPLES
-        {
+        if class.examples.len() < REQUIRED_POSITIVE_EXAMPLES {
             continue;
         }
         let positives = class.examples.clone();
@@ -570,10 +594,16 @@ fn calibrate_model(
             .iter()
             .map(|positive| nearest_distance(positive, &negatives))
             .fold(f32::INFINITY, f32::min);
-        if !nearest_negative.is_finite() || nearest_negative <= fitted + MIN_NEGATIVE_MARGIN {
+        if !negatives.is_empty()
+            && (!nearest_negative.is_finite() || nearest_negative <= fitted + MIN_NEGATIVE_MARGIN)
+        {
             return Err(EnrollmentError::NotSeparable);
         }
-        let threshold = fitted.min(nearest_negative - MIN_NEGATIVE_MARGIN);
+        let threshold = if negatives.is_empty() {
+            fitted.min(0.22)
+        } else {
+            fitted.min(nearest_negative - MIN_NEGATIVE_MARGIN)
+        };
         let target = match cue {
             CueKind::Name => model.name.as_mut(),
             CueKind::Quiet => model.quiet.as_mut(),
@@ -590,6 +620,10 @@ fn validate_enrollment_cohesion(
     examples: &[CueTemplateV1],
     allow_diverse: bool,
 ) -> Result<(), EnrollmentError> {
+    // Negative examples are deliberately unrelated words, not one coherent class.
+    if allow_diverse {
+        return Ok(());
+    }
     let training = &examples[..examples.len() - 1];
     let holdout = examples.last().expect("required example count is non-zero");
     let mut pair_distances = Vec::new();
@@ -599,6 +633,9 @@ fn validate_enrollment_cohesion(
         }
     }
     pair_distances.sort_by(f32::total_cmp);
+    if pair_distances.iter().any(|d| !d.is_finite()) {
+        return Err(EnrollmentError::InconsistentExamples);
+    }
     let median = pair_distances[pair_distances.len() / 2].max(0.02);
     let held_out = nearest_distance(holdout, training);
     let multiplier = if allow_diverse { 5.0 } else { 2.6 };
@@ -612,18 +649,15 @@ fn validate_enrollment_cohesion(
 }
 
 fn leave_one_out_distances(examples: &[CueTemplateV1]) -> Vec<f32> {
-    examples
-        .iter()
-        .enumerate()
-        .map(|(index, example)| {
-            examples
-                .iter()
-                .enumerate()
-                .filter(|(other, _)| *other != index)
-                .map(|(_, other)| dtw_distance(example, other))
-                .fold(f32::INFINITY, f32::min)
-        })
-        .collect()
+    let mut nearest = vec![f32::INFINITY; examples.len()];
+    for i in 0..examples.len() {
+        for j in i + 1..examples.len() {
+            let d = dtw_distance(&examples[i], &examples[j]);
+            nearest[i] = nearest[i].min(d);
+            nearest[j] = nearest[j].min(d);
+        }
+    }
+    nearest
 }
 
 fn nearest_distance(query: &CueTemplateV1, examples: &[CueTemplateV1]) -> f32 {
@@ -847,6 +881,74 @@ fn mel_to_hz(mel: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bad_first_example_is_replaced_instead_of_trapping_four_of_five() {
+        let mut trainer = CueTrainer::begin(TrainingCue::Name, CueModelV1::new()).unwrap();
+        let template = |frames| CueTemplateV1 {
+            frames: vec![
+                SpectralFrameV1 {
+                    values: [0.2; FEATURE_DIM]
+                };
+                frames
+            ],
+            duration_ms: 300,
+        };
+        trainer.accept_feature_segment(template(100)).unwrap();
+        for _ in 0..4 {
+            trainer.accept_feature_segment(template(15)).unwrap();
+        }
+        assert!(trainer.clone().finalize().is_err());
+        trainer.retry_outlier();
+        trainer.accept_feature_segment(template(15)).unwrap();
+        assert!(trainer.finalize().unwrap().is_ready(CueKind::Name));
+    }
+
+    #[test]
+    fn unrelated_negative_words_and_positive_only_name_are_supported() {
+        let model = train(CueModelV1::new(), TrainingCue::Name, 190.0, 70.0);
+        assert!(model.is_ready(CueKind::Name));
+        let examples: Vec<_> = [4, 15, 30, 60, 150]
+            .into_iter()
+            .map(|frames| CueTemplateV1 {
+                frames: vec![
+                    SpectralFrameV1 {
+                        values: [0.4; FEATURE_DIM]
+                    };
+                    frames
+                ],
+                duration_ms: 300,
+            })
+            .collect();
+        assert!(validate_enrollment_cohesion(&examples, true).is_ok());
+    }
+
+    #[test]
+    #[ignore = "optional local feature-only enrollment audit"]
+    fn saved_feature_model_recalibrates_without_rerecording() {
+        let path =
+            std::env::var("PET2_HEARING_AUDIT_PATH").expect("feature-only hearing state path");
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut model: CueModelV1 = serde_json::from_value(root["model"].clone()).unwrap();
+        model.calibrate_missing_thresholds();
+        let class = model.class(CueKind::Name).expect("saved name");
+        let threshold = class
+            .acceptance_distance
+            .expect("positive-only calibration");
+        let within = leave_one_out_distances(&class.examples);
+        let matched = within.iter().filter(|d| **d <= threshold).count();
+        println!(
+            "name_examples={} leave_one_out_matches={} threshold={threshold:.4}",
+            within.len(),
+            matched
+        );
+        assert!(model.is_ready(CueKind::Name));
+        assert!(
+            matched * 5 >= within.len() * 4,
+            "saved examples need a broader coherent enrollment"
+        );
+    }
 
     fn spoken_like(seed: usize, base: f32, sweep: f32) -> Vec<f32> {
         let length = (0.58 * TARGET_SAMPLE_RATE as f32) as usize + seed * 91;

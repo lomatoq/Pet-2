@@ -184,6 +184,47 @@ pub fn contain_face_origin(
     safe
 }
 
+/// Mouth has its own small footprint; moving it must never translate the eyes.
+pub fn contain_mouth_origin(
+    particles: &[ParticleRenderState],
+    iso: f32,
+    base: Vec2,
+    desired: Vec2,
+    axis_x: Vec2,
+    axis_y: Vec2,
+) -> Vec2 {
+    let ks = kernels(particles);
+    let inside = |p: Vec2| {
+        [
+            Vec2::ZERO,
+            axis_x * 0.085,
+            -axis_x * 0.085,
+            axis_y * 0.035,
+            -axis_y * 0.035,
+        ]
+        .iter()
+        .all(|offset| raw_density(&ks, p + *offset) >= iso.max(0.01))
+    };
+    let mut safe = base;
+    for step in 1..=24 {
+        let next = base.lerp(desired, step as f32 / 24.0);
+        if !inside(next) {
+            let mut outside = next;
+            for _ in 0..8 {
+                let mid = safe.lerp(outside, 0.5);
+                if inside(mid) {
+                    safe = mid;
+                } else {
+                    outside = mid;
+                }
+            }
+            break;
+        }
+        safe = next;
+    }
+    safe
+}
+
 fn density(kernels: &[Kernel], point: Vec2, filter: Vec2) -> f32 {
     if filter == Vec2::ZERO {
         return raw_density(kernels, point);
