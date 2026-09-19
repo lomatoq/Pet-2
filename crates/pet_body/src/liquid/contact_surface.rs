@@ -53,6 +53,37 @@ fn raw_density(kernels: &[Kernel], point: Vec2) -> f32 {
     density
 }
 
+/// Presentation-only critically damped translation, advanced once per redraw.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SmoothFaceOrigin {
+    pub origin: Option<Vec2>,
+    pub velocity: Vec2,
+}
+
+impl SmoothFaceOrigin {
+    pub fn advance(&mut self, target: Vec2, dt: f32) -> Vec2 {
+        let Some(previous) = self.origin else {
+            self.origin = Some(target);
+            return target;
+        };
+        let dt = if dt.is_finite() {
+            dt.clamp(0.0, 0.05)
+        } else {
+            0.0
+        };
+        // Exact critically damped spring: no overshoot, no frame-rate lerp.
+        let omega = 9.0;
+        let delta = previous - target;
+        let transient = self.velocity + delta * omega;
+        let decay = (-omega * dt).exp();
+        let next = target + (delta + transient * dt) * decay;
+        self.velocity = (self.velocity - transient * (omega * dt)) * decay;
+        let next = previous + (next - previous).clamp_length_max(0.65 * dt);
+        self.origin = Some(next);
+        next
+    }
+}
+
 /// Keep the complete face footprint in the dense main liquid component.
 /// Desired feeding translation is projected into that interior, not onto its rim.
 pub fn contain_face_origin(
@@ -120,6 +151,16 @@ pub fn contain_face_origin(
     for step in 1..=16 {
         let candidate = anchor.lerp(desired, step as f32 / 16.0);
         if clearance(candidate) < threshold {
+            // Refine the first boundary instead of snapping between 1/16 steps.
+            let mut outside = candidate;
+            for _ in 0..10 {
+                let middle = safe.lerp(outside, 0.5);
+                if clearance(middle) >= threshold {
+                    safe = middle;
+                } else {
+                    outside = middle;
+                }
+            }
             break;
         }
         safe = candidate;
@@ -397,6 +438,26 @@ mod tests {
         }
     }
     #[test]
+    fn face_target_jump_is_continuous_and_settles_without_overshoot() {
+        for hz in [30, 60, 120] {
+            let mut tracker = SmoothFaceOrigin {
+                origin: Some(Vec2::ZERO),
+                ..Default::default()
+            };
+            let target = Vec2::new(0.2, -0.1);
+            let mut previous = Vec2::ZERO;
+            for _ in 0..hz * 2 {
+                let next = tracker.advance(target, 1.0 / hz as f32);
+                assert!(next.distance(previous) <= 0.65 / hz as f32 + 1e-6);
+                assert!(next.distance(target) <= previous.distance(target) + 1e-6);
+                previous = next;
+            }
+            assert!(previous.distance(target) < 0.0001);
+            assert_eq!(tracker.advance(target, 0.0), previous);
+        }
+    }
+
+    #[test]
     fn feeding_face_stays_in_largest_volume_instead_of_chasing_food_outside() {
         let mut ps = Vec::new();
         for x in -3..=3 {
@@ -423,7 +484,7 @@ mod tests {
             Vec2::Y,
             Vec2::ONE,
         );
-        assert!(origin.y > -0.2 && origin.x.abs() < 0.3);
+        assert!(origin.y > -0.25 && origin.x.abs() < 0.3);
         let moved = contain_face_origin(
             &ps,
             0.18,

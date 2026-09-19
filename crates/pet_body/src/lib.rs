@@ -204,6 +204,7 @@ pub struct ProceduralBody {
     ecology_visual_effect: EcologyVisualEffect,
     feeding_mouth_offset: Vec2,
     feeding_mouth_activity: f32,
+    contained_face: liquid::SmoothFaceOrigin,
     fast_phenotype: FastPhenotypeActuation,
     contact_surface_cache: std::cell::Cell<Option<(u64, Vec2, Vec2)>>,
 }
@@ -236,6 +237,7 @@ impl ProceduralBody {
             ecology_visual_effect: EcologyVisualEffect::default(),
             feeding_mouth_offset: Vec2::ZERO,
             feeding_mouth_activity: 0.0,
+            contained_face: liquid::SmoothFaceOrigin::default(),
             fast_phenotype: FastPhenotypeActuation::default(),
             contact_surface_cache: std::cell::Cell::new(None),
         };
@@ -651,6 +653,38 @@ impl ProceduralBody {
     /// than to however many fixed ticks happened before this present.
     pub fn presentation_update(&mut self, dt: f32) {
         self.embodiment.presentation_update(dt);
+        let liquid = self.embodiment.liquid.render_state();
+        let frame = liquid.face_frame;
+        let previous = self.contained_face.origin.unwrap_or(frame.origin);
+        let desired = frame.origin
+            + frame.axis_x * self.feeding_mouth_offset.x * frame.scale.x
+            + frame.axis_y * self.feeding_mouth_offset.y * frame.scale.y;
+        let particles = &liquid.particles[..liquid.particle_count];
+        let target = liquid::contain_face_origin(
+            particles,
+            self.tuning.pbf.iso_threshold,
+            previous,
+            desired,
+            frame.axis_x,
+            frame.axis_y,
+            frame.scale,
+        );
+        let smooth = self.contained_face.advance(target, dt);
+        // The target has a larger interior margin than the emergency boundary.
+        // Ordinary contour ripples therefore do not repeatedly clamp the spring.
+        let supported = liquid::contain_face_origin(
+            particles,
+            self.tuning.pbf.iso_threshold * 0.85,
+            previous,
+            smooth,
+            frame.axis_x,
+            frame.axis_y,
+            frame.scale,
+        );
+        if supported.distance_squared(smooth) > 0.000001 {
+            self.contained_face.velocity = Vec2::ZERO;
+        }
+        self.contained_face.origin = Some(supported);
     }
 
     #[must_use]
@@ -1229,15 +1263,17 @@ impl ProceduralBody {
                     + liquid.face_frame.axis_y
                         * self.feeding_mouth_offset.y
                         * liquid.face_frame.scale.y;
-                liquid.face_frame.origin = liquid::contain_face_origin(
-                    &liquid.particles[..liquid.particle_count],
-                    self.tuning.pbf.iso_threshold,
-                    liquid.face_frame.origin,
-                    desired,
-                    liquid.face_frame.axis_x,
-                    liquid.face_frame.axis_y,
-                    liquid.face_frame.scale,
-                );
+                liquid.face_frame.origin = self.contained_face.origin.unwrap_or_else(|| {
+                    liquid::contain_face_origin(
+                        &liquid.particles[..liquid.particle_count],
+                        self.tuning.pbf.iso_threshold,
+                        liquid.face_frame.origin,
+                        desired,
+                        liquid.face_frame.axis_x,
+                        liquid.face_frame.axis_y,
+                        liquid.face_frame.scale,
+                    )
+                });
                 liquid
             },
             material_absorption: material.absorption,
