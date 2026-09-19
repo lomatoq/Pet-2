@@ -1,3 +1,4 @@
+mod companion_menu;
 mod face_capture;
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -79,12 +80,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let mut live_pet = false;
+    let mut pet_menu = false;
     let mut data_dir = None;
     let mut promote_report = None;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--live-pet" => live_pet = true,
+            "--pet-menu" => {
+                pet_menu = true;
+                live_pet = true;
+            }
             "--data-dir" => {
                 data_dir = Some(PathBuf::from(
                     arguments.next().ok_or("--data-dir requires a path")?,
@@ -114,7 +120,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return promote_report_cli(&store, &report_path).map_err(Into::into);
     }
     let event_loop = EventLoop::new()?;
-    event_loop.run_app(&mut BodyLab::new(SEED, store, live_pet))?;
+    let mut app = BodyLab::new(SEED, store, live_pet);
+    app.pet_menu = pet_menu;
+    event_loop.run_app(&mut app)?;
     Ok(())
 }
 
@@ -122,6 +130,7 @@ struct BodyLab {
     genome: Genome,
     store: Option<StateStore>,
     start_live: bool,
+    pet_menu: bool,
     runtime: Option<LabRuntime>,
 }
 
@@ -203,6 +212,7 @@ struct LabRuntime {
     voice_preview_counter: u64,
     panel: DevPanel,
     live_monitor: Option<LivePetMonitor>,
+    pet_menu: Option<companion_menu::MenuState>,
 }
 
 struct LivePetMonitor {
@@ -565,6 +575,7 @@ impl BodyLab {
             genome: Genome::from_seed(seed),
             store,
             start_live,
+            pet_menu: false,
             runtime: None,
         }
     }
@@ -577,9 +588,21 @@ impl ApplicationHandler for BodyLab {
         }
         let window = match event_loop.create_window(
             Window::default_attributes()
-                .with_title("Pet2 Dev Console")
-                .with_inner_size(LogicalSize::new(1_180.0, 880.0))
-                .with_min_inner_size(LogicalSize::new(880.0, 640.0))
+                .with_title(if self.pet_menu {
+                    "Персик — забота и обучение"
+                } else {
+                    "Pet2 Dev Console"
+                })
+                .with_inner_size(if self.pet_menu {
+                    LogicalSize::new(460.0, 570.0)
+                } else {
+                    LogicalSize::new(1_180.0, 880.0)
+                })
+                .with_min_inner_size(if self.pet_menu {
+                    LogicalSize::new(420.0, 530.0)
+                } else {
+                    LogicalSize::new(880.0, 640.0)
+                })
                 .with_position(LogicalPosition::new(32.0, 48.0))
                 .with_resizable(true),
         ) {
@@ -696,6 +719,10 @@ impl ApplicationHandler for BodyLab {
         ecology_state.den.size_scale = 1.42;
         ecology_state.den.familiarity = 0.72;
         let egui_context = Context::default();
+        if self.pet_menu {
+            companion_menu::configure(&egui_context);
+            window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+        }
         egui_context.set_theme(egui::ThemePreference::Dark);
         egui_context.set_visuals(egui::Visuals::dark());
         let egui_state = EguiWinitState::new(
@@ -717,9 +744,13 @@ impl ApplicationHandler for BodyLab {
         );
         let now = Instant::now();
         let audio_output_devices = AudioEngine::output_device_names().unwrap_or_default();
-        let (audio, audio_error) = match AudioEngine::try_start() {
-            Ok(engine) => (Some(engine), None),
-            Err(error) => (None, Some(error.to_string())),
+        let (audio, audio_error) = if self.pet_menu {
+            (None, None)
+        } else {
+            match AudioEngine::try_start() {
+                Ok(engine) => (Some(engine), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
         };
         let audio_output_device = audio.as_ref().map_or_else(
             || "Default output".to_owned(),
@@ -817,6 +848,7 @@ impl ApplicationHandler for BodyLab {
                 DevPanel::Character
             },
             live_monitor,
+            pet_menu: self.pet_menu.then(companion_menu::MenuState::default),
         });
     }
 
@@ -1579,6 +1611,10 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     let egui_context = runtime.egui_context.clone();
     let mut selected_panel = runtime.panel;
     let output = egui_context.run(raw_input, |context| {
+        if let Some(menu) = &mut runtime.pet_menu {
+            companion_menu::show(context, menu, runtime.live_monitor.as_mut());
+            return;
+        }
         dev_console_navigation(context, &mut selected_panel, runtime.live_monitor.as_ref());
         match selected_panel {
             DevPanel::Character => {
@@ -1600,6 +1636,9 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
             }
         }
     });
+    if runtime.pet_menu.as_ref().is_some_and(|menu| menu.close) {
+        event_loop.exit();
+    }
     runtime.panel = selected_panel;
     if runtime.ui.section != LabSection::Nervous {
         // Switching sections must clear synthetic stimuli even while paused.
@@ -1662,7 +1701,17 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     let ecology_renderer = &mut runtime.ecology_renderer;
     let renderer = &mut runtime.renderer;
     let egui_renderer = &mut runtime.egui_renderer;
-    let outcome = renderer.render_with_overlay(parameters, |device, queue, encoder, view| {
+    let capture = runtime
+        .pet_menu
+        .as_ref()
+        .filter(|m| !m.capture_done)
+        .and(runtime.live_monitor.as_ref())
+        .filter(|m| m.can_send_control())
+        .and_then(|_| std::env::var_os("PET2_MENU_CAPTURE"));
+    let overlay = |device: &wgpu::Device,
+                   queue: &wgpu::Queue,
+                   encoder: &mut wgpu::CommandEncoder,
+                   view: &wgpu::TextureView| {
         if show_den {
             // Review exactly the same pixels sampled by the optics shader. This
             // makes refraction falsifiable: displaced and undistorted regions
@@ -1696,7 +1745,33 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
             occlusion_query_set: None,
         });
         egui_renderer.render(&mut pass.forget_lifetime(), &paint_jobs, &screen);
-    });
+    };
+    let outcome = if let Some(path) = capture {
+        match renderer.render_capture_with_overlay(parameters, overlay) {
+            Ok(frame) => {
+                let mut bytes = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
+                bytes.extend(
+                    frame
+                        .rgba8
+                        .chunks_exact(4)
+                        .flat_map(|p| p[..3].iter().copied()),
+                );
+                if let Err(error) = std::fs::write(path, bytes) {
+                    eprintln!("menu capture: {error}");
+                }
+                if let Some(menu) = &mut runtime.pet_menu {
+                    menu.capture_done = true;
+                }
+                RenderOutcome::Presented
+            }
+            Err(error) => {
+                eprintln!("menu capture: {error}");
+                RenderOutcome::Skipped
+            }
+        }
+    } else {
+        renderer.render_with_overlay(parameters, overlay)
+    };
     for id in &output.textures_delta.free {
         runtime.egui_renderer.free_texture(id);
     }
@@ -2899,6 +2974,7 @@ fn build_lab_control_envelope(
         | LabControlCommand::DeleteGestureConvention { .. }
         | LabControlCommand::RollbackGestureConventions { .. }
         | LabControlCommand::ClearGestureConventions
+        | LabControlCommand::Feeding { .. }
         | LabControlCommand::Hearing { .. } => 5_000,
         LabControlCommand::ShutdownForPromotion => 15_000,
         LabControlCommand::StimulatePointerGesture {
@@ -2929,6 +3005,7 @@ fn lab_control_description(command: &LabControlCommand) -> String {
         LabControlCommand::DrivePulse { drive, delta, .. } => {
             format!("{} drive {delta:+.2}", lab_drive_label(*drive))
         }
+        LabControlCommand::Feeding { enabled } => format!("feeding {enabled}"),
         LabControlCommand::Reward { value } => format!("learning reward {value:+.2}"),
         LabControlCommand::FocusMode { enabled } => {
             format!("focus mode {}", if *enabled { "on" } else { "off" })

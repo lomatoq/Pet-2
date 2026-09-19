@@ -26,6 +26,7 @@ pub struct EcologyRuntime {
     adaptation_sequence: u64,
     placement_learning_attempt: Option<f32>,
     measured_orb_contact: Option<(PhysicalGrabFrame, f32)>,
+    last_orb_physical: PhysicalGrabFrame,
     pet_grips: Vec<PetObjectGrip>,
     release_grace: Vec<(ObjectId, f32)>,
     last_body_position: Vec2,
@@ -59,6 +60,10 @@ pub struct EcologyRuntime {
     episode_tick_microseconds: f64,
     object_physics_microseconds: f64,
     desktop_aspect: f32,
+    food_floors: Vec<(f32, f32, f32)>,
+    food_physical: Option<PhysicalGrabFrame>,
+    food_caught: Option<ObjectId>,
+    user_food_seconds: f32,
 }
 
 struct PetObjectGrip {
@@ -216,6 +221,7 @@ impl EcologyRuntime {
         Ok(Self {
             pet_grips: Vec::new(),
             measured_orb_contact: None,
+            last_orb_physical: PhysicalGrabFrame::default(),
             release_grace: Vec::new(),
             last_body_position: Vec2::ZERO,
             state,
@@ -250,6 +256,10 @@ impl EcologyRuntime {
             episode_tick_microseconds: 0.0,
             object_physics_microseconds: 0.0,
             desktop_aspect: 1.0,
+            food_floors: Vec::new(),
+            food_physical: None,
+            food_caught: None,
+            user_food_seconds: 0.0,
         })
     }
 
@@ -270,6 +280,21 @@ impl EcologyRuntime {
             orb_physical,
         } = frame;
         self.last_body_position = body.world_position;
+        self.last_orb_physical = orb_physical;
+        let feeding = self.user_food_seconds > 0.0
+            && self
+                .state
+                .objects
+                .iter()
+                .any(|o| o.kind == ObjectKind::Morsel);
+        if feeding {
+            self.director.notice_user_food(&mut self.state);
+        }
+        let selected_action = if feeding {
+            ActionId::IdleHover
+        } else {
+            selected_action
+        };
         let frame = EcologyBehaviorFrame {
             social_contact,
             selected_action,
@@ -277,6 +302,7 @@ impl EcologyRuntime {
             pet_velocity: body.velocity,
             desktop_aspect: self.desktop_aspect,
             orb_physical,
+            food_physical: self.food_physical,
             cursor_position: sensors.cursor_position,
             pointer_down: sensors.pointer_down,
             user_activity: sensors.user_activity_rate,
@@ -290,9 +316,13 @@ impl EcologyRuntime {
             play_drive: drives.play,
             curiosity_drive: drives.curiosity,
             autonomy_drive: drives.autonomy,
-            focus_mode,
+            focus_mode: focus_mode && !feeding,
             sleeping: selected_action == ActionId::Sleep,
-            window_pressure: self.environment.pressure,
+            window_pressure: if feeding {
+                0.0
+            } else {
+                self.environment.pressure
+            },
             window_escape_direction: self.environment.escape_direction,
             nearest_window_edge: self.environment.contacts[..self
                 .environment
@@ -414,7 +444,95 @@ impl EcologyRuntime {
 
     /// One physics tick only: the body supplies its visible gel contour.
     pub fn set_measured_orb_contact(&mut self, frame: PhysicalGrabFrame, viewport_height: f32) {
+        self.last_orb_physical = frame;
         self.measured_orb_contact = Some((frame, viewport_height.max(1.0)));
+    }
+
+    pub fn feeding_navigation(&self) -> Option<(Vec2, bool)> {
+        self.food_physical.map(|f| (f.socket_position, f.contact))
+    }
+
+    pub fn feeding_support(&self) -> Option<pet_motor::SurfaceAttachmentCommand> {
+        let contact = self.food_physical.filter(|f| f.contact)?;
+        let id = self.director.active_episode()?.object_id?;
+        let food = self
+            .state
+            .objects
+            .iter()
+            .find(|o| o.id == id && o.lifecycle == ObjectLifecycle::Sleeping)?;
+        let floor = self
+            .food_floors
+            .iter()
+            .find(|(left, right, _)| food.position.x >= *left && food.position.x <= *right)?
+            .2;
+        Some(pet_motor::SurfaceAttachmentCommand {
+            surface_id: lifecore::SurfaceId("food:taskbar".into()),
+            anchor_point: Vec2::new(contact.body_surface_position.x, floor),
+            normal: -Vec2::Y,
+            tangent: Vec2::X,
+            target_contact_fraction: 0.22,
+            normal_compliance: 0.3,
+            tangent_friction: 0.7,
+            adhesion: 0.0,
+            load_fraction: 0.24,
+            break_force: 0.75,
+            release_half_life: 0.2,
+        })
+    }
+
+    pub fn set_food_floors(&mut self, floors: Vec<(f32, f32, f32)>) {
+        self.food_floors = floors;
+    }
+
+    pub fn update_food_contact(&mut self, body: &ProceduralBody, height: f32) -> Option<Vec2> {
+        let active = self
+            .director
+            .active_episode()
+            .filter(|e| matches!(e.goal, EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel));
+        let food = active
+            .and_then(|e| e.object_id)
+            .and_then(|id| self.state.objects.iter().find(|o| o.id == id));
+        let Some(food) = food else {
+            if let Some(id) = self.food_caught.take()
+                && let Some(o) = self.state.objects.iter_mut().find(|o| o.id == id)
+            {
+                o.lifecycle = ObjectLifecycle::Free;
+            }
+            self.food_physical = None;
+            return None;
+        };
+        let center = body.simulation.feedback.world_position;
+        let scale = Vec2::new(height * self.desktop_aspect, height);
+        let relative = (food.position - center) * scale;
+        let settled = food.lifecycle == ObjectLifecycle::Sleeping;
+        let direction = if settled {
+            Vec2::Y
+        } else {
+            relative.normalize_or(Vec2::Y)
+        };
+        let support = body.liquid_physical_support_pixels(direction, height);
+        let radius = food.radius_px_at_reference * height / REFERENCE_DESKTOP_HEIGHT_PX;
+        let desired_center = food.position - (support + direction * radius * 0.35) / scale;
+        // Require the actual mouth-side surface, not any distant point on the hull.
+        let touching =
+            (relative - support).length() <= radius + 9.0 || self.food_caught == Some(food.id);
+        let id = food.id;
+        let catch = touching && !settled && food.lifecycle != ObjectLifecycle::GrabbedByUser;
+        if catch {
+            self.food_caught = Some(id);
+            if let Some(food) = self.state.objects.iter_mut().find(|o| o.id == id) {
+                food.lifecycle = ObjectLifecycle::CarriedByPet;
+                food.position = center + support * 0.96 / scale;
+                food.velocity = Vec2::ZERO;
+            }
+        }
+        self.food_physical = Some(PhysicalGrabFrame {
+            contact: touching,
+            socket_position: if catch { center } else { desired_center },
+            body_surface_position: center + support / scale,
+            ..PhysicalGrabFrame::default()
+        });
+        ((relative - support).length() < 95.0).then_some(support * 0.92)
     }
 
     pub fn fixed_update(
@@ -425,6 +543,7 @@ impl EcologyRuntime {
         dt: f32,
     ) {
         let started = Instant::now();
+        self.user_food_seconds = (self.user_food_seconds - dt.max(0.0)).max(0.0);
         self.desktop_aspect = desktop_aspect.clamp(0.25, 8.0);
         let config = ObjectPhysicsConfig {
             desktop_aspect: self.desktop_aspect,
@@ -500,6 +619,14 @@ impl EcologyRuntime {
             })
         });
         self.last_body_position = body.world_position;
+        for object in &mut self.state.objects {
+            if object.lifecycle == ObjectLifecycle::CarriedByPet
+                && self.food_caught != Some(object.id)
+                && !self.pet_grips.iter().any(|g| g.object_id == object.id)
+            {
+                object.lifecycle = ObjectLifecycle::Free;
+            }
+        }
         let measured_orb = self.measured_orb_contact.take();
         for object in &mut self.state.objects {
             if let Some(grip) = self
@@ -533,6 +660,17 @@ impl EcologyRuntime {
                         ),
                     });
                 }
+            }
+            if object.kind == ObjectKind::Morsel {
+                let floor = self
+                    .food_floors
+                    .iter()
+                    .find(|(left, right, _)| {
+                        object.position.x >= *left && object.position.x <= *right
+                    })
+                    .map_or(1.0, |(_, _, bottom)| *bottom);
+                pet_ecology::step_morsel(object, config, floor, dt);
+                continue;
             }
             let contacts_before = self.environment.contact_count;
             step_object_with_windows(object, config, windows, dt, &mut self.environment);
@@ -692,6 +830,38 @@ impl EcologyRuntime {
             self.den_events.pop_front();
         }
         self.den_events.push_back(event);
+    }
+
+    pub fn sprinkle_food(&mut self, position: Vec2, timestamp: f64) -> usize {
+        self.user_food_seconds = 180.0;
+        self.director.notice_user_food(&mut self.state);
+        let mut count = 0;
+        for offset in [-1.0_f32, 0.0, 1.0] {
+            let profile = MorselProfile {
+                hue: 0.10 + offset * 0.025,
+                saturation: 0.65,
+                value: 1.0,
+                warmth: 0.65,
+                pulse_rate: 0.3,
+                stimulation: 0.35,
+                cohesion_bias: 0.55,
+                novelty: 0.55,
+            };
+            if let Some(id) = self.state.spawn_morsel(
+                position + Vec2::new(offset * 0.008, -offset.abs() * 0.006),
+                profile,
+                timestamp,
+            ) {
+                if let Some(ball) = self.state.objects.iter_mut().find(|o| o.id == id) {
+                    ball.radius_px_at_reference = 2.4;
+                    ball.mass = 0.05;
+                    ball.glow = 0.9;
+                    ball.velocity = Vec2::new(offset * 0.045, 0.055);
+                }
+                count += 1;
+            }
+        }
+        count
     }
 
     pub fn spawn_morsel(
@@ -1024,10 +1194,23 @@ impl EcologyRuntime {
                         if !target.is_finite() || !speed.is_finite() {
                             continue;
                         }
+                        if object.kind == ObjectKind::Orb
+                            && object.lifecycle != ObjectLifecycle::CarriedByPet
+                            && !self.last_orb_physical.contact
+                        {
+                            continue;
+                        }
+                        if object.lifecycle == ObjectLifecycle::GrabbedByUser {
+                            continue;
+                        }
                         self.pet_grips.retain(|grip| grip.object_id != object_id);
                         self.pet_grips.push(PetObjectGrip {
                             object_id,
-                            target: target.clamp(Vec2::ZERO, Vec2::ONE),
+                            target: if object.kind == ObjectKind::Orb {
+                                self.last_orb_physical.socket_position
+                            } else {
+                                target.clamp(Vec2::ZERO, Vec2::ONE)
+                            },
                             body_origin: self.last_body_position,
                             strength: speed,
                         });
@@ -1104,6 +1287,9 @@ impl EcologyRuntime {
                         .iter_mut()
                         .find(|object| object.id == object_id)
                     {
+                        if object.kind == ObjectKind::Orb && !self.last_orb_physical.contact {
+                            continue;
+                        }
                         // Backward-compatible command semantics: take the
                         // object into the pet's carry state at its current
                         // position. Movement is subsequently explicit.
@@ -1642,6 +1828,33 @@ mod tests {
     }
 
     #[test]
+    fn remote_orb_move_cannot_start_a_grip() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 74, true).unwrap();
+        let id = runtime.state.objects[0].id;
+        let before = runtime.state.objects[0].clone();
+        let mut life = lifecore::LifeCore::new(lifecore::Genome::from_seed(74), 74);
+        let intent = life
+            .tick(&SensorFrame::default(), &BodyFeedback::default(), 0.05)
+            .body_intent;
+        let mut output = runtime.director.tick_passthrough(intent, false);
+        output.object_command_count = 1;
+        output.object_commands[0] = ObjectCommand::MoveToward {
+            object_id: id,
+            target: Vec2::new(0.1, 0.1),
+            speed: 5.0,
+        };
+        runtime.apply_object_commands(&output, 0.05);
+        assert_eq!(runtime.state.objects[0].position, before.position);
+        assert_ne!(
+            runtime.state.objects[0].lifecycle,
+            ObjectLifecycle::CarriedByPet
+        );
+        assert!(runtime.pet_grips.is_empty());
+    }
+
+    #[test]
     fn compliant_pickup_is_continuous_and_fast_release_escapes_den() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
@@ -1665,6 +1878,11 @@ mod tests {
             ..Default::default()
         };
         runtime.last_body_position = start;
+        runtime.last_orb_physical = PhysicalGrabFrame {
+            contact: true,
+            socket_position: start - Vec2::new(0.06, 0.0),
+            ..PhysicalGrabFrame::default()
+        };
         output.object_commands[0] = ObjectCommand::MoveToward {
             object_id: id,
             target: start - Vec2::new(0.06, 0.0),

@@ -75,7 +75,7 @@ fn vertex_main(
         vec2<f32>( 1.50, -1.50),
         vec2<f32>( 1.50,  1.50),
     );
-    let local = corners[vertex_index];
+    let local = corners[vertex_index] * select(1.0, 2.5, material.x > 1.5);
     var output: VertexOutput;
     output.position = vec4<f32>(center_radius.xy + local * center_radius.zw, 0.0, 1.0);
     output.local = local;
@@ -561,6 +561,15 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return encode_surface_output(vec4<f32>(rgb, alpha));
     }
 
+    if input.material.x > 1.5 {
+        let pulse = 0.62 + 0.38 * sin(input.material.w * 1.65);
+        let aa = max(fwidth(radial_distance), 0.03);
+        let core = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, radial_distance);
+        let halo = exp(-radial_distance * radial_distance * 0.42) * (1.0 - core) * pulse * 0.26;
+        let alpha = clamp(core + halo, 0.0, 1.0);
+        let rgb = mix(input.color.rgb, vec3<f32>(1.0, 0.96, 0.72), core * 0.65) * (0.72 + pulse * 0.28);
+        return encode_surface_output(vec4<f32>(rgb * alpha, alpha));
+    }
     let wobble = sin(atan2(input.local.y, input.local.x) * 3.0 + input.material.w * 1.7) * 0.025;
     let body = soft_edge(radial_distance + wobble, 0.88, 1.02);
     let halo = soft_edge(radial_distance, 1.03, 1.31) * (1.0 - body) * input.material.y * 0.34;

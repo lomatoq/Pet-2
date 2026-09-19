@@ -242,6 +242,7 @@ pub struct RenderParameters {
     pub geometry: lifecore::FaceGeometry,
     pub eye_aperture: f32,
     pub mouth_open: f32,
+    pub feeding_mouth_offset: Vec2,
     pub mouth_shout: f32,
     pub eye_scales: [Vec2; 2],
     pub mouth_curve: f32,
@@ -3262,6 +3263,7 @@ impl Default for RenderParameters {
             geometry: lifecore::FaceGeometry::default(),
             eye_aperture: 1.0,
             mouth_open: 0.0,
+            feeding_mouth_offset: Vec2::ZERO,
             mouth_shout: 0.0,
             eye_scales: [Vec2::ONE; 2],
             mouth_curve: 0.1,
@@ -3451,8 +3453,8 @@ fn globals_for_resolved(
         face_eye: [
             bounded(parameters.eye_aperture, 0.0, 1.0, 1.0),
             bounded(parameters.mouth_shout, 0.0, 1.0, 0.0),
-            0.0,
-            0.0,
+            finite_or(parameters.feeding_mouth_offset.x, 0.0),
+            finite_or(parameters.feeding_mouth_offset.y, 0.0),
         ],
         viewport_time: [
             aspect,

@@ -202,6 +202,8 @@ pub struct ProceduralBody {
     occlusion_mode: OcclusionMode,
     occlusion_edge: f32,
     ecology_visual_effect: EcologyVisualEffect,
+    feeding_mouth_offset: Vec2,
+    feeding_mouth_activity: f32,
     fast_phenotype: FastPhenotypeActuation,
     contact_surface_cache: std::cell::Cell<Option<(u64, Vec2, Vec2)>>,
 }
@@ -232,6 +234,8 @@ impl ProceduralBody {
             occlusion_mode: OcclusionMode::Front,
             occlusion_edge: 0.0,
             ecology_visual_effect: EcologyVisualEffect::default(),
+            feeding_mouth_offset: Vec2::ZERO,
+            feeding_mouth_activity: 0.0,
             fast_phenotype: FastPhenotypeActuation::default(),
             contact_surface_cache: std::cell::Cell::new(None),
         };
@@ -283,6 +287,17 @@ impl ProceduralBody {
         )
     }
 
+    pub fn restore_body_for_startup(
+        &mut self,
+        snapshot: &BodyMaterialSnapshot,
+    ) -> Result<(), BodySnapshotError> {
+        self.embodiment.liquid.restore_body_for_startup(
+            snapshot,
+            self.tuning.seed,
+            self.tuning.schema_version,
+        )
+    }
+
     pub fn restore_body_material_snapshot(
         &mut self,
         snapshot: &BodyMaterialSnapshot,
@@ -292,6 +307,23 @@ impl ProceduralBody {
             self.tuning.seed,
             self.tuning.schema_version,
         )
+    }
+
+    pub fn set_feeding_mouth(&mut self, surface_pixels: Option<Vec2>, height: f32, dt: f32) {
+        let target = surface_pixels.map_or(Vec2::ZERO, |p| {
+            let local =
+                p * Vec2::new(1.0, -1.0) * (2.0 * self.projection_scale() / height.max(1.0));
+            let frame = self.embodiment.liquid.render_state().face_frame;
+            let delta = local - frame.origin;
+            (Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
+                / frame.scale.max(Vec2::splat(0.01))
+                - Vec2::new(0.0, -0.1))
+            .clamp_length_max(0.65)
+        });
+        let alpha = 1.0 - (-12.0 * dt.max(0.0)).exp();
+        self.feeding_mouth_offset = self.feeding_mouth_offset.lerp(target, alpha);
+        self.feeding_mouth_activity +=
+            (f32::from(surface_pixels.is_some()) - self.feeding_mouth_activity) * alpha;
     }
 
     pub fn set_ecology_visual_effect(&mut self, effect: EcologyVisualEffect) {
@@ -1107,7 +1139,10 @@ impl ProceduralBody {
             brow_asymmetry: pose.brow_asymmetry,
             geometry: pose.geometry,
             eye_aperture: pose.eye_aperture,
-            mouth_open: pose.mouth_open,
+            mouth_open: pose.mouth_open.max(
+                self.feeding_mouth_activity * (0.26 + pose.breath.abs().clamp(0.0, 1.0) * 0.22),
+            ),
+            feeding_mouth_offset: Vec2::ZERO,
             mouth_curve: pose.mouth_curve,
             mouth_shout: pose.mouth_shout,
             mouth_tension: pose.mouth_tension,
@@ -1185,7 +1220,16 @@ impl ProceduralBody {
             droplet_cohesion: fast.visual_physiology.droplet_cohesion,
             droplet_spread: fast.visual_physiology.droplet_spread,
             droplets: self.embodiment.droplets.render_states(),
-            liquid: self.embodiment.liquid.render_state(),
+            liquid: {
+                let mut liquid = self.embodiment.liquid.render_state();
+                liquid.face_frame.origin += liquid.face_frame.axis_x
+                    * self.feeding_mouth_offset.x
+                    * liquid.face_frame.scale.x
+                    + liquid.face_frame.axis_y
+                        * self.feeding_mouth_offset.y
+                        * liquid.face_frame.scale.y;
+                liquid
+            },
             material_absorption: material.absorption,
             material_scattering: material.scattering,
             material_thickness: material.thickness,

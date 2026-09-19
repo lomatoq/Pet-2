@@ -292,6 +292,7 @@ impl Lab {
             pet_velocity: self.pet_velocity,
             desktop_aspect: LAB_DESKTOP_ASPECT,
             orb_physical,
+            food_physical: None,
             cursor_position: self.cursor,
             pointer_down: false,
             user_activity: self.user_activity,

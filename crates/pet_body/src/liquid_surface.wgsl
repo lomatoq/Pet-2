@@ -752,7 +752,7 @@ fn mouth_layer(
     // Explicit actual-playback activity; a wide yawn or silent grimace cannot
     // masquerade as a shout. Grow mainly below the eyes.
     let shout = globals.face_eye.y;
-    let center = vec2<f32>(0.0, -0.100 - shout * 0.035);
+    let center = vec2<f32>(0.0, -0.100 - shout * 0.035) + globals.face_eye.zw;
     let curve = globals.brow_mouth.w;
     let tension = globals.mouth_voice.x;
     let voice = globals.mouth_voice.z;

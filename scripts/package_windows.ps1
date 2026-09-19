@@ -55,6 +55,7 @@ $releaseManifest = [ordered]@{
     schema = 'pet2.release_manifest.v1'
     release_version = $releaseVersion
     lab_control_protocol = 2
+    lab_control_schema = 4
     built_utc = [DateTime]::UtcNow.ToString('o')
     compatible_pair = $true
     files = [ordered]@{

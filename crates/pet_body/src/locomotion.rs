@@ -133,6 +133,7 @@ impl BodySimulation {
             | LocomotionMode::Landing
             | LocomotionMode::EdgeCling => 6.2,
             LocomotionMode::Orbit => 4.4,
+            LocomotionMode::Arrive if intent.desired_speed > 0.6 => 8.0,
             LocomotionMode::Hover | LocomotionMode::Arrive => 2.8,
             LocomotionMode::Wander => 1.65,
             LocomotionMode::Sleep | LocomotionMode::Cocoon => 6.0,
@@ -170,7 +171,16 @@ impl BodySimulation {
         // physically quicker while low energy remains visibly heavier.
         let expression_effort = 0.82 + expression_energy * 0.28;
         let cruise = distance_cruise(intent, position.distance(target) / reference_span);
-        let speed_cap = base_speed_cap * expression_effort * cruise;
+        let burst = ((intent.desired_speed - 0.60) / 0.40).clamp(0.0, 1.0);
+        let burst_reserve = if matches!(
+            intent.locomotion,
+            LocomotionMode::Seek | LocomotionMode::Flee | LocomotionMode::Arrive
+        ) {
+            burst * 0.55
+        } else {
+            0.0
+        };
+        let speed_cap = (base_speed_cap + burst_reserve) * expression_effort * cruise;
         let desired_speed = (intent.desired_speed * BODY_MOVEMENT_TEMPO * cruise)
             .clamp(0.0, speed_cap)
             * reference_span;
@@ -908,8 +918,8 @@ mod tests {
         }
         let flee_speed = (flee.feedback.velocity * regular_scale).length();
         assert!(
-            (580.0..=670.0).contains(&flee_speed),
-            "2x flee={flee_speed} px/s"
+            (740.0..=850.0).contains(&flee_speed),
+            "burst flee={flee_speed} px/s"
         );
 
         let mut orbit = BodySimulation::new(0xFA57);

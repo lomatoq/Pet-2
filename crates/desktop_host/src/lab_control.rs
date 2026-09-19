@@ -81,6 +81,9 @@ pub enum LabControlCommand {
         lease_seconds: u32,
     },
     CloseSession,
+    Feeding {
+        enabled: bool,
+    },
     CueAttention {
         position: [f32; 2],
         duration_seconds: f32,
@@ -211,6 +214,7 @@ impl LabControlCommand {
             | Self::DeleteGestureConvention { .. }
             | Self::RollbackGestureConventions { .. }
             | Self::ClearGestureConventions
+            | Self::Feeding { .. }
             | Self::Hearing { .. }
             | Self::ShutdownForPromotion => Ok(()),
         }

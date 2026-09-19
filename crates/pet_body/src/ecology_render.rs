@@ -629,7 +629,7 @@ impl EcologyRenderer {
                     },
                     (object.glow * (1.0 + den_visual_blend * 0.10)).clamp(0.0, 1.0),
                     object.wear,
-                    time_seconds + (object.id as u32) as f32 * 0.000_13,
+                    time_seconds + (object.id % 997) as f32 * 0.013,
                 ],
                 den_surface: [0.0; 4],
                 den_optics: [0.0; 4],

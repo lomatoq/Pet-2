@@ -278,6 +278,7 @@ pub struct LiquidMorphRuntime {
     components: ComponentSummary,
     face_frame: FaceFrameRuntime,
     /// Unoriented major axis of the area-preserving character-field ellipse.
+    flight_comet: Vec2,
     flight_field_axis: Vec2,
     /// Ratio of major/minor field metric radii. One is the neutral field.
     flight_field_aspect: f32,
@@ -408,6 +409,7 @@ impl LiquidMorphRuntime {
             seed_phase: seed as u32 as f32 / u32::MAX as f32 * TAU,
             components,
             face_frame: FaceFrameRuntime::default(),
+            flight_comet: Vec2::ZERO,
             flight_field_axis: Vec2::Y,
             flight_field_aspect: 1.0,
             diagnostics: LiquidDiagnostics::default(),
@@ -493,6 +495,7 @@ impl LiquidMorphRuntime {
             let navigation_anchor_strength = self.navigation_anchor_strength;
             let local_containment_bounds = self.local_containment_bounds;
             let face_frame = self.face_frame.clone();
+            let flight_comet = self.flight_comet;
             let flight_field_axis = self.flight_field_axis;
             let flight_field_aspect = self.flight_field_aspect;
             let failsafe_hits = self.failsafe_hits;
@@ -506,6 +509,7 @@ impl LiquidMorphRuntime {
             replacement.face_frame = face_frame;
             replacement.face_frame.begin_recovery();
             replacement.face_frame.set_tuning(face);
+            replacement.flight_comet = flight_comet;
             replacement.flight_field_axis = flight_field_axis;
             replacement.flight_field_aspect = flight_field_aspect;
             replacement.cinematic_features = material_variant == MaterialVariant::CinematicJelly;
@@ -796,9 +800,14 @@ impl LiquidMorphRuntime {
                 },
                 inertia_scale: effective_flight_inertia,
                 maximum_inertial_acceleration: 6.0,
-                velocity_damping: (effective_flight_damping * 0.75).clamp(0.0, 3.5),
+                velocity_damping: {
+                    let flight =
+                        smoothstep01(((motion.velocity.length() - 0.15) / 0.65).clamp(0.0, 1.0));
+                    (effective_flight_damping * (0.75 - flight * 0.37)).clamp(0.0, 3.5)
+                },
                 flight_axis: self.flight_field_axis,
                 flight_aspect: self.flight_field_aspect,
+                comet: self.flight_comet,
             },
         );
         let supported_softness =
@@ -1402,6 +1411,7 @@ impl LiquidMorphRuntime {
         let navigation_anchor_strength = self.navigation_anchor_strength;
         let local_containment_bounds = self.local_containment_bounds;
         let cinematic_features = self.cinematic_features;
+        let flight_comet = self.flight_comet;
         let flight_field_axis = self.flight_field_axis;
         let flight_field_aspect = self.flight_field_aspect;
         let failsafe_hits = self.failsafe_hits;
@@ -1416,6 +1426,7 @@ impl LiquidMorphRuntime {
         replacement.navigation_anchor_strength = navigation_anchor_strength;
         replacement.local_containment_bounds = local_containment_bounds;
         replacement.cinematic_features = cinematic_features;
+        replacement.flight_comet = flight_comet;
         replacement.flight_field_axis = flight_field_axis;
         replacement.flight_field_aspect = flight_field_aspect;
         replacement.failsafe_hits = failsafe_hits;
@@ -1550,6 +1561,15 @@ impl LiquidMorphRuntime {
         dt: f32,
         measured_load: Option<(Vec2, f32)>,
     ) {
+        let comet_drive = if measured_load.is_some() {
+            0.0
+        } else {
+            smoothstep01(((motion.velocity.length() - 0.30) / 0.70).clamp(0.0, 1.0))
+        };
+        let comet_target = motion.velocity.normalize_or_zero() * comet_drive;
+        self.flight_comet = self
+            .flight_comet
+            .lerp(comet_target, 1.0 - (-5.5 * dt).exp());
         let speed_drive = smoothstep01(((motion.velocity.length() - 0.12) / 0.88).clamp(0.0, 1.0));
         let acceleration_drive =
             smoothstep01(((motion.acceleration.length() - 0.16) / 1.34).clamp(0.0, 1.0));

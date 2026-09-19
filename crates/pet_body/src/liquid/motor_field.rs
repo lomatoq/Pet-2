@@ -105,6 +105,8 @@ pub struct CharacterFieldParameters {
     pub flight_axis: Vec2,
     /// Area-preserving major/minor aspect ratio. One is the neutral ellipse.
     pub flight_aspect: f32,
+    /// Signed travel direction times the smoothed comet strength.
+    pub comet: Vec2,
 }
 
 impl Default for CharacterFieldParameters {
@@ -117,8 +119,30 @@ impl Default for CharacterFieldParameters {
             velocity_damping: 1.4,
             flight_axis: Vec2::Y,
             flight_aspect: 1.0,
+            comet: Vec2::ZERO,
         }
     }
+}
+
+/// A smooth conservative coordinate warp: rounded leading mass and a longer,
+/// narrower trailing well. Its Jacobian keeps forces consistent with the potential.
+fn comet_warp(local: Vec2, comet: Vec2) -> (Vec2, glam::Mat2) {
+    let strength = comet.length().clamp(0.0, 1.0);
+    let axis = comet.normalize_or(Vec2::X);
+    let side = Vec2::new(-axis.y, axis.x);
+    let x = local.dot(axis);
+    let y = local.dot(side);
+    let t = (x * 4.0).tanh();
+    let rear = (1.0 - t) * 0.5;
+    let derivative = -2.0 * (1.0 - t * t);
+    let length = 1.0 + 1.20 * strength * rear;
+    let taper = 1.0 + 0.95 * strength * rear;
+    let warped = axis * (x / length) + side * (y * taper);
+    let dx = axis * (1.0 / length - x * 1.20 * strength * derivative / (length * length))
+        + side * (y * 0.95 * strength * derivative);
+    let dy = side * taper;
+    let basis = glam::Mat2::from_cols(axis, side);
+    (warped, glam::Mat2::from_cols(dx, dy) * basis.transpose())
 }
 
 fn elliptical_metric(
@@ -189,8 +213,9 @@ pub fn apply_character_field(
 
     for particle in &mut particles[..count] {
         let local = particle.position - body_origin;
+        let (warped, jacobian) = comet_warp(local, parameters.comet);
         let (elliptical_radius, metric_gradient) = elliptical_metric(
-            local,
+            warped,
             radii,
             parameters.flight_axis,
             parameters.flight_aspect,
@@ -199,9 +224,10 @@ pub fn apply_character_field(
         // away. This is the analytic gradient of
         // A*r_min*(sqrt(1 + q^2) - 1), so the well itself cannot add energy.
         // There is no activation radius or component-dependent return mode.
-        let well_force = (-metric_gradient * well_acceleration * radii.min_element()
-            / (1.0 + elliptical_radius.powi(2)).sqrt())
-        .clamp_length_max(well_acceleration);
+        let well_force =
+            (-(jacobian.transpose() * metric_gradient) * well_acceleration * radii.min_element()
+                / (1.0 + elliptical_radius.powi(2)).sqrt())
+            .clamp_length_max(well_acceleration);
         particle.force += well_force + inertial_load;
         particle.force -= particle.velocity * parameters.velocity_damping.max(0.0);
     }
@@ -209,6 +235,29 @@ pub fn apply_character_field(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn comet_has_long_tapered_rear_and_correct_force_gradient() {
+        let c = glam::Vec2::X;
+        let front = super::comet_warp(glam::Vec2::new(0.4, 0.1), c).0;
+        let back = super::comet_warp(glam::Vec2::new(-0.4, 0.1), c).0;
+        assert!(front.x.abs() > back.x.abs() * 1.7);
+        assert!(back.y > front.y * 1.6);
+        for p in [
+            glam::Vec2::new(-0.3, 0.12),
+            glam::Vec2::new(0.0, -0.2),
+            glam::Vec2::new(0.3, 0.1),
+        ] {
+            let (_, j) = super::comet_warp(p, c);
+            for axis in [glam::Vec2::X, glam::Vec2::Y] {
+                let numeric = (super::comet_warp(p + axis * 0.0001, c).0
+                    - super::comet_warp(p - axis * 0.0001, c).0)
+                    / 0.0002;
+                assert!(numeric.distance(j * axis) < 0.002);
+            }
+            assert!(super::comet_warp(p, glam::Vec2::ZERO).0.distance(p) < 1.0e-6);
+        }
+    }
+
     use super::*;
 
     #[test]

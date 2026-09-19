@@ -914,7 +914,7 @@ impl EndpointDetector {
             .filter(|pair| pair[0].is_sign_positive() != pair[1].is_sign_positive())
             .count() as f32
             / block.len().saturating_sub(1).max(1) as f32;
-        let threshold = (self.noise_floor * 2.8).max(0.008);
+        let threshold = (self.noise_floor * 2.8).max(0.003);
         let voice_like = rms > threshold && (0.008..=0.40).contains(&crossings);
         let mut onset = false;
         let mut segment = None;

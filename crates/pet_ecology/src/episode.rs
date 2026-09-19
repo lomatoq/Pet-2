@@ -254,6 +254,7 @@ pub struct EcologyBehaviorFrame {
     /// threshold means the same physical distance on 16:9 and ultrawide hosts.
     pub desktop_aspect: f32,
     pub orb_physical: PhysicalGrabFrame,
+    pub food_physical: Option<PhysicalGrabFrame>,
     pub cursor_position: Vec2,
     pub pointer_down: bool,
     pub user_activity: f32,
@@ -454,6 +455,19 @@ impl EpisodeDirector {
     #[must_use]
     pub const fn active_episode(&self) -> Option<&ActivityEpisode> {
         self.active.as_ref()
+    }
+
+    pub fn notice_user_food(&mut self, state: &mut EcologyState) {
+        if self.active.is_some_and(|e| {
+            !matches!(
+                e.goal,
+                EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel | EpisodeGoal::EscapePressure
+            )
+        }) && let Some(old) = self.active.take()
+        {
+            state.episode_stats.aborted[old.goal.index()] =
+                state.episode_stats.aborted[old.goal.index()].saturating_add(1);
+        }
     }
 
     pub fn interrupt_for_shutdown(&mut self) -> Option<ActivityEpisode> {
@@ -853,6 +867,22 @@ fn select_episode(
             None,
         ));
     }
+    if let Some(morsel) = state.objects.iter().find(|object| {
+        object.kind == ObjectKind::Morsel
+            && matches!(
+                object.lifecycle,
+                ObjectLifecycle::Free | ObjectLifecycle::Sleeping
+            )
+            && object.morsel_profile.is_some()
+            && (object.preference >= -0.01
+                || frame.timestamp - object.last_interaction_seconds >= 45.0)
+    }) {
+        return Some((
+            EpisodeGoal::InspectMorsel,
+            EpisodeReason::FoodOpportunity,
+            Some(morsel.id),
+        ));
+    }
     if frame.sleeping || frame.selected_action == ActionId::Sleep {
         return Some((EpisodeGoal::SleepInDen, EpisodeReason::ReturnToDen, None));
     }
@@ -889,22 +919,6 @@ fn select_episode(
             },
             EpisodeReason::VisualNovelty,
             None,
-        ));
-    }
-    if let Some(morsel) = state.objects.iter().find(|object| {
-        object.kind == ObjectKind::Morsel
-            && matches!(
-                object.lifecycle,
-                ObjectLifecycle::Free | ObjectLifecycle::Sleeping
-            )
-            && object.morsel_profile.is_some()
-            && (object.preference >= -0.01
-                || frame.timestamp - object.last_interaction_seconds >= 45.0)
-    }) {
-        return Some((
-            EpisodeGoal::InspectMorsel,
-            EpisodeReason::FoodOpportunity,
-            Some(morsel.id),
         ));
     }
     if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
@@ -1986,7 +2000,18 @@ fn drive_episode(
                 EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.24 => {
                     set_phase(active, EpisodePhase::Approach);
                 }
-                EpisodePhase::Approach if frame.pet_position.distance(morsel_position) <= 0.055 => {
+                EpisodePhase::Approach
+                    if frame.food_physical.map_or_else(
+                        || {
+                            desktop_distance(
+                                frame.pet_position,
+                                morsel_position,
+                                frame.desktop_aspect,
+                            ) <= 0.055
+                        },
+                        |f| f.contact,
+                    ) =>
+                {
                     set_phase(active, EpisodePhase::Inspect);
                     output.vocal_trigger = Some(EcologyVocalTrigger::FoodInspect);
                 }
@@ -2027,8 +2052,10 @@ fn drive_episode(
                 _ => {}
             }
             output.body_intent.locomotion = if active.phase == EpisodePhase::Approach {
-                output.body_intent.target_position = morsel_position;
-                output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.28);
+                output.body_intent.target_position = frame
+                    .food_physical
+                    .map_or(morsel_position, |f| f.socket_position);
+                output.body_intent.desired_speed = 0.85;
                 LocomotionMode::Arrive
             } else {
                 LocomotionMode::Hover
@@ -2036,6 +2063,36 @@ fn drive_episode(
             output.visual_context.active_target = Some(morsel_position);
         }
         EpisodeGoal::EatMorsel => {
+            // Food can move after inspection. Reacquire it before crediting
+            // ingestion; never consume a remote or user-held morsel.
+            if let Some(food) = active
+                .object_id
+                .and_then(|id| state.objects.iter().find(|o| o.id == id))
+            {
+                if food.lifecycle == ObjectLifecycle::GrabbedByUser {
+                    return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+                }
+                if !frame.food_physical.map_or_else(
+                    || {
+                        desktop_distance(frame.pet_position, food.position, frame.desktop_aspect)
+                            <= 0.055
+                    },
+                    |f| f.contact,
+                ) {
+                    active.phase_elapsed_seconds = 0.0;
+                    output.body_intent.target_position = frame
+                        .food_physical
+                        .map_or(food.position, |f| f.socket_position);
+                    output.body_intent.gaze_target = Some(food.position);
+                    output.body_intent.locomotion = LocomotionMode::Arrive;
+                    output.body_intent.desired_speed = 0.85;
+                    return if active.elapsed_seconds > 10.0 {
+                        EpisodeStep::Abort(EpisodeReason::TimedOut)
+                    } else {
+                        EpisodeStep::Continue
+                    };
+                }
+            }
             let Some((morsel_id, profile)) = active.object_id.and_then(|id| {
                 state
                     .objects
@@ -2045,6 +2102,16 @@ fn drive_episode(
             }) else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
+            if let Some(contact) = frame.food_physical {
+                output.body_intent.target_position = contact.socket_position;
+                output.body_intent.locomotion = LocomotionMode::Arrive;
+                output.body_intent.desired_speed = 0.12;
+                output.body_intent.pose = PoseIntent::Compact;
+                output.body_intent.expression.mouth_open = 0.45;
+                if active.phase_elapsed_seconds < 0.38 {
+                    return EpisodeStep::Continue;
+                }
+            }
             state.metabolism.consume(&profile);
             state.taste.learn(
                 &profile,
@@ -2619,6 +2686,7 @@ mod tests {
             pet_position: Vec2::splat(0.5),
             pet_velocity: Vec2::ZERO,
             desktop_aspect: 16.0 / 9.0,
+            food_physical: None,
             orb_physical: PhysicalGrabFrame {
                 socket_position: Vec2::splat(0.5),
                 ..PhysicalGrabFrame::default()
@@ -3416,6 +3484,44 @@ mod tests {
         assert!(state.metabolism.active_effect.is_some());
         assert!(state.taste.confidence > 0.0);
         assert!(state.taste.confidence <= 1.0);
+    }
+
+    #[test]
+    fn food_moved_after_inspection_is_not_eaten_or_rewarded_remotely() {
+        let mut state = EcologyState::new(99);
+        let id = state
+            .spawn_morsel(Vec2::splat(0.5), test_morsel(0.23), 1.0)
+            .unwrap();
+        let frame = behavior_frame(ActionId::IdleHover);
+        let mut director = EpisodeDirector::default();
+        for _ in 0..12 {
+            let _ = director.tick(&mut state, frame, representative_intent(), 0.25);
+            if director
+                .active
+                .as_ref()
+                .is_some_and(|e| e.goal == EpisodeGoal::EatMorsel)
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            director.active.as_ref().unwrap().goal,
+            EpisodeGoal::EatMorsel
+        );
+        state
+            .objects
+            .iter_mut()
+            .find(|o| o.id == id)
+            .unwrap()
+            .position = Vec2::new(0.9, 0.8);
+        let before = state.metabolism.reserve;
+        let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert!(
+            !output.outcomes[..output.outcome_count].contains(&EcologyOutcome::MorselConsumed(id))
+        );
+        assert!(state.metabolism.reserve <= before);
+        assert_eq!(output.body_intent.target_position, Vec2::new(0.9, 0.8));
+        assert!(output.body_intent.desired_speed > 0.0);
     }
 
     #[test]

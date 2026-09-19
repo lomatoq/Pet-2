@@ -34,14 +34,14 @@ pub fn step_compliant_grip(
     let maximum = Vec2::new(aspect - radius, 1.0 - radius);
     let mut position = Vec2::new(object.position.x * aspect, object.position.y);
     let target = Vec2::new(target.x * aspect, target.y).clamp(minimum, maximum);
-    let omega = 5.0 + strength.clamp(0.0, 12.0) * 1.6;
+    let omega = 5.0 + strength.clamp(0.0, 12.0) * 0.7;
     let mass = if object.mass.is_finite() {
         object.mass.clamp(0.05, 8.0)
     } else {
         0.72
     };
     let stiffness = omega * omega * 0.72;
-    let damping = 2.0 * (stiffness * mass).sqrt();
+    let damping = 1.35 * (stiffness * mass).sqrt();
     let grip_force =
         ((target - position) * stiffness - object.velocity * damping).clamp_length_max(4.32);
     let acceleration = (grip_force / mass + Vec2::Y * ORB_SCREEN_GRAVITY).clamp_length_max(6.0);
@@ -258,6 +258,55 @@ pub fn step_object(object: &mut WorldObject, config: ObjectPhysicsConfig, dt: f3
         object.velocity = Vec2::ZERO;
         object.lifecycle = ObjectLifecycle::Sleeping;
     } else if object.lifecycle == ObjectLifecycle::Sleeping {
+        object.lifecycle = ObjectLifecycle::Free;
+    }
+}
+
+/// Food settles on the OS work-area floor, independently of open windows.
+pub fn step_morsel(object: &mut WorldObject, config: ObjectPhysicsConfig, floor: f32, dt: f32) {
+    if object.kind != ObjectKind::Morsel
+        || !matches!(
+            object.lifecycle,
+            ObjectLifecycle::Free | ObjectLifecycle::Sleeping
+        )
+    {
+        return;
+    }
+    let dt = if dt.is_finite() {
+        dt.clamp(0.0, 1.0 / 30.0)
+    } else {
+        0.0
+    };
+    let radius =
+        (object.radius_px_at_reference / config.reference_height_px.max(64.0)).clamp(0.001, 0.2);
+    let floor = if floor.is_finite() {
+        floor.clamp(radius * 2.0, 1.0)
+    } else {
+        1.0
+    };
+    let aspect = config.desktop_aspect.clamp(0.25, 8.0);
+    object.velocity.y = (object.velocity.y + ORB_SCREEN_GRAVITY * dt).min(MAX_OBJECT_SPEED);
+    object.position += Vec2::new(object.velocity.x / aspect, object.velocity.y) * dt;
+    object.position.x = object
+        .position
+        .x
+        .clamp(radius / aspect, 1.0 - radius / aspect);
+    object.position.y = object.position.y.max(radius);
+    if object.position.y >= floor - radius {
+        object.position.y = floor - radius;
+        if object.velocity.y > 0.06 {
+            object.velocity.y *= -0.28;
+        } else {
+            object.velocity.y = 0.0;
+        }
+        object.velocity.x *= (-10.0 * dt).exp();
+        if object.velocity.y == 0.0 && object.velocity.x.abs() < 0.004 {
+            object.velocity = Vec2::ZERO;
+            object.lifecycle = ObjectLifecycle::Sleeping;
+        } else {
+            object.lifecycle = ObjectLifecycle::Free;
+        }
+    } else {
         object.lifecycle = ObjectLifecycle::Free;
     }
 }
@@ -696,6 +745,38 @@ fn swept_point_aabb(start: Vec2, delta: Vec2, minimum: Vec2, maximum: Vec2) -> O
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crumbs_fall_to_work_area_and_remain_there() {
+        let mut state = crate::EcologyState::default();
+        let id = state
+            .spawn_morsel(
+                glam::Vec2::new(0.4, 0.2),
+                crate::MorselProfile {
+                    hue: 0.1,
+                    saturation: 0.8,
+                    value: 0.9,
+                    warmth: 0.7,
+                    pulse_rate: 0.4,
+                    stimulation: 0.5,
+                    cohesion_bias: 0.6,
+                    novelty: 0.8,
+                },
+                0.0,
+            )
+            .unwrap();
+        let food = state.objects.iter_mut().find(|o| o.id == id).unwrap();
+        food.radius_px_at_reference = 6.0;
+        let config = super::ObjectPhysicsConfig::default();
+        for _ in 0..600 {
+            super::step_morsel(food, config, 0.94, 1.0 / 120.0);
+        }
+        assert!((food.position.y - (0.94 - 6.0 / config.reference_height_px)).abs() < 1.0e-6);
+        assert_eq!(food.velocity, glam::Vec2::ZERO);
+        assert_eq!(food.lifecycle, crate::ObjectLifecycle::Sleeping);
+        super::step_morsel(food, config, 0.9, 1.0 / 120.0);
+        assert!(food.position.y < 0.9);
+    }
+
     #[test]
     fn soft_orb_contact_has_reciprocal_momentum_and_no_teleport() {
         for hz in [30, 60, 120] {

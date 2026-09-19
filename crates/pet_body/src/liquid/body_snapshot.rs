@@ -344,6 +344,30 @@ impl LiquidMorphRuntime {
         }
     }
 
+    pub fn restore_body_for_startup(
+        &mut self,
+        snapshot: &BodyMaterialSnapshot,
+        identity: u64,
+        schema: u32,
+    ) -> Result<(), BodySnapshotError> {
+        snapshot.validate(identity, schema, self.tuning)?;
+        let canonical = self.body_material_snapshot(identity, schema, snapshot.tuning_revision);
+        let mut rested = snapshot.clone();
+        rested.body_origin = Vec2::ZERO;
+        rested.bonds = canonical.bonds;
+        rested.components = canonical.components;
+        for (particle, seed) in rested.particles.iter_mut().zip(canonical.particles) {
+            particle.position = seed.position;
+            particle.render_position = seed.render_position;
+            particle.velocity = Vec2::ZERO;
+            particle.component_id = seed.component_id;
+            particle.detached_seconds = 0.0;
+            particle.render_axis_major = seed.render_axis_major;
+            particle.render_aspect = seed.render_aspect;
+        }
+        self.restore_body_material_snapshot(&rested, identity, schema)
+    }
+
     pub fn restore_body_material_snapshot(
         &mut self,
         snapshot: &BodyMaterialSnapshot,
@@ -440,6 +464,31 @@ impl LiquidMorphRuntime {
 mod tests {
     use super::*;
     use crate::{LIQUID_TUNING_SCHEMA_VERSION, PbfTuning};
+
+    #[test]
+    fn startup_collects_all_mass_without_replaying_old_velocity() {
+        let mut original = LiquidMorphRuntime::new(73);
+        original.particles[0].position += Vec2::new(1.0, 0.0);
+        original.particles[0].velocity = Vec2::splat(3.0);
+        let snapshot = original.body_material_snapshot(73, LIQUID_TUNING_SCHEMA_VERSION, 0);
+        let mut restored = LiquidMorphRuntime::new(73);
+        restored
+            .restore_body_for_startup(&snapshot, 73, LIQUID_TUNING_SCHEMA_VERSION)
+            .unwrap();
+        let result = restored.body_material_snapshot(73, LIQUID_TUNING_SCHEMA_VERSION, 0);
+        assert_eq!(
+            snapshot.total_mass_bits_checksum,
+            result.total_mass_bits_checksum
+        );
+        assert!(result.particles.iter().all(|p| p.velocity == Vec2::ZERO));
+        assert!(
+            result
+                .particles
+                .iter()
+                .all(|p| p.component_id == result.particles[0].component_id)
+        );
+        assert_eq!(snapshot.particles[0].pigment, result.particles[0].pigment);
+    }
 
     #[test]
     fn body_snapshot_restores_full_mass_and_component_lifecycle() {

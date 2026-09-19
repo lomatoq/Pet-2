@@ -2081,6 +2081,9 @@ struct PetRuntime {
     body: ProceduralBody,
     audio: AudioManager,
     hearing: hearing_bridge::HearingBridge,
+    feeding_seconds: f32,
+    food_click_cooldown: f32,
+    companion_menu: Option<std::process::Child>,
     organic: organic_runtime::OrganicRuntime,
     sensors: SensorFrame,
     intent: BodyIntent,
@@ -2391,6 +2394,16 @@ impl PetApplication {
         }
         let elapsed = (now - runtime.last_update).as_secs_f32().min(0.25);
         runtime.last_update = now;
+        runtime.feeding_seconds = (runtime.feeding_seconds - elapsed).max(0.0);
+        runtime.food_click_cooldown = (runtime.food_click_cooldown - elapsed).max(0.0);
+        if runtime.feeding_seconds > 0.0 && feeding_escape_down() {
+            runtime.feeding_seconds = 0.0;
+        }
+        runtime.window.set_cursor(if runtime.feeding_seconds > 0.0 {
+            winit::window::CursorIcon::Crosshair
+        } else {
+            winit::window::CursorIcon::Default
+        });
         runtime.hearing.poll(
             elapsed,
             runtime.audio.callback_levels().rms,
@@ -2542,7 +2555,8 @@ impl PetApplication {
                     4.0,
                 )
             });
-            let primary_down = snapshot.primary_button_down.unwrap_or(runtime.pointer.down);
+            let primary_down = runtime.feeding_seconds <= 0.0
+                && snapshot.primary_button_down.unwrap_or(runtime.pointer.down);
             let pet_capture_active = runtime.pointer_tracker.captured;
             let petting_started = update_pointer_state(
                 &mut runtime.pointer,
@@ -2564,9 +2578,10 @@ impl PetApplication {
                 hovered_hysteresis || ecology_hover_hysteresis,
                 pet_dragged || runtime.ecology.is_dragging_object(),
             );
-            let _ = runtime
-                .platform
-                .set_cursor_hittest(&runtime.window, accepts_cursor);
+            let _ = runtime.platform.set_cursor_hittest(
+                &runtime.window,
+                accepts_cursor || runtime.feeding_seconds > 0.0,
+            );
             runtime.sensors = runtime.normalizer.normalize(
                 &snapshot,
                 &runtime.topology,
@@ -2689,7 +2704,11 @@ impl PetApplication {
                 runtime.vita.percept().scroll_velocity,
                 runtime.vita.percept().window_pressure,
             );
-            let body_sensors = runtime.sensors.clone();
+            let mut body_sensors = runtime.sensors.clone();
+            if runtime.ecology.feeding_navigation().is_some() {
+                body_sensors.visible_surfaces.clear();
+            }
+
             runtime.body.fixed_update(
                 &runtime.life.state.genome,
                 &runtime.intent,
@@ -2710,6 +2729,29 @@ impl PetApplication {
             runtime
                 .ecology
                 .set_measured_orb_contact(orb_contact, orb_contact_height);
+            runtime.ecology.set_food_floors(
+                runtime
+                    .topology
+                    .monitors
+                    .iter()
+                    .map(|m| {
+                        (
+                            (m.physical_bounds.minimum.x - bounds.minimum.x) as f32
+                                / bounds.width().max(1) as f32,
+                            (m.physical_bounds.maximum.x - bounds.minimum.x) as f32
+                                / bounds.width().max(1) as f32,
+                            (m.working_area.maximum.y - bounds.minimum.y) as f32
+                                / bounds.height().max(1) as f32,
+                        )
+                    })
+                    .collect(),
+            );
+            let food_mouth = runtime
+                .ecology
+                .update_food_contact(&runtime.body, orb_contact_height);
+            runtime
+                .body
+                .set_feeding_mouth(food_mouth, orb_contact_height, body_dt);
             runtime.ecology.fixed_update(
                 desktop_aspect,
                 runtime.vita.window_affordances(),
@@ -3133,7 +3175,11 @@ impl PetApplication {
                 source: gaze_source,
             };
             let mut motor_context = build_motor_context(runtime);
+            let sound_startle = runtime.hearing.take_startle();
             let heard_name = runtime.hearing.take_name_event();
+            if sound_startle > 0.0 {
+                motor_context.cursor_position = motor_context.body.motion.world_position;
+            }
             if heard_name
                 && !runtime.sensors.pet_dragged
                 && !runtime.hearing.quiet_boundary()
@@ -3161,6 +3207,8 @@ impl PetApplication {
                 .any(|o| matches!(o, EcologyOutcome::MorselConsumed(_)))
             {
                 motor_context.world_event = MotorWorldEvent::FoodConsumed;
+                apply_shared_feedback(runtime, FeedbackEvent::Reward(0.18));
+                runtime.save_accumulator = 30.0;
             }
             let nervous_snapshot = runtime.nervous_system.snapshot();
             runtime
@@ -3174,7 +3222,11 @@ impl PetApplication {
                 body_intent: ecology_output.body_intent.clone(),
                 affect: output.affect,
                 drives: runtime.life.state.drives,
-                felt: nervous_snapshot.felt,
+                felt: {
+                    let mut felt = nervous_snapshot.felt;
+                    felt.startle = felt.startle.max(sound_startle);
+                    felt
+                },
                 derived: nervous_snapshot.derived,
                 attachment: runtime.life.state.affect.attachment,
                 recent_outcome,
@@ -3461,6 +3513,17 @@ impl PetApplication {
                 runtime.sensors.pet_dragged,
             );
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
+            if matches!(
+                runtime.ecology.active_episode().map(|e| e.goal),
+                Some(EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel)
+            ) && motor_packet.program
+                != Some(pet_motor::BehaviorProgramId::DefenseStartleOrientFreeze)
+            {
+                motor_packet.support = runtime.ecology.feeding_support();
+                if motor_goal.felt.startle < 0.35 && motor_goal.felt.pain_like < 0.2 {
+                    motor_packet.fields.fill(None);
+                }
+            }
             runtime.nervous_system.apply_motor_actuation(
                 &mut runtime.life,
                 &runtime.vita,
@@ -3496,6 +3559,21 @@ impl PetApplication {
             }
             runtime.last_motor_packet = motor_packet;
             project_navigation_target_to_monitor_union(&mut output.body_intent, &runtime.topology);
+            if !runtime.sensors.pet_dragged
+                && motor_goal.felt.startle < 0.35
+                && motor_goal.felt.pain_like < 0.2
+                && let Some((target, contact)) = runtime.ecology.feeding_navigation()
+            {
+                let height = runtime.window.inner_size().height.max(1) as f32;
+                let hull = runtime.body.liquid_contact_bounds_pixels(height);
+                let desired = virtual_normalized_to_physical(&runtime.topology, target);
+                let center =
+                    nearest_covered_center(&runtime.topology, desired, hull.minimum, hull.maximum);
+                output.body_intent.target_position =
+                    physical_to_virtual_normalized(&runtime.topology, center);
+                output.body_intent.locomotion = LocomotionMode::Arrive;
+                output.body_intent.desired_speed = if contact { 0.12 } else { 0.85 };
+            }
             runtime.nervous_system.commit_intent(
                 &mut runtime.life,
                 &mut runtime.body,
@@ -4018,6 +4096,7 @@ impl PetApplication {
                         "orb_preference": orb.map(|object| object.preference),
                         "den_anchor": ecology_state.den.anchor.to_array(),
                         "den_slots": ecology_state.den.slots,
+                        "food": ecology_state.objects.iter().filter(|o| o.kind == pet_ecology::ObjectKind::Morsel).map(|o| serde_json::json!({"id":o.id,"position":o.position.to_array(),"velocity":o.velocity.to_array(),"state":format!("{:?}",o.lifecycle)})).collect::<Vec<_>>(),
                         "metabolic_reserve": ecology_state.metabolism.reserve,
                         "satiation": ecology_state.metabolism.satiation,
                         "active_food_effect": ecology_state.metabolism.active_effect,
@@ -4080,6 +4159,7 @@ impl PetApplication {
                     "audio_accepted_requests": runtime.audio.accepted_requests,
                     "audio_rejected_requests": runtime.audio.rejected_requests,
                     "hearing": runtime.hearing.telemetry(),
+                    "feeding": { "enabled": runtime.feeding_seconds > 0.0, "seconds_remaining": runtime.feeding_seconds },
                     "organic": runtime.organic.latest().map(|latest| serde_json::json!({
                         "trace":latest.regulation.trace,
                         "activation":latest.regulation.activation,
@@ -4345,6 +4425,9 @@ impl ApplicationHandler for PetApplication {
                 &self.store.paths.root,
                 self.arguments.listen,
             ),
+            feeding_seconds: 0.0,
+            food_click_cooldown: 0.0,
+            companion_menu: None,
             organic: organic_runtime::OrganicRuntime::load(&self.store.paths.root),
             pointer: PointerState::default(),
             pointer_tracker: DesktopPointerTracker::default(),
@@ -4510,17 +4593,66 @@ impl ApplicationHandler for PetApplication {
                 );
             }
             WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                runtime.feeding_seconds = 0.0;
+                let running = runtime
+                    .companion_menu
+                    .as_mut()
+                    .is_some_and(|child| child.try_wait().ok().flatten().is_none());
+                if !running {
+                    let executable = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+                    if let Some(folder) = executable {
+                        let menu = [
+                            folder.join("Pet2 Dev Console.exe"),
+                            folder.join("body_lab.exe"),
+                        ]
+                        .into_iter()
+                        .find(|p| p.is_file());
+                        if let Some(menu) = menu {
+                            match std::process::Command::new(menu)
+                                .arg("--pet-menu")
+                                .arg("--data-dir")
+                                .arg(&self.store.paths.root)
+                                .spawn()
+                            {
+                                Ok(child) => runtime.companion_menu = Some(child),
+                                Err(error) => eprintln!("companion menu: {error}"),
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
             } => {
                 let down = state == ElementState::Pressed;
-                runtime.pointer_tracker.record_window_event(down);
+                if runtime.feeding_seconds > 0.0 {
+                    if down && runtime.food_click_cooldown <= 0.0 {
+                        runtime.ecology.sprinkle_food(
+                            runtime.sensors.cursor_position,
+                            runtime.sensors.timestamp.max(0.0),
+                        );
+                        runtime.food_click_cooldown = 0.20;
+                        runtime.save_accumulator = 30.0;
+                    }
+                } else {
+                    runtime.pointer_tracker.record_window_event(down);
+                }
             }
             WindowEvent::ModifiersChanged(modifiers) => runtime.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
+                if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
+                    runtime.feeding_seconds = 0.0;
+                }
                 if runtime.modifiers.super_key() && runtime.modifiers.alt_key() {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyF) => {
@@ -4685,13 +4817,10 @@ impl ApplicationHandler for PetApplication {
                     |_device, _queue, encoder, view| {
                         if ecology_ready {
                             ecology_renderer.render_prepared_den(encoder, view);
-                        }
-                    },
-                    |_device, _queue, encoder, view| {
-                        if ecology_ready {
                             ecology_renderer.render_prepared_objects(encoder, view);
                         }
                     },
+                    |_device, _queue, _encoder, _view| {},
                 );
                 runtime.render_microseconds = render_started.elapsed().as_secs_f64() * 1_000_000.0;
                 runtime
@@ -5264,6 +5393,15 @@ fn poll_lab_control(
             }
             changed
         }
+        LabControlCommand::Feeding { enabled } => {
+            runtime.feeding_seconds = if enabled { 90.0 } else { 0.0 };
+            runtime.window.set_cursor(if enabled {
+                winit::window::CursorIcon::Crosshair
+            } else {
+                winit::window::CursorIcon::Default
+            });
+            true
+        }
         LabControlCommand::Hearing { action } => {
             runtime.hearing.control(action);
             true
@@ -5299,6 +5437,7 @@ const fn lab_command_name(command: &LabControlCommand) -> &'static str {
         LabControlCommand::DeleteGestureConvention { .. } => "delete_gesture_convention",
         LabControlCommand::RollbackGestureConventions { .. } => "rollback_gesture_conventions",
         LabControlCommand::ClearGestureConventions => "clear_gesture_conventions",
+        LabControlCommand::Feeding { .. } => "feeding",
         LabControlCommand::Hearing { .. } => "hearing",
         LabControlCommand::ShutdownForPromotion => "shutdown_for_promotion",
     }
@@ -5942,7 +6081,13 @@ fn restore_orb_play_navigation(
 ) {
     if !matches!(
         goal,
-        Some(EpisodeGoal::SoloOrbPlay | EpisodeGoal::ChaseOrb | EpisodeGoal::InterceptOrb)
+        Some(
+            EpisodeGoal::SoloOrbPlay
+                | EpisodeGoal::ChaseOrb
+                | EpisodeGoal::InterceptOrb
+                | EpisodeGoal::InspectMorsel
+                | EpisodeGoal::EatMorsel
+        )
     ) || packet
         .program
         .is_some_and(|p| p.family() == pet_motor::ProgramFamily::DefenseIntegrity)
@@ -6826,7 +6971,7 @@ fn load_restore_body_state(store: &StateStore, body: &mut ProceduralBody) -> Res
     let Some(snapshot) = snapshot else {
         return Ok(false);
     };
-    body.restore_body_material_snapshot(&snapshot)
+    body.restore_body_for_startup(&snapshot)
         .map_err(|error| error.to_string())?;
     Ok(true)
 }
@@ -7059,6 +7204,39 @@ fn neutral_intent() -> BodyIntent {
     }
 }
 
+#[cfg(windows)]
+fn native_work_area(bounds: RectI) -> RectI {
+    use windows_sys::Win32::{
+        Foundation::POINT,
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
+    };
+    let point = POINT {
+        x: bounds.minimum.x + bounds.width() / 2,
+        y: bounds.minimum.y + bounds.height() / 2,
+    };
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST), &mut info) } != 0
+    {
+        RectI {
+            minimum: PhysicalDesktopPoint {
+                x: info.rcWork.left,
+                y: info.rcWork.top,
+            },
+            maximum: PhysicalDesktopPoint {
+                x: info.rcWork.right,
+                y: info.rcWork.bottom,
+            },
+        }
+    } else {
+        bounds
+    }
+}
+#[cfg(not(windows))]
+fn native_work_area(bounds: RectI) -> RectI {
+    bounds
+}
+
 fn topology_from_event_loop(event_loop: &ActiveEventLoop, revision: u64) -> DisplayTopology {
     let primary = event_loop.primary_monitor();
     let topology = DisplayTopology::new(
@@ -7091,7 +7269,7 @@ fn topology_from_event_loop(event_loop: &ActiveEventLoop, revision: u64) -> Disp
                         index
                     )),
                     physical_bounds: bounds,
-                    working_area: bounds,
+                    working_area: native_work_area(bounds),
                     scale_factor: monitor.scale_factor(),
                     primary: is_primary,
                 }
@@ -7668,6 +7846,16 @@ fn print_help() {
          \n  --listen                 Enable local microphone input and learned cues\n\
          \n\nHOTKEY: Cmd/Win+Alt+D toggles bounded causal telemetry at runtime\n"
     );
+}
+
+#[cfg(windows)]
+fn feeding_escape_down() -> bool {
+    // Read only while the user has explicitly selected feeding mode.
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x1B) < 0 }
+}
+#[cfg(not(windows))]
+fn feeding_escape_down() -> bool {
+    false
 }
 
 #[cfg(test)]

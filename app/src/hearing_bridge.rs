@@ -48,9 +48,12 @@ pub struct HearingBridge {
     onset_seconds: f32,
     onset_strength: f32,
     name_pending: bool,
+    startle_pending: f32,
+    startle_cooldown: f32,
     pub message: String,
     last_cue: String,
     accepted: u64,
+    completed_trainings: u64,
     rejected: u64,
     elapsed_since_save: f32,
     dirty: bool,
@@ -111,9 +114,12 @@ impl HearingBridge {
             onset_seconds: 0.0,
             onset_strength: 0.0,
             name_pending: false,
+            startle_pending: 0.0,
+            startle_cooldown: 0.0,
             message,
             last_cue: "none".into(),
             accepted: 0,
+            completed_trainings: 0,
             rejected: 0,
             elapsed_since_save: 0.0,
             dirty: enable,
@@ -137,6 +143,7 @@ impl HearingBridge {
                 self.name_seconds = 0.0;
                 self.name_pending = false;
                 self.onset_seconds = 0.0;
+                self.startle_pending = 0.0;
                 self.message = "Microphone off.".into();
                 self.dirty = true;
             }
@@ -211,6 +218,7 @@ impl HearingBridge {
         } else {
             0.0
         };
+        self.startle_cooldown = (self.startle_cooldown - dt).max(0.0);
         self.quiet_seconds = (self.quiet_seconds - dt).max(0.0);
         let was_testing = self.test_seconds > 0.0;
         self.test_seconds = (self.test_seconds - dt).max(0.0);
@@ -236,26 +244,27 @@ impl HearingBridge {
         for event in self.input.drain_percepts() {
             match event {
                 AudioPercept::Onset { rms } => {
-                    if !own_active && rms > 0.008 {
-                        self.onset_seconds = 0.65;
-                        let floor = self.input.status().noise_floor.max(0.002);
-                        self.onset_strength =
-                            ((rms / floor).max(1.0).log2() * 0.09).clamp(0.06, 0.42);
+                    let (interest, startle) =
+                        acoustic_response(rms, self.input.status().noise_floor, own_active);
+                    if interest > 0.0 {
+                        self.onset_seconds = 0.9;
+                        self.onset_strength = interest;
+                        if startle > 0.0 && self.startle_cooldown <= 0.0 && !self.training() {
+                            self.startle_pending = startle;
+                            self.startle_cooldown = 3.0;
+                        }
                     }
                 }
                 AudioPercept::CueAccepted { decision } => {
                     self.accepted += 1;
                     self.last_cue =
                         format!("{:?} ({:.0}%)", decision.cue, decision.confidence * 100.0);
-                    if self.test_seconds > 0.0 {
-                        continue;
-                    }
                     match decision.cue {
                         Some(CueKind::Name) if self.name_seconds <= 0.0 => {
                             self.name_seconds = 2.0;
                             self.name_pending = true;
                         }
-                        Some(CueKind::Quiet) => self.quiet(),
+                        Some(CueKind::Quiet) if self.test_seconds <= 0.0 => self.quiet(),
                         _ => {}
                     }
                 }
@@ -267,6 +276,7 @@ impl HearingBridge {
                     )
                 }
                 AudioPercept::TrainingComplete { cue, model_ready } => {
+                    self.completed_trainings += 1;
                     self.message = format!(
                         "{cue:?} examples saved; ready: {model_ready}. Add other words, then test fresh examples."
                     );
@@ -297,6 +307,10 @@ impl HearingBridge {
             (None, None)
         }
     }
+    pub fn take_startle(&mut self) -> f32 {
+        std::mem::take(&mut self.startle_pending)
+    }
+
     pub fn name_attention(&self) -> bool {
         self.name_seconds > 0.0 && !self.quiet_boundary()
     }
@@ -304,7 +318,7 @@ impl HearingBridge {
         std::mem::take(&mut self.name_pending)
     }
     pub fn sound_interest(&self) -> f32 {
-        (self.onset_seconds / 0.65).clamp(0.0, 1.0) * self.onset_strength
+        (self.onset_seconds / 0.9).clamp(0.0, 1.0) * self.onset_strength
     }
     pub fn quiet_boundary(&self) -> bool {
         self.quiet_seconds > 0.0
@@ -320,7 +334,11 @@ impl HearingBridge {
             "message":status.last_error.as_ref().unwrap_or(&self.message),"input_level":status.rms,
             "status":status,"last_cue":self.last_cue,"master_gain":self.master_gain,
             "quiet_seconds":self.quiet_seconds,"test_seconds":self.test_seconds,
-            "accepted":self.accepted,"rejected":self.rejected,"training":self.input.training_progress(),
+            "completed_trainings":self.completed_trainings,"accepted":self.accepted,"rejected":self.rejected,"training":self.input.training_progress(),
+            "name_examples":model.name.as_ref().map_or(0, |c| c.examples.len()),
+            "other_examples":model.other_examples.len(),
+            "quiet_examples":model.quiet.as_ref().map_or(0, |c| c.examples.len()),
+            "sound_interest": self.sound_interest(),
             "name_ready":model.is_ready(CueKind::Name),"quiet_ready":model.is_ready(CueKind::Quiet)})
     }
 
@@ -367,4 +385,33 @@ fn reference_updates_leave_queue_capacity_for_teaching_but_voice_edges_are_immed
         assert!(!cadence.due(0.001, true));
         assert!(cadence.due(0.001, false));
     }
+}
+
+// Salience relative to the measured room floor, with an absolute guard so a
+// whisper in a quiet room is interesting but never a frightening explosion.
+fn acoustic_response(rms: f32, floor: f32, own_active: bool) -> (f32, f32) {
+    if own_active || !rms.is_finite() || !floor.is_finite() || rms < 0.003 {
+        return (0.0, 0.0);
+    }
+    let ratio = rms / floor.max(0.0005);
+    if ratio < 2.2 {
+        return (0.0, 0.0);
+    }
+    let interest = (0.34 + ratio.log2() * 0.11).clamp(0.34, 0.82);
+    let startle = if rms >= 0.045 && ratio >= 5.0 {
+        0.85
+    } else {
+        0.0
+    };
+    (interest, startle)
+}
+
+#[test]
+fn sounds_distinguish_whispers_loud_onsets_and_own_voice() {
+    let whisper = acoustic_response(0.005, 0.001, false);
+    assert!(whisper.0 > 0.44 && whisper.1 == 0.0);
+    assert!(acoustic_response(0.10, 0.006, false).1 > 0.55);
+    assert_eq!(acoustic_response(0.10, 0.006, true), (0.0, 0.0));
+    assert_eq!(acoustic_response(0.006, 0.006, false), (0.0, 0.0));
+    assert_eq!(acoustic_response(f32::NAN, 0.001, false), (0.0, 0.0));
 }

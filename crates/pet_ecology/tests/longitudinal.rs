@@ -26,6 +26,7 @@ fn frame(action: ActionId, position: Vec2, timestamp: f64) -> EcologyBehaviorFra
         pet_position: position,
         pet_velocity: Vec2::ZERO,
         desktop_aspect: 16.0 / 9.0,
+        food_physical: None,
         orb_physical: PhysicalGrabFrame {
             socket_position: Vec2::splat(0.5),
             ..PhysicalGrabFrame::default()

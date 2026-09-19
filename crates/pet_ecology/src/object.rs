@@ -148,7 +148,12 @@ impl WorldObject {
             && self.position.cmpge(Vec2::ZERO).all()
             && self.position.cmple(Vec2::ONE).all()
             && self.velocity.length_squared() <= MAX_OBJECT_SPEED * MAX_OBJECT_SPEED + f32::EPSILON
-            && (4.0..=96.0).contains(&self.radius_px_at_reference)
+            && ((if self.kind == ObjectKind::Morsel {
+                1.0
+            } else {
+                4.0
+            })..=96.0)
+                .contains(&self.radius_px_at_reference)
             && (0.05..=8.0).contains(&self.mass)
             && (0.0..=1.0).contains(&self.restitution)
             && (0.0..=8.0).contains(&self.linear_drag)
