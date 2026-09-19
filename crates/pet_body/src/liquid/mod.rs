@@ -1242,7 +1242,11 @@ impl LiquidMorphRuntime {
                 self.seed_phase,
                 self.elapsed,
                 mind,
-                traits.flow_speed,
+                traits.flow_speed * self.somatic_actuation.internal.flow_speed_multiplier,
+                self.somatic_actuation.internal.flow_strength_multiplier,
+                self.somatic_actuation.internal.flow_damping,
+                self.somatic_actuation.internal.flow_phase,
+                self.somatic_actuation.internal.flow_phase_progress,
             );
             if self.cinematic_features {
                 self.apply_idle_breathing(breath, pose_drive, sub_dt);
@@ -1496,12 +1500,15 @@ impl LiquidMorphRuntime {
         body_world_position: Vec2,
         measured: bool,
     ) -> Option<SupportPlane> {
-        let Some(support) = self
-            .somatic_actuation
-            .support
-            .as_ref()
-            .filter(|support| measured && support.surface_id.0 == "screen:bottom_edge")
-        else {
+        let Some(support) = self.somatic_actuation.support.as_ref().filter(|support| {
+            let awake_cling = self.somatic_actuation.program
+                == Some(BehaviorProgramId::DefenseStrainBraceAndRelease)
+                && matches!(
+                    support.surface_id.0.as_str(),
+                    "screen:left_edge" | "screen:right_edge" | "screen:top_edge"
+                );
+            measured && (support.surface_id.0 == "screen:bottom_edge" || awake_cling)
+        }) else {
             self.support_plane_clearance = None;
             return None;
         };
@@ -3832,6 +3839,70 @@ mod flight_field_tests {
             runtime.somatic_feedback.completion_reason,
             CompletionReason::None
         );
+    }
+
+    #[test]
+    fn awake_side_and_top_grip_require_real_contour_contact_and_release_cleanly() {
+        let body_world = Vec2::splat(0.5);
+        let scale = Vec2::new(10.0, -10.0);
+        let motion = DropletMotion {
+            world_to_body_scale: scale,
+            ..DropletMotion::default()
+        };
+        for (surface_id, outward, tangent) in [
+            ("screen:left_edge", Vec2::NEG_X, Vec2::Y),
+            ("screen:top_edge", Vec2::Y, Vec2::X),
+        ] {
+            let mut runtime = LiquidMorphRuntime::new(0xC11A_600D);
+            runtime.somatic_actuation.program =
+                Some(BehaviorProgramId::DefenseStrainBraceAndRelease);
+            let render = runtime.render_state();
+            let contour = contact_surface::contact_surface_support(
+                &render.particles[..render.particle_count],
+                runtime.tuning.iso_threshold,
+                outward,
+            )
+            .expect("visible contour support point");
+            let inward = -outward;
+            runtime.somatic_actuation.support = Some(pet_motor::SurfaceAttachmentCommand {
+                surface_id: lifecore::SurfaceId(surface_id.into()),
+                anchor_point: body_world + contour / scale,
+                normal: inward * scale.signum(),
+                tangent: tangent * scale.signum(),
+                target_contact_fraction: 0.28,
+                normal_compliance: 0.22,
+                tangent_friction: 0.68,
+                adhesion: 0.42,
+                load_fraction: 0.18,
+                break_force: 0.58,
+                release_half_life: 0.42,
+            });
+            let measured = runtime.measured_surface_load(motion, body_world);
+            assert!(
+                measured.is_some(),
+                "{surface_id} did not touch liquid contour"
+            );
+            assert!(
+                runtime
+                    .measured_support_plane(motion, body_world, measured.is_some())
+                    .is_some(),
+                "{surface_id} did not create a physical support plane"
+            );
+
+            runtime
+                .somatic_actuation
+                .support
+                .as_mut()
+                .expect("support command")
+                .load_fraction = 0.0;
+            assert!(runtime.measured_surface_load(motion, body_world).is_none());
+            assert!(
+                runtime
+                    .measured_support_plane(motion, body_world, false)
+                    .is_none(),
+                "{surface_id} retained support after release"
+            );
+        }
     }
 }
 

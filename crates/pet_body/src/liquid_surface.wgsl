@@ -444,9 +444,9 @@ fn lid_aperture(local_eye: vec2<f32>, blink: f32, squint: f32, side: f32) -> f32
     // controls shift its crest toward the inner/outer corner.
     let span = sqrt(max(1.0 - x2, 0.0));
     let canthus = (shape.y - shape.x) * local_eye.x * side * 0.12;
-    // Neutral rests partly over the eye; positive recruitment has visible
-    // headroom to uncover it without magnifying the eyeball or iris.
-    let upper = canthus + span * (0.58 + mix(shape.x, shape.y, inner_to_outer) * 0.9
+    // Neutral rests lightly over the eye while remaining visibly awake;
+    // positive recruitment still has headroom to uncover the fixed eyeball.
+    let upper = canthus + span * (0.68 + mix(shape.x, shape.y, inner_to_outer) * 0.9
         - shape.w * 0.08 - blink * 1.65 - squint * 0.2 - (1.0 - globals.face_eye.x) * 1.7);
     let lower = canthus + span * (-0.86 + shape.z * 0.95 + blink * 0.72 + squint * 0.16);
     let aa = max(fwidth(local_eye.y), 0.035);

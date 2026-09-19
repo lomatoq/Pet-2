@@ -2,7 +2,10 @@ use glam::Vec2;
 use lifecore::{CompanionIntentFrame, PrimaryIntent};
 
 use crate::gaze_controller::GazeMode as CompanionGazeMode;
-use crate::{BlinkController, BlinkOwner, BlinkRequest, GazeController, GazePlan};
+use crate::{
+    BlinkContext, BlinkController, BlinkOutput, BlinkOwner, BlinkReason, BlinkRequest,
+    GazeController, GazePlan,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FaceTarget {
@@ -80,6 +83,7 @@ pub struct CompanionExpressionTarget {
     pub blink_left: f32,
     pub blink_right: f32,
     pub blink_owner: BlinkOwner,
+    pub blink_reason: BlinkReason,
     pub owner: ExpressionOwner,
 }
 
@@ -97,6 +101,13 @@ impl CompanionExpressionDirector {
     /// social refractory rules decide whether it is accepted.
     pub fn request_blink(&mut self, request: BlinkRequest) {
         self.blink.request(request);
+    }
+
+    /// Advances only the eyelid motor envelope. The host calls this at body
+    /// cadence after the slower causal `tick` has selected any new event.
+    #[must_use]
+    pub fn present_blink(&mut self, dt: f32) -> BlinkOutput {
+        self.blink.present(dt)
     }
 
     #[must_use]
@@ -126,6 +137,13 @@ impl CompanionExpressionDirector {
         let mut face = face_prototype(intent.primary);
         let mut body = body_prototype(intent.primary);
         let mut owner = ExpressionOwner::MotorIntent;
+
+        // Quiet supported rest is not sleep. Lid droop must follow measured
+        // fatigue rather than the Rest label alone.
+        if intent.primary == PrimaryIntent::Rest {
+            let tired = ((intent.fatigue - 0.35) / 0.50).clamp(0.0, 1.0);
+            face.eye_aperture = 0.96 - tired * 0.34;
+        }
 
         // Appraisal modulation is deliberately small: it enriches the semantic
         // intent rather than replacing it with a generic emotion mask.
@@ -283,31 +301,18 @@ impl CompanionExpressionDirector {
         let gaze = self.gaze.tick(gaze_plan, dt);
         face.pupil_focus = gaze.pupil_focus;
 
-        if matches!(intent.primary, PrimaryIntent::Sleep) {
-            self.blink.request(BlinkRequest {
-                owner: BlinkOwner::Sleep,
-                strength: 1.0,
-                duration: 2.5,
-            });
-        } else if matches!(intent.primary, PrimaryIntent::QuietCompanionship)
-            && intent.attachment > 0.55
-            && intent.arousal < 0.45
-            && intent.confidence > 0.7
-        {
-            // The runtime should gate this with a social event/refractory condition;
-            // this request is safe because BlinkController arbitrates/refracts it.
-            self.blink.request(BlinkRequest {
-                owner: BlinkOwner::Social,
-                strength: 0.82,
-                duration: 0.52,
-            });
-        }
-        let blink = self.blink.tick(
+        self.blink.update_context(
             dt,
-            intent.primary == PrimaryIntent::Sleep,
-            danger,
-            intent.fatigue,
+            BlinkContext {
+                sleeping: intent.primary == PrimaryIntent::Sleep,
+                protective: danger,
+                fatigue: intent.fatigue,
+                fixation_transition: gaze.fixation_started,
+                awaiting_important_outcome: intent.expected_outcome.user_response > 0.55
+                    && intent.anticipation > 0.35,
+            },
         );
+        let blink = self.blink.sample();
 
         sanitize_face(&mut face);
         sanitize_body(&mut body);
@@ -318,6 +323,7 @@ impl CompanionExpressionDirector {
             blink_left: blink.left,
             blink_right: blink.right,
             blink_owner: blink.owner,
+            blink_reason: blink.reason,
             owner,
         }
     }
@@ -358,8 +364,8 @@ fn gaze_mode_for(intent: PrimaryIntent, uncertainty: f32) -> CompanionGazeMode {
 
 fn face_prototype(intent: PrimaryIntent) -> FaceTarget {
     let mut face = FaceTarget {
-        eye_aperture: 0.90,
-        squint: 0.04,
+        eye_aperture: 0.98,
+        squint: 0.0,
         pupil_size: 0.50,
         pupil_focus: 0.55,
         brow_raise: 0.02,
@@ -536,6 +542,25 @@ mod tests {
     }
 
     #[test]
+    fn quiet_rest_keeps_awake_eyes_and_fatigue_still_droops_them() {
+        let mut director = CompanionExpressionDirector::new(42);
+        let mut resting = intent(PrimaryIntent::Rest);
+        resting.fatigue = 0.1;
+        let awake = director.tick(resting, ExpressionEvidence::default(), 0.05);
+        resting.fatigue = 0.9;
+        let tired = director.tick(resting, ExpressionEvidence::default(), 0.05);
+        assert!(awake.face.eye_aperture >= 0.95);
+        assert_eq!(awake.face.squint, 0.0);
+        assert!(awake.face.eye_aperture - tired.face.eye_aperture > 0.30);
+        let sleeping = director.tick(
+            intent(PrimaryIntent::Sleep),
+            ExpressionEvidence::default(),
+            0.05,
+        );
+        assert_eq!(sleeping.face.eye_aperture, 0.0);
+    }
+
+    #[test]
     fn actual_intent_families_drive_distinct_coherent_faces() {
         let mut director = CompanionExpressionDirector::new(42);
         let mut inspect = intent(PrimaryIntent::Inspect);
@@ -633,5 +658,43 @@ mod tests {
         }
         assert!(director.mouth_asymmetry.abs() < 0.001);
         assert!(director.brow_asymmetry.abs() < 0.001);
+    }
+
+    #[test]
+    fn quiet_companionship_label_does_not_generate_social_blinks() {
+        for hz in [30, 60, 120] {
+            let mut director = CompanionExpressionDirector::new(42);
+            let mut quiet = intent(PrimaryIntent::QuietCompanionship);
+            quiet.attachment = 0.95;
+            quiet.arousal = 0.1;
+            let mut social_frames = 0;
+            for body_tick in 0..hz * 90 {
+                if body_tick % (hz / 20).max(1) == 0 {
+                    let _ = director.tick(quiet, ExpressionEvidence::default(), 0.05);
+                }
+                let blink = director.present_blink(1.0 / hz as f32);
+                social_frames += usize::from(blink.owner == BlinkOwner::Social);
+            }
+            assert_eq!(social_frames, 0, "hz={hz}");
+        }
+    }
+
+    #[test]
+    fn explicit_social_response_is_one_complete_blink() {
+        let mut director = CompanionExpressionDirector::new(42);
+        director.request_blink(BlinkRequest {
+            owner: BlinkOwner::Social,
+            strength: 0.82,
+            duration: 0.52,
+        });
+        let mut starts = 0;
+        let mut active = false;
+        for _ in 0..120 {
+            let blink = director.present_blink(1.0 / 120.0);
+            let next = blink.owner == BlinkOwner::Social && blink.left > 0.05;
+            starts += usize::from(next && !active);
+            active = next;
+        }
+        assert_eq!(starts, 1);
     }
 }

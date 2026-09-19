@@ -38,6 +38,7 @@ fn rest_can_continue(goal: &BehaviorGoalFrame, context: &BehaviorContextFrame) -
 #[derive(Debug, Clone)]
 pub struct BehaviorPerformanceRuntime {
     previous_touch: bool,
+    startle_latched: bool,
     previous_world_goal: crate::MotorWorldGoal,
     contact_side: f32,
     pleasant_touch_seconds: f32,
@@ -65,8 +66,7 @@ pub struct BehaviorPerformanceRuntime {
     pending_convention_tempo: Option<(BehaviorProgramId, f32, f32)>,
     active_convention_tempo: f32,
     active_expression_gain: f32,
-    last_ornamental_attention:
-        Option<(lifecore::ActionId, lifecore::PrimaryIntent, glam::Vec2, f32)>,
+    last_ornamental_attention: Option<(glam::Vec2, f32)>,
 }
 
 impl BehaviorPerformanceRuntime {
@@ -74,6 +74,7 @@ impl BehaviorPerformanceRuntime {
     pub fn new(identity_seed: u64) -> Self {
         Self {
             previous_touch: false,
+            startle_latched: false,
             previous_world_goal: crate::MotorWorldGoal::None,
             contact_side: 1.0,
             pleasant_touch_seconds: 0.0,
@@ -208,6 +209,20 @@ impl BehaviorPerformanceRuntime {
         };
         for cooldown in &mut self.cooldowns {
             *cooldown = (*cooldown - dt).max(0.0);
+        }
+        let fresh_flick = context.gesture == lifecore::EmbodiedGestureKind::SharpFlick
+            && self.previous_gesture != context.gesture
+            && !context.gesture_ended
+            && context.gesture_confidence > 0.40;
+        if goal.felt.startle < 0.25 || fresh_flick {
+            self.startle_latched = false;
+        }
+        // A sustained alarm is one event, not a fresh head jerk every time
+        // the program cooldown expires. Rearm after recovery or a new flick.
+        if self.startle_latched {
+            let cooldown =
+                &mut self.cooldowns[BehaviorProgramId::DefenseStartleOrientFreeze.index()];
+            *cooldown = cooldown.max(dt + 0.01);
         }
         if let Some((_, _, age)) = &mut self.pending_convention_tempo {
             *age -= dt;
@@ -396,6 +411,8 @@ impl BehaviorPerformanceRuntime {
                     decision.program,
                     BehaviorProgramId::MoveInspectPauseScan
                         | BehaviorProgramId::MoveCheckBackSocialReference
+                        | BehaviorProgramId::MoveCuriosityArcApproach
+                        | BehaviorProgramId::SocialMutualGazePulse
                 ) && matches!(
                     goal.action,
                     lifecore::ActionId::IdleHover
@@ -408,22 +425,15 @@ impl BehaviorPerformanceRuntime {
                     .gaze_target
                     .unwrap_or(context.cursor_position);
                 let stale_ornament = ornamental
-                    && self.last_ornamental_attention.is_some_and(
-                        |(action, primary, point, salience)| {
-                            action == goal.action
-                                && primary == context.companion_intent
-                                && point.distance(target) < 0.08
+                    && self
+                        .last_ornamental_attention
+                        .is_some_and(|(point, salience)| {
+                            point.distance(target) < 0.08
                                 && context.selected_salience <= salience + 0.2
-                        },
-                    );
+                        });
                 if should_start && !stale_ornament {
                     if ornamental {
-                        self.last_ornamental_attention = Some((
-                            goal.action,
-                            context.companion_intent,
-                            target,
-                            context.selected_salience,
-                        ));
+                        self.last_ornamental_attention = Some((target, context.selected_salience));
                     }
                     if self.active.is_some() {
                         self.finish_active(CompletionReason::Interrupted);
@@ -599,6 +609,9 @@ impl BehaviorPerformanceRuntime {
         context: &BehaviorContextFrame,
     ) {
         let bout_id = self.next_bout_id;
+        if program == BehaviorProgramId::DefenseStartleOrientFreeze {
+            self.startle_latched = true;
+        }
         self.next_bout_id = self.next_bout_id.saturating_add(1);
         let target = lock_target(program, goal, context, self.remembered_surface.as_ref());
         if let Some(BehaviorTarget::Surface(surface)) = &target {
@@ -640,11 +653,24 @@ impl BehaviorPerformanceRuntime {
         }
         self.recent_motion_signatures
             .push_back(motion_signature(sampled_style));
+        // REM-like phases belong to sleep. A genuine WakeUp begins at the
+        // authored wake stretch instead of replaying onset/twitch/murmur with
+        // closed eyes after the animal is already awake.
+        let initial_phase_index = if program == BehaviorProgramId::RestRemDreamWake
+            && goal.action == lifecore::ActionId::WakeUp
+        {
+            4
+        } else {
+            0
+        };
         self.active = Some(ActivePerformance {
             social_bid: None,
             bout_id,
             program,
-            phase: PhaseId { program, index: 0 },
+            phase: PhaseId {
+                program,
+                index: initial_phase_index,
+            },
             phase_time: 0.0,
             total_time: 0.0,
             locked_target: target,
@@ -942,6 +968,73 @@ mod tests {
     }
 
     #[test]
+    fn sustained_startle_cannot_restart_the_same_head_motion_during_refractory_time() {
+        let mut goal = goal(ActionId::ObserveCursor, Vec2::new(0.9, 0.5));
+        goal.felt.startle = 0.9;
+        let context = BehaviorContextFrame::default();
+        let mut runtime = BehaviorPerformanceRuntime::new(10);
+
+        let first = runtime.tick(&goal, &context, 0.01);
+        assert_eq!(
+            first.program,
+            Some(BehaviorProgramId::DefenseStartleOrientFreeze)
+        );
+        runtime.finish_active(CompletionReason::PhaseComplete);
+        let second = runtime.tick(&goal, &context, 0.01);
+        assert_ne!(
+            second.program,
+            Some(BehaviorProgramId::DefenseStartleOrientFreeze)
+        );
+        assert!(runtime.cooldowns[BehaviorProgramId::DefenseStartleOrientFreeze.index()] > 5.9);
+    }
+
+    #[test]
+    fn genuine_wake_starts_at_opening_phase_not_closed_eye_rem_replay() {
+        let goal = goal(ActionId::WakeUp, Vec2::new(0.5, 0.9));
+        let context = BehaviorContextFrame::default();
+        let mut runtime = BehaviorPerformanceRuntime::new(11);
+        runtime.start(
+            BehaviorProgramId::RestRemDreamWake,
+            crate::MotorCause::BrainAction,
+            &goal,
+            &context,
+        );
+        let active = runtime.active().unwrap();
+        assert_eq!(active.phase.index, 4);
+        let packet = runtime.tick_lab_fixture(&goal, &context, 0.01);
+        assert_eq!(packet.phase_name, "wake_stretch_or_nrem");
+        assert!(packet.expression.eye_aperture_delta > -0.23);
+    }
+
+    #[test]
+    fn landing_hysteresis_does_not_flip_back_to_search_at_the_eight_pixel_boundary() {
+        let goal = goal(ActionId::Sleep, Vec2::new(0.5, 1.0));
+        let mut context = BehaviorContextFrame::default();
+        context.surfaces.push(crate::SurfaceCandidate {
+            surface_id: SurfaceId("screen:bottom_edge".into()),
+            minimum: Vec2::new(0.0, 1.0),
+            maximum: Vec2::ONE,
+            velocity: Vec2::ZERO,
+            familiarity: 1.0,
+            recent_failed_landings: 0,
+        });
+        context.screen_edge_gap_px = 11.5;
+        let decision = crate::selector::choose_program_with_rest_commitment(
+            &goal,
+            &context,
+            Some(BehaviorProgramId::RestLandingSoftTouchdown),
+            true,
+            &[0.0; PROGRAM_COUNT],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.program,
+            BehaviorProgramId::RestLandingSoftTouchdown
+        );
+    }
+
+    #[test]
     fn focus_or_boundary_cancels_social_bids_before_the_wait_phase() {
         let goal = goal(ActionId::ApproachCursor, Vec2::new(0.7, 0.5));
         for program in BehaviorProgramId::ALL
@@ -1055,6 +1148,103 @@ mod tests {
                 - values.iter().map(|v| v.0).fold(f32::INFINITY, f32::min)
         };
         assert!(spread(&loaded) < spread(&free) * 0.3);
+    }
+
+    #[test]
+    fn latched_startle_does_not_mask_new_pain() {
+        let mut runtime = BehaviorPerformanceRuntime::new(42);
+        let mut goal = goal(ActionId::ObserveCursor, Vec2::new(0.7, 0.5));
+        goal.felt.startle = 0.9;
+        let context = BehaviorContextFrame::default();
+        let _ = runtime.tick(&goal, &context, 0.05);
+        runtime.finish_active(CompletionReason::PhaseComplete);
+        goal.felt.pain_like = 0.8;
+        let packet = runtime.tick(&goal, &context, 0.05);
+        assert_eq!(
+            packet.program,
+            Some(BehaviorProgramId::DefenseLocalPainGuard)
+        );
+    }
+
+    #[test]
+    fn held_alarm_is_one_bout_and_recovery_rearms_it() {
+        let mut runtime = BehaviorPerformanceRuntime::new(42);
+        let mut goal = goal(ActionId::ObserveCursor, Vec2::new(0.7, 0.5));
+        goal.felt.startle = 0.9;
+        let context = BehaviorContextFrame::default();
+        let mut bouts = std::collections::BTreeSet::new();
+        for _ in 0..4_000 {
+            let packet = runtime.tick(&goal, &context, 0.05);
+            if packet.program == Some(BehaviorProgramId::DefenseStartleOrientFreeze) {
+                bouts.insert(packet.source_bout_id);
+            }
+        }
+        assert_eq!(bouts.len(), 1, "200 seconds of one alarm must not loop");
+        // Ablation: retaining the same cooldown but removing the event memory
+        // reproduces the old periodic restart under an unchanged alarm.
+        let mut control = BehaviorPerformanceRuntime::new(42);
+        let mut control_bouts = std::collections::BTreeSet::new();
+        for _ in 0..4_000 {
+            control.startle_latched = false;
+            let packet = control.tick(&goal, &context, 0.05);
+            if packet.program == Some(BehaviorProgramId::DefenseStartleOrientFreeze) {
+                control_bouts.insert(packet.source_bout_id);
+            }
+        }
+        assert!(
+            control_bouts.len() > 1,
+            "cooldown alone does not fix the loop"
+        );
+        goal.felt.startle = 0.0;
+        for _ in 0..140 {
+            let _ = runtime.tick(&goal, &context, 0.05);
+        }
+        goal.felt.startle = 0.9;
+        let packet = runtime.tick(&goal, &context, 0.05);
+        assert_eq!(
+            packet.program,
+            Some(BehaviorProgramId::DefenseStartleOrientFreeze)
+        );
+        assert!(!bouts.contains(&packet.source_bout_id));
+    }
+
+    #[test]
+    fn quiet_action_chatter_does_not_renew_the_same_head_gesture() {
+        let mut runtime = BehaviorPerformanceRuntime::new(42);
+        let mut context = BehaviorContextFrame {
+            companion_confidence: 0.9,
+            ..BehaviorContextFrame::default()
+        };
+        let mut goal = goal(ActionId::ObserveCursor, Vec2::new(0.7, 0.5));
+        goal.drives.safety = 0.0;
+        let mut bouts = std::collections::BTreeSet::new();
+        for tick in 0..4_000 {
+            goal.action = if (tick / 80) % 2 == 0 {
+                ActionId::ObserveCursor
+            } else {
+                ActionId::ObserveUserActivity
+            };
+            context.companion_intent = if (tick / 80) % 2 == 0 {
+                lifecore::PrimaryIntent::Inspect
+            } else {
+                lifecore::PrimaryIntent::SocialCheckIn
+            };
+            let packet = runtime.tick(&goal, &context, 0.05);
+            if matches!(
+                packet.program,
+                Some(
+                    BehaviorProgramId::MoveInspectPauseScan
+                        | BehaviorProgramId::MoveCheckBackSocialReference
+                )
+            ) {
+                bouts.insert(packet.source_bout_id);
+            }
+        }
+        assert_eq!(bouts.len(), 1);
+        goal.body_intent.gaze_target = Some(Vec2::new(0.2, 0.5));
+        let packet = runtime.tick(&goal, &context, 0.05);
+        assert!(packet.program.is_some());
+        assert!(!bouts.contains(&packet.source_bout_id));
     }
 
     #[test]

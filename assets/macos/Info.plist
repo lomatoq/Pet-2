@@ -15,6 +15,7 @@
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>When you enable hearing, Persik reacts to sound and learns your name and quiet cues locally. Audio recordings are not saved or sent anywhere.</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict>
 </plist>

@@ -2,7 +2,10 @@ use std::{
     fs::File,
     io::{self, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -16,6 +19,26 @@ use crate::{
 };
 
 const ERROR_CAPACITY: usize = 8;
+static MASTER_OUTPUT_GAIN: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
+
+struct OutputGain {
+    current: f32,
+    step: f32,
+}
+
+impl OutputGain {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            current: 1.0,
+            step: 1.0 / (0.05 * sample_rate.max(1) as f32),
+        }
+    }
+
+    fn apply(&mut self, stereo: [f32; 2], target: f32) -> [f32; 2] {
+        self.current += (target - self.current).clamp(-self.step, self.step);
+        stereo.map(|sample| sample * self.current)
+    }
+}
 
 #[test]
 fn sleep_breath_uses_real_queue_renderer_without_phonation() {
@@ -187,6 +210,21 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    /// Immediate process-local output boundary; active phrases and breath share
+    /// the same 50 ms click-free ramp. Never raises the authored output level.
+    pub fn set_master_gain(gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        MASTER_OUTPUT_GAIN.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn master_gain() -> f32 {
+        f32::from_bits(MASTER_OUTPUT_GAIN.load(Ordering::Relaxed))
+    }
     /// Caller retains quiet-mode, event admission and cooldown ownership.
     pub fn enqueue_nonphonated(
         &self,
@@ -268,10 +306,17 @@ impl AudioEngine {
                 );
                 let channels = usize::from(selected.channels);
                 let feedback_for_levels = Arc::clone(&feedback);
+                let mut gain = OutputGain::new(selected.sample_rate);
                 device.build_output_stream(
                     &config,
                     move |output: &mut [f32], _| {
-                        fill_f32(&mut synth, output, channels, &feedback_for_levels);
+                        fill_f32(
+                            &mut synth,
+                            output,
+                            channels,
+                            &feedback_for_levels,
+                            &mut gain,
+                        );
                     },
                     error_callback,
                     None,
@@ -286,10 +331,17 @@ impl AudioEngine {
                 );
                 let channels = usize::from(selected.channels);
                 let feedback_for_levels = Arc::clone(&feedback);
+                let mut gain = OutputGain::new(selected.sample_rate);
                 device.build_output_stream(
                     &config,
                     move |output: &mut [i16], _| {
-                        fill_i16(&mut synth, output, channels, &feedback_for_levels);
+                        fill_i16(
+                            &mut synth,
+                            output,
+                            channels,
+                            &feedback_for_levels,
+                            &mut gain,
+                        );
                     },
                     error_callback,
                     None,
@@ -304,10 +356,17 @@ impl AudioEngine {
                 );
                 let channels = usize::from(selected.channels);
                 let feedback_for_levels = Arc::clone(&feedback);
+                let mut gain = OutputGain::new(selected.sample_rate);
                 device.build_output_stream(
                     &config,
                     move |output: &mut [u16], _| {
-                        fill_u16(&mut synth, output, channels, &feedback_for_levels);
+                        fill_u16(
+                            &mut synth,
+                            output,
+                            channels,
+                            &feedback_for_levels,
+                            &mut gain,
+                        );
                     },
                     error_callback,
                     None,
@@ -551,13 +610,15 @@ fn fill_f32(
     output: &mut [f32],
     channels: usize,
     feedback: &AudioVisualBridge,
+    gain: &mut OutputGain,
 ) {
     synth.begin_callback();
+    let target_gain = AudioEngine::master_gain();
     let mut energy = 0.0;
     let mut peak = 0.0_f32;
     let mut count = 0.0_f32;
     for frame in output.chunks_mut(channels.max(1)) {
-        let stereo = synth.next_stereo_frame();
+        let stereo = gain.apply(synth.next_stereo_frame(), target_gain);
         accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
         write_frame_slice(stereo, frame, |sample| sample);
     }
@@ -569,13 +630,15 @@ fn fill_i16(
     output: &mut [i16],
     channels: usize,
     feedback: &AudioVisualBridge,
+    gain: &mut OutputGain,
 ) {
     synth.begin_callback();
+    let target_gain = AudioEngine::master_gain();
     let mut energy = 0.0;
     let mut peak = 0.0_f32;
     let mut count = 0.0_f32;
     for frame in output.chunks_mut(channels.max(1)) {
-        let stereo = synth.next_stereo_frame();
+        let stereo = gain.apply(synth.next_stereo_frame(), target_gain);
         accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
         write_frame_slice(stereo, frame, to_i16);
     }
@@ -587,13 +650,15 @@ fn fill_u16(
     output: &mut [u16],
     channels: usize,
     feedback: &AudioVisualBridge,
+    gain: &mut OutputGain,
 ) {
     synth.begin_callback();
+    let target_gain = AudioEngine::master_gain();
     let mut energy = 0.0;
     let mut peak = 0.0_f32;
     let mut count = 0.0_f32;
     for frame in output.chunks_mut(channels.max(1)) {
-        let stereo = synth.next_stereo_frame();
+        let stereo = gain.apply(synth.next_stereo_frame(), target_gain);
         accumulate_levels(stereo, channels, &mut energy, &mut peak, &mut count);
         write_frame_slice(stereo, frame, to_u16);
     }
@@ -676,6 +741,22 @@ fn to_u16(sample: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_boundary_attenuates_active_samples_with_bounded_ramp() {
+        for rate in [16_000, 44_100, 48_000] {
+            let mut gain = OutputGain::new(rate);
+            let mut previous = 1.0;
+            for _ in 0..rate / 10 {
+                let frame = gain.apply([1.0, -0.5], 0.15);
+                assert!(frame[0] <= previous + 1.0e-6);
+                assert!((frame[0] - previous).abs() <= gain.step + 1.0e-6);
+                assert!((frame[1] + frame[0] * 0.5).abs() < 1.0e-6);
+                previous = frame[0];
+            }
+            assert!((previous - 0.15).abs() < 1.0e-5);
+        }
+    }
 
     fn panned(source: f32, pan: f32) -> [f32; 2] {
         [

@@ -877,10 +877,27 @@ impl BoundedMaterialActuation {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalFlowPhase {
+    #[default]
+    Ambient,
+    Notice,
+    Prepare,
+    Act,
+    AwaitOutcome,
+    Outcome,
+    Recover,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct InternalPhysiologyActuation {
     pub flow_strength_multiplier: f32,
     pub flow_speed_multiplier: f32,
+    #[serde(default)]
+    pub flow_phase: InternalFlowPhase,
+    #[serde(default)]
+    pub flow_phase_progress: f32,
     pub pulse_amplitude: f32,
     pub breath_amplitude_multiplier: f32,
     pub breath_speed_multiplier: f32,
@@ -892,6 +909,8 @@ impl Default for InternalPhysiologyActuation {
         Self {
             flow_strength_multiplier: 1.0,
             flow_speed_multiplier: 1.0,
+            flow_phase: InternalFlowPhase::Ambient,
+            flow_phase_progress: 0.0,
             pulse_amplitude: 0.0,
             breath_amplitude_multiplier: 1.0,
             breath_speed_multiplier: 1.0,
@@ -1101,6 +1120,7 @@ impl SomaticActuationPacket {
             finite(self.internal.flow_strength_multiplier, 1.0).clamp(0.20, 1.60);
         self.internal.flow_speed_multiplier =
             finite(self.internal.flow_speed_multiplier, 1.0).clamp(0.20, 1.60);
+        self.internal.flow_phase_progress = unit(self.internal.flow_phase_progress);
         self.internal.pulse_amplitude = unit(self.internal.pulse_amplitude);
         self.internal.breath_amplitude_multiplier =
             finite(self.internal.breath_amplitude_multiplier, 1.0).clamp(0.35, 1.80);

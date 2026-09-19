@@ -18,6 +18,7 @@ mod interoception;
 mod language;
 mod memory;
 mod microbrain;
+mod organic_regulation;
 mod persistence;
 mod phenotype;
 mod phenotype_director;
@@ -44,6 +45,7 @@ pub use interoception::*;
 pub use language::*;
 pub use memory::*;
 pub use microbrain::*;
+pub use organic_regulation::*;
 pub use persistence::*;
 pub use phenotype::*;
 pub use phenotype_director::*;
@@ -928,6 +930,18 @@ impl LifeCore {
             if sensors.desktop_focus_pressure > 0.62 && !action.is_desktop_work_allowed() {
                 return -100.0;
             }
+            // WakeUp is a transition out of an actual sleep bout, not an
+            // ordinary quiet action. Letting it enter the awake softmax made
+            // the animal repeatedly perform its closed-eye wake sequence while
+            // already active.
+            if action == ActionId::WakeUp
+                && !matches!(
+                    self.state.current_action,
+                    ActionId::Sleep | ActionId::WakeUp
+                )
+            {
+                return -100.0;
+            }
             if action == ActionId::FrustratedRetreat
                 && self.state.affect.frustration < 0.22
                 && self.state.drives.safety < 0.35
@@ -1553,7 +1567,16 @@ fn conditions_met(
         return false;
     }
     if conditions.needs_surface && sensors.visible_surfaces.is_empty() {
-        return false;
+        // The four physical desktop boundaries are always present even on a
+        // clear desktop. Window surfaces are optional sensed affordances; they
+        // must not make edge landing/clinging unreachable when no window is
+        // exposed. An invalid/zero screen still rejects the action.
+        let desktop_boundary_available = sensors.screen_size.is_finite()
+            && sensors.screen_size.x > 0.0
+            && sensors.screen_size.y > 0.0;
+        if !desktop_boundary_available {
+            return false;
+        }
     }
     if conditions.threat_only
         && state.drives.safety < 0.35
@@ -1589,7 +1612,11 @@ fn temperament_bias(action: ActionId, state: &LifeState) -> f32 {
         ActionId::RetreatFromCursor | ActionId::FrustratedRetreat => {
             (1.0 - temperament.boldness) * 0.30 + state.drives.safety * 0.45
         }
-        ActionId::ExploreScreen | ActionId::PeekFromEdge | ActionId::ObserveCursor => {
+        ActionId::ExploreScreen
+        | ActionId::PeekFromEdge
+        | ActionId::ObserveCursor
+        | ActionId::LandOnWindow
+        | ActionId::ClingToWindowSide => {
             temperament.curiosity * 0.28 + temperament.exploration_rate * 0.24
         }
         ActionId::InviteCursorChase
@@ -2379,6 +2406,28 @@ mod tests {
     }
 
     #[test]
+    fn wake_up_is_only_a_sleep_transition_candidate() {
+        let mut core = LifeCore::new(Genome::from_seed(45), 45);
+        core.state.current_action = ActionId::ObserveCursor;
+        let awake_scores = core.score_actions(
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            &[0.0; CONTEXT_SIZE],
+            &[0.0; ACTION_COUNT],
+        );
+        assert_eq!(awake_scores[ActionId::WakeUp.index()], -100.0);
+
+        core.state.current_action = ActionId::Sleep;
+        let sleeping_scores = core.score_actions(
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            &[0.0; CONTEXT_SIZE],
+            &[0.0; ACTION_COUNT],
+        );
+        assert!(sleeping_scores[ActionId::WakeUp.index()] > -100.0);
+    }
+
+    #[test]
     fn captured_material_drag_cannot_replace_navigation_action_mid_press() {
         let mut core = LifeCore::new(Genome::from_seed(46), 46);
         core.state.current_action = ActionId::SelfPlay;
@@ -2549,6 +2598,35 @@ mod tests {
         let body = BodyFeedback::default();
         assert!(!conditions_met(conditions, &core.state, &distant, &body));
         assert!(conditions_met(conditions, &core.state, &nearby, &body));
+    }
+
+    #[test]
+    fn desktop_boundary_is_a_surface_affordance_without_visible_windows() {
+        let core = LifeCore::new(Genome::from_seed(44), 44);
+        let conditions = ActionId::ClingToWindowSide.definition().required_conditions;
+        let clear_desktop = SensorFrame {
+            screen_size: Vec2::new(2560.0, 1440.0),
+            visible_surfaces: Vec::new(),
+            ..SensorFrame::default()
+        };
+        assert!(conditions_met(
+            conditions,
+            &core.state,
+            &clear_desktop,
+            &BodyFeedback::default()
+        ));
+
+        let unavailable_desktop = SensorFrame {
+            screen_size: Vec2::ZERO,
+            visible_surfaces: Vec::new(),
+            ..SensorFrame::default()
+        };
+        assert!(!conditions_met(
+            conditions,
+            &core.state,
+            &unavailable_desktop,
+            &BodyFeedback::default()
+        ));
     }
 
     #[test]

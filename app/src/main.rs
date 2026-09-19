@@ -8,10 +8,12 @@ mod activity_glance;
 mod companion_runtime;
 mod ecology_runtime;
 mod evolution_runner;
+mod hearing_bridge;
 mod local_voice_context;
 mod motor_context;
 mod nearby_gaze;
 mod nervous_system_runtime;
+mod organic_runtime;
 mod pointer_replay_runner;
 mod repertoire_bridge;
 mod repertoire_learning_events;
@@ -290,6 +292,7 @@ struct Arguments {
     reset_learning: bool,
     reset_pet: bool,
     no_audio: bool,
+    listen: bool,
     focus_mode: bool,
     brain_mode: BrainMode,
     debug_log: bool,
@@ -364,6 +367,7 @@ impl Arguments {
                     );
                 }
                 "--no-audio" | "--no-audio-output" => parsed.no_audio = true,
+                "--listen" => parsed.listen = true,
                 "--focus-mode" => parsed.focus_mode = true,
                 "--brain-mode" => {
                     parsed.brain_mode = value("--brain-mode", &mut arguments)?.parse()?;
@@ -1447,6 +1451,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             );
             body.set_embodied_environment(ecology.environment());
             body.set_ecology_visual_effect(ecology.visual_effect());
+            nervous.advance_eye_presentation(&mut output.body_intent, SENSOR_DT);
             body.embodied_update(
                 &output.body_intent,
                 &sensors,
@@ -2075,6 +2080,8 @@ struct PetRuntime {
     dev_mode: bool,
     body: ProceduralBody,
     audio: AudioManager,
+    hearing: hearing_bridge::HearingBridge,
+    organic: organic_runtime::OrganicRuntime,
     sensors: SensorFrame,
     intent: BodyIntent,
     pointer: PointerState,
@@ -2384,6 +2391,11 @@ impl PetApplication {
         }
         let elapsed = (now - runtime.last_update).as_secs_f32().min(0.25);
         runtime.last_update = now;
+        runtime.hearing.poll(
+            elapsed,
+            runtime.audio.callback_levels().rms,
+            runtime.audio.visual_feedback().active,
+        );
         runtime.body_accumulator += elapsed;
         runtime.life_accumulator += elapsed;
         runtime.sensor_accumulator += elapsed;
@@ -2604,6 +2616,9 @@ impl PetApplication {
             runtime.vita.set_embodied_gesture_tuning(classifier_tuning(
                 runtime.body.tuning_profile().interaction,
             ));
+            let (input_rms, input_voice) = runtime.hearing.input_levels();
+            runtime.sensors.audio_rms = input_rms;
+            runtime.sensors.voice_activity = input_voice;
             runtime.vita.observe(
                 &runtime.sensors,
                 &runtime.body.simulation.feedback,
@@ -2769,6 +2784,9 @@ impl PetApplication {
                 runtime.screen_tick_jump_events = runtime.screen_tick_jump_events.saturating_add(1);
             }
             let voice = voice_visual_state(&runtime.audio);
+            runtime
+                .nervous_system
+                .advance_eye_presentation(&mut runtime.intent, body_dt);
             runtime.body.embodied_update(
                 &runtime.intent,
                 &runtime.sensors,
@@ -2959,6 +2977,9 @@ impl PetApplication {
                 .map_or(0.0, |target| target.score),
         );
         while runtime.life_accumulator >= LIFE_DT {
+            let (input_rms, input_voice) = runtime.hearing.input_levels();
+            runtime.sensors.audio_rms = input_rms;
+            runtime.sensors.voice_activity = input_voice;
             let tick_started = Instant::now();
             if !runtime.nervous_system.has_fresh_body() {
                 // A delayed presentation must not train repeatedly on one body sample.
@@ -3112,6 +3133,20 @@ impl PetApplication {
                 source: gaze_source,
             };
             let mut motor_context = build_motor_context(runtime);
+            let heard_name = runtime.hearing.take_name_event();
+            if heard_name
+                && !runtime.sensors.pet_dragged
+                && !runtime.hearing.quiet_boundary()
+                && !motor_context.focus_mode
+                && runtime.life.state.current_action != ActionId::Sleep
+            {
+                runtime
+                    .motor
+                    .acknowledge_recognition(runtime.body.simulation.feedback.world_position, 0.95);
+            }
+            motor_context.selected_salience = motor_context
+                .selected_salience
+                .max(runtime.hearing.sound_interest());
             if let Some(episode) = runtime.ecology.active_episode()
                 && episode.phase == EpisodePhase::AskForHelp
                 && episode.attempts >= 2
@@ -3145,6 +3180,22 @@ impl PetApplication {
                 recent_outcome,
             };
             update_surface_care(runtime, &motor_goal, &mut motor_context);
+            runtime.organic.tick(
+                &motor_goal,
+                &mut motor_context,
+                organic_runtime::OrganicRuntimeInput {
+                    heard_name,
+                    sound_interest: runtime.hearing.sound_interest(),
+                    quiet: runtime.hearing.quiet_boundary() || runtime.hearing.training(),
+                    user_available: runtime.vita.percept().user_available,
+                    novelty: runtime.vita.percept().visual_change.unwrap_or(0.0),
+                    prediction_error: runtime.vita.companion_intent().surprise,
+                    direct_contact: f32::from(runtime.sensors.pet_touched),
+                    expected: Some(runtime.vita.companion_intent().expected_outcome),
+                    ..Default::default()
+                },
+                LIFE_DT,
+            );
             let mut motor_packet = if let Some(program) = runtime.lab_motor_program {
                 if runtime.lab_motor_restart {
                     runtime
@@ -3274,6 +3325,18 @@ impl PetApplication {
             );
             repertoire_bridge::merge_packet(&mut motor_packet, &repertoire);
             apply_surface_care_packet(&runtime.last_surface_care, &mut motor_packet);
+            runtime
+                .organic
+                .decorate_packet(&motor_goal, &mut motor_packet);
+            if runtime.hearing.quiet_boundary()
+                && !motor_context.pet_dragged
+                && motor_goal.felt.startle <= 0.4
+                && motor_goal.felt.pain_like <= 0.2
+            {
+                motor_packet.locomotion.speed_multiplier =
+                    motor_packet.locomotion.speed_multiplier.min(0.45);
+                motor_packet.internal.flow_strength_multiplier *= 0.8;
+            }
             if let Some(request) = repertoire.blink_request {
                 runtime.nervous_system.request_repertoire_blink(request);
             }
@@ -3339,6 +3402,21 @@ impl PetApplication {
             let (attention, kind) = if activity_glance.active {
                 (
                     Some(motor_context.body.motion.world_position),
+                    lifecore::AttentionTargetKind::Social,
+                )
+            } else {
+                (attention, kind)
+            };
+            let (attention, kind) = if runtime.hearing.name_attention()
+                && !danger
+                && !runtime.sensors.pet_dragged
+                && !runtime.sensors.pet_touched
+                && !motor_context.focus_mode
+                && motor_goal.action != ActionId::Sleep
+                && motor_context.world_goal == MotorWorldGoal::None
+            {
+                (
+                    Some(runtime.body.simulation.feedback.world_position),
                     lifecore::AttentionTargetKind::Social,
                 )
             } else {
@@ -3438,8 +3516,10 @@ impl PetApplication {
             }
             // Sleep itself suppresses social chatter, not the requested quiet
             // breathing. Explicit focus and disabled audio still prohibit it.
-            let quiet =
-                runtime.life.state.focus_mode || runtime.audio.state == AudioManagerState::Disabled;
+            let quiet = runtime.life.state.focus_mode
+                || runtime.audio.state == AudioManagerState::Disabled
+                || runtime.hearing.quiet_boundary()
+                || runtime.hearing.training();
             let actual_sleep = runtime.last_motor_packet.locomotion.pose
                 == pet_motor::MotorPoseIntent::SupportedSleep;
             let supported = runtime
@@ -3807,6 +3887,7 @@ impl PetApplication {
                         "activity_glance": runtime.last_activity_glance,
                         "repertoire_catalog_count": pet_motor::REPERTOIRE_COUNT,
                         "observed_ordinary_blinks": runtime.nervous_system.observed_ordinary_blinks,
+                        "blink_reason": format!("{:?}", runtime.nervous_system.blink_reason()),
                         "repertoire_autonomous_ids": pet_motor::AUTONOMOUS_REPERTOIRE_IDS,
                         "repertoire_object_event_ids": repertoire_object_events::OBJECT_REPERTOIRE_IDS,
                         "repertoire_perception_ids": repertoire_perception_events::PERCEPTION_REPERTOIRE_IDS,
@@ -3984,6 +4065,16 @@ impl PetApplication {
                     "audio_recent_peak": runtime.audio.recent_peak,
                     "audio_accepted_requests": runtime.audio.accepted_requests,
                     "audio_rejected_requests": runtime.audio.rejected_requests,
+                    "hearing": runtime.hearing.telemetry(),
+                    "organic": runtime.organic.latest().map(|latest| serde_json::json!({
+                        "trace":latest.regulation.trace,
+                        "activation":latest.regulation.activation,
+                        "recovery":latest.regulation.recovery,
+                        "bid_allowed":latest.regulation.bid_allowed,
+                        "habit_strength":latest.regulation.selected_habit_strength,
+                        "preferred_rest_target":latest.preferred_rest_target,
+                        "cling_available":latest.cling_available,
+                    })),
                     "audio": {
                         "state": format!("{:?}", runtime.audio.state),
                         "configured": runtime.audio.selected_config().is_some(),
@@ -4235,6 +4326,11 @@ impl ApplicationHandler for PetApplication {
             brain_mode: self.arguments.brain_mode,
             dev_mode: self.arguments.dev_mode,
             audio,
+            hearing: hearing_bridge::HearingBridge::load(
+                &self.store.paths.root,
+                self.arguments.listen,
+            ),
+            organic: organic_runtime::OrganicRuntime::load(&self.store.paths.root),
             pointer: PointerState::default(),
             pointer_tracker: DesktopPointerTracker::default(),
             cursor_hittest_latch: CursorHitTestLatch::default(),
@@ -4674,6 +4770,9 @@ fn write_runtime_ack(store: &StateStore, runtime: &PetRuntime, status: RuntimeLo
 }
 
 fn persist_runtime(store: &StateStore, export: Option<&PathBuf>, runtime: &PetRuntime) {
+    if let Err(error) = runtime.organic.save(&store.paths.root) {
+        eprintln!("could not save causal behavior state: {error}");
+    }
     let size = runtime.window.outer_size();
     let body_center = safe_body_center(
         &runtime.topology,
@@ -5150,6 +5249,10 @@ fn poll_lab_control(
             }
             changed
         }
+        LabControlCommand::Hearing { action } => {
+            runtime.hearing.control(action);
+            true
+        }
         LabControlCommand::ShutdownForPromotion => {
             runtime.shutdown_for_promotion = true;
             true
@@ -5181,6 +5284,7 @@ const fn lab_command_name(command: &LabControlCommand) -> &'static str {
         LabControlCommand::DeleteGestureConvention { .. } => "delete_gesture_convention",
         LabControlCommand::RollbackGestureConventions { .. } => "rollback_gesture_conventions",
         LabControlCommand::ClearGestureConventions => "clear_gesture_conventions",
+        LabControlCommand::Hearing { .. } => "hearing",
         LabControlCommand::ShutdownForPromotion => "shutdown_for_promotion",
     }
 }
@@ -5661,6 +5765,32 @@ fn build_motor_context(runtime: &mut PetRuntime) -> BehaviorContextFrame {
         familiarity: 1.0,
         recent_failed_landings: 0,
     });
+    for (id, minimum, maximum) in [
+        (
+            "screen:left_edge",
+            Vec2::ZERO,
+            Vec2::new(1.0 / desktop_size.x, 1.0),
+        ),
+        (
+            "screen:right_edge",
+            Vec2::new(1.0 - 1.0 / desktop_size.x, 0.0),
+            Vec2::ONE,
+        ),
+        (
+            "screen:top_edge",
+            Vec2::ZERO,
+            Vec2::new(1.0, 1.0 / desktop_size.y),
+        ),
+    ] {
+        context.surfaces.push(SurfaceCandidate {
+            surface_id: SurfaceId(id.into()),
+            minimum,
+            maximum,
+            velocity: Vec2::ZERO,
+            familiarity: 0.8,
+            recent_failed_landings: 0,
+        });
+    }
     context
 }
 
@@ -6281,6 +6411,10 @@ fn request_ecology_voice(
 }
 
 fn enqueue_vocal_candidate(runtime: &mut PetRuntime, mut request: lifecore::VocalRequest) {
+    if runtime.hearing.quiet_boundary() || runtime.hearing.training() {
+        runtime.life.cancel_vocal_request(request.performance_seed);
+        return;
+    }
     let voice = runtime.life.state.genome.voice.clone();
     runtime
         .nervous_system
@@ -7197,6 +7331,9 @@ fn apply_screen_domain(
     // The side walls touch visible gel, not the zero-density kernel skirt.
     bounds_minimum.x = contact.minimum.x;
     bounds_maximum.x = contact.maximum.x;
+    // The ceiling, like the other walls, meets the visible gel rather than
+    // the symmetric free-flight hull surrounding its largest lobe.
+    bounds_minimum.y = contact.minimum.y.min(-1.0);
     // Collision geometry cannot change merely because a behavior changes.
     // Switching from the actual lower silhouette to the taller upper lobe's
     // symmetric radius on leaving rest projected the pet upward by >60 px.
@@ -7482,6 +7619,7 @@ fn print_help() {
          \n  --debug-log              Write 1 Hz frame and embodiment diagnostics\n\
          \n  --dev-mode               Start bounded 5 Hz causal telemetry\n\
          \n  --no-audio-output        Disable device playback, not offline synthesis\n\
+         \n  --listen                 Enable local microphone input and learned cues\n\
          \n\nHOTKEY: Cmd/Win+Alt+D toggles bounded causal telemetry at runtime\n"
     );
 }

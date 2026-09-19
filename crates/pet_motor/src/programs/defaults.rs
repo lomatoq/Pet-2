@@ -7,6 +7,8 @@ use crate::{
     VoiceSemanticIntent, body_field, push_field, wave_field,
 };
 
+use super::{smooth, surface_command};
+
 /// Family-level procedural defaults for the catalog programs that do not need
 /// bespoke tuning. One controller per family keeps all 64 programs executable
 /// and bounded without 64 independent visual calibration passes.
@@ -253,6 +255,65 @@ pub(crate) fn apply(
                 packet.voice.semantic = VoiceSemanticIntent::Boundary;
                 packet.voice.emit_once = true;
                 packet.voice.intensity = 0.30;
+            }
+            if active.program == P::DefenseStrainBraceAndRelease
+                && goal.action == lifecore::ActionId::ClingToWindowSide
+            {
+                let release = if phase == "release" {
+                    1.0 - smooth(progress)
+                } else {
+                    1.0
+                };
+                let holding = context.somatic.supported && release > 0.05;
+                packet.locomotion.pose = if phase == "release" {
+                    MotorPoseIntent::Recover
+                } else if holding {
+                    MotorPoseIntent::SupportedRest
+                } else {
+                    MotorPoseIntent::Landing
+                };
+                // The target lock chooses a measured desktop edge. Keep an
+                // approach drive until the contour has actually established
+                // support; otherwise the defense-family default leaves this
+                // action stationary and it can never acquire its grip.
+                packet.locomotion.speed_multiplier = if phase == "release" || holding {
+                    0.0
+                } else {
+                    0.62
+                };
+                packet.locomotion.acceleration_limit = if holding { 0.72 } else { 0.55 };
+                packet.locomotion.gaze_lead = if holding { 0.24 } else { 0.82 };
+                packet.material.density_compliance_multiplier = 1.04;
+                packet.material.viscosity_multiplier = 1.08;
+                packet.material.surface_tension_multiplier = 1.02;
+                packet.internal.flow_damping = 0.24;
+                let load = if holding { 0.18 } else { 0.06 };
+                let adhesion = if holding { 0.42 } else { 0.12 };
+                packet.support = surface_command(active, load * release, 0.28, adhesion * release);
+                if let Some(support) = &mut packet.support {
+                    support.break_force = 0.58;
+                    support.release_half_life = 0.42;
+                    let contact_axis = -support.normal;
+                    push_field(
+                        packet,
+                        crate::LocalSomaticField {
+                            kind: if phase == "release" {
+                                SomaticFieldKind::Gather
+                            } else {
+                                SomaticFieldKind::Flatten
+                            },
+                            space: FieldSpace::SurfaceTangentNormal,
+                            center: contact_axis * 0.18,
+                            axis: contact_axis,
+                            radius: 0.56,
+                            strength: 0.24 * amplitude * release,
+                            falloff: 2.0,
+                            frequency_hz: 0.0,
+                            phase_01: progress,
+                            target_component: None,
+                        },
+                    );
+                }
             }
         }
         ProgramFamily::PhysiologyMaterial => {

@@ -407,8 +407,13 @@ pub const fn definition(id: BehaviorProgramId) -> ProgramDefinition {
             MotorPriority::Voluntary,
             InterruptPolicy::FinishReadablePhase,
         ),
-        P::DefenseStartleOrientFreeze
-        | P::DefenseOverpressureBoundary
+        P::DefenseStartleOrientFreeze => (
+            FAMILY_DEFENSE.as_slice(),
+            6.0,
+            MotorPriority::Integrity,
+            InterruptPolicy::Immediate,
+        ),
+        P::DefenseOverpressureBoundary
         | P::DefenseLocalPainGuard
         | P::DefenseStrainBraceAndRelease
         | P::DefenseSafeFragmentDetach

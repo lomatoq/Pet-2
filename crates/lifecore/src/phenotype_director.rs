@@ -494,11 +494,13 @@ fn raw_targets(source: &EmbodimentSourceFrame, i: InteroceptionSnapshot) -> Fast
     // One is the neutral aperture in the renderer and readability calibration
     // amplifies deviations around that neutral. A 0.72 base therefore made a
     // fully awake animal look chronically drowsy even at near-zero fatigue.
-    expression.eye_aperture = (0.94 + 0.18 * f.surprise + 0.12 * e.interest + 0.16 * f.startle
+    expression.eye_aperture = (0.98 + 0.18 * f.surprise + 0.12 * e.interest + 0.16 * f.startle
         - 0.34 * d.fatigue
         - 0.14 * e.sadness)
         .clamp(0.28, 1.0);
-    expression.squint = unit(0.15 + 0.42 * f.pain_like + 0.20 * e.protest + 0.12 * d.stress);
+    // Squint is recruited by a real cause. A permanent 0.15 offset narrowed
+    // every neutral eye and read as chronic drowsiness even at aperture 1.0.
+    expression.squint = unit(0.42 * f.pain_like + 0.20 * e.protest + 0.12 * d.stress);
     expression.brow_asymmetry = confusion_asymmetry;
     expression.mouth_asymmetry = confusion_asymmetry;
     expression.mouth_curve = bounded_signed(

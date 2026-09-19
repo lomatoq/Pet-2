@@ -2898,7 +2898,8 @@ fn build_lab_control_envelope(
         | LabControlCommand::CancelMotorProgram
         | LabControlCommand::DeleteGestureConvention { .. }
         | LabControlCommand::RollbackGestureConventions { .. }
-        | LabControlCommand::ClearGestureConventions => 5_000,
+        | LabControlCommand::ClearGestureConventions
+        | LabControlCommand::Hearing { .. } => 5_000,
         LabControlCommand::ShutdownForPromotion => 15_000,
         LabControlCommand::StimulatePointerGesture {
             duration_seconds, ..
@@ -2950,6 +2951,7 @@ fn lab_control_description(command: &LabControlCommand) -> String {
             format!("rollback gesture conventions to version {version}")
         }
         LabControlCommand::ClearGestureConventions => "clear gesture conventions".into(),
+        LabControlCommand::Hearing { action } => format!("local hearing: {action:?}"),
         LabControlCommand::ShutdownForPromotion => "graceful shutdown for promotion".into(),
     }
 }
@@ -3141,6 +3143,7 @@ fn show_live_panel(context: &Context, monitor: &mut LivePetMonitor, panel: DevPa
                 return;
             };
             live_now_summary(ui, &latest);
+            live_hearing_controls(ui, monitor, &latest);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match panel {
@@ -3215,6 +3218,46 @@ fn panel_description(panel: DevPanel) -> &'static str {
             "Replay, causal blockers, motor/body performance, learning, and raw telemetry."
         }
     }
+}
+
+fn live_hearing_controls(ui: &mut egui::Ui, monitor: &mut LivePetMonitor, latest: &Value) {
+    use desktop_host::HearingAction as H;
+    egui::CollapsingHeader::new("Hearing · microphone and learned cues")
+        .default_open(true)
+        .show(ui, |ui| {
+            let enabled = monitor.can_send_control();
+            ui.label(text(latest, "/details/hearing/message"));
+            let rms = latest.pointer("/details/hearing/input_level").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            ui.add(egui::ProgressBar::new((rms.max(0.0).sqrt() * 2.0).clamp(0.0, 1.0)).text("Microphone level"));
+            ui.small(format!("Name ready: {} · Quiet ready: {}",
+                text(latest, "/details/hearing/name_ready"), text(latest, "/details/hearing/quiet_ready")));
+            ui.small(format!("Device: {} · input: {} · cue: {}",
+                text(latest, "/details/hearing/device"),
+                text(latest, "/details/hearing/input_level"),
+                text(latest, "/details/hearing/last_cue")));
+            let mut chosen = None;
+            ui.horizontal_wrapped(|ui| {
+                for (label, action) in [
+                    ("Enable microphone", H::Enable), ("Disable", H::Disable),
+                    ("Teach name", H::TrainName), ("Teach quiet", H::TrainQuiet),
+                    ("Teach other words", H::TrainOther), ("Cancel teaching", H::CancelTraining),
+                    ("Test cues", H::Test), ("Quiet now", H::QuietNow),
+                    ("Restore voice", H::RestoreVolume), ("Forget cues", H::Forget),
+                ] {
+                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                        chosen = Some(action);
+                    }
+                }
+            });
+            ui.small("Teach each cue with separate repetitions and short pauses. Teach other words to reject ordinary speech, then test fresh examples. Raw microphone recordings are never saved.");
+            if let Some(action) = chosen {
+                monitor.send_control(LabControlCommand::Hearing { action });
+            }
+            ui.small(format!("Learned quiet level: {} · current sequence: {} / {}",
+                text(latest, "/details/hearing/master_gain"),
+                text(latest, "/details/organic/trace/cause"),
+                text(latest, "/details/organic/trace/phase")));
+        });
 }
 
 fn live_status_card(ui: &mut egui::Ui, severity: u8, message: &str) {

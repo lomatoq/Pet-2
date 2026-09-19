@@ -34,6 +34,8 @@ pub struct GazeOutput {
     pub target: Option<Vec2>,
     pub fixation_strength: f32,
     pub pupil_focus: f32,
+    /// True only when the semantic fixation owner accepts a new target.
+    pub fixation_started: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,7 +44,6 @@ pub struct GazeController {
     has_current: bool,
     dwell_seconds: f32,
     checkback_phase: bool,
-    deterministic_phase: f32,
     accepted_target: Option<Vec2>,
     pending_target: Option<Vec2>,
     pending_seconds: f32,
@@ -55,7 +56,6 @@ impl Default for GazeController {
             has_current: false,
             dwell_seconds: 0.0,
             checkback_phase: false,
-            deterministic_phase: 0.0,
             accepted_target: None,
             pending_target: None,
             pending_seconds: 0.0,
@@ -64,6 +64,11 @@ impl Default for GazeController {
 }
 
 impl GazeController {
+    #[must_use]
+    pub const fn accepted_target(&self) -> Option<Vec2> {
+        self.accepted_target
+    }
+
     #[must_use]
     pub fn tick(&mut self, plan: GazePlan, dt: f32) -> GazeOutput {
         let dt = finite_dt(dt);
@@ -94,6 +99,7 @@ impl GazeController {
                 },
                 fixation_strength: 0.0,
                 pupil_focus: 0.35,
+                fixation_started: false,
             };
         };
         target = target.clamp(Vec2::ZERO, Vec2::ONE);
@@ -104,7 +110,8 @@ impl GazeController {
             plan.mode,
             GazeMode::PredictiveIntercept | GazeMode::AvoidantCheck
         );
-        if let Some(accepted) = self.accepted_target {
+        let accepted_before = self.accepted_target;
+        if let Some(accepted) = accepted_before {
             if !immediate && accepted.distance(target) > 0.12 {
                 if self
                     .pending_target
@@ -130,8 +137,16 @@ impl GazeController {
         } else {
             self.accepted_target = Some(target);
         }
-        self.dwell_seconds += dt;
-        self.deterministic_phase = (self.deterministic_phase + dt * 1.37).rem_euclid(1000.0);
+        let fixation_started = match (accepted_before, self.accepted_target) {
+            (None, Some(_)) => true,
+            (Some(before), Some(after)) => before.distance(after) > 0.04,
+            _ => false,
+        };
+        if fixation_started {
+            self.dwell_seconds = 0.0;
+        } else {
+            self.dwell_seconds += dt;
+        }
 
         if plan.mode == GazeMode::SocialReference
             && secondary.is_some()
@@ -150,29 +165,15 @@ impl GazeController {
         self.current += (target - self.current) * response;
         self.has_current = true;
 
-        // Presentation variation must not feed back into the tracked fixation. Adding
-        // an offset to self.current every tick amplifies it in an FPS-dependent way.
-        let mut presented = self.current;
-        // Micro-saccade is intentionally tiny and disabled for interception/threat-like gaze.
-        if matches!(
-            plan.mode,
-            GazeMode::Inspect | GazeMode::MutualGaze | GazeMode::ContactMonitor
-        ) && plan.confidence > 0.45
-        {
-            let a = plan.micro_saccade_amplitude.clamp(0.0, 0.015);
-            let offset = Vec2::new(
-                (self.deterministic_phase * 3.17).sin(),
-                (self.deterministic_phase * 2.41 + 0.7).cos(),
-            ) * a;
-            presented = (self.current + offset).clamp(Vec2::ZERO, Vec2::ONE);
-        }
-
         let distance = self.current.distance(target);
         GazeOutput {
-            target: Some(presented),
+            // This is the world/semantic target. Eye-local ballistic offsets are
+            // applied later by EmbodiedRuntime and never leak into head motion.
+            target: Some(self.current),
             fixation_strength: (1.0 - distance * 8.0).clamp(0.0, 1.0)
                 * plan.confidence.clamp(0.0, 1.0),
             pupil_focus: (0.45 + (1.0 - distance * 5.0).clamp(0.0, 1.0) * 0.45).clamp(0.0, 1.0),
+            fixation_started,
         }
     }
 }
@@ -218,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn fixation_variation_is_bounded_and_frame_rate_independent() {
+    fn held_fixation_has_no_continuous_world_target_jitter_at_any_rate() {
         let plan = GazePlan {
             primary_target: Some(Vec2::splat(0.5)),
             mode: GazeMode::Inspect,
@@ -227,25 +228,38 @@ mod tests {
             confidence: 1.0,
             ..GazePlan::default()
         };
-        let mut samples = Vec::new();
         for hz in [30, 60, 120] {
             let mut controller = GazeController::default();
-            let mut at_seconds = Vec::new();
             for tick in 1..=hz * 12 {
                 let out = controller.tick(plan, 1.0 / hz as f32);
                 let target = out.target.unwrap();
-                assert!((target - Vec2::splat(0.5)).abs().max_element() <= 0.01001);
+                assert_eq!(target, Vec2::splat(0.5), "hz={hz} tick={tick}");
                 assert_eq!(controller.current, Vec2::splat(0.5));
-                if tick % hz == 0 {
-                    at_seconds.push(target);
-                }
             }
-            samples.push(at_seconds);
         }
-        for other in &samples[1..] {
-            for (a, b) in samples[0].iter().zip(other) {
-                assert!(a.distance(*b) < 0.0001, "{a:?} != {b:?}");
+    }
+
+    #[test]
+    fn fixation_started_is_an_event_not_label_chatter() {
+        for hz in [30, 60, 120] {
+            let mut controller = GazeController::default();
+            let mut starts = 0;
+            let mut plan = GazePlan {
+                primary_target: Some(Vec2::new(0.30, 0.60)),
+                mode: GazeMode::Inspect,
+                acquire_tau: 0.07,
+                confidence: 1.0,
+                ..GazePlan::default()
+            };
+            for _ in 0..hz * 10 {
+                starts += usize::from(controller.tick(plan, 1.0 / hz as f32).fixation_started);
             }
+            assert_eq!(starts, 1, "hz={hz}");
+            plan.primary_target = Some(Vec2::new(0.80, 0.20));
+            for _ in 0..hz {
+                starts += usize::from(controller.tick(plan, 1.0 / hz as f32).fixation_started);
+            }
+            assert_eq!(starts, 2, "hz={hz}");
         }
     }
 

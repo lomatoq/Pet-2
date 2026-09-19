@@ -107,11 +107,11 @@ fn expressive_lids_do_not_magnify_eye_disks_at_any_presentation_rate() {
         assert_eq!(startle.eye_size, neutral.eye_size);
         let upper_center = |r: &pet_body::RenderParameters| {
             let lid = r.geometry.lids[0];
-            0.58 + (lid[0] + lid[1]) * 0.45 - lid[3] * 0.08
+            0.68 + (lid[0] + lid[1]) * 0.45 - lid[3] * 0.08
         };
         assert!(
-            upper_center(&neutral) < 0.62,
-            "neutral must reserve actual lid headroom"
+            (0.64..0.72).contains(&upper_center(&neutral)),
+            "neutral must look awake while reserving actual lid headroom"
         );
         assert!(
             upper_center(&startle) > upper_center(&neutral) + 0.25,

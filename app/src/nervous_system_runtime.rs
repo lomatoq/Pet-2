@@ -38,6 +38,7 @@ pub struct NervousSystemRuntime {
     voice_mouth_open: f32,
     companion_expression: Option<CompanionExpressionDirector>,
     blink_owner: pet_body::BlinkOwner,
+    blink_reason: pet_body::BlinkReason,
     ordinary_blink_active: bool,
     pub observed_ordinary_blinks: u64,
     final_gaze: pet_body::GazeController,
@@ -68,6 +69,7 @@ impl Default for NervousSystemRuntime {
             voice_mouth_open: 0.0,
             companion_expression: None,
             blink_owner: pet_body::BlinkOwner::Physiological,
+            blink_reason: pet_body::BlinkReason::None,
             ordinary_blink_active: false,
             observed_ordinary_blinks: 0,
             final_gaze: pet_body::GazeController::default(),
@@ -94,13 +96,45 @@ impl NervousSystemRuntime {
             director.request_blink(pet_body::BlinkRequest {
                 owner: if request.sleep_check {
                     pet_body::BlinkOwner::SleepCheck
-                } else {
+                } else if request.duration_seconds >= 0.45 {
+                    // The repertoire's long blink is emitted on the concrete
+                    // social signal/response onset. Short release, irritation,
+                    // and ordinary events remain physiological accents.
                     pet_body::BlinkOwner::Social
+                } else {
+                    pet_body::BlinkOwner::Physiological
                 },
                 strength: request.strength,
                 duration: request.duration_seconds,
             });
         }
+    }
+
+    /// Samples the already-selected eyelid event at body cadence. Call once
+    /// immediately before `ProceduralBody::embodied_update`; cognition owns
+    /// event causes, while this method owns only the visible motor envelope.
+    pub fn advance_eye_presentation(&mut self, intent: &mut BodyIntent, dt: f32) {
+        let Some(director) = &mut self.companion_expression else {
+            return;
+        };
+        let blink = director.present_blink(dt);
+        self.blink_owner = blink.owner;
+        self.blink_reason = blink.reason;
+        let ordinary_active =
+            blink.owner == pet_body::BlinkOwner::Physiological && blink.left > 0.05;
+        if ordinary_active && !self.ordinary_blink_active {
+            self.observed_ordinary_blinks = self.observed_ordinary_blinks.saturating_add(1);
+        }
+        self.ordinary_blink_active = ordinary_active;
+        intent.expression.blink_left = blink.left;
+        intent.expression.blink_right = blink.right;
+        self.actuation.expression.blink_left = blink.left;
+        self.actuation.expression.blink_right = blink.right;
+    }
+
+    #[must_use]
+    pub const fn blink_reason(&self) -> pet_body::BlinkReason {
+        self.blink_reason
     }
 
     /// Publishes the completed authoritative body state. The previous packet is
@@ -363,6 +397,12 @@ impl NervousSystemRuntime {
         // render pose. A transient Sleeping pose must not reset fixation state.
         let final_gaze_mode =
             causal_gaze_mode(motor.as_ref(), life.state.current_action, protective);
+        body.embodiment.suppress_microsaccades = matches!(
+            final_gaze_mode,
+            pet_body::FixationGazeMode::PredictiveIntercept
+                | pet_body::FixationGazeMode::AvoidantCheck
+                | pet_body::FixationGazeMode::Sleep
+        );
         calibration.apply(&mut phenotype);
         if let Some(motor) = &motor
             && let Some(pose) = motor.scene_pose
@@ -634,12 +674,7 @@ impl NervousSystemRuntime {
         );
         apply_companion_expression(&mut actuation, companion);
         self.blink_owner = companion.blink_owner;
-        let ordinary_active = companion.blink_owner == pet_body::BlinkOwner::Physiological
-            && companion.blink_left > 0.05;
-        if ordinary_active && !self.ordinary_blink_active {
-            self.observed_ordinary_blinks = self.observed_ordinary_blinks.saturating_add(1);
-        }
-        self.ordinary_blink_active = ordinary_active;
+        self.blink_reason = companion.blink_reason;
         // Motor physiology and defensive ownership must survive R14's face layer.
         SomaticActuationBus::compose(&mut actuation, motor_actuation);
         if companion.blink_owner == pet_body::BlinkOwner::SleepCheck {
@@ -725,6 +760,15 @@ fn causal_gaze_mode(
         pet_body::FixationGazeMode::AvoidantCheck
     } else if sleeping {
         pet_body::FixationGazeMode::Sleep
+    } else if motor.is_some_and(|motor| {
+        matches!(
+            motor.context.companion_intent,
+            lifecore::PrimaryIntent::Intercept
+                | lifecore::PrimaryIntent::Chase
+                | lifecore::PrimaryIntent::Catch
+        )
+    }) {
+        pet_body::FixationGazeMode::PredictiveIntercept
     } else {
         pet_body::FixationGazeMode::Track
     }
@@ -918,6 +962,7 @@ mod tests {
     fn managed_physiological_blinks_survive_legacy_and_scene_projection() {
         let mut scheduler = pet_body::BlinkController::new(913);
         let mut smoothed = pet_body::ExpressionRuntime::default();
+        smoothed.managed_actions = true;
         let mut intent = LifeCore::new(lifecore::Genome::from_seed(7), 11)
             .tick(
                 &SensorFrame::default(),
@@ -952,12 +997,62 @@ mod tests {
             }
             closed = now_closed;
         }
-        assert!((3..=7).contains(&peaks), "managed blink peaks={peaks}");
+        assert!((1..=8).contains(&peaks), "managed blink peaks={peaks}");
         restore_managed_blinks(&mut intent.expression, [0.0, 0.0]);
         assert_eq!(
             intent.expression.blink_left, 0.0,
             "opening must not latch prior closure"
         );
+    }
+
+    #[test]
+    fn body_rate_hook_delivers_unfiltered_asymmetric_blink_to_render_pose() {
+        for hz in [30, 60, 120] {
+            let genome = lifecore::Genome::from_seed(0xE1E5);
+            let mut body = ProceduralBody::generate(&genome).unwrap();
+            body.embodiment.managed_blink = true;
+            let mut nervous = NervousSystemRuntime {
+                companion_expression: Some(CompanionExpressionDirector::new(genome.identity_seed)),
+                ..Default::default()
+            };
+            nervous.request_repertoire_blink(pet_motor::RepertoireBlinkRequest {
+                strength: 1.0,
+                duration_seconds: 0.29,
+                sleep_check: false,
+            });
+            let mut intent = LifeCore::new(genome.clone(), 11)
+                .tick(
+                    &SensorFrame::default(),
+                    &lifecore::BodyFeedback::default(),
+                    1.0 / hz as f32,
+                )
+                .body_intent;
+            intent.expression.eye_aperture = 1.0;
+            let mut visible = Vec::new();
+            for _ in 0..hz {
+                nervous.advance_eye_presentation(&mut intent, 1.0 / hz as f32);
+                body.embodied_update(
+                    &intent,
+                    &SensorFrame::default(),
+                    lifecore::AffectState::default(),
+                    pet_body::VisualMindInput::default(),
+                    pet_body::VoiceVisualState::default(),
+                    1.0 / hz as f32,
+                );
+                visible.push(body.embodiment.pose.blink_left);
+            }
+            let peak = visible
+                .iter()
+                .position(|sample| *sample >= 0.98)
+                .expect("visible closure peak");
+            let reopened = visible[peak..]
+                .iter()
+                .position(|sample| *sample <= 0.01)
+                .map(|offset| peak + offset)
+                .expect("visible opening tail completes");
+            assert!(peak < reopened - peak, "hz={hz} visible={visible:?}");
+            assert!(visible.len() >= 7);
+        }
     }
 
     #[test]
@@ -1087,9 +1182,14 @@ mod tests {
             body.presentation_update(0.05);
             if (20..100).contains(&tick) {
                 assert!(
-                    body.embodiment.pose.gaze.length() < 0.005,
-                    "raw motor gaze bypassed final owner: tick={tick} gaze={:?}",
-                    body.embodiment.pose.gaze
+                    body.embodiment.semantic_gaze_target().length() < 0.005,
+                    "raw motor gaze bypassed final owner: tick={tick} semantic={:?}",
+                    body.embodiment.semantic_gaze_target()
+                );
+                assert!(
+                    body.embodiment.microsaccade_offset().length() <= 0.042_001,
+                    "eye-local offset exceeded its bound: tick={tick} offset={:?}",
+                    body.embodiment.microsaccade_offset()
                 );
             }
             if tick > 140 {

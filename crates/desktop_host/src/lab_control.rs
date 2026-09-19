@@ -119,6 +119,9 @@ pub enum LabControlCommand {
         version: u32,
     },
     ClearGestureConventions,
+    Hearing {
+        action: HearingAction,
+    },
     /// Graceful persistence barrier used only by validated state promotion.
     ShutdownForPromotion,
 }
@@ -208,9 +211,25 @@ impl LabControlCommand {
             | Self::DeleteGestureConvention { .. }
             | Self::RollbackGestureConventions { .. }
             | Self::ClearGestureConventions
+            | Self::Hearing { .. }
             | Self::ShutdownForPromotion => Ok(()),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HearingAction {
+    Enable,
+    Disable,
+    TrainName,
+    TrainQuiet,
+    TrainOther,
+    CancelTraining,
+    Test,
+    Forget,
+    QuietNow,
+    RestoreVolume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

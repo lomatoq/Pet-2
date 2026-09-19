@@ -1,0 +1,18 @@
+{
+  "date": "2026-09-14",
+  "command": "cargo run -p desktop_host --example hearing_probe -- 10",
+  "seconds": 10,
+  "reached_listening": true,
+  "device": "Headset (Nothing Headphone (a))",
+  "native_sample_rate": 16000,
+  "native_channels": 1,
+  "dropped_audio_chunks": 0,
+  "retry_count": 0,
+  "last_error": null,
+  "max_rms": 0.27812448143959045,
+  "onsets": 7,
+  "segments": 6,
+  "cue_accepted": 0,
+  "cue_rejected": 6,
+  "interpretation": "Actual microphone capture succeeds. No enrolled model was supplied, so no words were accepted. This is not a test of the user's learned-name accuracy. No PCM was saved."
+}

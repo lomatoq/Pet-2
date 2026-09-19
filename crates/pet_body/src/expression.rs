@@ -112,22 +112,30 @@ impl ExpressionRuntime {
         } else {
             finite(procedural_blink, 0.0).clamp(0.0, 1.0)
         };
-        self.current.blink_left = follow(
-            self.current.blink_left,
-            target.blink_left.max(automatic),
-            dt,
-            0.032,
-            0.0,
-            1.0,
-        );
-        self.current.blink_right = follow(
-            self.current.blink_right,
-            target.blink_right.max(automatic),
-            dt,
-            0.034,
-            0.0,
-            1.0,
-        );
+        if self.managed_actions {
+            // The managed blink owner already evaluates a bounded analytic
+            // envelope at body cadence. A second low-pass would erase fast
+            // closure and keep the eye shut well into the opening tail.
+            self.current.blink_left = finite(target.blink_left, 0.0).clamp(0.0, 1.0);
+            self.current.blink_right = finite(target.blink_right, 0.0).clamp(0.0, 1.0);
+        } else {
+            self.current.blink_left = follow(
+                self.current.blink_left,
+                target.blink_left.max(automatic),
+                dt,
+                0.032,
+                0.0,
+                1.0,
+            );
+            self.current.blink_right = follow(
+                self.current.blink_right,
+                target.blink_right.max(automatic),
+                dt,
+                0.034,
+                0.0,
+                1.0,
+            );
+        }
         for (current, desired, tau, low, high) in [
             (&mut self.current.squint, target.squint, 0.12, 0.0, 1.0),
             (
@@ -314,6 +322,30 @@ mod tests {
             if tick > 150 {
                 assert!(runtime.current.mouth_open < 0.001, "tick={tick}");
             }
+        }
+    }
+
+    #[test]
+    fn managed_blink_samples_are_not_stretched_by_downstream_smoothing() {
+        for hz in [30, 60, 120] {
+            let mut runtime = ExpressionRuntime {
+                managed_actions: true,
+                ..Default::default()
+            };
+            let dt = 1.0 / hz as f32;
+            let mut target = ExpressionState {
+                blink_left: 1.0,
+                blink_right: 0.985,
+                ..Default::default()
+            };
+            runtime.update(target, 0.0, dt);
+            assert_eq!(runtime.current.blink_left, 1.0);
+            assert_eq!(runtime.current.blink_right, 0.985);
+            target.blink_left = 0.0;
+            target.blink_right = 0.0;
+            runtime.update(target, 0.0, dt);
+            assert_eq!(runtime.current.blink_left, 0.0);
+            assert_eq!(runtime.current.blink_right, 0.0);
         }
     }
 }

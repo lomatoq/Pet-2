@@ -3,7 +3,8 @@ use lifecore::{ActionId, BehaviorGoalFrame, EmbodiedGestureKind, PrimaryIntent};
 
 use crate::{
     BehaviorContextFrame, BehaviorProgramId, BehaviorTarget, CompletionReason, MotorCause,
-    MotorPriority, MotorWorldEvent, MotorWorldGoal, PROGRAM_COUNT, definition, rank_surface,
+    MotorPriority, MotorWorldEvent, MotorWorldGoal, PROGRAM_COUNT, definition, rank_cling_surface,
+    rank_surface,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,10 +158,11 @@ pub(crate) fn choose_program_with_rest_commitment(
         && context.gesture_confidence > 0.44
     {
         Some((P::DefenseSafeFragmentDetach, MotorCause::UserGesture))
-    } else if (context.gesture == EmbodiedGestureKind::SharpFlick
+    } else if ((context.gesture == EmbodiedGestureKind::SharpFlick
         && !context.gesture_ended
         && context.gesture_confidence > 0.40)
-        || goal.felt.startle > 0.55
+        || goal.felt.startle > 0.55)
+        && eligible(P::DefenseStartleOrientFreeze)
     {
         Some((P::DefenseStartleOrientFreeze, MotorCause::BodyIntegrity))
     } else if goal.felt.pain_like > 0.24 {
@@ -180,7 +182,8 @@ pub(crate) fn choose_program_with_rest_commitment(
         None
     };
     if let Some((program, cause)) = interrupt
-        && (cause == MotorCause::BodyIntegrity || eligible(program))
+        && ((cause == MotorCause::BodyIntegrity && program != P::DefenseStartleOrientFreeze)
+            || eligible(program))
     {
         return Some(ProgramDecision {
             program,
@@ -207,7 +210,12 @@ pub(crate) fn choose_program_with_rest_commitment(
                 } else {
                     P::RestNremSleep
                 }
-            } else if context.screen_edge_gap_px <= 8.0 {
+            } else if context.screen_edge_gap_px <= 8.0
+                || (matches!(
+                    active_program,
+                    Some(P::RestLandingSoftTouchdown | P::RestSitSettle)
+                ) && context.screen_edge_gap_px <= 14.0)
+            {
                 P::RestLandingSoftTouchdown
             } else {
                 P::RestSurfaceRoostSearch
@@ -657,6 +665,9 @@ pub fn lock_target(
         P::DefenseSafeFragmentDetach => Some(BehaviorTarget::Component(
             context.body.contact.component_id.unwrap_or(1),
         )),
+        P::DefenseStrainBraceAndRelease if goal.action == ActionId::ClingToWindowSide => {
+            rank_cling_surface(context).map(BehaviorTarget::Surface)
+        }
         P::DefenseStartleOrientFreeze
         | P::DefenseOverpressureBoundary
         | P::DefenseLocalPainGuard

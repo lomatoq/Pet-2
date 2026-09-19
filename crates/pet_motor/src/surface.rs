@@ -8,20 +8,46 @@ pub fn rank_surface(
     tired: bool,
     social: bool,
 ) -> Option<SurfaceTarget> {
+    let use_kind = if tired {
+        SurfaceUse::Sleep
+    } else {
+        SurfaceUse::General
+    };
     context
         .surfaces
         .iter()
-        .filter_map(|candidate| score_surface(candidate, context, tired, social))
+        .filter_map(|candidate| score_surface(candidate, context, use_kind, social))
         .max_by(|left, right| left.score.total_cmp(&right.score))
+}
+
+/// Chooses a measured non-floor edge for a finite awake cling. Sleep must keep
+/// using `rank_surface(context, true, ..)`, which only admits the bottom edge.
+#[must_use]
+pub fn rank_cling_surface(context: &BehaviorContextFrame) -> Option<SurfaceTarget> {
+    context
+        .surfaces
+        .iter()
+        .filter_map(|candidate| score_surface(candidate, context, SurfaceUse::Cling, false))
+        .max_by(|left, right| left.score.total_cmp(&right.score))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceUse {
+    General,
+    Sleep,
+    Cling,
 }
 
 fn score_surface(
     candidate: &SurfaceCandidate,
     context: &BehaviorContextFrame,
-    tired: bool,
+    use_kind: SurfaceUse,
     social: bool,
 ) -> Option<SurfaceTarget> {
-    if tired && candidate.surface_id.0 != "screen:bottom_edge" {
+    if use_kind == SurfaceUse::Sleep && candidate.surface_id.0 != "screen:bottom_edge" {
+        return None;
+    }
+    if use_kind == SurfaceUse::Cling && candidate.surface_id.0 == "screen:bottom_edge" {
         return None;
     }
     if !candidate.minimum.is_finite()
@@ -71,7 +97,13 @@ fn score_surface(
     // window side is a cling target, not a visible sitting/sleeping pose.
     let (anchor, normal, clearance) = edges
         .into_iter()
-        .filter(|(_, normal, _)| !tired || normal.y < -0.5)
+        .filter(|(_, normal, _)| match use_kind {
+            SurfaceUse::General => true,
+            SurfaceUse::Sleep => normal.y < -0.5,
+            // Side walls and the underside of the desktop top edge are awake
+            // grip affordances. A load-bearing floor is deliberately excluded.
+            SurfaceUse::Cling => normal.y >= -0.5,
+        })
         .min_by(|left, right| {
             body.distance_squared(left.0)
                 .total_cmp(&body.distance_squared(right.0))
@@ -79,7 +111,7 @@ fn score_surface(
     let tangent = Vec2::new(-normal.y, normal.x);
     let distance = body.distance(anchor);
     let den_bonus = context.den_anchor.map_or(0.0, |den| {
-        if tired {
+        if use_kind == SurfaceUse::Sleep {
             (1.0 - den.distance(anchor) * 3.0).clamp(0.0, 1.0) * 0.32
         } else {
             0.0
@@ -169,5 +201,35 @@ mod tests {
         assert!((target.center_clearance - 0.091).abs() < 1.0e-6);
         let centre = BehaviorTarget::Surface(target).world_position().unwrap();
         assert!((centre.y - 0.904).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn awake_cling_uses_side_or_top_while_sleep_remains_bottom_only() {
+        let mut context = BehaviorContextFrame::default();
+        context.body.motion.world_position = Vec2::new(0.04, 0.45);
+        context.surfaces = vec![
+            SurfaceCandidate {
+                surface_id: SurfaceId("screen:bottom_edge".into()),
+                minimum: Vec2::new(0.0, 0.995),
+                maximum: Vec2::ONE,
+                velocity: Vec2::ZERO,
+                familiarity: 1.0,
+                recent_failed_landings: 0,
+            },
+            SurfaceCandidate {
+                surface_id: SurfaceId("screen:left_edge".into()),
+                minimum: Vec2::ZERO,
+                maximum: Vec2::new(0.005, 1.0),
+                velocity: Vec2::ZERO,
+                familiarity: 0.5,
+                recent_failed_landings: 0,
+            },
+        ];
+        let cling = rank_cling_surface(&context).expect("awake edge");
+        assert_eq!(cling.surface_id.0, "screen:left_edge");
+        assert!(cling.normal.x.abs() > 0.9);
+        let sleep = rank_surface(&context, true, false).expect("floor");
+        assert_eq!(sleep.surface_id.0, "screen:bottom_edge");
+        assert!(sleep.normal.y < -0.9);
     }
 }

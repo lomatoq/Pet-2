@@ -47,6 +47,15 @@ pub(crate) fn apply(
         Vec2::Y
     };
     let support_confirmed = context.support_confirmed();
+    let support_tangent = active
+        .locked_target
+        .as_ref()
+        .and_then(|target| match target {
+            crate::BehaviorTarget::Surface(surface) => Some(surface.tangent),
+            _ => None,
+        })
+        .unwrap_or(Vec2::X)
+        .normalize_or(Vec2::X);
     match active.program {
         P::RestSurfaceRoostSearch => {
             packet.locomotion.pose = MotorPoseIntent::Orient;
@@ -168,14 +177,18 @@ pub(crate) fn apply(
                 };
                 push_field(
                     packet,
-                    body_field(
-                        SomaticFieldKind::Flatten,
-                        Vec2::new(0.0, 0.24),
-                        Vec2::Y,
-                        0.68,
-                        flatten * tuning.support_gain,
-                        1.0,
-                    ),
+                    crate::LocalSomaticField {
+                        kind: SomaticFieldKind::Flatten,
+                        space: FieldSpace::SurfaceTangentNormal,
+                        center: contact_axis * 0.24,
+                        axis: contact_axis,
+                        radius: 0.68,
+                        strength: flatten * tuning.support_gain,
+                        falloff: 2.0,
+                        frequency_hz: 0.0,
+                        phase_01: 1.0,
+                        target_component: None,
+                    },
                 );
             }
             if phase == "micro_adjust" {
@@ -184,7 +197,7 @@ pub(crate) fn apply(
                     wave_field(
                         FieldSpace::SurfaceTangentNormal,
                         Vec2::ZERO,
-                        Vec2::X,
+                        support_tangent,
                         0.54,
                         0.10,
                         0.7,
@@ -193,9 +206,17 @@ pub(crate) fn apply(
                 );
             }
             if phase == "rest_hold" {
+                // An awake supported gel relaxes into slow circulation and
+                // compliance while the measured plane still carries its load.
+                packet.material.density_compliance_multiplier = 1.06;
+                packet.material.viscosity_multiplier = 0.90;
+                packet.material.surface_tension_multiplier = 0.95;
                 packet.internal.breath_amplitude_multiplier = 0.76;
                 packet.internal.breath_speed_multiplier = 0.72;
-                packet.material.flight_damping_multiplier = 1.26;
+                packet.internal.flow_strength_multiplier = 0.72;
+                packet.internal.flow_speed_multiplier = 0.64;
+                packet.internal.flow_damping = 0.12;
+                packet.material.flight_damping_multiplier = 1.18;
             }
         }
         P::RestDrowsyYawn => {
@@ -535,5 +556,37 @@ mod sleep_tests {
         let wake = packet(&rem, &goal, &context, "wake_stretch_or_nrem", 1.0);
         assert_eq!(wake.locomotion.pose, MotorPoseIntent::Recover);
         assert_eq!(wake.expression.eye_aperture_delta, 0.0);
+    }
+
+    #[test]
+    fn awake_settle_shape_follows_the_measured_support_normal_and_tangent() {
+        let (goal, mut context, mut active) = fixture(P::RestSitSettle);
+        context.surfaces.clear();
+        context.somatic.supported = true;
+        active.locked_target = Some(crate::BehaviorTarget::Surface(crate::SurfaceTarget {
+            surface_id: lifecore::SurfaceId("screen:left_edge".into()),
+            anchor_point: Vec2::new(0.0, 0.5),
+            normal: Vec2::X,
+            tangent: Vec2::Y,
+            center_clearance: 0.038,
+            score: 1.0,
+        }));
+        let spread = packet(&active, &goal, &context, "spread_contact_patch", 1.0);
+        let flatten = spread
+            .fields
+            .iter()
+            .flatten()
+            .find(|field| field.kind == SomaticFieldKind::Flatten)
+            .expect("support-oriented flatten");
+        assert_eq!(flatten.space, FieldSpace::SurfaceTangentNormal);
+        assert!(flatten.axis.dot(Vec2::NEG_X) > 0.99);
+        let adjust = packet(&active, &goal, &context, "micro_adjust", 0.5);
+        let wave = adjust
+            .fields
+            .iter()
+            .flatten()
+            .find(|field| field.kind == SomaticFieldKind::Wave)
+            .expect("tangent micro-adjustment");
+        assert!(wave.axis.dot(Vec2::Y) > 0.99);
     }
 }
