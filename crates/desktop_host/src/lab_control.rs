@@ -226,6 +226,8 @@ impl LabControlCommand {
 pub enum HearingAction {
     Enable,
     Disable,
+    TrainCommand { cue: crate::CueKind },
+    Perform { cue: crate::CueKind },
     TrainName,
     TrainQuiet,
     TrainOther,

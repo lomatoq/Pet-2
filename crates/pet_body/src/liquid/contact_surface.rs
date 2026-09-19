@@ -136,8 +136,24 @@ pub fn contain_face_origin(
     let mut anchor = origin;
     if clearance(anchor) < threshold {
         // The old region disappeared: find the broadest remaining volume.
+        // Prefer the nearest valid interior, not a distant density maximum.
+        if let Some(nearest) = main
+            .iter()
+            .step_by(3)
+            .map(|p| p.position)
+            .filter(|&p| clearance(p) >= threshold)
+            .min_by(|a, b| {
+                a.distance_squared(origin)
+                    .total_cmp(&b.distance_squared(origin))
+            })
+        {
+            anchor = nearest;
+        }
         let mut best = clearance(anchor);
         for particle in main.iter().step_by(3) {
+            if best >= threshold {
+                break;
+            }
             let candidate = particle.position;
             let c = clearance(candidate);
             if c > best {

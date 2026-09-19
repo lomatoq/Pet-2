@@ -298,6 +298,8 @@ impl EcologyState {
         profile: MorselProfile,
         timestamp: f64,
     ) -> Option<ObjectId> {
+        self.objects
+            .retain(|object| object.lifecycle != ObjectLifecycle::Consumed);
         if !position.is_finite()
             || !profile.is_valid()
             || !timestamp.is_finite()
@@ -340,6 +342,36 @@ impl EcologyState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumed_food_does_not_exhaust_lifetime_object_capacity() {
+        let mut state = EcologyState::new(42);
+        for i in 0..100 {
+            let id = state
+                .spawn_morsel(
+                    Vec2::splat(0.5),
+                    MorselProfile {
+                        hue: 0.2,
+                        saturation: 0.8,
+                        value: 0.9,
+                        warmth: 0.6,
+                        pulse_rate: 0.4,
+                        stimulation: 0.5,
+                        cohesion_bias: 0.7,
+                        novelty: 0.8,
+                    },
+                    i as f64,
+                )
+                .expect("consumed slots must be reusable");
+            state
+                .objects
+                .iter_mut()
+                .find(|o| o.id == id)
+                .unwrap()
+                .lifecycle = ObjectLifecycle::Consumed;
+        }
+        state.validate().unwrap();
+    }
 
     #[test]
     fn default_is_deterministic_and_has_one_canonical_orb() {

@@ -23,6 +23,7 @@ mod repertoire_perception_events;
 mod replay;
 mod surface_care_runtime;
 mod vita_runtime;
+mod voice_actions;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -2081,6 +2082,9 @@ struct PetRuntime {
     body: ProceduralBody,
     audio: AudioManager,
     hearing: hearing_bridge::HearingBridge,
+    voice_motion: Option<voice_actions::VoiceMotion>,
+    emotion_burst: voice_actions::EmotionBurst,
+    activity_recovery: voice_actions::ActivityRecovery,
     feeding_seconds: f32,
     food_click_cooldown: f32,
     companion_menu: Option<std::process::Child>,
@@ -2398,6 +2402,7 @@ impl PetApplication {
         runtime.food_click_cooldown = (runtime.food_click_cooldown - elapsed).max(0.0);
         if runtime.feeding_seconds > 0.0 && feeding_escape_down() {
             runtime.feeding_seconds = 0.0;
+            runtime.ecology.cancel_user_food();
         }
         runtime.window.set_cursor(if runtime.feeding_seconds > 0.0 {
             winit::window::CursorIcon::Crosshair
@@ -2709,6 +2714,124 @@ impl PetApplication {
                 body_sensors.visible_surfaces.clear();
             }
 
+            if runtime.sensors.pet_dragged {
+                runtime.voice_motion = None;
+            }
+            let care_busy = runtime.ecology.feeding_navigation().is_some()
+                || runtime.hearing.training()
+                || runtime.sensors.pet_dragged
+                || runtime.hearing.name_attention();
+            if care_busy
+                && runtime
+                    .voice_motion
+                    .as_ref()
+                    .is_some_and(|m| m.autonomous_rest)
+            {
+                runtime.voice_motion = None;
+            }
+            let extent = Vec2::new(
+                runtime.window.inner_size().width as f32,
+                runtime.window.inner_size().height.max(1) as f32,
+            );
+            let speed = (runtime.body.simulation.feedback.velocity * extent).length()
+                / extent.min_element().max(1.0);
+            if runtime.activity_recovery.update(
+                if runtime.sensors.pet_dragged {
+                    0.0
+                } else {
+                    speed
+                },
+                runtime.life.state.drives.sleep,
+                runtime.life.state.affect.arousal,
+                !care_busy
+                    && runtime.voice_motion.is_none()
+                    && runtime.life.state.affect.stress < 0.65,
+                body_dt,
+            ) {
+                let origin = runtime.body.simulation.feedback.world_position;
+                let bounds = runtime.topology.virtual_physical_bounds;
+                let physical = virtual_normalized_to_physical(&runtime.topology, origin);
+                let bottom = runtime
+                    .topology
+                    .monitors
+                    .iter()
+                    .find(|m| {
+                        physical.x >= m.physical_bounds.minimum.x as f32
+                            && physical.x <= m.physical_bounds.maximum.x as f32
+                    })
+                    .map_or(bounds.maximum.y, |m| m.working_area.maximum.y);
+                let foot = runtime
+                    .body
+                    .liquid_contact_bounds_pixels(extent.y)
+                    .maximum
+                    .y;
+                let floor = (bottom as f32 - bounds.minimum.y as f32 - foot)
+                    / bounds.height().max(1) as f32;
+                runtime.voice_motion = voice_actions::VoiceMotion::new(
+                    desktop_host::CueKind::Sit,
+                    origin,
+                    origin,
+                    floor,
+                    origin,
+                    extent.x / extent.y,
+                );
+                if let Some(m) = &mut runtime.voice_motion {
+                    m.autonomous_rest = true;
+                    m.rest_drift = if runtime.life.state.affect.valence > 0.0 {
+                        (0.02 + runtime.life.state.affect.arousal * 0.035)
+                            * if origin.x > 0.5 { -1.0 } else { 1.0 }
+                    } else {
+                        0.0
+                    };
+                    m.support_y =
+                        (bottom as f32 - bounds.minimum.y as f32) / bounds.height().max(1) as f32;
+                }
+            }
+            runtime.emotion_burst.update(
+                runtime.life.state.affect.frustration,
+                runtime.life.state.affect.arousal,
+                runtime.voice_motion.is_none()
+                    && !runtime.sensors.pet_dragged
+                    && !runtime.hearing.training()
+                    && runtime.ecology.feeding_navigation().is_none()
+                    && runtime.life.state.current_action != ActionId::Sleep,
+                runtime.body.simulation.feedback.world_position,
+                runtime.window.inner_size().width as f32
+                    / runtime.window.inner_size().height.max(1) as f32,
+                body_dt,
+            );
+            runtime.emotion_burst.apply(&mut runtime.intent);
+            if let Some(motion) = &mut runtime.voice_motion {
+                let foot = runtime
+                    .body
+                    .liquid_contact_bounds_pixels(extent.y)
+                    .maximum
+                    .y;
+                motion.follow_supported_extent(foot / extent.y);
+                if !motion.apply(
+                    &mut runtime.intent,
+                    runtime.sensors.cursor_position,
+                    body_dt,
+                ) {
+                    runtime.voice_motion = None;
+                } else {
+                    let hull = runtime
+                        .body
+                        .liquid_contact_bounds_pixels(runtime.window.inner_size().height as f32);
+                    let target = virtual_normalized_to_physical(
+                        &runtime.topology,
+                        runtime.intent.target_position,
+                    );
+                    let target = nearest_covered_center(
+                        &runtime.topology,
+                        target,
+                        hull.minimum,
+                        hull.maximum,
+                    );
+                    runtime.intent.target_position =
+                        physical_to_virtual_normalized(&runtime.topology, target);
+                }
+            }
             runtime.body.fixed_update(
                 &runtime.life.state.genome,
                 &runtime.intent,
@@ -3177,15 +3300,43 @@ impl PetApplication {
             let mut motor_context = build_motor_context(runtime);
             let sound_startle = runtime.hearing.take_startle();
             let heard_name = runtime.hearing.take_name_event();
+            if let Some(cue) = runtime.hearing.take_command() {
+                let origin = runtime.body.simulation.feedback.world_position;
+                let bounds = runtime.topology.virtual_physical_bounds;
+                let physical = virtual_normalized_to_physical(&runtime.topology, origin);
+                let bottom = runtime
+                    .topology
+                    .monitors
+                    .iter()
+                    .find(|m| {
+                        physical.x >= m.physical_bounds.minimum.x as f32
+                            && physical.x <= m.physical_bounds.maximum.x as f32
+                    })
+                    .map_or(bounds.maximum.y, |m| m.working_area.maximum.y);
+                let contact = runtime
+                    .body
+                    .liquid_contact_bounds_pixels(runtime.window.inner_size().height as f32);
+                let floor = (bottom as f32 - bounds.minimum.y as f32 - contact.maximum.y)
+                    / bounds.height().max(1) as f32;
+                runtime.voice_motion = voice_actions::VoiceMotion::new(
+                    cue,
+                    origin,
+                    runtime.sensors.cursor_position,
+                    floor,
+                    runtime.ecology.state().den.anchor,
+                    bounds.width() as f32 / bounds.height().max(1) as f32,
+                );
+                if let Some(motion) = &mut runtime.voice_motion {
+                    motion.support_y =
+                        (bottom as f32 - bounds.minimum.y as f32) / bounds.height().max(1) as f32;
+                }
+                runtime.lab_motor_program = voice_actions::program(cue);
+                runtime.lab_motor_restart = runtime.lab_motor_program.is_some();
+            }
             if sound_startle > 0.0 {
                 motor_context.cursor_position = motor_context.body.motion.world_position;
             }
-            if heard_name
-                && !runtime.sensors.pet_dragged
-                && !runtime.hearing.quiet_boundary()
-                && !motor_context.focus_mode
-                && runtime.life.state.current_action != ActionId::Sleep
-            {
+            if heard_name && !runtime.sensors.pet_dragged {
                 runtime
                     .motor
                     .acknowledge_recognition(runtime.body.simulation.feedback.world_position, 0.95);
@@ -3523,6 +3674,15 @@ impl PetApplication {
                 if motor_goal.felt.startle < 0.35 && motor_goal.felt.pain_like < 0.2 {
                     motor_packet.fields.fill(None);
                 }
+            }
+            if runtime.emotion_burst.active {
+                motor_packet.fields.fill(None);
+                motor_packet.support = None;
+            }
+            if let Some(motion) = &runtime.voice_motion {
+                motor_packet.fields.fill(None);
+                motor_packet.support =
+                    motion.support(runtime.body.simulation.feedback.world_position);
             }
             runtime.nervous_system.apply_motor_actuation(
                 &mut runtime.life,
@@ -3986,6 +4146,9 @@ impl PetApplication {
                         "repertoire_learning_ids": repertoire_learning_events::LEARNING_REPERTOIRE_IDS,
                         "repertoire_surface_ids": surface_care_runtime::INTEGRATED_SURFACE_CARE_IDS,
                         "lab_program_override": runtime.lab_motor_program,
+                        "voice_command": runtime.voice_motion.as_ref().filter(|m| !m.autonomous_rest).map(|m| m.cue),
+                        "autonomous_rest": runtime.voice_motion.as_ref().is_some_and(|m| m.autonomous_rest),
+                        "frustration_burst": runtime.emotion_burst.active,
                         "active_performance": runtime.motor.active(),
                         "packet": &runtime.last_motor_packet,
                         "somatic_feedback": runtime.body.somatic_feedback(),
@@ -4416,6 +4579,9 @@ impl ApplicationHandler for PetApplication {
                 repertoire_perception_events::RepertoirePerceptionEvents::default(),
             activity_glance: activity_glance::ActivityGlance::default(),
             last_activity_glance: activity_glance::ActivityGlanceOutput::default(),
+            voice_motion: None,
+            emotion_burst: voice_actions::EmotionBurst::default(),
+            activity_recovery: voice_actions::ActivityRecovery::default(),
             lab_motor_program: None,
             lab_motor_restart: false,
             brain_mode: self.arguments.brain_mode,
@@ -4597,6 +4763,9 @@ impl ApplicationHandler for PetApplication {
                 button: MouseButton::Right,
                 ..
             } => {
+                if runtime.feeding_seconds > 0.0 {
+                    runtime.ecology.cancel_user_food();
+                }
                 runtime.feeding_seconds = 0.0;
                 let running = runtime
                     .companion_menu
@@ -4652,6 +4821,7 @@ impl ApplicationHandler for PetApplication {
             {
                 if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
                     runtime.feeding_seconds = 0.0;
+                    runtime.ecology.cancel_user_food();
                 }
                 if runtime.modifiers.super_key() && runtime.modifiers.alt_key() {
                     match event.physical_key {
@@ -5395,6 +5565,9 @@ fn poll_lab_control(
         }
         LabControlCommand::Feeding { enabled } => {
             runtime.feeding_seconds = if enabled { 90.0 } else { 0.0 };
+            if !enabled {
+                runtime.ecology.cancel_user_food();
+            }
             runtime.window.set_cursor(if enabled {
                 winit::window::CursorIcon::Crosshair
             } else {

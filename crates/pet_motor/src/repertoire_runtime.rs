@@ -111,6 +111,9 @@ pub struct RepertoireContextAdapter {
     loaded_carry_seconds: f32,
     post_carry_release_seconds: f32,
     irritation_blink_latched: bool,
+    initiative_charge: f32,
+    initiative_pause: f32,
+    previous_initiative: u16,
 }
 
 impl RepertoireContextAdapter {
@@ -414,6 +417,58 @@ impl RepertoireContextAdapter {
                         _ => {}
                     }
                 }
+            }
+        }
+        // Internal needs also earn a brief initiative; scene edges alone left
+        // an otherwise healthy, unchanged desktop almost expressionless.
+        self.initiative_pause = (self.initiative_pause - dt).max(0.0);
+        let available = !next.sleeping
+            && !next.dragged
+            && !next.touched
+            && !context.focus_mode
+            && !physical_danger(goal, context)
+            && context.world_goal == MotorWorldGoal::None;
+        if available && self.initiative_pause <= 0.0 {
+            let urge = (goal.felt.boredom * 0.6
+                + goal.derived.curiosity * 0.5
+                + goal.felt.play_readiness * 0.35)
+                .clamp(0.0, 1.0);
+            self.initiative_charge = (self.initiative_charge + dt * (urge - 0.15)).max(0.0);
+            if self.initiative_charge >= 14.0 {
+                self.initiative_charge = 0.0;
+                self.initiative_pause = 18.0 + (self.event_sequence % 13) as f32;
+                let variants: &[u16] = if next.supported && goal.derived.fatigue > 0.4 {
+                    &[104, 105, 106]
+                } else if next.supported && goal.felt.boredom > 0.35 {
+                    &[84, 103, 104, 89]
+                } else if orb.is_some() && goal.derived.curiosity > 0.3 {
+                    &[14, 15, 20, 10]
+                } else {
+                    &[10, 14, 15, 22]
+                };
+                let hash = self
+                    .seed
+                    .wrapping_add(self.event_sequence.wrapping_mul(0x9E3779B97F4A7C15));
+                let sample = ((hash ^ (hash >> 29)).wrapping_mul(0xBF58476D1CE4E5B9) >> 32) as f32
+                    / u32::MAX as f32;
+                let weight = |id: u16| {
+                    if id == self.previous_initiative {
+                        0.15
+                    } else {
+                        1.0
+                    }
+                };
+                let mut choice = sample * variants.iter().map(|&id| weight(id)).sum::<f32>();
+                let mut id = variants[0];
+                for &candidate in variants {
+                    id = candidate;
+                    choice -= weight(candidate);
+                    if choice <= 0.0 {
+                        break;
+                    }
+                }
+                self.previous_initiative = id;
+                emit(id, orb.or(den), 0.9);
             }
         }
         self.previous = Some(next);
@@ -1321,6 +1376,27 @@ mod tests {
         context.world_goal = MotorWorldGoal::CarryOrbHome;
         assert!(render(7, 1.0, &context).field.is_none());
     }
+    #[test]
+    fn internal_curiosity_generates_bounded_initiative_and_sleep_suppresses_it() {
+        let (mut goal, context, packet) = fixture();
+        goal.derived.curiosity = 0.8;
+        goal.felt.boredom = 0.7;
+        let mut adapter = RepertoireContextAdapter::default();
+        let mut count = 0;
+        for _ in 0..2400 {
+            count += adapter.observe(&goal, &context, &packet, 0.05).len();
+        }
+        assert!(
+            (2..=8).contains(&count),
+            "bounded need-driven bouts: {count}"
+        );
+        goal.action = ActionId::Sleep;
+        adapter.observe(&goal, &context, &packet, 0.05);
+        for _ in 0..2400 {
+            assert!(adapter.observe(&goal, &context, &packet, 0.05).is_empty());
+        }
+    }
+
     #[test]
     fn unchanged_scene_has_no_timer_generated_behavior() {
         let (goal, context, packet) = fixture();

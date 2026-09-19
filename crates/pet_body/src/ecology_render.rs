@@ -5,7 +5,7 @@ use wgpu::util::DeviceExt;
 
 use crate::DenVisualTuning;
 
-const MAX_ECOLOGY_INSTANCES: usize = 9;
+const MAX_ECOLOGY_INSTANCES: usize = 25;
 const STORED_ORB_HOVER_FREQUENCY: f32 = 1.15;
 const STORED_ORB_HOVER_MAX_SPEED_PX: f32 = 0.85;
 const STORED_ORB_HOVER_MAX_ACCELERATION_PX: f32 = 1.20;
@@ -79,6 +79,8 @@ pub struct EcologyRenderer {
     background_bind_group_layout: wgpu::BindGroupLayout,
     background_bind_group: wgpu::BindGroup,
     background_texture: wgpu::Texture,
+    pearl_texture: wgpu::Texture,
+    pearl_uploaded: bool,
     background_sampler: wgpu::Sampler,
     background_size: (u32, u32),
     background_bytes_per_row: u32,
@@ -110,6 +112,16 @@ impl EcologyRenderer {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("living desktop ecology background layout"),
                 entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -234,11 +246,26 @@ impl EcologyRenderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        let pearl_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imagegen pearl sprite"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 256,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         let background_bind_group = create_ecology_background_bind_group(
             device,
             &background_bind_group_layout,
             &background_texture,
             &background_sampler,
+            &pearl_texture,
         );
         Self {
             pipeline,
@@ -247,6 +274,8 @@ impl EcologyRenderer {
             background_bind_group_layout,
             background_bind_group,
             background_texture,
+            pearl_texture,
+            pearl_uploaded: false,
             background_sampler,
             background_size: (1, 1),
             background_bytes_per_row: 4,
@@ -350,6 +379,7 @@ impl EcologyRenderer {
                 &self.background_bind_group_layout,
                 &self.background_texture,
                 &self.background_sampler,
+                &self.pearl_texture,
             );
         }
         let expected_length = bytes_per_row as usize * height as usize;
@@ -452,6 +482,28 @@ impl EcologyRenderer {
         desktop_aspect: f32,
         time_seconds: f32,
     ) {
+        if !self.pearl_uploaded {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.pearl_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                include_bytes!("../assets/pearl-256.rgba"),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(1024),
+                    rows_per_image: Some(256),
+                },
+                wgpu::Extent3d {
+                    width: 256,
+                    height: 256,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.pearl_uploaded = true;
+        }
         let aspect = if desktop_aspect.is_finite() {
             desktop_aspect.clamp(0.25, 8.0)
         } else {
@@ -817,12 +869,18 @@ fn create_ecology_background_bind_group(
     layout: &wgpu::BindGroupLayout,
     texture: &wgpu::Texture,
     sampler: &wgpu::Sampler,
+    pearl: &wgpu::Texture,
 ) -> wgpu::BindGroup {
+    let pearl_view = pearl.create_view(&wgpu::TextureViewDescriptor::default());
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("living desktop ecology background bind group"),
         layout,
         entries: &[
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&pearl_view),
+            },
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&view),

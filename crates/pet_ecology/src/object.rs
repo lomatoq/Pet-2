@@ -5,8 +5,8 @@ use crate::{EcologyError, MorselProfile};
 
 pub type ObjectId = u64;
 
-pub const MAX_OBJECTS: usize = 8;
-pub const MAX_ACTIVE_MORSELS: usize = 3;
+pub const MAX_OBJECTS: usize = 24;
+pub const MAX_ACTIVE_MORSELS: usize = 18;
 pub const MAX_OBJECT_SPEED: f32 = 2.5;
 pub const REFERENCE_DESKTOP_HEIGHT_PX: f32 = 1_152.0;
 

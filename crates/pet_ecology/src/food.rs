@@ -126,12 +126,21 @@ impl MetabolicState {
     }
 
     pub fn consume(&mut self, morsel: &MorselProfile) {
+        self.consume_portion(morsel, 1.0);
+    }
+
+    pub fn consume_portion(&mut self, morsel: &MorselProfile, portion: f32) {
+        let portion = if portion.is_finite() {
+            portion.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         if !morsel.is_valid() {
             return;
         }
-        self.reserve =
-            (self.reserve + 0.08 + morsel.value * 0.08).clamp(METABOLIC_RESERVE_FLOOR, 1.0);
-        self.satiation = (self.satiation + 0.28).clamp(0.0, 1.0);
+        self.reserve = (self.reserve + (0.08 + morsel.value * 0.08) * portion)
+            .clamp(METABOLIC_RESERVE_FLOOR, 1.0);
+        self.satiation = (self.satiation + 0.28 * portion).clamp(0.0, 1.0);
         self.digestion = 1.0;
         self.active_effect = Some(ConsumedMorselEffect {
             hue: morsel.hue,

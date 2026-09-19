@@ -835,7 +835,38 @@ impl EcologyRuntime {
         self.den_events.push_back(event);
     }
 
+    pub fn cancel_user_food(&mut self) {
+        self.user_food_seconds = 0.0;
+        self.state
+            .objects
+            .retain(|o| o.kind != ObjectKind::Morsel || o.radius_px_at_reference > 3.0);
+        self.food_caught = None;
+        self.food_physical = None;
+    }
+
     pub fn sprinkle_food(&mut self, position: Vec2, timestamp: f64) -> usize {
+        self.state
+            .objects
+            .retain(|o| o.lifecycle != ObjectLifecycle::Consumed);
+        let protected = self.director.active_episode().and_then(|e| e.object_id);
+        while self
+            .state
+            .objects
+            .iter()
+            .filter(|o| o.is_active_morsel())
+            .count()
+            > 15
+        {
+            let Some(index) = self.state.objects.iter().position(|o| {
+                o.kind == ObjectKind::Morsel
+                    && o.radius_px_at_reference <= 3.0
+                    && Some(o.id) != protected
+                    && Some(o.id) != self.food_caught
+            }) else {
+                break;
+            };
+            self.state.objects.remove(index);
+        }
         self.user_food_seconds = 180.0;
         self.director.notice_user_food(&mut self.state);
         let mut count = 0;

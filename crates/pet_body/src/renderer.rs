@@ -401,6 +401,7 @@ struct InternalFeatureTracker {
     frame: InternalFeatureFrame,
     initialized: bool,
     last_time: f32,
+    last_anchor: Vec2,
 }
 
 impl InternalFeatureTracker {
@@ -415,8 +416,23 @@ impl InternalFeatureTracker {
             };
             self.initialized = true;
             self.last_time = parameters.time;
+            self.last_anchor = parameters.liquid.face_frame.origin;
             return self.frame;
         }
+        // Advect the whole internal feature cloud with the contained face.
+        // Only relative material drift is smoothed, never body translation.
+        let anchor = parameters.liquid.face_frame.origin;
+        let displacement = anchor - self.last_anchor;
+        for orb in self
+            .frame
+            .orb_position_radius
+            .iter_mut()
+            .chain(self.frame.soul_position_radius.iter_mut())
+        {
+            orb[0] += displacement.x;
+            orb[1] += displacement.y;
+        }
+        self.last_anchor = anchor;
         let raw_dt = parameters.time - self.last_time;
         let dt = if raw_dt.is_finite() && (0.0..=0.25).contains(&raw_dt) {
             raw_dt.max(1.0 / 240.0)
@@ -3855,8 +3871,7 @@ fn internal_glow_orbs(
     let count = parameters
         .material_internal_orb_count
         .min(MAX_INTERNAL_GLOW_ORBS);
-    let speed = parameters.material_internal_orb_speed.clamp(0.0, 2.0)
-        * (0.72 + parameters.flow_speed.clamp(0.0, 0.6) * 0.8);
+    let speed = parameters.material_internal_orb_speed.clamp(0.0, 2.0) * 0.22;
     let mood_energy = (0.72
         + parameters.arousal.clamp(0.0, 1.0) * 0.38
         + parameters.core_glow.clamp(0.0, 0.72) * 0.55)
@@ -4227,6 +4242,25 @@ mod tests {
         assert!((0.93..=0.96).contains(&srgb), "mapped sclera={srgb}");
         let rgb = Vec3::splat(srgb);
         assert!(rgb.max_element() - rgb.min_element() <= 0.02);
+    }
+
+    #[test]
+    fn internal_features_advect_with_face_before_slow_relative_drift() {
+        let mut parameters = RenderParameters {
+            material_variant: MaterialVariant::CinematicJelly,
+            material_internal_orb_count: 1,
+            ..RenderParameters::default()
+        };
+        parameters.liquid.particle_count = 1;
+        parameters.liquid.particles[0].main_component = true;
+        let mut tracker = InternalFeatureTracker::default();
+        let first = tracker.update(&parameters).orb_position_radius[0];
+        let shift = Vec2::new(0.30, -0.20);
+        parameters.liquid.particles[0].position += shift;
+        parameters.liquid.face_frame.origin += shift;
+        parameters.time += 1.0 / 60.0;
+        let next = tracker.update(&parameters).orb_position_radius[0];
+        assert!((Vec2::new(next[0] - first[0], next[1] - first[1]) - shift).length() < 0.0151);
     }
 
     #[test]

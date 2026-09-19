@@ -19,7 +19,7 @@ const WINDOW_SAMPLES: usize = 400;
 const HOP_SAMPLES: usize = 160;
 const MIN_CUE_SAMPLES: usize = 2_880;
 const MAX_CUE_SAMPLES: usize = 40_000;
-const MAX_TEMPLATES_PER_CLASS: usize = 12;
+const MAX_TEMPLATES_PER_CLASS: usize = 40;
 const MAX_FEATURE_FRAMES: usize = 248;
 const MAX_FEATURE_ABS: f32 = 64.0;
 const MIN_NEGATIVE_MARGIN: f32 = 0.055;
@@ -29,6 +29,75 @@ const MIN_NEGATIVE_MARGIN: f32 = 0.055;
 pub enum CueKind {
     Name,
     Quiet,
+    Sit,
+    Jump,
+    Circle,
+    Come,
+    Stay,
+    Dash,
+    Up,
+    Down,
+    Left,
+    Right,
+    Sleep,
+    Wake,
+    Blink,
+    Look,
+    Bow,
+    Shake,
+    Stretch,
+    Play,
+    Home,
+}
+impl CueKind {
+    pub const ALL: [Self; 21] = [
+        Self::Name,
+        Self::Quiet,
+        Self::Sit,
+        Self::Jump,
+        Self::Circle,
+        Self::Come,
+        Self::Stay,
+        Self::Dash,
+        Self::Up,
+        Self::Down,
+        Self::Left,
+        Self::Right,
+        Self::Sleep,
+        Self::Wake,
+        Self::Blink,
+        Self::Look,
+        Self::Bow,
+        Self::Shake,
+        Self::Stretch,
+        Self::Play,
+        Self::Home,
+    ];
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Имя · Benny",
+            Self::Quiet => "Тише",
+            Self::Sit => "Сидеть",
+            Self::Jump => "Прыгни",
+            Self::Circle => "Сделай круг",
+            Self::Come => "Ко мне",
+            Self::Stay => "Стой",
+            Self::Dash => "Быстро",
+            Self::Up => "Вверх",
+            Self::Down => "Вниз",
+            Self::Left => "Влево",
+            Self::Right => "Вправо",
+            Self::Sleep => "Спать",
+            Self::Wake => "Проснись",
+            Self::Blink => "Моргни",
+            Self::Look => "Смотри",
+            Self::Bow => "Поклонись",
+            Self::Shake => "Отряхнись",
+            Self::Stretch => "Потянись",
+            Self::Play => "Играй",
+            Self::Home => "Домой",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -37,6 +106,18 @@ pub enum TrainingCue {
     Name,
     Quiet,
     Other,
+    Command(CueKind),
+}
+
+impl TrainingCue {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => CueKind::Name.label(),
+            Self::Quiet => CueKind::Quiet.label(),
+            Self::Other => "Посторонние слова",
+            Self::Command(cue) => cue.label(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +148,8 @@ pub struct CueModelV1 {
     pub quiet: Option<CueClassModelV1>,
     /// Explicit local counterexamples: room sounds, unrelated speech, and noise.
     pub other_examples: Vec<CueTemplateV1>,
+    #[serde(default)]
+    pub commands: Vec<CueClassModelV1>,
 }
 
 impl Default for CueModelV1 {
@@ -83,6 +166,7 @@ impl CueModelV1 {
             name: None,
             quiet: None,
             other_examples: Vec::new(),
+            commands: Vec::new(),
         }
     }
 
@@ -99,8 +183,18 @@ impl CueModelV1 {
         for template in &self.other_examples {
             validate_template(template)?;
         }
-        for (expected, class) in [(CueKind::Name, &self.name), (CueKind::Quiet, &self.quiet)] {
-            let Some(class) = class else { continue };
+        if self.commands.len() > 19
+            || self.commands.iter().enumerate().any(|(i, c)| {
+                matches!(c.cue, CueKind::Name | CueKind::Quiet)
+                    || self.commands[..i].iter().any(|p| p.cue == c.cue)
+            })
+        {
+            return Err(CueModelValidationError::WrongClassSlot);
+        }
+        for expected in CueKind::ALL {
+            let Some(class) = self.class(expected) else {
+                continue;
+            };
             if class.cue != expected {
                 return Err(CueModelValidationError::WrongClassSlot);
             }
@@ -133,23 +227,36 @@ impl CueModelV1 {
         })
     }
 
-    fn class(&self, cue: CueKind) -> Option<&CueClassModelV1> {
+    pub fn class(&self, cue: CueKind) -> Option<&CueClassModelV1> {
         match cue {
             CueKind::Name => self.name.as_ref(),
             CueKind::Quiet => self.quiet.as_ref(),
+            _ => self.commands.iter().find(|c| c.cue == cue),
         }
     }
 
     fn replace_class(&mut self, cue: CueKind, examples: Vec<CueTemplateV1>) {
-        let value = Some(CueClassModelV1 {
+        let mut combined = self
+            .class(cue)
+            .map_or_else(Vec::new, |c| c.examples.clone());
+        combined.extend(examples);
+        if combined.len() > MAX_TEMPLATES_PER_CLASS {
+            combined.drain(..combined.len() - MAX_TEMPLATES_PER_CLASS);
+        }
+        let examples = combined;
+        let value = CueClassModelV1 {
             cue,
             examples,
             acceptance_distance: None,
             required_negative_margin: MIN_NEGATIVE_MARGIN,
-        });
+        };
         match cue {
-            CueKind::Name => self.name = value,
-            CueKind::Quiet => self.quiet = value,
+            CueKind::Name => self.name = Some(value),
+            CueKind::Quiet => self.quiet = Some(value),
+            _ => {
+                self.commands.retain(|c| c.cue != cue);
+                self.commands.push(value);
+            }
         }
     }
 }
@@ -268,16 +375,36 @@ impl CueTrainer {
         match self.cue {
             TrainingCue::Name => candidate.replace_class(CueKind::Name, self.examples),
             TrainingCue::Quiet => candidate.replace_class(CueKind::Quiet, self.examples),
-            TrainingCue::Other => candidate.other_examples = self.examples,
+            TrainingCue::Command(cue) => candidate.replace_class(cue, self.examples),
+            TrainingCue::Other => {
+                candidate.other_examples.extend(self.examples);
+                if candidate.other_examples.len() > MAX_TEMPLATES_PER_CLASS {
+                    candidate
+                        .other_examples
+                        .drain(..candidate.other_examples.len() - MAX_TEMPLATES_PER_CLASS);
+                }
+            }
         }
-        calibrate_model(&mut candidate)?;
+        let changed = match self.cue {
+            TrainingCue::Name => Some(CueKind::Name),
+            TrainingCue::Quiet => Some(CueKind::Quiet),
+            TrainingCue::Command(cue) => Some(cue),
+            TrainingCue::Other => None,
+        };
+        calibrate_model(&mut candidate, changed)?;
         candidate.validate()?;
         Ok(candidate)
     }
 
+    pub(crate) fn retry_last(&mut self) {
+        self.examples.pop();
+    }
+
     fn required(&self) -> usize {
         match self.cue {
-            TrainingCue::Name | TrainingCue::Quiet => REQUIRED_POSITIVE_EXAMPLES,
+            TrainingCue::Name | TrainingCue::Quiet | TrainingCue::Command(_) => {
+                REQUIRED_POSITIVE_EXAMPLES
+            }
             TrainingCue::Other => REQUIRED_OTHER_EXAMPLES,
         }
     }
@@ -358,7 +485,7 @@ pub(crate) fn classify_segment(model: &CueModelV1, evidence: &SegmentEvidence) -
         return CueDecision::rejected(CueRejectReason::InvalidSegment);
     };
     let mut candidates = Vec::with_capacity(2);
-    for cue in [CueKind::Name, CueKind::Quiet] {
+    for cue in CueKind::ALL {
         let Some(class) = model.class(cue) else {
             continue;
         };
@@ -406,8 +533,17 @@ pub(crate) fn classify_segment(model: &CueModelV1, evidence: &SegmentEvidence) -
     }
 }
 
-fn calibrate_model(model: &mut CueModelV1) -> Result<(), EnrollmentError> {
-    for cue in [CueKind::Name, CueKind::Quiet] {
+fn calibrate_model(
+    model: &mut CueModelV1,
+    changed: Option<CueKind>,
+) -> Result<(), EnrollmentError> {
+    for cue in CueKind::ALL {
+        // Existing class thresholds stay valid; live classification still checks
+        // every competing class. Avoid quadratic retraining of all old words
+        // when the owner merely adds another five examples of one phrase.
+        if changed.is_some_and(|changed| changed != cue) {
+            continue;
+        }
         let Some(class) = model.class(cue) else {
             continue;
         };
@@ -418,11 +554,10 @@ fn calibrate_model(model: &mut CueModelV1) -> Result<(), EnrollmentError> {
         }
         let positives = class.examples.clone();
         let mut negatives = model.other_examples.clone();
-        if let Some(other) = model.class(match cue {
-            CueKind::Name => CueKind::Quiet,
-            CueKind::Quiet => CueKind::Name,
-        }) {
-            negatives.extend(other.examples.iter().cloned());
+        for other in CueKind::ALL.into_iter().filter(|other| *other != cue) {
+            if let Some(other) = model.class(other) {
+                negatives.extend(other.examples.iter().cloned());
+            }
         }
         // The last sample passed a separate holdout check above. Fit only on the
         // first four so enrollment cannot simply memorize its own validation.
@@ -440,6 +575,7 @@ fn calibrate_model(model: &mut CueModelV1) -> Result<(), EnrollmentError> {
         let target = match cue {
             CueKind::Name => model.name.as_mut(),
             CueKind::Quiet => model.quiet.as_mut(),
+            _ => model.commands.iter_mut().find(|c| c.cue == cue),
         }
         .expect("class was checked above");
         target.acceptance_distance = Some(threshold);
@@ -738,6 +874,42 @@ mod tests {
                 .unwrap();
         }
         trainer.finalize().unwrap()
+    }
+
+    #[test]
+    fn incremental_enrollment_preserves_other_commands_and_keeps_forty_examples() {
+        fn batch(model: CueModelV1, cue: TrainingCue, value: f32) -> CueModelV1 {
+            let mut trainer = CueTrainer::begin(cue, model).unwrap();
+            for i in 0..5 {
+                trainer
+                    .accept_feature_segment(CueTemplateV1 {
+                        frames: vec![
+                            SpectralFrameV1 {
+                                values: [value + i as f32 * 0.001; FEATURE_DIM]
+                            };
+                            4
+                        ],
+                        duration_ms: 300,
+                    })
+                    .unwrap();
+            }
+            trainer.finalize().unwrap()
+        }
+        let mut model = batch(CueModelV1::new(), TrainingCue::Other, 20.0);
+        for (i, cue) in CueKind::ALL.into_iter().enumerate() {
+            model = batch(model, TrainingCue::Command(cue), i as f32 * 0.4);
+            assert!(model.is_ready(cue));
+        }
+        let sit = model.class(CueKind::Sit).unwrap().examples.clone();
+        for _ in 0..8 {
+            model = batch(model, TrainingCue::Command(CueKind::Name), 0.0);
+        }
+        assert_eq!(model.name.as_ref().unwrap().examples.len(), 40);
+        assert_eq!(model.class(CueKind::Sit).unwrap().examples, sit);
+        let restored: CueModelV1 =
+            serde_json::from_str(&serde_json::to_string(&model).unwrap()).unwrap();
+        assert_eq!(restored, model);
+        restored.validate().unwrap();
     }
 
     #[test]

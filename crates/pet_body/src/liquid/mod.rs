@@ -855,9 +855,10 @@ impl LiquidMorphRuntime {
             },
         );
         let supported_softness =
-            smoothstep01(((self.flight_field_aspect - 1.34) / (2.4 - 1.34)).clamp(0.0, 1.0));
+            smoothstep01(((self.flight_field_aspect - 1.34) / (2.4 - 1.34)).clamp(0.0, 1.0))
+                .max(self.measured_support_load.mul_add(2.5, 0.0).clamp(0.0, 1.0));
         let supported_tension = parameters.surface_tension
-            + (parameters.surface_tension.min(0.62) - parameters.surface_tension)
+            + (parameters.surface_tension.min(0.48) - parameters.surface_tension)
                 * supported_softness;
         let cooperative_separation_scale = if sensors.interaction_actuation.allow_intentional_bud {
             0.35
@@ -1622,7 +1623,9 @@ impl LiquidMorphRuntime {
         } else {
             smoothstep01(((motion.velocity.length() - 0.30) / 0.70).clamp(0.0, 1.0))
         };
-        let comet_target = motion.velocity.normalize_or_zero() * comet_drive;
+        let comet_target = motion.velocity.normalize_or_zero()
+            * comet_drive
+            * (self.effective_flight_stretch() * 0.65).clamp(0.0, 1.0);
         self.flight_comet = self
             .flight_comet
             .lerp(comet_target, 1.0 - (-5.5 * dt).exp());
@@ -1660,13 +1663,13 @@ impl LiquidMorphRuntime {
             self.flight_field_axis = Vec2::from_angle(next_angle);
         }
 
-        let authored_stretch = self.effective_flight_stretch().clamp(0.0, 2.0);
-        let target_aspect = measured_load.map_or_else(
-            || (1.0 + drive * authored_stretch * 0.36).clamp(1.0, 1.34),
-            |(_, load)| 1.0 + (load * 3.5).clamp(0.0, 1.4),
-        );
+        // Only contact flattens the well. The old cross-flight ellipse opposed
+        // the longitudinal comet warp, creating a tilted pancake at speed.
+        // Free flight now has one shape driver plus real particle inertia.
+        let target_aspect =
+            measured_load.map_or(1.0, |(_, load)| 1.0 + (load * 3.5).clamp(0.0, 1.4));
         let aspect_rate = if measured_load.is_some() {
-            2.5
+            8.5
         } else {
             3.5 + drive * 3.5
         };
@@ -3651,15 +3654,15 @@ mod flight_field_tests {
     }
 
     #[test]
-    fn flight_field_flattens_continuously_and_relaxes_without_axis_flip() {
+    fn free_flight_comet_does_not_compete_with_a_flattening_ellipse() {
         let mut runtime = LiquidMorphRuntime::new(0x00F1_1E1D);
         let dt = 1.0 / 120.0;
         for _ in 0..240 {
             runtime.update_flight_field_shape(motion(Vec2::new(1.4, 0.0), Vec2::ZERO), dt);
         }
 
-        assert!(runtime.flight_field_aspect > 1.24);
-        assert!(runtime.flight_field_aspect <= 1.34);
+        assert!((runtime.flight_field_aspect - 1.0).abs() < 1e-5);
+        assert!(runtime.flight_comet.length() > 0.25);
         assert!(runtime.flight_field_axis.dot(Vec2::X).abs() < 1.0e-5);
         let area_scale = runtime.flight_field_aspect.sqrt();
         assert!((area_scale * area_scale.recip() - 1.0).abs() < 1.0e-6);

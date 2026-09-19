@@ -204,7 +204,10 @@ pub struct ProceduralBody {
     ecology_visual_effect: EcologyVisualEffect,
     feeding_mouth_offset: Vec2,
     feeding_mouth_activity: f32,
+    mouth_context_age: f32,
+    mouth_context_open: f32,
     contained_face: liquid::SmoothFaceOrigin,
+    face_mass_anchor: Option<Vec2>,
     fast_phenotype: FastPhenotypeActuation,
     contact_surface_cache: std::cell::Cell<Option<(u64, Vec2, Vec2)>>,
 }
@@ -237,7 +240,10 @@ impl ProceduralBody {
             ecology_visual_effect: EcologyVisualEffect::default(),
             feeding_mouth_offset: Vec2::ZERO,
             feeding_mouth_activity: 0.0,
+            mouth_context_age: 0.0,
+            mouth_context_open: 0.0,
             contained_face: liquid::SmoothFaceOrigin::default(),
+            face_mass_anchor: None,
             fast_phenotype: FastPhenotypeActuation::default(),
             contact_surface_cache: std::cell::Cell::new(None),
         };
@@ -570,6 +576,12 @@ impl ProceduralBody {
         voice: VoiceVisualState,
         dt: f32,
     ) {
+        if (intent.expression.mouth_open - self.mouth_context_open).abs() > 0.12 || voice.active {
+            self.mouth_context_age = 0.0;
+            self.mouth_context_open = intent.expression.mouth_open;
+        } else {
+            self.mouth_context_age = (self.mouth_context_age + dt.max(0.0)).min(60.0);
+        }
         let mut presented_intent = intent.clone();
         // The caller already composed R14, motor and semantic scene expression.
         // Keep that final intent, including lab/manual geometry and held closure.
@@ -658,11 +670,36 @@ impl ProceduralBody {
         self.embodiment.presentation_update(dt);
         let liquid = self.embodiment.liquid.render_state();
         let frame = liquid.face_frame;
+        let particles = &liquid.particles[..liquid.particle_count];
+        let mut sum = Vec2::ZERO;
+        let mut mass = 0.0;
+        for p in particles
+            .iter()
+            .filter(|p| p.main_component && p.position.is_finite())
+        {
+            let weight = p.density.max(0.0);
+            sum += p.position * weight;
+            mass += weight;
+        }
+        if mass > 0.0 {
+            let center = sum / mass;
+            if let Some(old) = self.face_mass_anchor
+                && let Some(origin) = &mut self.contained_face.origin
+            {
+                *origin += center - old;
+            }
+            self.face_mass_anchor = Some(center);
+        }
         let previous = self.contained_face.origin.unwrap_or(frame.origin);
         let desired = frame.origin
             + frame.axis_x * self.feeding_mouth_offset.x * frame.scale.x
             + frame.axis_y * self.feeding_mouth_offset.y * frame.scale.y;
         let particles = &liquid.particles[..liquid.particle_count];
+        // Ignore small target ripples relative to the advected liquid mass.
+        // Continuous deadband avoids a hold-then-jump threshold.
+        let relative = desired - previous;
+        let desired = previous
+            + relative * ((relative.length() - 0.045).max(0.0) / relative.length().max(0.0001));
         let target = liquid::contain_face_origin(
             particles,
             self.tuning.pbf.iso_threshold,
@@ -1084,7 +1121,39 @@ impl ProceduralBody {
 
     #[must_use]
     pub fn render_parameters(&self, genome: &Genome, arousal: f32) -> RenderParameters {
-        let pose = self.embodiment.pose;
+        let mut pose = self.embodiment.pose;
+        // Small coupled tissue motions follow arousal, breathing and current
+        // aperture. Closed mouths/eyes stay closed; speech retains authority.
+        let awake = pose.eye_aperture.clamp(0.0, 1.0);
+        let t = self.animation.time;
+        let identity_phase = (genome.identity_seed % 997) as f32 * 0.013;
+        let interest = arousal.clamp(0.0, 1.0);
+        let phase = t * 2.1 + identity_phase;
+        let tissue = phase.sin() * 0.65 + (phase * 1.73 + 0.8).sin() * 0.35;
+        let settle = (-(self.mouth_context_age - 3.0).max(0.0) * 1.4).exp();
+        let voice_authority = pose.audio_envelope.clamp(0.0, 1.0);
+        pose.mouth_open *= settle.max(voice_authority);
+        // One brief tissue adjustment per long quiet interval, not a perpetual
+        // mouth oscillator. Voice and food have independent opening authority.
+        let cycle = (t + identity_phase).rem_euclid(8.5);
+        let micro_gate = if cycle < 1.1 {
+            (std::f32::consts::PI * cycle / 1.1).sin().powi(2)
+        } else {
+            0.0
+        };
+        let lips = pose.mouth_open * awake * (1.0 - voice_authority) * micro_gate;
+        pose.mouth_open = (pose.mouth_open + lips * tissue * 0.055).clamp(0.0, 1.0);
+        pose.mouth_curve =
+            (pose.mouth_curve + lips * (phase * 0.71).sin() * 0.025).clamp(-1.0, 1.0);
+        pose.mouth_tension = (pose.mouth_tension + lips * tissue.abs() * 0.025).clamp(0.0, 1.0);
+        pose.geometry.mouth[0] += lips * tissue * 0.025;
+        pose.geometry.mouth[1] += lips * (phase * 0.71).sin() * 0.015;
+        pose.geometry.mouth[2] += lips * (phase * 0.71).sin() * 0.015;
+        pose.geometry = pose.geometry.sanitized();
+        pose.gaze += Vec2::new((phase * 1.31).sin(), (phase * 0.83).sin())
+            * (0.003 + interest * 0.003)
+            * awake;
+        pose.pupil_size = (pose.pupil_size + tissue * 0.008 * awake).clamp(0.0, 1.0);
         let physiology = self.embodiment.physiology.pose;
         let traits = self.visual_traits;
         let profile = &self.tuning;
@@ -1373,6 +1442,21 @@ mod tests {
     use lifecore::{BodyIntent, ExpressionState, Genome, LocomotionMode, PoseIntent, SensorFrame};
 
     use super::*;
+
+    #[test]
+    fn sustained_expression_relaxes_mouth_but_voice_can_open_it() {
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.embodiment.pose.mouth_open = 0.7;
+        body.embodiment.pose.audio_envelope = 0.0;
+        body.mouth_context_age = 12.0;
+        for tick in 0..120 {
+            body.animation.time = tick as f32 * 0.1;
+            assert!(body.render_parameters(&genome, 0.2).mouth_open < 0.001);
+        }
+        body.embodiment.pose.audio_envelope = 0.9;
+        assert!(body.render_parameters(&genome, 0.2).mouth_open > 0.5);
+    }
 
     #[test]
     fn apparent_scale_shader_projection_preserves_desktop_anchor() {

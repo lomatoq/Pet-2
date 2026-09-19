@@ -48,6 +48,7 @@ pub struct HearingBridge {
     onset_seconds: f32,
     onset_strength: f32,
     name_pending: bool,
+    command_pending: Option<CueKind>,
     startle_pending: f32,
     startle_cooldown: f32,
     pub message: String,
@@ -75,7 +76,7 @@ impl HearingBridge {
         let path = root.join("hearing-state.json");
         let loaded = fs::metadata(&path)
             .ok()
-            .filter(|m| m.len() <= 2_000_000)
+            .filter(|m| m.len() <= 64_000_000)
             .and_then(|_| fs::read(&path).ok())
             .and_then(|bytes| serde_json::from_slice::<HearingSave>(&bytes).ok())
             .filter(|s| {
@@ -87,7 +88,7 @@ impl HearingBridge {
         let mut message = if path.exists() && loaded.is_none() {
             "Could not validate saved hearing model; teach again to replace it.".to_owned()
         } else {
-            "Microphone off. Enable hearing to react to sound and teach cues.".to_owned()
+            "Микрофон выключен. Включи его для реакции на звуки и обучения.".to_owned()
         };
         let enabled = enable || loaded.as_ref().is_some_and(|s| s.enabled);
         let master_gain = loaded.as_ref().map_or(1.0, |s| s.master_gain);
@@ -96,9 +97,7 @@ impl HearingBridge {
             .expect("validated local hearing model");
         if enabled {
             message = match input.start() {
-                Ok(()) => {
-                    "Listening locally. Teach name, quiet, and other words before testing.".into()
-                }
+                Ok(()) => "Слушаю. Выбери имя или команду и добавь примеры своего голоса.".into(),
                 Err(error) => format!("Microphone unavailable: {error}"),
             };
         }
@@ -114,6 +113,7 @@ impl HearingBridge {
             onset_seconds: 0.0,
             onset_strength: 0.0,
             name_pending: false,
+            command_pending: None,
             startle_pending: 0.0,
             startle_cooldown: 0.0,
             message,
@@ -132,7 +132,7 @@ impl HearingBridge {
             HearingAction::Enable => {
                 self.enabled = true;
                 self.message = match self.input.start() {
-                    Ok(()) => "Listening locally; say something to check the input meter.".into(),
+                    Ok(()) => "Слушаю. Скажи что-нибудь — индикатор должен двигаться.".into(),
                     Err(error) => format!("Microphone unavailable: {error}"),
                 };
                 self.dirty = true;
@@ -144,33 +144,43 @@ impl HearingBridge {
                 self.name_pending = false;
                 self.onset_seconds = 0.0;
                 self.startle_pending = 0.0;
-                self.message = "Microphone off.".into();
+                self.message = "Микрофон выключен.".into();
                 self.dirty = true;
             }
-            HearingAction::TrainName | HearingAction::TrainQuiet | HearingAction::TrainOther => {
+            HearingAction::TrainName
+            | HearingAction::TrainQuiet
+            | HearingAction::TrainOther
+            | HearingAction::TrainCommand { .. } => {
                 if !self.enabled {
                     self.control(HearingAction::Enable);
                 }
                 self.test_seconds = 0.0;
+                self.command_pending = None;
+                pet_audio::AudioEngine::set_master_gain(0.0);
                 let cue = match action {
                     HearingAction::TrainName => TrainingCue::Name,
                     HearingAction::TrainQuiet => TrainingCue::Quiet,
+                    HearingAction::TrainCommand { cue } => TrainingCue::Command(cue),
                     _ => TrainingCue::Other,
                 };
                 self.message = match self.input.begin_training(cue) {
                     Ok(()) => format!(
-                        "Teaching {cue:?}: speak separate examples with a pause between them."
+                        "Записываю «{}»: пять повторов, после каждого пауза одну секунду.",
+                        cue.label()
                     ),
                     Err(error) => format!("Could not start teaching: {error}"),
                 };
             }
             HearingAction::CancelTraining => {
                 self.message = match self.input.cancel_training() {
-                    Ok(()) => "Teaching cancelled; previous cues retained.".into(),
+                    Ok(()) => "Запись остановлена. Ранее выученные команды сохранены.".into(),
                     Err(error) => format!("Could not cancel teaching: {error}"),
                 };
             }
             HearingAction::Test => {
+                if !self.enabled {
+                    self.control(HearingAction::Enable);
+                }
                 if self.training()
                     && let Err(error) = self.input.cancel_training()
                 {
@@ -180,7 +190,7 @@ impl HearingBridge {
                 self.test_seconds = 30.0;
                 self.accepted = 0;
                 self.rejected = 0;
-                self.message = "30-second test: try fresh cue examples and ordinary words. No commands applied during this check.".into();
+                self.message = "Проверка 30 секунд: говори команды отдельно. Узнанные команды выполняются; посторонние слова должны игнорироваться.".into();
             }
             HearingAction::Forget => match self.input.forget() {
                 Ok(()) => {
@@ -192,12 +202,20 @@ impl HearingBridge {
                 }
                 Err(error) => self.message = format!("Could not forget cues: {error}"),
             },
+            HearingAction::Perform { cue } => match cue {
+                CueKind::Quiet => self.quiet(),
+                CueKind::Name => {
+                    self.name_seconds = 3.0;
+                    self.name_pending = true;
+                }
+                _ => self.command_pending = Some(cue),
+            },
             HearingAction::QuietNow => self.quiet(),
             HearingAction::RestoreVolume => {
                 self.master_gain = 1.0;
                 self.quiet_seconds = 0.0;
                 pet_audio::AudioEngine::set_master_gain(1.0);
-                self.message = "Original voice level restored.".into();
+                self.message = "Обычная громкость восстановлена.".into();
                 self.dirty = true;
             }
         }
@@ -208,7 +226,7 @@ impl HearingBridge {
         self.master_gain = 0.25;
         self.quiet_seconds = 20.0;
         pet_audio::AudioEngine::set_master_gain(self.master_gain);
-        self.message = "Quiet: voice softened and new calls paused. Restore voice to undo.".into();
+        self.message = "Тише: голос приглушён, новые возгласы приостановлены.".into();
         self.dirty = true;
     }
 
@@ -218,13 +236,19 @@ impl HearingBridge {
         } else {
             0.0
         };
+        pet_audio::AudioEngine::set_master_gain(if self.training() {
+            0.0
+        } else {
+            self.master_gain
+        });
+        let own_active = own_active && !self.training();
         self.startle_cooldown = (self.startle_cooldown - dt).max(0.0);
         self.quiet_seconds = (self.quiet_seconds - dt).max(0.0);
         let was_testing = self.test_seconds > 0.0;
         self.test_seconds = (self.test_seconds - dt).max(0.0);
         if was_testing && self.test_seconds == 0.0 {
             self.message = format!(
-                "Test finished: {} accepted, {} rejected. Check that only intended cues were accepted.",
+                "Проверка завершена: узнано {}, посторонних или неузнанных звуков {}.",
                 self.accepted, self.rejected
             );
         }
@@ -257,33 +281,54 @@ impl HearingBridge {
                 }
                 AudioPercept::CueAccepted { decision } => {
                     self.accepted += 1;
-                    self.last_cue =
-                        format!("{:?} ({:.0}%)", decision.cue, decision.confidence * 100.0);
+                    self.last_cue = format!(
+                        "{} ({:.0}%)",
+                        decision.cue.map_or("—", |cue| cue.label()),
+                        decision.confidence * 100.0
+                    );
                     match decision.cue {
                         Some(CueKind::Name) if self.name_seconds <= 0.0 => {
-                            self.name_seconds = 2.0;
+                            self.name_seconds = 3.0;
                             self.name_pending = true;
                         }
-                        Some(CueKind::Quiet) if self.test_seconds <= 0.0 => self.quiet(),
+                        Some(CueKind::Quiet) => self.quiet(),
+                        Some(cue) if cue != CueKind::Name => self.command_pending = Some(cue),
                         _ => {}
                     }
                 }
-                AudioPercept::CueRejected { .. } => self.rejected += 1,
+                AudioPercept::CueRejected { .. } => {
+                    self.rejected += 1;
+                    if self.test_seconds > 0.0 {
+                        self.message = "Не узнал команду. Произнеси отдельно, с паузой. Можно добавить ещё пять примеров.".into();
+                    }
+                }
                 AudioPercept::TrainingProgress { progress } => {
                     self.message = format!(
-                        "Teaching {:?}: {}/{} accepted. Pause, then say the next example.",
-                        progress.cue, progress.accepted, progress.required
+                        "«{}»: {} из {}. Сделай паузу, затем повтори.",
+                        progress.cue.label(),
+                        progress.accepted,
+                        progress.required
                     )
                 }
                 AudioPercept::TrainingComplete { cue, model_ready } => {
                     self.completed_trainings += 1;
                     self.message = format!(
-                        "{cue:?} examples saved; ready: {model_ready}. Add other words, then test fresh examples."
+                        "«{}»: примеры сохранены. {}",
+                        cue.label(),
+                        if model_ready {
+                            "Можно проверить или добавить ещё пять."
+                        } else {
+                            "Добавь пять посторонних слов для различения команд."
+                        }
                     );
                     self.dirty = true;
                 }
                 AudioPercept::TrainingRejected { cue, reason } => {
-                    self.message = format!("{cue:?} example rejected: {reason}")
+                    self.message = format!(
+                        "«{}»: пример не сохранён. {}",
+                        cue.label(),
+                        explain_training_error(&reason)
+                    )
                 }
                 _ => {}
             }
@@ -307,12 +352,16 @@ impl HearingBridge {
             (None, None)
         }
     }
+    pub fn take_command(&mut self) -> Option<CueKind> {
+        self.command_pending.take()
+    }
+
     pub fn take_startle(&mut self) -> f32 {
         std::mem::take(&mut self.startle_pending)
     }
 
     pub fn name_attention(&self) -> bool {
-        self.name_seconds > 0.0 && !self.quiet_boundary()
+        self.name_seconds > 0.0
     }
     pub fn take_name_event(&mut self) -> bool {
         std::mem::take(&mut self.name_pending)
@@ -321,7 +370,7 @@ impl HearingBridge {
         (self.onset_seconds / 0.9).clamp(0.0, 1.0) * self.onset_strength
     }
     pub fn quiet_boundary(&self) -> bool {
-        self.quiet_seconds > 0.0
+        self.quiet_seconds > 0.0 || self.training()
     }
     pub fn training(&self) -> bool {
         self.input.training_progress().is_some()
@@ -338,6 +387,7 @@ impl HearingBridge {
             "name_examples":model.name.as_ref().map_or(0, |c| c.examples.len()),
             "other_examples":model.other_examples.len(),
             "quiet_examples":model.quiet.as_ref().map_or(0, |c| c.examples.len()),
+            "cues": CueKind::ALL.map(|cue| serde_json::json!({"cue":cue,"label":cue.label(),"examples":model.class(cue).map_or(0, |c| c.examples.len()),"ready":model.is_ready(cue)})),
             "sound_interest": self.sound_interest(),
             "name_ready":model.is_ready(CueKind::Name),"quiet_ready":model.is_ready(CueKind::Quiet)})
     }
@@ -414,4 +464,20 @@ fn sounds_distinguish_whispers_loud_onsets_and_own_voice() {
     assert_eq!(acoustic_response(0.10, 0.006, true), (0.0, 0.0));
     assert_eq!(acoustic_response(0.006, 0.006, false), (0.0, 0.0));
     assert_eq!(acoustic_response(f32::NAN, 0.001, false), (0.0, 0.0));
+}
+
+fn explain_training_error(reason: &str) -> &'static str {
+    if reason.contains("quiet") || reason.contains("silent") {
+        "Слишком тихо: говори чуть ближе к микрофону."
+    } else if reason.contains("duration") {
+        "Произнеси одно слово или короткую фразу, затем помолчи секунду."
+    } else if reason.contains("output") {
+        "Звучал голос питомца. Подожди тишины и повтори."
+    } else if reason.contains("separable") {
+        "Фраза похожа на другую команду или посторонний пример. Используй отличающиеся слова; сохранённые команды не потеряны."
+    } else if reason.contains("held-out") || reason.contains("inconsistent") {
+        "Последний пример сильно отличается. Предыдущие четыре сохранены — повтори ещё один обычным голосом."
+    } else {
+        "Не удалось выделить голос. Говори обычным голосом, делая паузу после фразы."
+    }
 }

@@ -795,11 +795,12 @@ impl AudioProcessor {
             return;
         }
         let trainer = self.trainer.take().expect("training existence checked");
-        match trainer.finalize() {
+        match trainer.clone().finalize() {
             Ok(candidate) => {
                 let model_ready = match progress.cue {
                     TrainingCue::Name => candidate.is_ready(CueKind::Name),
                     TrainingCue::Quiet => candidate.is_ready(CueKind::Quiet),
+                    TrainingCue::Command(cue) => candidate.is_ready(cue),
                     TrainingCue::Other => {
                         candidate.is_ready(CueKind::Name) || candidate.is_ready(CueKind::Quiet)
                     }
@@ -816,7 +817,12 @@ impl AudioProcessor {
                 );
             }
             Err(error) => {
-                update_status(&self.status, |value| value.training = None);
+                let mut trainer = trainer;
+                trainer.retry_last();
+                update_status(&self.status, |value| {
+                    value.training = Some(trainer.progress())
+                });
+                self.trainer = Some(trainer);
                 send_percept(
                     &self.percepts,
                     AudioPercept::TrainingRejected {
@@ -1069,6 +1075,7 @@ mod tests {
     #[test]
     fn forget_joins_an_inflight_worker_before_clearing_the_model() {
         let learned = CueModelV1 {
+            commands: Vec::new(),
             schema_version: crate::CUE_MODEL_SCHEMA_VERSION,
             name: None,
             quiet: None,

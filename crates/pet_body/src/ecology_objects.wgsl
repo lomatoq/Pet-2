@@ -19,6 +19,7 @@ struct VertexOutput {
 
 @group(0) @binding(0) var desktop_background: texture_2d<f32>;
 @group(0) @binding(1) var desktop_background_sampler: sampler;
+@group(0) @binding(2) var pearl_sprite: texture_2d<f32>;
 
 struct ReferenceBackgroundVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -570,15 +571,15 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let rgb = mix(input.color.rgb, vec3<f32>(1.0, 0.96, 0.72), core * 0.65) * (0.72 + pulse * 0.28);
         return encode_surface_output(vec4<f32>(rgb * alpha, alpha));
     }
-    let wobble = sin(atan2(input.local.y, input.local.x) * 3.0 + input.material.w * 1.7) * 0.025;
-    let body = soft_edge(radial_distance + wobble, 0.88, 1.02);
-    let halo = soft_edge(radial_distance, 1.03, 1.31) * (1.0 - body) * input.material.y * 0.34;
-    let highlight_center = vec2<f32>(-0.30, 0.32);
-    let highlight = soft_edge(distance(input.local, highlight_center), 0.08, 0.34);
-    let core = soft_edge(radial_distance, 0.0, 0.88);
-    let alpha = clamp(body * input.color.a + halo, 0.0, 1.0);
-    var rgb = input.color.rgb * (0.72 + core * 0.34);
-    rgb += vec3<f32>(0.62, 0.78, 0.92) * highlight * body * 0.52;
-    rgb += input.color.rgb * halo * 0.72;
-    return encode_surface_output(vec4<f32>(rgb * alpha, alpha));
+    // Generated nacre sprite: visual sphere and physical radius coincide.
+    let uv = input.local * vec2<f32>(0.43, -0.43) + vec2<f32>(0.5);
+    let pearl = textureSampleLevel(pearl_sprite, desktop_background_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+    let body = pearl.a * (1.0 - smoothstep(0.98, 1.03, radial_distance));
+    let pulse = 0.5 + 0.5 * sin(input.material.w * 1.15);
+    let halo = exp(-radial_distance * radial_distance * 2.0) * (1.0 - body) * (0.08 + pulse * 0.035);
+    let glint = pow(max(0.0, sin(input.material.w * 0.7)), 12.0)
+        * exp(-dot(input.local - vec2<f32>(-0.32, 0.4), input.local - vec2<f32>(-0.32, 0.4)) * 90.0);
+    let alpha = clamp(body + halo, 0.0, 1.0);
+    let rgb = pearl.rgb * body + vec3<f32>(0.8, 0.94, 1.0) * halo + vec3<f32>(glint * 0.18) * body;
+    return encode_surface_output(vec4<f32>(rgb, alpha));
 }
