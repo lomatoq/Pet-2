@@ -46,7 +46,7 @@ pub(super) fn show(
     monitor: Option<&mut LivePetMonitor>,
 ) {
     egui::CentralPanel::default().frame(egui::Frame::default().fill(Color32::from_rgb(20,24,34)).inner_margin(22.0)).show(ctx, |ui| {
-        ui.label(RichText::new("BENNY · ОБЩЕНИЕ").color(Color32::from_rgb(248,184,119)));
+        ui.label(RichText::new("БЕНДЕР · ОБЩЕНИЕ").color(Color32::from_rgb(248,184,119)));
         let Some(monitor) = monitor else { ui.label("Не удалось найти питомца."); return; };
         let latest = monitor.selected_frame().cloned().unwrap_or(Value::Null);
         let ready = monitor.can_send_control();

@@ -5,7 +5,9 @@ work=Path(__file__).resolve().parents[1];root=work.parent.parent
 old=root/'builds/Pet2-V21-Voice-2026-09-19';out=root/'builds/Pet2-V22-Contact-2026-09-19'
 out.mkdir(parents=True,exist_ok=True)
 for folder in ['config','licenses','assets']:shutil.copytree(old/folder,out/folder,dirs_exist_ok=True)
-for src,dst in [('pet2.exe','Pet2.exe'),('body_lab.exe','Pet2 Dev Console.exe')]:shutil.copy2(work/'target/x86_64-pc-windows-msvc/release'/src,out/dst)
+for src,dst in [('pet2.exe','Pet2.exe'),('body_lab.exe','Pet2 Dev Console.exe')]:
+ source=work/'target/x86_64-pc-windows-msvc/release'/src
+ if not (out/dst).exists() or hashlib.sha256(source.read_bytes()).digest()!=hashlib.sha256((out/dst).read_bytes()).digest():shutil.copy2(source,out/dst)
 shutil.copy2(work/'docs/V22-contact-hearing.md',out/'V22-notes.md')
 (out/'ПРОЧИТАЙ.md').write_text("""# Pet2 V22
 
