@@ -802,7 +802,7 @@ impl AudioProcessor {
                     TrainingCue::Quiet => candidate.is_ready(CueKind::Quiet),
                     TrainingCue::Command(cue) => candidate.is_ready(cue),
                     TrainingCue::Other => {
-                        candidate.is_ready(CueKind::Name) || candidate.is_ready(CueKind::Quiet)
+                        CueKind::ALL.into_iter().any(|cue| candidate.is_ready(cue))
                     }
                 };
                 *lock_recover(&self.model) = candidate;
