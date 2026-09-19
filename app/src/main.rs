@@ -3475,6 +3475,20 @@ impl PetApplication {
                 }),
                 LIFE_DT,
             );
+            // Object episodes own their measured approach/pause trajectory;
+            // generic posture programs must not retarget a pounce to the cursor.
+            if runtime.last_surface_care.target.is_none()
+                && !runtime.sensors.pet_dragged
+                && !runtime.life.state.focus_mode
+            {
+                restore_orb_play_navigation(
+                    runtime.ecology.active_episode().map(|e| e.goal),
+                    &motor_packet,
+                    &motor_goal.body_intent,
+                    &mut output.body_intent,
+                    runtime.hearing.quiet_boundary(),
+                );
+            }
             keep_eyes_available_during_active_locomotion(&mut output.body_intent);
             repertoire_bridge::merge_face(&mut output.body_intent, &repertoire);
             if let Some(pose) = runtime.lab_face_pose {
@@ -4096,6 +4110,7 @@ impl PetApplication {
                         "shout": audio_visual.shout,
                         "callback_rms": audio_levels.rms,
                         "callback_peak": audio_levels.peak,
+                        "callback_count": audio_levels.callback_count,
                         "recent_rms": runtime.audio.recent_rms,
                         "recent_peak": runtime.audio.recent_peak,
                         "accepted_requests": runtime.audio.accepted_requests,
@@ -5613,6 +5628,9 @@ fn activity_telemetry_json(
         // LifeCore action arbiter plus the EpisodeDirector, without creating a
         // second behavior supervisor.
         "activity": activity,
+        "orb_play_variant": episode.filter(|e| matches!(e.goal, EpisodeGoal::SoloOrbPlay | EpisodeGoal::ChaseOrb))
+            .map(|e| pet_ecology::orb_play_name(e.id)),
+        "orb_play_variant_count": pet_ecology::ORB_PLAY_NAMES.len(),
         "concrete_action": action_wire_name(state.current_action),
         "source": if episode.is_some() { "ecology_episode" } else { "lifecore_action" },
         "phase": episode.map_or_else(
@@ -5915,10 +5933,38 @@ fn update_surface_care(
     }
 }
 
+fn restore_orb_play_navigation(
+    goal: Option<EpisodeGoal>,
+    packet: &pet_motor::SomaticActuationPacket,
+    authored: &lifecore::BodyIntent,
+    intent: &mut lifecore::BodyIntent,
+    quiet: bool,
+) {
+    if !matches!(
+        goal,
+        Some(EpisodeGoal::SoloOrbPlay | EpisodeGoal::ChaseOrb | EpisodeGoal::InterceptOrb)
+    ) || packet
+        .program
+        .is_some_and(|p| p.family() == pet_motor::ProgramFamily::DefenseIntegrity)
+        || packet.regime.primary == pet_motor::SomaticRegime::Threatened
+    {
+        return;
+    }
+    intent.target_position = authored.target_position;
+    intent.desired_speed = authored.desired_speed * if quiet { 0.45 } else { 1.0 };
+    intent.locomotion = authored.locomotion;
+    intent.pose = authored.pose;
+    intent.target_surface = None;
+    intent.interaction_target = authored.interaction_target.clone();
+}
+
 fn apply_surface_care_packet(
     care: &surface_care_runtime::SurfaceCareOutput,
     packet: &mut SomaticActuationPacket,
 ) {
+    if packet.program == Some(pet_motor::BehaviorProgramId::DefenseStartleOrientFreeze) {
+        return;
+    }
     if let Some(preferred) = care.preferred_rest_target
         && packet.support.is_some()
         && packet.locomotion.pose == pet_motor::MotorPoseIntent::Landing
@@ -7626,6 +7672,53 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn orb_navigation_survives_projection_but_yields_to_startle() {
+        let mut authored = lifecore::BodyIntent {
+            locomotion: lifecore::LocomotionMode::Seek,
+            target_position: Vec2::new(0.7, 0.3),
+            target_surface: None,
+            desired_speed: 0.82,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: lifecore::PoseIntent::Playful,
+            expression: Default::default(),
+            interaction_target: Some(lifecore::InteractionTarget::ProceduralOrb),
+        };
+        let mut projected = authored.clone();
+        projected.desired_speed = 0.02;
+        projected.target_position = Vec2::ZERO;
+        let mut packet = pet_motor::SomaticActuationPacket::default();
+        restore_orb_play_navigation(
+            Some(EpisodeGoal::SoloOrbPlay),
+            &packet,
+            &authored,
+            &mut projected,
+            false,
+        );
+        assert_eq!(projected.desired_speed, 0.82);
+        assert_eq!(projected.target_position, authored.target_position);
+        authored.desired_speed = 0.0;
+        restore_orb_play_navigation(
+            Some(EpisodeGoal::SoloOrbPlay),
+            &packet,
+            &authored,
+            &mut projected,
+            false,
+        );
+        assert_eq!(projected.desired_speed, 0.0);
+        projected.target_position = Vec2::ZERO;
+        packet.program = Some(pet_motor::BehaviorProgramId::DefenseStartleOrientFreeze);
+        restore_orb_play_navigation(
+            Some(EpisodeGoal::SoloOrbPlay),
+            &packet,
+            &authored,
+            &mut projected,
+            false,
+        );
+        assert_eq!(projected.target_position, Vec2::ZERO);
+    }
+
     use pet_body::{BodyRenderMode, MaterialVariant};
 
     use super::*;

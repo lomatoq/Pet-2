@@ -207,6 +207,13 @@ const FAMILY_HOME: [PhaseSpec; 5] = [
     PhaseSpec::new("consume_carry_or_rest", 0.25, 2.4),
     PhaseSpec::new("appraise", 0.16, 0.70),
 ];
+const STARTLE: [PhaseSpec; 5] = [
+    PhaseSpec::new("startle_freeze", 0.035, 0.065),
+    PhaseSpec::new("startle_launch", 0.12, 0.22),
+    PhaseSpec::new("startle_brake", 0.12, 0.24),
+    PhaseSpec::new("startle_recheck", 0.25, 0.55),
+    PhaseSpec::new("startle_recover", 0.45, 0.85),
+];
 const FAMILY_DEFENSE: [PhaseSpec; 5] = [
     PhaseSpec::new("detect", 0.03, 0.12),
     PhaseSpec::new("protect", 0.06, 0.28),
@@ -408,7 +415,7 @@ pub const fn definition(id: BehaviorProgramId) -> ProgramDefinition {
             InterruptPolicy::FinishReadablePhase,
         ),
         P::DefenseStartleOrientFreeze => (
-            FAMILY_DEFENSE.as_slice(),
+            STARTLE.as_slice(),
             6.0,
             MotorPriority::Integrity,
             InterruptPolicy::Immediate,

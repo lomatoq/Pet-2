@@ -668,8 +668,8 @@ pub fn lock_target(
         P::DefenseStrainBraceAndRelease if goal.action == ActionId::ClingToWindowSide => {
             rank_cling_surface(context).map(BehaviorTarget::Surface)
         }
-        P::DefenseStartleOrientFreeze
-        | P::DefenseOverpressureBoundary
+        P::DefenseStartleOrientFreeze => Some(BehaviorTarget::Cursor(context.cursor_position)),
+        P::DefenseOverpressureBoundary
         | P::DefenseLocalPainGuard
         | P::DefenseStrainBraceAndRelease
         | P::DefensePostStressShakeOff => None,

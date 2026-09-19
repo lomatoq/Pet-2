@@ -1298,6 +1298,7 @@ mod tests {
             AudioCallbackLevels {
                 rms: 0.4,
                 peak: 1.0,
+                ..AudioCallbackLevels::default()
             },
             &genome,
         );

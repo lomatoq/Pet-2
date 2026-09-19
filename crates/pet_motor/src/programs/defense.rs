@@ -18,6 +18,63 @@ pub(crate) fn apply(
     context: &BehaviorContextFrame,
     tuning: MotorReadabilityTuning,
 ) -> bool {
+    if active.program == P::DefenseStartleOrientFreeze {
+        let position = context.body.motion.world_position;
+        // The threat position is locked for the bout: cursor motion cannot
+        // reverse the escape vector every frame. Contact normals take priority.
+        let threat = active
+            .locked_target
+            .as_ref()
+            .and_then(crate::BehaviorTarget::world_position)
+            .unwrap_or(context.cursor_position);
+        let away = if context.body.contact.contact_count > 0 {
+            context.body.contact.normal.normalize_or(-Vec2::Y)
+        } else {
+            (position - threat).normalize_or(-Vec2::Y)
+        };
+        let escape = (position + away * 0.11 - Vec2::Y * 0.025)
+            .clamp(Vec2::splat(0.035), Vec2::splat(0.965));
+        packet.support = None;
+        packet.expression.gaze_target = Some(threat);
+        packet.expression.eye_aperture_delta = 0.32;
+        packet.internal.flow_speed_multiplier = 0.55;
+        packet.locomotion.pose = MotorPoseIntent::Orient;
+        packet.locomotion.speed_multiplier = 0.0;
+        match phase {
+            "startle_launch" if !context.pet_dragged => {
+                packet.locomotion.pose = MotorPoseIntent::Travel;
+                packet.locomotion.target_position = Some(escape);
+                packet.locomotion.speed_multiplier = 1.5;
+                packet.locomotion.acceleration_limit = 1.5;
+                packet.material.flight_stretch_multiplier = 1.24;
+                packet.material.viscosity_multiplier = 0.86;
+            }
+            "startle_brake" => {
+                packet.locomotion.pose = MotorPoseIntent::Brake;
+                packet.locomotion.target_position = Some(position);
+                packet.locomotion.braking = 1.0;
+                packet.material.density_compliance_multiplier = 1.15;
+            }
+            "startle_recover" => {
+                packet.locomotion.pose = MotorPoseIntent::Recover;
+                packet.expression.eye_aperture_delta *= 1.0 - progress;
+                packet.internal.flow_speed_multiplier = 0.55 + 0.45 * progress;
+            }
+            _ => {}
+        }
+        push_field(
+            packet,
+            body_field(
+                SomaticFieldKind::Gather,
+                Vec2::ZERO,
+                away,
+                0.62,
+                0.25 * (1.0 - progress),
+                progress,
+            ),
+        );
+        return true;
+    }
     if !matches!(
         active.program,
         P::DefenseThreatHardenCompact | P::DefenseFragmentTrackAndRemerge

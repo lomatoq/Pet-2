@@ -336,6 +336,14 @@ impl OrganicRuntime {
     /// Adds phase-specific internal flow and enforces finite awake grip.
     /// This never changes the root position or selects a different action.
     pub fn decorate_packet(&self, goal: &BehaviorGoalFrame, packet: &mut SomaticActuationPacket) {
+        // Integrity reflexes own their full launch/brake sequence, even if a
+        // social bid was being withheld or a resting grip was still active.
+        if packet
+            .program
+            .is_some_and(|p| p.family() == pet_motor::ProgramFamily::DefenseIntegrity)
+        {
+            return;
+        }
         let Some(latest) = &self.latest else {
             return;
         };

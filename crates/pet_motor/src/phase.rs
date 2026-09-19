@@ -17,7 +17,8 @@ pub const BODY_ACTION_TEMPO: f32 = 2.0;
 #[must_use]
 pub fn phase_clock_scale(program: BehaviorProgramId, phase_name: &str) -> f32 {
     use BehaviorProgramId as P;
-    if program == P::MoveInspectPauseScan
+    if program == P::DefenseStartleOrientFreeze
+        || program == P::MoveInspectPauseScan
         || response_phase(phase_name)
         || matches!(
             phase_name,

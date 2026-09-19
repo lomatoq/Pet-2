@@ -155,11 +155,22 @@ impl SomaticActuationBus {
             intent.target_position = (target + arc).clamp(glam::Vec2::ZERO, glam::Vec2::ONE);
         }
         // A neutral packet must preserve a stop or an intentionally small effort.
-        let base_speed = if packet.program.is_some()
+        let launching_startle = packet.program
+            == Some(crate::BehaviorProgramId::DefenseStartleOrientFreeze)
+            && packet.locomotion.pose == MotorPoseIntent::Travel
+            && !context.pet_dragged;
+        let base_speed = if launching_startle {
+            // A sleeping intent has zero effort; a real alarm must still wake
+            // its motor, without increasing the speed of ordinary resting.
+            intent.pose = PoseIntent::Compact;
+            intent.target_surface = None;
+            intent.desired_speed.max(0.55)
+        } else if packet.program.is_some()
             && matches!(
                 packet.locomotion.pose,
                 MotorPoseIntent::Travel | MotorPoseIntent::Landing
-            ) {
+            )
+        {
             intent.desired_speed.max(0.08)
         } else {
             intent.desired_speed.max(0.0)
@@ -226,6 +237,9 @@ impl SomaticActuationBus {
                 intent.pose = PoseIntent::Compact;
                 intent.locomotion = LocomotionMode::Hover;
             }
+        }
+        if launching_startle {
+            intent.locomotion = LocomotionMode::Seek;
         }
     }
 }

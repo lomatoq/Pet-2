@@ -1346,6 +1346,17 @@ fn drive_episode(
             };
             let orb_distance =
                 desktop_distance(frame.pet_position, orb.position, frame.desktop_aspect);
+            let play_plan = crate::orb_play_plan(
+                active.id,
+                active.attempts,
+                active.phase_elapsed_seconds,
+                frame.pet_position,
+                orb.position,
+                orb.velocity,
+                frame.desktop_aspect,
+                active.bout_play_drive,
+                active.bout_fatigue,
+            );
             if active.goal == EpisodeGoal::SoloOrbPlay && active.phase == EpisodePhase::Evaluate {
                 output.body_intent.target_position = orb.position;
                 output.body_intent.locomotion = LocomotionMode::Arrive;
@@ -1456,6 +1467,7 @@ fn drive_episode(
             if active.goal == EpisodeGoal::SoloOrbPlay
                 && active.attempts == 0
                 && frame.play_drive > 0.5
+                && active.id.is_multiple_of(4)
                 && frame.orb_physical.contact
                 && orb.lifecycle != ObjectLifecycle::GrabbedByUser
             {
@@ -1470,7 +1482,7 @@ fn drive_episode(
                 );
                 return EpisodeStep::Continue;
             }
-            output.body_intent.target_position = orb.position;
+            output.body_intent.target_position = play_plan.target;
             output.body_intent.gaze_target = Some(orb.position);
             // An earlier VITA stage may have selected direct viewer contact.
             // Name the orb as the interaction subject so gaze_mode cannot throw
@@ -1483,16 +1495,15 @@ fn drive_episode(
                 LocomotionMode::Seek
             } else {
                 active.phase = EpisodePhase::Execute;
-                LocomotionMode::Orbit
+                LocomotionMode::Arrive
             };
             output.body_intent.pose = PoseIntent::Playful;
-            output.body_intent.desired_speed = output.body_intent.desired_speed.max(
-                if active.goal == EpisodeGoal::SoloOrbPlay && orb_distance > 0.15 {
-                    0.64
-                } else {
-                    0.48
-                },
-            );
+            output.body_intent.desired_speed = play_plan.speed;
+            if play_plan.speed == 0.0 {
+                // Hover adds a minimum-speed ambient drift; a watching pause
+                // should brake at the current point instead.
+                output.body_intent.locomotion = LocomotionMode::Arrive;
+            }
             if active.goal == EpisodeGoal::ChaseOrb
                 && orb.lifecycle == ObjectLifecycle::Free
                 && orb.velocity.length() >= 0.18
@@ -1512,27 +1523,12 @@ fn drive_episode(
                 && orb.lifecycle != ObjectLifecycle::GrabbedByUser
                 && (active.attempts == 0
                     || active.phase_elapsed_seconds
-                        >= (0.65 + active.bout_fatigue * 1.5) * bout_scale(active.id, 2))
+                        >= play_plan.pause_seconds * bout_scale(active.id, 2))
             {
-                let contact_axis = (orb.position - frame.pet_position).normalize_or_zero();
-                let authored_tap = Vec2::new(
-                    if active.attempts.is_multiple_of(2) {
-                        0.72
-                    } else {
-                        -0.72
-                    },
-                    -0.50,
-                )
-                .normalize();
-                let mut direction = if contact_axis.length_squared() > 1.0e-6 {
-                    contact_axis.lerp(authored_tap, 0.76).normalize_or_zero()
-                } else {
-                    authored_tap
-                };
+                let mut direction = play_plan.impulse.normalize_or_zero();
+                let mut strength = play_plan.impulse.length();
                 let wall_distance = orb.position.x.min(1.0 - orb.position.x) * frame.desktop_aspect;
                 let floor_distance = 1.0 - orb.position.y;
-                let mut strength =
-                    0.18 + frame.user_activity * 0.06 + active.bout_play_drive * 0.05;
                 if wall_distance < 0.07 {
                     // One weak probe of a nearby desktop wall; observe its real
                     // rebound instead of injecting another impulse every tick.
@@ -2887,11 +2883,49 @@ mod tests {
     }
 
     #[test]
+    fn every_orb_tactic_requires_contact_and_respects_user_ownership() {
+        for id in 1..=24 {
+            for (contact, held_by_user) in [(false, false), (true, false), (true, true)] {
+                let mut state = EcologyState::new(9101);
+                state.objects[0].position = Vec2::splat(0.5);
+                state.objects[0].novelty = 0.0;
+                state.objects[0].lifecycle = if held_by_user {
+                    ObjectLifecycle::GrabbedByUser
+                } else {
+                    ObjectLifecycle::Free
+                };
+                state.episode_stats.next_episode_id = id;
+                let mut director = EpisodeDirector::default();
+                let mut hits = 0;
+                for tick in 0..60 {
+                    let mut frame = behavior_frame(ActionId::SelfPlay);
+                    frame.play_drive = 0.4;
+                    frame.timestamp += tick as f64 * 0.05;
+                    frame.orb_physical.contact = contact;
+                    let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+                    for command in &output.object_commands[..output.object_command_count] {
+                        if let ObjectCommand::ApplyImpulse { impulse, .. } = command {
+                            hits += 1;
+                            assert!(impulse.is_finite() && impulse.length() <= 0.31);
+                        }
+                    }
+                }
+                if contact && !held_by_user {
+                    assert!(hits > 0, "id={id}");
+                } else {
+                    assert_eq!(hits, 0, "id={id}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn solo_throw_requires_measured_hold_and_has_clearance_limited_plan() {
         for (held, aspect) in [(false, 1.0), (true, 0.5), (true, 1.0), (true, 3.0)] {
             let mut state = EcologyState::new(9101);
             state.objects[0].novelty = 0.0;
             let mut director = EpisodeDirector::default();
+            state.episode_stats.next_episode_id = 4;
             let mut releases = 0;
             let mut saw_prepare = false;
             for tick in 0..25 {

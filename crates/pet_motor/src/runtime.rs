@@ -399,6 +399,13 @@ impl BehaviorPerformanceRuntime {
                 let should_start = match self.active.as_ref() {
                     None => true,
                     Some(active) if active.program == decision.program => false,
+                    Some(active)
+                        if active.program == BehaviorProgramId::DefenseStartleOrientFreeze
+                            && decision.priority.rank()
+                                < definition(active.program).priority.rank() =>
+                    {
+                        false
+                    }
                     Some(active) if active.social_bid.is_some() && decision.priority.rank() < 3 => {
                         false
                     }
@@ -534,7 +541,10 @@ impl BehaviorPerformanceRuntime {
         if matches!(
             context.world_goal,
             crate::MotorWorldGoal::OfferOrb | crate::MotorWorldGoal::PetMore
-        ) {
+        ) && !packet
+            .program
+            .is_some_and(|p| p.family() == crate::ProgramFamily::DefenseIntegrity)
+        {
             packet.locomotion.target_position = Some(goal.body_intent.target_position);
             packet.locomotion.speed_multiplier = f32::from(goal.body_intent.desired_speed > 0.001);
             packet.expression.gaze_target = goal.body_intent.gaze_target;
@@ -1148,6 +1158,52 @@ mod tests {
                 - values.iter().map(|v| v.0).fold(f32::INFINITY, f32::min)
         };
         assert!(spread(&loaded) < spread(&free) * 0.3);
+    }
+
+    #[test]
+    fn sleeping_alarm_launches_then_brakes_without_repeating_or_fighting_drag() {
+        for dragged in [false, true] {
+            for hz in [30.0, 60.0, 120.0] {
+                let mut runtime = BehaviorPerformanceRuntime::new(42);
+                let mut goal = goal(ActionId::Sleep, Vec2::splat(0.5));
+                goal.body_intent.desired_speed = 0.0;
+                goal.body_intent.locomotion = LocomotionMode::Sleep;
+                goal.body_intent.pose = PoseIntent::Sleeping;
+                goal.felt.startle = 0.9;
+                let mut context = BehaviorContextFrame::default();
+                context.body.motion.world_position = Vec2::splat(0.5);
+                context.cursor_position = Vec2::new(0.7, 0.5);
+                context.pet_dragged = dragged;
+                let mut launch_frames = 0;
+                let mut saw_brake = false;
+                for frame in 0..(hz as usize * 3) {
+                    context.frame_id = frame as u64;
+                    context.timestamp_seconds = frame as f64 / hz as f64;
+                    let packet = runtime.tick(&goal, &context, 1.0 / hz);
+                    let mut intent = goal.body_intent.clone();
+                    crate::SomaticActuationBus::apply_to_intent(&packet, &context, &mut intent);
+                    if packet.phase_name == "startle_launch" && !dragged {
+                        launch_frames += 1;
+                        assert!(intent.desired_speed > 0.8);
+                        assert!(intent.target_position.x < context.body.motion.world_position.x);
+                        assert_ne!(intent.locomotion, LocomotionMode::Sleep);
+                    }
+                    if packet.phase_name == "startle_brake" {
+                        saw_brake = true;
+                        assert_eq!(intent.desired_speed, 0.0);
+                    }
+                    if dragged
+                        && packet.program == Some(BehaviorProgramId::DefenseStartleOrientFreeze)
+                    {
+                        assert_eq!(intent.desired_speed, 0.0);
+                    }
+                }
+                assert!(saw_brake);
+                if !dragged {
+                    assert!((0.08..0.26).contains(&(launch_frames as f32 / hz)));
+                }
+            }
+        }
     }
 
     #[test]
