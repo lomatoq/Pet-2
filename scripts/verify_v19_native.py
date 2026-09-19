@@ -30,7 +30,7 @@ def sample(seconds):
             for line in path.read_bytes().splitlines()[-2:]:
                 try:
                     row = json.loads(line)['details']
-                    if not rows or row.get('sequence') != rows[-1].get('sequence'):
+                    if not rows or row.get('sequence', 0) > rows[-1].get('sequence', 0):
                         rows.append(row)
                 except (ValueError, KeyError):
                     pass
@@ -42,7 +42,9 @@ with (data/'stdout.log').open('w') as out, (data/'stderr.log').open('w') as err:
     process = subprocess.Popen([str(exe), '--data-dir', str(data), '--no-audio-output', '--dev-mode'],
                                cwd=exe.parent, startupinfo=startup, stdout=out, stderr=err)
     try:
-        sample(5)
+        deadline = time.monotonic() + 40
+        while not rows and time.monotonic() < deadline:
+            sample(1)
         assert rows, 'No rendered telemetry'
         send(dict(type='open_session', protocol_version=2, lease_seconds=10))
         sample(.5)

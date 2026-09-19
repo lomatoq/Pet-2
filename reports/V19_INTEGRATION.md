@@ -21,4 +21,12 @@ Source branch: `codex/pet2-integrated-v19` in `.worktrees/macos-parity-r14`.
 
 ## Verification
 
+Full workspace: 858 passed, 0 failed, 5 intentionally ignored. Final focused
+checks after the last navigation refinements: 285 passed, 0 failed, 1 ignored.
+`cargo clippy --workspace --all-targets -- -D warnings` and formatting passed.
+Voice Lab: 15/15. Release package hashes verified after copying.
+Native Windows desktop: 63 distinct telemetry frames, average 101.92 FPS,
+minimum 58.46 FPS, observed launch/brake/recheck/recovery and finite motion.
+The first sandbox smoke could not capture the desktop and exceeded its startup
+window; the ordinary desktop run passed with a bounded startup wait.
 See packaged verification logs and `verification/native.json` for final results. Native validation uses disposable state, with no microphone activation. Windows is the available host; no macOS package or installation is claimed.
