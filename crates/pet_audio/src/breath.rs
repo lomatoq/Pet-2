@@ -22,9 +22,12 @@ impl BreathPressureController {
     }
 
     pub(crate) fn begin_syllable(&mut self) {
-        self.onset_capture = 0.0;
-        self.lung_pressure *= 0.42;
-        self.subglottal_pressure *= 0.30;
+        // Preserve part of the previous pressure/capture so adjacent gestures
+        // share a physical breath and their resonant bands can overlap. A full
+        // reset made every syllable sound like a separately cropped sample.
+        self.onset_capture *= 0.30;
+        self.lung_pressure *= 0.72;
+        self.subglottal_pressure *= 0.58;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -145,5 +148,29 @@ mod tests {
             }
         }
         assert!(first_capture.is_some_and(|frame| frame > 250));
+    }
+
+    #[test]
+    fn adjacent_syllable_preserves_bounded_breath_continuity() {
+        let anatomy = lifecore::Genome::from_seed(9).voice.anatomy;
+        let mut controller = BreathPressureController::default();
+        for frame in 0..2_400 {
+            let _ = controller.process(
+                frame as f32 / 2_399.0,
+                VocalGesture::default(),
+                anatomy,
+                0.8,
+                0.4,
+                0.0,
+                0.0,
+                0.5,
+                0.0,
+                1.0 / 48_000.0,
+            );
+        }
+        let pressure_before = controller.subglottal_pressure;
+        controller.begin_syllable();
+        assert!(controller.subglottal_pressure > pressure_before * 0.50);
+        assert!(controller.subglottal_pressure < pressure_before * 0.65);
     }
 }
