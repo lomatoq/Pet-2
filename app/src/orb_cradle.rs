@@ -3,6 +3,29 @@ use crate::cradle_runtime::CradleGeometry;
 use glam::Vec2;
 use pet_ecology::{ObjectKind, ObjectLifecycle, WorldObject};
 
+/// Support under food, using the same floor and walls as swept bowl contact.
+/// Food already below the base remains below it rather than teleporting inside.
+pub fn food_floor(object: &WorldObject, anchor: Vec2, scale: f32, viewport: [u32; 2], desktop_floor: f32) -> f32 {
+    let extent = Vec2::new(viewport[0].max(1) as f32, viewport[1].max(1) as f32);
+    let g = CradleGeometry::new(anchor * extent, viewport, scale);
+    let radius = object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * extent.y;
+    let p = object.position * extent;
+    let dx = (p.x - g.anchor.x).abs();
+    let width = g.half_width / 0.285;
+    let surface = if dx + radius <= g.half_width + 0.01 {
+        g.floor
+    } else if dx <= width * 0.45 + radius {
+        g.anchor.y - width * 0.015
+    } else {
+        return desktop_floor;
+    };
+    if p.y + radius <= surface + 0.5 {
+        desktop_floor.min(surface / extent.y)
+    } else {
+        desktop_floor
+    }
+}
+
 pub fn constrain(
     object: &mut WorldObject,
     previous: Vec2,
@@ -10,7 +33,7 @@ pub fn constrain(
     scale: f32,
     viewport: [u32; 2],
 ) -> bool {
-    if object.kind != ObjectKind::Orb {
+    if !matches!(object.kind, ObjectKind::Orb | ObjectKind::Morsel) {
         return false;
     }
     let extent = Vec2::new(viewport[0].max(1) as f32, viewport[1].max(1) as f32);
@@ -98,6 +121,24 @@ mod tests {
     fn orb() -> WorldObject {
         pet_ecology::EcologyState::new(42).objects[0].clone()
     }
+    #[test]
+    fn food_cannot_cross_bowl_walls_but_food_below_base_keeps_desktop_floor() {
+        let extent = Vec2::new(800.0, 1080.0);
+        let anchor = Vec2::new(300.0, 300.0) / extent;
+        let mut food = orb();
+        food.kind = ObjectKind::Morsel;
+        food.lifecycle = ObjectLifecycle::Free;
+        food.radius_px_at_reference = 2.4;
+        let previous = Vec2::new(300.0, 315.0) / extent;
+        for x in [100.0, 520.0] {
+            food.position = Vec2::new(x, 315.0) / extent;
+            constrain(&mut food, previous, anchor, 1.0, [800, 1080]);
+            assert!((food.position.x * extent.x - 300.0).abs() < 89.0);
+        }
+        food.position = Vec2::new(300.0, 460.0) / extent;
+        assert_eq!(food_floor(&food, anchor, 1.0, [800, 1080], 0.96), 0.96);
+    }
+
     #[test]
     fn fast_inside_motion_cannot_cross_floor_or_side_walls_but_can_exit_above() {
         for destination in [

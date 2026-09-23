@@ -76,6 +76,13 @@ impl Default for MetabolicState {
 }
 
 impl MetabolicState {
+    /// Empty stomach and depleted reserve both increase eating urgency, while
+    /// a full stomach still suppresses intake despite an energy deficit.
+    pub fn feeding_appetite(&self) -> f32 {
+        let deficit = ((1.0 - self.reserve) / (1.0 - METABOLIC_RESERVE_FLOOR)).clamp(0.0, 1.0);
+        ((1.0 - self.satiation).clamp(0.0, 1.0) * (0.65 + 0.35 * deficit)).clamp(0.0, 1.0)
+    }
+
     pub fn validate(&self) -> Result<(), EcologyError> {
         let bounded = self.reserve.is_finite()
             && (METABOLIC_RESERVE_FLOOR..=1.0).contains(&self.reserve)
@@ -336,5 +343,151 @@ mod tests {
         metabolism.consume(&profile);
         let repeated = evaluate_food_utility(&metabolism, &taste, &profile, 0.0).total;
         assert!(repeated < before);
+    }
+}
+
+/// A bite is driven by appetite, bolus size and the food's cohesion; no
+/// unrelated random gag or fixed animation clip is scheduled.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FeedingBite {
+    pub chew_seconds: f32,
+    pub chew_hz: f32,
+    pub effort: f32,
+    pub settle_seconds: f32,
+    pub cohesion: f32,
+}
+impl FeedingBite {
+    pub fn new(metabolism: &MetabolicState, food: &MorselProfile, portion: f32) -> Self {
+        let appetite = metabolism.feeding_appetite();
+        let load = portion.clamp(0.0, 1.0).sqrt();
+        // A hasty large cohesive bolus can exceed comfortable processing
+        // capacity. It causes a small closed-mouth settling pause, not illness.
+        let excess = (load * (0.55 + food.cohesion_bias * 0.45) * appetite - 0.68).max(0.0);
+        let settle_seconds = (excess * 1.7).min(0.42);
+        Self {
+            chew_seconds: 0.45
+                + load * 0.85
+                + (1.0 - appetite) * 1.1
+                + food.cohesion_bias * 0.4
+                + settle_seconds,
+            chew_hz: 1.4 + appetite * 1.7 - food.cohesion_bias * 0.3,
+            effort: 0.04 + load * 0.11 + food.cohesion_bias * 0.04,
+            settle_seconds,
+            cohesion: food.cohesion_bias,
+        }
+    }
+    pub fn settling(self, elapsed: f32) -> bool {
+        self.settle_seconds > 0.0 && (0.28..0.28 + self.settle_seconds).contains(&elapsed)
+    }
+    pub fn aperture(self, elapsed: f32) -> f32 {
+        if elapsed < 0.14 || elapsed > self.chew_seconds - 0.2 || self.settling(elapsed) {
+            return 0.0;
+        }
+        // Remove the settling time from jaw phase: the jaw resumes where it
+        // stopped. As the bolus breaks down, its resistance and cycle duration
+        // fall; closing remains quicker than opening under cohesive load.
+        let t = (elapsed - 0.14 - (elapsed - 0.28).clamp(0.0, self.settle_seconds)).max(0.0);
+        let duration = (self.chew_seconds - self.settle_seconds).max(0.1);
+        let progress = (t / duration).clamp(0.0, 1.0);
+        let cycles = self.chew_hz * (t * 0.78 + 0.22 * t * t / duration);
+        let phase = cycles.fract();
+        let opening_share = 0.58 + self.cohesion * (1.0 - progress) * 0.12;
+        let jaw = if phase < opening_share {
+            phase / opening_share
+        } else {
+            (1.0 - phase) / (1.0 - opening_share)
+        };
+        let smooth_jaw = jaw * jaw * (3.0 - 2.0 * jaw);
+        smooth_jaw * self.effort * (1.0 - progress * 0.7)
+    }
+}
+
+#[cfg(test)]
+mod feeding_tests {
+    use super::*;
+    #[test]
+    fn reserve_and_excess_bolus_causally_control_settling() {
+        let food = MorselProfile {
+            hue: 0.2,
+            saturation: 0.5,
+            value: 0.8,
+            warmth: 0.5,
+            pulse_rate: 0.3,
+            stimulation: 0.4,
+            cohesion_bias: 1.0,
+            novelty: 0.3,
+        };
+        let depleted = MetabolicState {
+            reserve: METABOLIC_RESERVE_FLOOR,
+            satiation: 0.02,
+            ..Default::default()
+        };
+        let rested = MetabolicState {
+            reserve: 1.0,
+            ..depleted.clone()
+        };
+        let hasty = FeedingBite::new(&depleted, &food, 1.0);
+        let easy = FeedingBite::new(&depleted, &food, 0.125);
+        let rested = FeedingBite::new(&rested, &food, 1.0);
+        assert!(hasty.chew_hz > rested.chew_hz);
+        assert!(hasty.settle_seconds > 0.0 && hasty.settle_seconds <= 0.42);
+        assert_eq!(easy.settle_seconds, 0.0);
+        assert_eq!(rested.settle_seconds, 0.0);
+        assert_eq!(hasty.aperture(0.28 + hasty.settle_seconds * 0.5), 0.0);
+        for i in 0..500 {
+            let a = hasty.aperture(i as f32 * 0.01);
+            assert!(a.is_finite() && (0.0..=0.25).contains(&a));
+        }
+        // Later jaw cycles accelerate as food softens instead of replaying a
+        // constant-frequency clip. Compare successive maxima in the easy bite.
+        let samples: Vec<f32> = (0..250).map(|i| easy.aperture(i as f32 * 0.01)).collect();
+        let peaks: Vec<usize> = (1..samples.len() - 1)
+            .filter(|&i| samples[i] > samples[i - 1] && samples[i] > samples[i + 1])
+            .collect();
+        assert!(peaks.len() >= 3);
+        assert!(peaks[2] - peaks[1] < peaks[1] - peaks[0]);
+    }
+
+    #[test]
+    fn hunger_and_food_load_control_chewing_and_contact_closes_mouth() {
+        let food = MorselProfile {
+            hue: 0.2,
+            saturation: 0.5,
+            value: 0.8,
+            warmth: 0.5,
+            pulse_rate: 0.3,
+            stimulation: 0.4,
+            cohesion_bias: 0.6,
+            novelty: 0.3,
+        };
+        let hungry = FeedingBite::new(
+            &MetabolicState {
+                satiation: 0.05,
+                ..Default::default()
+            },
+            &food,
+            0.125,
+        );
+        let full = FeedingBite::new(
+            &MetabolicState {
+                satiation: 0.85,
+                ..Default::default()
+            },
+            &food,
+            0.125,
+        );
+        let large = FeedingBite::new(
+            &MetabolicState {
+                satiation: 0.05,
+                ..Default::default()
+            },
+            &food,
+            1.0,
+        );
+        assert!(hungry.chew_seconds < full.chew_seconds && hungry.chew_hz > full.chew_hz);
+        assert!(large.chew_seconds > hungry.chew_seconds);
+        assert_eq!(hungry.aperture(0.0), 0.0);
+        assert_eq!(hungry.aperture(hungry.chew_seconds), 0.0);
+        assert!((1..80).any(|i| hungry.aperture(i as f32 * 0.02) > 0.02));
     }
 }

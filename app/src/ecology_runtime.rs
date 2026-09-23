@@ -310,6 +310,7 @@ impl EcologyRuntime {
         self.last_body_position = body.world_position;
         self.last_orb_physical = orb_physical;
         let feeding = self.user_food_seconds > 0.0
+            && self.state.metabolism.satiation < 0.88
             && self
                 .state
                 .objects
@@ -480,6 +481,13 @@ impl EcologyRuntime {
         self.food_physical.map(|f| (f.socket_position, f.contact))
     }
 
+    fn food_floor(&self, food: &WorldObject) -> f32 {
+        let desktop = self.food_floors.iter()
+            .find(|(left, right, _)| food.position.x >= *left && food.position.x <= *right)
+            .map_or(1.0, |f| f.2);
+        crate::orb_cradle::food_floor(food, self.state.den.anchor, self.state.den.size_scale, self.den_viewport, desktop)
+    }
+
     pub fn feeding_support(&self) -> Option<pet_motor::SurfaceAttachmentCommand> {
         let contact = self.food_physical?;
         let id = self.director.active_episode()?.object_id?;
@@ -488,16 +496,12 @@ impl EcologyRuntime {
             .objects
             .iter()
             .find(|o| o.id == id && o.lifecycle == ObjectLifecycle::Sleeping)?;
-        let floor = self
-            .food_floors
-            .iter()
-            .find(|(left, right, _)| food.position.x >= *left && food.position.x <= *right)?
-            .2;
+        let floor = self.food_floor(food);
         if (contact.body_surface_position.y - floor).abs() > 0.006 {
             return None;
         }
         Some(pet_motor::SurfaceAttachmentCommand {
-            surface_id: lifecore::SurfaceId("food:taskbar".into()),
+            surface_id: lifecore::SurfaceId("food:support".into()),
             anchor_point: Vec2::new(contact.body_surface_position.x, floor),
             normal: -Vec2::Y,
             tangent: Vec2::X,
@@ -516,19 +520,19 @@ impl EcologyRuntime {
     }
 
     pub fn update_food_contact(&mut self, body: &ProceduralBody, height: f32) -> Option<Vec2> {
-        let active = self
-            .director
-            .active_episode()
-            .filter(|e| matches!(e.goal, EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel));
+        let active = self.director.active_episode().filter(|e| {
+            matches!(e.goal, EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel)
+                && e.phase != pet_ecology::EpisodePhase::Recover
+        });
         let food = active
             .and_then(|e| e.object_id)
             .and_then(|id| self.state.objects.iter().find(|o| o.id == id));
         let Some(food) = food else {
             if let Some(id) = self.food_caught.take()
                 && let Some(o) = self.state.objects.iter_mut().find(|o| o.id == id)
-            {
-                o.lifecycle = ObjectLifecycle::Free;
-            }
+                && o.lifecycle == ObjectLifecycle::CarriedByPet {
+                    o.lifecycle = ObjectLifecycle::Free;
+                }
             self.food_physical = None;
             return None;
         };
@@ -552,11 +556,7 @@ impl EcologyRuntime {
             )
         };
         let desired_center = if settled {
-            let floor = self
-                .food_floors
-                .iter()
-                .find(|(left, right, _)| food.position.x >= *left && food.position.x <= *right)
-                .map_or(food.position.y + radius / height, |f| f.2);
+            let floor = self.food_floor(food);
             Vec2::new(
                 food.position.x - body.feeding_mouth_rest_pixels(height).x / scale.x,
                 floor - support.y / scale.y,
@@ -569,7 +569,7 @@ impl EcologyRuntime {
         let touching = if settled {
             hit.is_some() && mouth_contact
         } else {
-            hit.is_some() || self.food_caught == Some(food.id)
+            (hit.is_some() && mouth_contact) || self.food_caught == Some(food.id)
         };
         let id = food.id;
         let catch = touching && !settled && food.lifecycle != ObjectLifecycle::GrabbedByUser;
@@ -747,7 +747,11 @@ impl EcologyRuntime {
                         object.position.x >= *left && object.position.x <= *right
                     })
                     .map_or(1.0, |(_, _, bottom)| *bottom);
+                let floor = crate::orb_cradle::food_floor(object, den_anchor, den_scale, den_viewport, floor);
                 pet_ecology::step_morsel(object, config, floor, dt);
+                if matches!(object.lifecycle, ObjectLifecycle::Free | ObjectLifecycle::Sleeping) {
+                    crate::orb_cradle::constrain(object, before_motion, den_anchor, den_scale, den_viewport);
+                }
                 continue;
             }
             let contacts_before = self.environment.contact_count;
@@ -920,6 +924,11 @@ impl EcologyRuntime {
         self.environment.orb_trapped = self.orb_trapped_seconds >= 0.75;
         self.object_physics_microseconds = started.elapsed().as_secs_f64() * 1_000_000.0;
         self.state.metabolism.advance(dt);
+        // Unattended crumbs lose freshness in simulated time. Holding/carrying
+        // food suspends expiry, and expiry never credits nutrition.
+        for food in &mut self.state.objects {
+            food.advance_food_freshness(dt);
+        }
     }
 
     #[must_use]
@@ -1773,6 +1782,38 @@ impl EcologyRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn food_lands_on_cradle_and_navigation_uses_its_seat_not_taskbar() {
+        for viewport in [[1920, 1080], [1280, 720], [900, 1440]] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = StateStore::at(directory.path());
+            let mut runtime = EcologyRuntime::load_or_create(&store, 42, true).unwrap();
+            runtime.den_viewport = viewport;
+            runtime.state.den.anchor = Vec2::new(0.5, 0.7);
+            runtime.set_food_floors(vec![(0.0, 1.0, 0.96)]);
+            runtime.sprinkle_food(Vec2::new(0.5, 0.45), 1.0);
+            for o in &mut runtime.state.objects {
+                if o.kind == ObjectKind::Morsel { o.velocity = Vec2::new(0.0, 2.0); }
+            }
+            let body = BodyFeedback { world_position: Vec2::new(0.1, 0.1), ..BodyFeedback::default() };
+            let extent = Vec2::new(viewport[0] as f32, viewport[1] as f32);
+            let g = crate::cradle_runtime::CradleGeometry::new(runtime.state.den.anchor * extent, viewport, runtime.state.den.size_scale);
+            for _ in 0..600 {
+                runtime.fixed_update(extent.x / extent.y, &WindowAffordanceFrame::default(), &body, 1.0 / 120.0);
+                for food in runtime.state.objects.iter().filter(|o| o.kind == ObjectKind::Morsel) {
+                    let bottom = (food.position.y + food.radius_px_at_reference / REFERENCE_DESKTOP_HEIGHT_PX) * extent.y;
+                    assert!(bottom <= g.floor + 0.05, "food tunneled through cradle: {bottom} > {}", g.floor);
+                }
+            }
+            for food in runtime.state.objects.iter().filter(|o| o.kind == ObjectKind::Morsel) {
+                assert_eq!(food.lifecycle, ObjectLifecycle::Sleeping);
+                assert!((runtime.food_floor(food) * extent.y - g.floor).abs() < 0.05);
+                let bottom = (food.position.y + food.radius_px_at_reference / REFERENCE_DESKTOP_HEIGHT_PX) * extent.y;
+                assert!((bottom - g.floor).abs() < 0.05);
+            }
+        }
+    }
 
     #[test]
     fn orb_contact_socket_and_carry_anchor_are_bit_identical_for_glow_zero_to_one() {

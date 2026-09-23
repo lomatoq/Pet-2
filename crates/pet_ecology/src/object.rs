@@ -64,6 +64,24 @@ pub struct WorldObject {
 }
 
 impl WorldObject {
+    /// Food left on the desktop expires after four minutes of unattended
+    /// simulation. User-held, being eaten and stored food remain available.
+    pub fn advance_food_freshness(&mut self, dt: f32) {
+        if self.kind != ObjectKind::Morsel
+            || !dt.is_finite()
+            || !matches!(
+                self.lifecycle,
+                ObjectLifecycle::Free | ObjectLifecycle::Sleeping
+            )
+        {
+            return;
+        }
+        self.wear = (self.wear + dt.clamp(0.0, 60.0) / 240.0).min(1.0);
+        if self.wear >= 1.0 {
+            self.lifecycle = ObjectLifecycle::Consumed;
+        }
+    }
+
     #[must_use]
     pub const fn physical_hull(&self) -> PhysicalInteractionHull {
         PhysicalInteractionHull {
@@ -230,5 +248,29 @@ mod tests {
                 expected.radius_px_at_reference.to_bits()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    #[test]
+    fn food_expires_but_holding_it_pauses_expiry_and_orb_is_unchanged() {
+        let mut orb = WorldObject::canonical_orb(1, Vec2::splat(0.5));
+        let mut food = orb.clone();
+        food.kind = ObjectKind::Morsel;
+        food.lifecycle = ObjectLifecycle::Sleeping;
+        for _ in 0..3 {
+            food.advance_food_freshness(60.0);
+        }
+        assert_eq!(food.lifecycle, ObjectLifecycle::Sleeping);
+        food.lifecycle = ObjectLifecycle::GrabbedByUser;
+        food.advance_food_freshness(60.0);
+        assert_eq!(food.wear, 0.75);
+        food.lifecycle = ObjectLifecycle::Free;
+        food.advance_food_freshness(60.0);
+        assert_eq!(food.lifecycle, ObjectLifecycle::Consumed);
+        orb.advance_food_freshness(60.0);
+        assert_eq!(orb.wear, 0.0);
     }
 }

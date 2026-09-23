@@ -323,7 +323,7 @@ impl ProceduralBody {
             let local =
                 p * Vec2::new(1.0, -1.0) * (2.0 * self.projection_scale() / height.max(1.0));
             let frame = self.embodiment.liquid.render_state().face_frame;
-            let delta = local - self.contained_face.origin.unwrap_or(frame.origin);
+            let delta = local - frame.origin;
             (Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
                 / frame.scale.max(Vec2::splat(0.01))
                 - Vec2::new(0.0, -0.1))
@@ -344,7 +344,7 @@ impl ProceduralBody {
         let frame = liquid.face_frame;
         let origin = self.contained_face.origin.unwrap_or(frame.origin);
         let base = origin - frame.axis_y * 0.1 * frame.scale.y;
-        let desired = base
+        let desired = frame.origin - frame.axis_y * 0.1 * frame.scale.y
             + frame.axis_x * self.feeding_mouth_offset.x * frame.scale.x
             + frame.axis_y * self.feeding_mouth_offset.y * frame.scale.y;
         let mouth = liquid::contain_mouth_origin(
@@ -732,7 +732,13 @@ impl ProceduralBody {
             self.face_mass_anchor = Some(center);
         }
         let previous = self.contained_face.origin.unwrap_or(frame.origin);
-        let desired = frame.origin;
+        // Feeding carries eyes, brows and mouth down together. The same full-face
+        // density footprint keeps the eyes within the liquid; the mouth may reach
+        // a little farther to make actual food contact.
+        let feeding = self.feeding_mouth_offset * 0.68;
+        let desired = frame.origin
+            + frame.axis_x * feeding.x * frame.scale.x
+            + frame.axis_y * feeding.y * frame.scale.y;
         let particles = &liquid.particles[..liquid.particle_count];
         // Ignore small target ripples relative to the advected liquid mass.
         // Continuous deadband avoids a hold-then-jump threshold.
@@ -1328,9 +1334,7 @@ impl ProceduralBody {
             brow_asymmetry: pose.brow_asymmetry,
             geometry: pose.geometry,
             eye_aperture: pose.eye_aperture,
-            mouth_open: pose.mouth_open.max(
-                self.feeding_mouth_activity * (0.26 + pose.breath.abs().clamp(0.0, 1.0) * 0.22),
-            ),
+            mouth_open: pose.mouth_open,
             feeding_mouth_offset: self.feeding_mouth_render_offset(),
             mouth_curve: pose.mouth_curve,
             mouth_shout: pose.mouth_shout,
@@ -1521,7 +1525,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feeding_moves_only_mouth_and_keeps_its_tip_near_the_surface() {
+    fn feeding_lowers_the_whole_face_and_keeps_its_tip_near_the_surface() {
         let genome = Genome::from_seed(42);
         let mut body = ProceduralBody::generate(&genome).unwrap();
         body.presentation_update(1.0 / 60.0);
@@ -1533,15 +1537,24 @@ mod tests {
         let support = body.liquid_physical_support_pixels(Vec2::Y, 1080.0);
         for _ in 0..120 {
             body.set_feeding_mouth(Some(support), 1080.0, 1.0 / 120.0);
+            body.presentation_update(1.0 / 120.0);
         }
         let after = body.render_parameters(&genome, 0.3);
-        assert_eq!(before, after.liquid.face_frame.origin);
+        assert!(after.liquid.face_frame.origin.y < before.y - 0.02);
+        assert_eq!(after.mouth_open, body.embodiment.pose.mouth_open);
         let tip = body.feeding_mouth_tip_pixels(1080.0);
         assert!(
-            tip.distance(support) < 12.0,
+            tip.distance(support) < 4.0,
             "tip={tip:?}, support={support:?}"
         );
         assert!(after.feeding_mouth_offset.y < 0.0);
+        for _ in 0..360 {
+            body.set_feeding_mouth(None, 1080.0, 1.0 / 120.0);
+            body.presentation_update(1.0 / 120.0);
+        }
+        let restored = body.render_parameters(&genome, 0.3);
+        assert!(restored.feeding_mouth_offset.length() < 0.001);
+        assert!(restored.liquid.face_frame.origin.distance(before) < 0.06);
     }
 
     #[test]
