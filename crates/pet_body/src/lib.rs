@@ -327,7 +327,9 @@ impl ProceduralBody {
             (Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
                 / frame.scale.max(Vec2::splat(0.01))
                 - Vec2::new(0.0, -0.1))
-            .clamp_length_max(1.8)
+            // Feeding may lower the face, never pull the mouth sideways or
+            // above the eyes to chase an airborne crumb.
+            .clamp(Vec2::new(0.0, -1.8), Vec2::ZERO)
         });
         let alpha = 1.0 - (-12.0 * dt.max(0.0)).exp();
         self.feeding_mouth_offset = self.feeding_mouth_offset.lerp(target, alpha);
@@ -1525,6 +1527,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn feeding_target_cannot_pull_mouth_above_or_beside_face() {
+        let genome = Genome::from_seed(42);
+        for target in [Vec2::new(120.0, -100.0), Vec2::new(-120.0, -100.0)] {
+            let mut body = ProceduralBody::generate(&genome).unwrap();
+            body.presentation_update(1.0 / 60.0);
+            for _ in 0..120 {
+                body.set_feeding_mouth(Some(target), 1080.0, 1.0 / 120.0);
+                body.presentation_update(1.0 / 120.0);
+            }
+            assert_eq!(body.feeding_mouth_offset, Vec2::ZERO);
+            assert_eq!(body.feeding_mouth_render_offset(), Vec2::ZERO);
+        }
+    }
+
+    #[test]
     fn feeding_lowers_the_whole_face_and_keeps_its_tip_near_the_surface() {
         let genome = Genome::from_seed(42);
         let mut body = ProceduralBody::generate(&genome).unwrap();
@@ -1534,7 +1551,10 @@ mod tests {
             .liquid
             .face_frame
             .origin;
-        let support = body.liquid_physical_support_pixels(Vec2::Y, 1080.0);
+        let support = Vec2::new(
+            body.feeding_mouth_rest_pixels(1080.0).x,
+            body.liquid_physical_support_pixels(Vec2::Y, 1080.0).y,
+        );
         for _ in 0..120 {
             body.set_feeding_mouth(Some(support), 1080.0, 1.0 / 120.0);
             body.presentation_update(1.0 / 120.0);

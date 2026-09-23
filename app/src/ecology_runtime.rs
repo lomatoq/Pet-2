@@ -562,7 +562,9 @@ impl EcologyRuntime {
                 floor - support.y / scale.y,
             )
         } else {
-            food.position - (support - direction * radius * 0.35) / scale
+            // Intercept airborne food with the face, not by sending the mouth
+            // to an arbitrary point on the body's silhouette.
+            food.position - body.feeding_mouth_tip_pixels(height) / scale
         };
         let mouth_contact =
             (body.feeding_mouth_tip_pixels(height) - relative).length() <= radius + 3.0;
@@ -577,7 +579,7 @@ impl EcologyRuntime {
             self.food_caught = Some(id);
             if let Some(food) = self.state.objects.iter_mut().find(|o| o.id == id) {
                 food.lifecycle = ObjectLifecycle::CarriedByPet;
-                food.position = center + support * 0.96 / scale;
+                food.position = center + body.feeding_mouth_tip_pixels(height) / scale;
                 food.velocity = Vec2::ZERO;
             }
         }
@@ -587,11 +589,12 @@ impl EcologyRuntime {
             body_surface_position: center + support / scale,
             ..PhysicalGrabFrame::default()
         });
-        ((relative - support).length() < 120.0).then_some(if settled {
-            Vec2::new(body.feeding_mouth_rest_pixels(height).x, relative.y)
-        } else {
-            relative
-        })
+        // Lower-face reach is only for food resting on a surface. Falling
+        // crumbs move the pet's navigation target; the mouth stays with its face.
+        (settled && (relative - support).length() < 120.0).then_some(Vec2::new(
+            body.feeding_mouth_rest_pixels(height).x,
+            relative.y,
+        ))
     }
 
     pub fn fixed_update(
