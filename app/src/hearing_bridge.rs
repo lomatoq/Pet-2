@@ -240,6 +240,13 @@ impl HearingBridge {
                 _ => self.command_pending = Some(cue),
             },
             HearingAction::QuietNow => self.quiet(),
+            HearingAction::SetVolume { percent } => {
+                self.master_gain = f32::from(percent.min(100)) / 100.0;
+                self.quiet_seconds = 0.0;
+                pet_audio::AudioEngine::set_master_gain(self.master_gain);
+                self.message = format!("Voice volume: {}%", percent.min(100));
+                self.dirty = true;
+            }
             HearingAction::RestoreVolume => {
                 self.master_gain = 1.0;
                 self.quiet_seconds = 0.0;

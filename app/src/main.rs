@@ -143,6 +143,14 @@ const CAUSAL_TELEMETRY_SCHEMA_VERSION: u32 = 4;
 const TELEMETRY_RECENT_MEMORY_LIMIT: usize = 16;
 const TELEMETRY_EPISODE_MEMORY_LIMIT: usize = 16;
 
+fn spawn_companion_menu(root: &std::path::Path, idle: bool) -> Option<std::process::Child> {
+    let folder = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let menu = [folder.join("Pet2 Dev Console.exe"), folder.join("body_lab.exe")].into_iter().find(|p| p.is_file())?;
+    std::process::Command::new(menu)
+        .arg(if idle { "--pet-menu-idle" } else { "--pet-menu" })
+        .arg("--data-dir").arg(root).spawn().map_err(|error| eprintln!("companion menu: {error}")).ok()
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = Arguments::parse(env::args().skip(1))?;
     startup_probe(arguments.debug_log, "arguments parsed");
@@ -2591,6 +2599,19 @@ impl PetApplication {
                 desktop_size.y,
                 runtime.normalizer.monotonic_seconds(),
             );
+            let nest = virtual_normalized_to_physical(
+                &runtime.topology,
+                runtime.ecology.state().den.anchor,
+            );
+            let nest_width = (310.0 * runtime.ecology.state().den.size_scale)
+                .min(desktop_size.x * 0.8)
+                .min(desktop_size.y * 0.65);
+            let den_hover = snapshot.cursor.is_some_and(|p| {
+                let q =
+                    (Vec2::new(p.x as f32, p.y as f32) - nest - Vec2::new(0.0, nest_width * 0.10))
+                        / Vec2::new(nest_width * 0.49, nest_width * 0.23);
+                q.length_squared() <= 1.0
+            });
             let accepts_cursor = runtime.cursor_hittest_latch.resolve(
                 hovered_predictive || ecology_hover_predictive,
                 hovered_hysteresis || ecology_hover_hysteresis,
@@ -2598,7 +2619,7 @@ impl PetApplication {
             );
             let _ = runtime.platform.set_cursor_hittest(
                 &runtime.window,
-                (accepts_cursor || runtime.feeding_seconds > 0.0)
+                (accepts_cursor || den_hover || runtime.feeding_seconds > 0.0)
                     && runtime.birth.started.is_none(),
             );
             runtime.sensors = runtime.normalizer.normalize(
@@ -4858,7 +4879,7 @@ impl ApplicationHandler for PetApplication {
             ),
             feeding_seconds: 0.0,
             food_click_cooldown: 0.0,
-            companion_menu: None,
+            companion_menu: spawn_companion_menu(&self.store.paths.root, true),
             organic: organic_runtime::OrganicRuntime::load(&self.store.paths.root),
             pointer: PointerState::default(),
             pointer_tracker: DesktopPointerTracker::default(),
@@ -5032,6 +5053,27 @@ impl ApplicationHandler for PetApplication {
                     runtime.ecology.cancel_user_food();
                 }
                 runtime.feeding_seconds = 0.0;
+                let nest = virtual_normalized_to_physical(
+                    &runtime.topology,
+                    runtime.ecology.state().den.anchor,
+                );
+                let bounds = runtime
+                    .topology
+                    .monitors
+                    .iter()
+                    .find(|m| {
+                        m.physical_bounds
+                            .contains(desktop_host::PhysicalDesktopPoint {
+                                x: nest.x as i32,
+                                y: nest.y as i32,
+                            })
+                    })
+                    .map_or(runtime.topology.virtual_physical_bounds, |m| m.working_area);
+                let placement = serde_json::json!({"x":nest.x,"y":nest.y,"left":bounds.minimum.x,"top":bounds.minimum.y,"right":bounds.maximum.x,"bottom":bounds.maximum.y});
+                let _ = std::fs::write(
+                    self.store.paths.root.join("companion-menu-placement.json"),
+                    placement.to_string(),
+                );
                 let running = runtime
                     .companion_menu
                     .as_mut()
@@ -5041,28 +5083,7 @@ impl ApplicationHandler for PetApplication {
                         std::fs::write(self.store.paths.root.join("companion-menu-open"), b"open");
                 }
                 if !running {
-                    let executable = std::env::current_exe()
-                        .ok()
-                        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-                    if let Some(folder) = executable {
-                        let menu = [
-                            folder.join("Pet2 Dev Console.exe"),
-                            folder.join("body_lab.exe"),
-                        ]
-                        .into_iter()
-                        .find(|p| p.is_file());
-                        if let Some(menu) = menu {
-                            match std::process::Command::new(menu)
-                                .arg("--pet-menu")
-                                .arg("--data-dir")
-                                .arg(&self.store.paths.root)
-                                .spawn()
-                            {
-                                Ok(child) => runtime.companion_menu = Some(child),
-                                Err(error) => eprintln!("companion menu: {error}"),
-                            }
-                        }
-                    }
+                    runtime.companion_menu = spawn_companion_menu(&self.store.paths.root, false);
                 }
             }
             WindowEvent::MouseInput {

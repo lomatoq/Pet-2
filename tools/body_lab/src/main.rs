@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod birth_capture;
+mod companion_glass;
+mod companion_instance;
 mod companion_menu;
 mod face_capture;
 use std::{
@@ -91,12 +93,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut live_pet = false;
     let mut pet_menu = false;
+    let mut menu_idle = false;
     let mut data_dir = None;
     let mut promote_report = None;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--live-pet" => live_pet = true,
+            "--pet-menu-idle" => { pet_menu = true; menu_idle = true; },
             "--pet-menu" => {
                 pet_menu = true;
                 live_pet = true;
@@ -129,9 +133,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = store.ok_or("Pet 2 data directory is unavailable")?;
         return promote_report_cli(&store, &report_path).map_err(Into::into);
     }
+    let _menu_owner = if pet_menu {
+        let root = &store.as_ref().ok_or("Pet data unavailable")?.paths.root;
+        match companion_instance::Guard::acquire(root)? {
+            Some(guard) => Some(guard),
+            None => { if !menu_idle { fs::write(root.join("companion-menu-open"), b"open")?; } return Ok(()); }
+        }
+    } else { None };
     let event_loop = EventLoop::new()?;
     let mut app = BodyLab::new(SEED, store, live_pet);
     app.pet_menu = pet_menu;
+    app.menu_idle = menu_idle;
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -141,6 +153,7 @@ struct BodyLab {
     store: Option<StateStore>,
     start_live: bool,
     pet_menu: bool,
+    menu_idle: bool,
     runtime: Option<LabRuntime>,
 }
 
@@ -587,6 +600,7 @@ impl BodyLab {
             store,
             start_live,
             pet_menu: false,
+            menu_idle: false,
             runtime: None,
         }
     }
@@ -597,34 +611,38 @@ impl ApplicationHandler for BodyLab {
         if self.runtime.is_some() {
             return;
         }
-        let window = match event_loop.create_window(
-            Window::default_attributes()
-                .with_window_icon(Some(desktop_host::application_icon()))
-                .with_title(if self.pet_menu {
-                    "Персик — забота и обучение"
-                } else {
-                    "Pet2 Dev Console"
-                })
-                .with_inner_size(if self.pet_menu {
-                    LogicalSize::new(460.0, 570.0)
-                } else {
-                    LogicalSize::new(1_180.0, 880.0)
-                })
-                .with_min_inner_size(if self.pet_menu {
-                    LogicalSize::new(420.0, 530.0)
-                } else {
-                    LogicalSize::new(880.0, 640.0)
-                })
-                .with_position(LogicalPosition::new(32.0, 48.0))
-                .with_resizable(true),
-        ) {
-            Ok(window) => Arc::new(window),
-            Err(error) => {
-                eprintln!("could not create Pet2 Dev Console window: {error}");
-                event_loop.exit();
-                return;
-            }
-        };
+        let window =
+            match event_loop.create_window(desktop_host::prepare_overlay_window_attributes(
+                Window::default_attributes()
+                    .with_window_icon(Some(desktop_host::application_icon()))
+                    .with_title(if self.pet_menu {
+                        "Bender · Care"
+                    } else {
+                        "Pet2 Dev Console"
+                    })
+                    .with_inner_size(if self.pet_menu {
+                        LogicalSize::new(420.0, 580.0)
+                    } else {
+                        LogicalSize::new(1_180.0, 880.0)
+                    })
+                    .with_min_inner_size(if self.pet_menu {
+                        LogicalSize::new(350.0, 520.0)
+                    } else {
+                        LogicalSize::new(880.0, 640.0)
+                    })
+                    .with_position(LogicalPosition::new(32.0, 48.0))
+                    .with_visible(!self.menu_idle)
+                    .with_resizable(!self.pet_menu)
+                    .with_decorations(!self.pet_menu)
+                    .with_transparent(self.pet_menu),
+            )) {
+                Ok(window) => Arc::new(window),
+                Err(error) => {
+                    eprintln!("could not create Pet2 Dev Console window: {error}");
+                    event_loop.exit();
+                    return;
+                }
+            };
         let mut body = match generate_lab_body(&self.genome) {
             Ok(body) => body,
             Err(error) => {
@@ -708,7 +726,11 @@ impl ApplicationHandler for BodyLab {
                 return;
             }
         };
-        renderer.set_review_background(BACKGROUNDS[DEFAULT_BACKGROUND]);
+        renderer.set_review_background(if self.pet_menu {
+            ReviewBackground::Transparent
+        } else {
+            BACKGROUNDS[DEFAULT_BACKGROUND]
+        });
         let mut ecology_renderer = EcologyRenderer::new(
             renderer.device(),
             renderer.surface_format(),
@@ -737,6 +759,9 @@ impl ApplicationHandler for BodyLab {
         }
         egui_context.set_theme(egui::ThemePreference::Dark);
         egui_context.set_visuals(egui::Visuals::dark());
+        if self.pet_menu {
+            companion_menu::configure(&egui_context);
+        }
         let egui_state = EguiWinitState::new(
             egui_context.clone(),
             egui::ViewportId::ROOT,
@@ -776,6 +801,10 @@ impl ApplicationHandler for BodyLab {
             let mut m = LivePetMonitor::new(store, self.start_live);
             m.menu_only = self.pet_menu;
             m.previous_loaded = self.pet_menu;
+            if self.pet_menu {
+                m.offset = fs::metadata(m.active_path()).map_or(0, |m| m.len());
+                m.current_bootstrapped = true;
+            }
             m
         });
         let ui = LabUi {
@@ -867,7 +896,7 @@ impl ApplicationHandler for BodyLab {
                 DevPanel::Character
             },
             live_monitor,
-            pet_menu: self.pet_menu.then(companion_menu::MenuState::default),
+            pet_menu: self.pet_menu.then(|| companion_menu::MenuState::new(self.menu_idle)),
         });
     }
 
@@ -881,24 +910,28 @@ impl ApplicationHandler for BodyLab {
             return;
         }
         if let Some(menu) = &mut runtime.pet_menu {
+            if menu.glass.is_none() {
+                menu.glass = companion_glass::Glass::new(&runtime.window);
+                if let Some(store) = &self.store {
+                    companion_glass::position(&runtime.window, &store.paths.root);
+                }
+            }
             if let Some(store) = &self.store {
                 let request = store.paths.root.join("companion-menu-open");
                 if request.exists() {
                     let _ = fs::remove_file(&request);
-                    menu.hidden = false;
-                    menu.close = false;
-                    menu.waiting_for_feed = false;
-                    runtime.window.set_visible(true);
-                    runtime.window.focus_window();
-                    if let Some(monitor) = &mut runtime.live_monitor {
-                        monitor.connect();
+                    if menu.reopen() {
+                        companion_glass::position(&runtime.window, &store.paths.root);
+                        runtime.window.set_visible(true);
+                        if let Some(monitor) = &mut runtime.live_monitor { monitor.connect(); }
                     }
+                    runtime.window.focus_window();
                 }
                 if menu.hidden {
                     let stopped = fs::read(store.paths.root.join("runtime-load-ack.json"))
                         .ok()
                         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                        .is_some_and(|v| v["status"] == "stopped");
+                        .is_some_and(|v| v["status"] == "stopped" && v["updated_unix_ms"].as_u64().is_some_and(|t| t >= menu.created_unix_ms));
                     if stopped {
                         event_loop.exit();
                         return;
@@ -922,7 +955,13 @@ impl ApplicationHandler for BodyLab {
         if let Some(monitor) = runtime.live_monitor.as_mut() {
             monitor.poll();
         }
-        if runtime.panel.is_live() {
+        if let Some(menu) = &mut runtime.pet_menu {
+            if let Some(glass) = &mut menu.glass {
+                glass.update(&runtime.egui_context, &runtime.window);
+            }
+            runtime.next_frame = now + Duration::from_micros(16_667);
+        }
+        if runtime.panel.is_live() || runtime.pet_menu.is_some() {
             runtime.window.request_redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
             return;
@@ -1112,10 +1151,15 @@ impl ApplicationHandler for BodyLab {
                 .egui_state
                 .on_window_event(runtime.window.as_ref(), &event);
             match event {
+                WindowEvent::Focused(false) if runtime.pet_menu.is_some() => {
+                    if let Some(menu) = &mut runtime.pet_menu
+                        && menu.can_dismiss_on_focus_loss() {
+                        menu.close = true;
+                    }
+                }
                 WindowEvent::CloseRequested => {
                     if let Some(menu) = &mut runtime.pet_menu {
-                        menu.hidden = true;
-                        runtime.window.set_visible(false);
+                        menu.close = true;
                     } else {
                         event_loop.exit();
                     }
@@ -1145,7 +1189,11 @@ impl ApplicationHandler for BodyLab {
                 {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         match code {
-                            KeyCode::Escape => event_loop.exit(),
+                            KeyCode::Escape => {
+                                if let Some(menu) = &mut runtime.pet_menu { menu.close = true; }
+                                else { event_loop.exit(); }
+                            }
+                            _ if runtime.pet_menu.is_some() => {} ,
                             KeyCode::F1 => runtime.panel = DevPanel::Character,
                             KeyCode::F2 => runtime.panel = DevPanel::Perception,
                             KeyCode::F3 => runtime.panel = DevPanel::Behavior,
@@ -1694,13 +1742,18 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
         }
     });
     if let Some(menu) = &mut runtime.pet_menu
-        && menu.close
+        && menu.hide_ready()
     {
         menu.close = false;
         menu.hidden = true;
         menu.waiting_for_feed = false;
         runtime.window.set_visible(false);
+        if let Some(monitor) = &mut runtime.live_monitor { monitor.disconnect(); }
     }
+    if let Some(menu) = &mut runtime.pet_menu
+        && let Some(glass) = &mut menu.glass {
+            glass.set_regions(&runtime.window, &menu.regions);
+        }
     runtime.panel = selected_panel;
     if runtime.ui.section != LabSection::Nervous {
         // Switching sections must clear synthetic stimuli even while paused.
@@ -1739,7 +1792,13 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     let mut parameters = runtime.body.render_parameters(genome, 0.35);
     parameters.render_mode = BodyRenderMode::ParticlePbf;
     parameters.debug_view = runtime.ui.debug_view;
-    let show_den = runtime.ui.section == LabSection::Den;
+    if runtime.pet_menu.is_some() {
+        parameters.presentation_offset = Vec2::splat(8.0);
+        runtime
+            .renderer
+            .set_review_background(ReviewBackground::Transparent);
+    }
+    let show_den = runtime.pet_menu.is_none() && runtime.ui.section == LabSection::Den;
     if show_den {
         // Keep the physical liquid advancing unchanged, but move only its
         // presentation outside the surface while reviewing the den. A zero
@@ -2128,7 +2187,8 @@ impl LivePetMonitor {
 
         let active_path = self.active_path().to_path_buf();
         let incremental_read = self.current_bootstrapped;
-        let events = match read_telemetry_file(&active_path, &mut self.offset, true) {
+        let events = match read_telemetry_file_bounded(&active_path, &mut self.offset, true,
+            if self.menu_only { 1024 * 1024 } else { LIVE_BOOTSTRAP_BYTES }) {
             Ok(events) => events,
             Err(error) => {
                 self.status = error;
@@ -2189,6 +2249,14 @@ impl LivePetMonitor {
         {
             self.connection = LabConnectionState::Connected;
             self.connect_started = None;
+        }
+        if self.menu_only {
+            // Menu needs two small fields, not a cloned 240 KB diagnostic frame at 60 Hz.
+            let compact = serde_json::json!({"details": {"hearing": event["details"]["hearing"], "feeding": event["details"]["feeding"]}});
+            self.frames.clear();
+            self.frames.push_back(compact);
+            self.selected = 0;
+            return;
         }
         let frame_bytes = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len());
         let velocity = vector2(&event, "/details/screen_velocity_px");
@@ -3118,6 +3186,9 @@ fn read_telemetry_file(
     offset: &mut u64,
     tail_on_first_read: bool,
 ) -> Result<Vec<Value>, String> {
+    read_telemetry_file_bounded(path, offset, tail_on_first_read, LIVE_BOOTSTRAP_BYTES)
+}
+fn read_telemetry_file_bounded(path: &Path, offset: &mut u64, tail_on_first_read: bool, budget: u64) -> Result<Vec<Value>, String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -3127,8 +3198,8 @@ fn read_telemetry_file(
         *offset = 0;
     }
     let mut truncated_start = false;
-    if tail_on_first_read && *offset == 0 && metadata.len() > LIVE_BOOTSTRAP_BYTES {
-        *offset = metadata.len() - LIVE_BOOTSTRAP_BYTES;
+    if tail_on_first_read && metadata.len().saturating_sub(*offset) > budget {
+        *offset = metadata.len() - budget;
         truncated_start = true;
     }
     let mut file =
@@ -8834,6 +8905,20 @@ fn preview_seeded_unit(mut value: u64) -> f32 {
 mod tests {
     use super::*;
     use lifecore::LifeCore;
+
+    #[test]
+    fn menu_tail_read_skips_backlog_but_preserves_latest_complete_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let mut lines = String::new();
+        for sequence in 0..1000 { lines.push_str(&format!("{{\"sequence\":{sequence}}}\n")); }
+        std::fs::write(&path, &lines).unwrap();
+        let mut offset = 0;
+        let events = read_telemetry_file_bounded(&path, &mut offset, true, 256).unwrap();
+        assert!(events.len() < 20);
+        assert_eq!(events.last().unwrap()["sequence"], 999);
+        assert_eq!(offset, lines.len() as u64);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
