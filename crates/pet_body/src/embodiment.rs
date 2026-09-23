@@ -150,6 +150,7 @@ pub struct EmbodiedRuntime {
     world_to_body_scale: Vec2,
     motion_response_scale: f32,
     motion_acceleration_limit: f32,
+    liquid_frame_acceleration: Vec2,
     previous_world_position: Option<Vec2>,
     runtime_face: FaceRuntimeActuation,
     runtime_visual: VisualPhysiologyActuation,
@@ -231,6 +232,7 @@ impl EmbodiedRuntime {
             world_to_body_scale: Vec2::ONE,
             motion_response_scale: 1.0,
             motion_acceleration_limit: 8.0,
+            liquid_frame_acceleration: Vec2::ZERO,
             previous_world_position: None,
             runtime_face: FaceRuntimeActuation::default(),
             runtime_visual: VisualPhysiologyActuation::default(),
@@ -415,6 +417,20 @@ impl EmbodiedRuntime {
         self.pose.mouth_shout = self.shout_activity;
         // Silent O/smile is semantic geometry. Only actual playback adds articulation.
         self.pose.geometry = expressive_asymmetric_geometry(expression);
+        // Only strong actual phonation recruits a widened, rounded eye. Ordinary
+        // talking keeps its emotional lid shape; attack/release shares the voice envelope.
+        let shout_eyes = ((self.shout_activity - 0.30) / 0.70).clamp(0.0, 1.0);
+        let startled = lifecore::FacePose::Startled.expression().geometry;
+        for eye in 0..2 {
+            for channel in 0..4 {
+                self.pose.geometry.lids[eye][channel] += (startled.lids[eye][channel]
+                    - self.pose.geometry.lids[eye][channel])
+                    * shout_eyes;
+                self.pose.geometry.brows[eye][channel] += (startled.brows[eye][channel]
+                    - self.pose.geometry.brows[eye][channel])
+                    * shout_eyes;
+            }
+        }
         self.pose.geometry.mouth[0] += (1.60 - self.pose.geometry.mouth[0]) * self.shout_activity;
         self.pose.geometry.mouth[3] *= 1.0 - self.shout_activity;
         self.authored_lids = self.pose.geometry.lids;
@@ -429,7 +445,8 @@ impl EmbodiedRuntime {
             * (1.0 - self.shout_activity)
             - self.shout_activity * 0.08;
         self.pose.mouth_tension = expression.mouth_tension.clamp(0.0, 1.0);
-        self.pose.brow_raise = expression.brow_raise.clamp(-1.0, 1.0);
+        self.pose.brow_raise =
+            expression.brow_raise.clamp(-1.0, 1.0) * (1.0 - shout_eyes) + 0.8 * shout_eyes;
         self.pose.brow_tension = expression.brow_tension.clamp(0.0, 1.0);
         self.pose.brow_asymmetry = expression.brow_asymmetry.clamp(-1.0, 1.0);
         self.pose.mouth_compression = expression.mouth_compression;
@@ -469,6 +486,12 @@ impl EmbodiedRuntime {
             (liquid_motion.velocity * self.motion_response_scale).clamp_length_max(16.0);
         liquid_motion.acceleration = (liquid_motion.acceleration * self.motion_response_scale)
             .clamp_length_max(self.motion_acceleration_limit);
+        // Navigation changes can be sharp; the liquid's distributed load has a
+        // finite rise time. Contact impulses remain in the contact solver.
+        let acceleration_delta = (liquid_motion.acceleration - self.liquid_frame_acceleration)
+            * (1.0 - (-18.0 * dt).exp());
+        self.liquid_frame_acceleration += acceleration_delta.clamp_length_max(24.0 * dt);
+        liquid_motion.acceleration = self.liquid_frame_acceleration;
         self.droplets.update_with_morph(
             visual_traits,
             self.physiology.pose,
@@ -669,7 +692,7 @@ impl EmbodiedRuntime {
         {
             0.0
         } else {
-            smoothstep(0.045, 0.42, flight_speed) * 0.90
+            smoothstep(0.035, 0.32, flight_speed) * 0.90
         };
 
         if !semantic_engaged {
@@ -702,9 +725,11 @@ impl EmbodiedRuntime {
         } else {
             0.0
         };
-        let turn_vector =
-            fixation_direction * semantic_strength * self.face_attention_translation_gain
-                + flight_direction * flight_drive * (1.0 - semantic_strength * 0.20);
+        let turn_vector = fixation_direction
+            * semantic_strength
+            * self.face_attention_translation_gain
+            * (1.0 - flight_drive * 0.85)
+            + flight_direction * flight_drive;
         let turn_strength = turn_vector.length().clamp(0.0, 1.0);
         if turn_strength <= 1.0e-5 {
             self.pose.face_attention_offset = Vec2::ZERO;
@@ -712,7 +737,10 @@ impl EmbodiedRuntime {
             return;
         }
         let turn_direction = turn_vector.normalize_or_zero();
-        let offset = Vec2::new(turn_direction.x * 0.076, turn_direction.y * 0.048) * turn_strength;
+        // At cruising speed the complete face sits in the broad leading lobe.
+        // Semantic glances stay smaller; both use the same bounded carrier.
+        let forward_gain = Vec2::new(0.030, 0.022).lerp(Vec2::new(0.086, 0.066), flight_drive);
+        let offset = turn_direction * forward_gain * turn_strength;
         self.pose.face_attention_offset = offset.clamp_length_max(0.082);
         let semantic_roll =
             -fixation_direction.x * 0.098 * self.face_attention_roll_gain * semantic_strength;
@@ -2127,8 +2155,8 @@ mod tests {
             VisualMindInput::default(),
             &flying,
         );
-        assert!(runtime.pose.face_attention_offset.x > 0.035);
-        assert!(runtime.pose.face_attention_offset.y > 0.015);
+        assert!((0.040..0.075).contains(&runtime.pose.face_attention_offset.x));
+        assert!((0.018..0.045).contains(&runtime.pose.face_attention_offset.y));
         assert!(runtime.pose.face_attention_roll < -0.03);
 
         runtime.update_attention_face_pose(

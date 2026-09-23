@@ -1,14 +1,12 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3, Vec4};
-use pet_ecology::{EcologyState, ObjectKind, ObjectLifecycle, stored_orb_hover_offset};
+use pet_ecology::{EcologyState, ObjectKind, ObjectLifecycle};
 use wgpu::util::DeviceExt;
 
 use crate::DenVisualTuning;
 
 const MAX_ECOLOGY_INSTANCES: usize = 25;
-const STORED_ORB_HOVER_FREQUENCY: f32 = 1.15;
-const STORED_ORB_HOVER_MAX_SPEED_PX: f32 = 0.85;
-const STORED_ORB_HOVER_MAX_ACCELERATION_PX: f32 = 1.20;
+const PEARL_BYTES: &[u8] = include_bytes!("../../../assets/nest/orb-pearl-v28.rgba");
 
 fn ecology_source_over_blend(premultiplied_output: bool) -> wgpu::BlendState {
     wgpu::BlendState {
@@ -90,8 +88,6 @@ pub struct EcologyRenderer {
     den_activity: f32,
     den_activity_integral_seconds: f32,
     last_time_seconds: Option<f32>,
-    stored_orb_hover_offset_px: Vec2,
-    stored_orb_hover_velocity_px: Vec2,
     den_tuning: DenVisualTuning,
     prepared_den_count: u32,
     prepared_count: u32,
@@ -253,8 +249,8 @@ impl EcologyRenderer {
         let pearl_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("imagegen pearl sprite"),
             size: wgpu::Extent3d {
-                width: 256,
-                height: 256,
+                width: u32::from_le_bytes(PEARL_BYTES[..4].try_into().unwrap()),
+                height: u32::from_le_bytes(PEARL_BYTES[4..8].try_into().unwrap()),
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -289,8 +285,6 @@ impl EcologyRenderer {
             den_activity: 0.0,
             den_activity_integral_seconds: 0.0,
             last_time_seconds: None,
-            stored_orb_hover_offset_px: Vec2::ZERO,
-            stored_orb_hover_velocity_px: Vec2::ZERO,
             den_tuning: DenVisualTuning::default(),
             prepared_den_count: 0,
             prepared_count: 0,
@@ -491,6 +485,8 @@ impl EcologyRenderer {
         time_seconds: f32,
     ) {
         if !self.pearl_uploaded {
+            let width = u32::from_le_bytes(PEARL_BYTES[..4].try_into().unwrap());
+            let height = u32::from_le_bytes(PEARL_BYTES[4..8].try_into().unwrap());
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.pearl_texture,
@@ -498,15 +494,15 @@ impl EcologyRenderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                include_bytes!("../assets/pearl-256.rgba"),
+                &PEARL_BYTES[8..],
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(1024),
-                    rows_per_image: Some(256),
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
-                    width: 256,
-                    height: 256,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -556,27 +552,6 @@ impl EcologyRenderer {
         self.den_activity += (target_activity - self.den_activity) * response_alpha;
         self.den_activity = self.den_activity.clamp(0.0, 1.0);
         self.den_activity_integral_seconds += self.den_activity * dt;
-
-        let stored_hover_target = state
-            .objects
-            .iter()
-            .find(|object| {
-                object.kind == ObjectKind::Orb && object.lifecycle == ObjectLifecycle::StoredInDen
-            })
-            .map_or(Vec2::ZERO, |orb| {
-                let offset = stored_orb_hover_offset(orb.id, time_seconds, aspect);
-                Vec2::new(offset.x * aspect, offset.y) * pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX
-            });
-        advance_stored_orb_hover(
-            &mut self.stored_orb_hover_offset_px,
-            &mut self.stored_orb_hover_velocity_px,
-            stored_hover_target,
-            dt,
-        );
-        let stored_hover_offset = Vec2::new(
-            self.stored_orb_hover_offset_px.x / (pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * aspect),
-            self.stored_orb_hover_offset_px.y / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX,
-        );
 
         let mut instances = [EcologyInstance::default(); MAX_ECOLOGY_INSTANCES];
         let mut count = 0_usize;
@@ -674,36 +649,18 @@ impl EcologyRenderer {
             if object_in_front(object.kind, object.lifecycle) && foreground_start.is_none() {
                 foreground_start = Some(count as u32);
             }
-            let stored_in_den = object.lifecycle == ObjectLifecycle::StoredInDen;
-            let den_distance_px = Vec2::new(
-                (object.position.x - state.den.anchor.x) * aspect,
-                object.position.y - state.den.anchor.y,
-            )
-            .length()
-                * pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX;
-            let den_visual_blend = if object.kind == ObjectKind::Orb {
-                if stored_in_den {
-                    1.0
-                } else {
-                    1.0 - smoothstep(24.0, 105.0, den_distance_px)
-                }
+            let den_visual_blend = if object.lifecycle == ObjectLifecycle::StoredInDen {
+                1.0
             } else {
                 0.0
             };
-            let den_scale = 1.0 - den_visual_blend * 0.14;
-            let radius_y = object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX
-                * 2.0
-                * den_scale;
+            let radius_y =
+                object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * 2.0;
             let rgb = hsv_to_rgb(object.hue, object.saturation, object.value);
-            let hover_offset = if object.kind == ObjectKind::Orb {
-                stored_hover_offset
-            } else {
-                Vec2::ZERO
-            };
             instances[count] = EcologyInstance {
                 center_radius: [
-                    (object.position.x + hover_offset.x) * 2.0 - 1.0,
-                    1.0 - (object.position.y + hover_offset.y) * 2.0,
+                    object.position.x * 2.0 - 1.0,
+                    1.0 - object.position.y * 2.0,
                     radius_y / aspect,
                     radius_y,
                 ],
@@ -722,7 +679,7 @@ impl EcologyRenderer {
                     },
                     time_seconds + (object.id % 997) as f32 * 0.013,
                 ],
-                den_surface: [0.0; 4],
+                den_surface: [den_visual_blend, 0.0, 0.0, 0.0],
                 den_optics: [0.0; 4],
                 den_particles: [0.0; 4],
                 den_noise: [0.0; 4],
@@ -982,32 +939,6 @@ fn create_ecology_background_bind_group(
     })
 }
 
-fn advance_stored_orb_hover(
-    offset_px: &mut Vec2,
-    velocity_px: &mut Vec2,
-    target_px: Vec2,
-    dt: f32,
-) {
-    let dt = if dt.is_finite() {
-        dt.clamp(0.0, 0.05)
-    } else {
-        0.0
-    };
-    if dt <= 0.0 {
-        return;
-    }
-    let acceleration = ((target_px - *offset_px) * STORED_ORB_HOVER_FREQUENCY.powi(2)
-        - *velocity_px * (2.0 * STORED_ORB_HOVER_FREQUENCY))
-        .clamp_length_max(STORED_ORB_HOVER_MAX_ACCELERATION_PX);
-    *velocity_px =
-        (*velocity_px + acceleration * dt).clamp_length_max(STORED_ORB_HOVER_MAX_SPEED_PX);
-    *offset_px += *velocity_px * dt;
-    if target_px == Vec2::ZERO && offset_px.length() < 0.001 && velocity_px.length() < 0.001 {
-        *offset_px = Vec2::ZERO;
-        *velocity_px = Vec2::ZERO;
-    }
-}
-
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -1062,10 +993,8 @@ mod tests {
     use naga::valid::{Capabilities, ValidationFlags, Validator};
 
     use super::{
-        EcologyCaptureExclusion, STORED_ORB_HOVER_MAX_ACCELERATION_PX,
-        STORED_ORB_HOVER_MAX_SPEED_PX, advance_stored_orb_hover, den_activity_response_seconds,
-        ecology_source_over_blend, orb_drives_den_activity, stable_den_scale,
-        temporally_stabilize_background,
+        EcologyCaptureExclusion, den_activity_response_seconds, ecology_source_over_blend,
+        orb_drives_den_activity, stable_den_scale, temporally_stabilize_background,
     };
     use pet_ecology::ObjectLifecycle;
 
@@ -1251,32 +1180,6 @@ mod tests {
         assert_eq!(sink(0.20, 1.0), 0.0);
         assert!(sink(0.235, 1.0) > 0.0);
         assert_eq!(sink(0.27, 1.0), 1.0);
-    }
-
-    #[test]
-    fn stored_orb_hover_enters_and_leaves_without_a_position_step() {
-        let dt = 1.0 / 60.0;
-        let mut offset = Vec2::ZERO;
-        let mut velocity = Vec2::ZERO;
-        let target = Vec2::new(2.4, -1.5);
-
-        advance_stored_orb_hover(&mut offset, &mut velocity, target, dt);
-        assert!(offset.length() <= STORED_ORB_HOVER_MAX_ACCELERATION_PX * dt * dt);
-
-        for _ in 0..600 {
-            let previous = offset;
-            advance_stored_orb_hover(&mut offset, &mut velocity, target, dt);
-            assert!((offset - previous).length() <= STORED_ORB_HOVER_MAX_SPEED_PX * dt + 1.0e-6);
-        }
-
-        let before_release = offset;
-        advance_stored_orb_hover(&mut offset, &mut velocity, Vec2::ZERO, dt);
-        assert!((offset - before_release).length() <= STORED_ORB_HOVER_MAX_SPEED_PX * dt + 1.0e-6);
-        for _ in 0..1_200 {
-            advance_stored_orb_hover(&mut offset, &mut velocity, Vec2::ZERO, dt);
-        }
-        assert!(offset.length() < 0.01);
-        assert!(velocity.length() < 0.01);
     }
 
     #[test]

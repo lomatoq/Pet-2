@@ -367,6 +367,7 @@ impl ActionId {
                 | Self::IdleHover
                 | Self::ObserveCursor
                 | Self::ObserveUserActivity
+                | Self::ExploreScreen
                 | Self::RetreatFromCursor
         )
     }

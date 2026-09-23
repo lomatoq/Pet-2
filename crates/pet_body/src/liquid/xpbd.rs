@@ -49,6 +49,34 @@ impl SupportPlane {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct CradleBoundary {
+    pub minimum: Vec2,
+    pub maximum: Vec2,
+    pub component_id: u8,
+}
+
+pub(super) fn project_cradle(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    cradle: Option<CradleBoundary>,
+) {
+    let Some(c) = cradle else {
+        return;
+    };
+    let half = (c.maximum.x - c.minimum.x) * 0.5;
+    let center = (c.minimum.x + c.maximum.x) * 0.5;
+    for p in &mut particles[..count] {
+        if p.component_id != c.component_id || p.inverse_mass <= 0.0 {
+            continue;
+        }
+        let x = p.predicted_position.x.clamp(c.minimum.x, c.maximum.x);
+        let floor = c.minimum.y + ((x - center) / half).powi(4) * half * 0.10;
+        p.predicted_position.x = x;
+        p.predicted_position.y = p.predicted_position.y.max(floor);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct DensityConstraintParameters {
     pub rest_density: f32,
     pub kernel_radius: f32,
@@ -64,6 +92,7 @@ pub struct DensityConstraintParameters {
     /// Optional unilateral plane projected after every density iteration. The
     /// caller owns support evidence and a consistent plane/containment domain.
     pub support_plane: Option<SupportPlane>,
+    pub cradle: Option<CradleBoundary>,
 }
 
 /// Reapply the same contact after any subsequent bond/topology positional
@@ -99,6 +128,7 @@ pub fn solve_density_constraints(
         dt,
         containment_bounds,
         support_plane,
+        cradle,
     } = parameters;
     let count = count.min(MAX_LIQUID_PARTICLES);
     if count == 0
@@ -202,6 +232,7 @@ pub fn solve_density_constraints(
             }
         }
         project_support_plane(particles, count, support_plane);
+        project_cradle(particles, count, cradle);
     }
     update_density_and_surface(particles, count, kernel_radius);
 }
@@ -209,6 +240,33 @@ pub fn solve_density_constraints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cradle_is_open_above_and_restrains_only_the_admitted_component() {
+        let mut particles = std::array::from_fn(|_| LiquidParticle::default());
+        for p in &mut particles[..3] {
+            p.inverse_mass = 1.0;
+        }
+        particles[0].component_id = 0;
+        particles[0].predicted_position = Vec2::new(0.8, -0.5);
+        particles[1].component_id = 1;
+        particles[1].predicted_position = Vec2::new(0.8, -0.5);
+        particles[2].component_id = 0;
+        particles[2].predicted_position = Vec2::new(0.0, 3.0);
+        project_cradle(
+            &mut particles,
+            3,
+            Some(CradleBoundary {
+                minimum: Vec2::new(-0.4, -0.2),
+                maximum: Vec2::new(0.4, 1.0),
+                component_id: 0,
+            }),
+        );
+        assert!(
+            particles[0].predicted_position.x <= 0.4 && particles[0].predicted_position.y >= -0.2
+        );
+        assert_eq!(particles[1].predicted_position, Vec2::new(0.8, -0.5));
+        assert_eq!(particles[2].predicted_position, Vec2::new(0.0, 3.0));
+    }
     use crate::liquid::{
         density::{calibrate_rest_density, mean_density_error},
         particles::{KERNEL_RADIUS, initialize_particles_with},
@@ -247,6 +305,7 @@ mod tests {
                         dt: 1.0 / 120.0,
                         containment_bounds: None,
                         support_plane: Some(plane),
+                        cradle: None,
                     },
                 );
                 for index in 0..3 {
@@ -281,6 +340,7 @@ mod tests {
             dt: 1.0 / 120.0,
             containment_bounds: None,
             support_plane: None,
+            cradle: None,
         };
         let mut baseline = reference;
         solve_density_constraints(&mut baseline, count, parameters);
@@ -312,6 +372,7 @@ mod tests {
                 count,
                 DensityConstraintParameters {
                     support_plane: Some(plane),
+                    cradle: None,
                     ..parameters
                 },
             );
@@ -354,6 +415,7 @@ mod tests {
                 dt: 1.0 / 120.0,
                 containment_bounds: None,
                 support_plane: Some(plane),
+                cradle: None,
             },
         );
         assert_eq!(particles[0].predicted_position, Vec2::new(0.0, -0.3));
@@ -394,6 +456,7 @@ mod tests {
                 dt: 1.0 / 240.0,
                 containment_bounds: None,
                 support_plane: None,
+                cradle: None,
             },
         );
         let after_center = particles[..count]
@@ -445,6 +508,7 @@ mod tests {
                 dt: 1.0 / 120.0,
                 containment_bounds: None,
                 support_plane: None,
+                cradle: None,
             },
         );
         let after_peak = compressed[..count]
@@ -485,6 +549,7 @@ mod tests {
                 dt: 1.0 / 120.0,
                 containment_bounds: None,
                 support_plane: None,
+                cradle: None,
             },
         );
         assert_eq!(isolated[0].predicted_position, before[0]);
@@ -512,6 +577,7 @@ mod tests {
             dt: 1.0 / 120.0,
             containment_bounds: Some((Vec2::splat(-0.05), Vec2::splat(0.05))),
             support_plane: None,
+            cradle: None,
         };
         solve_density_constraints(&mut particles, 2, parameters);
         assert!(particles[..2].iter().any(|particle| particle.lambda < 0.0));

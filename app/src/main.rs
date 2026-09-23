@@ -5,7 +5,9 @@
 #![recursion_limit = "512"]
 
 mod activity_glance;
+mod birth_runtime;
 mod companion_runtime;
+mod cradle_runtime;
 mod ecology_runtime;
 mod evolution_runner;
 mod hearing_bridge;
@@ -13,6 +15,7 @@ mod local_voice_context;
 mod motor_context;
 mod nearby_gaze;
 mod nervous_system_runtime;
+mod orb_cradle;
 mod organic_runtime;
 mod pointer_replay_runner;
 mod repertoire_bridge;
@@ -1383,8 +1386,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
                 drives: life.state.drives,
                 sensors: &sensors,
                 body: &feedback,
-                focus_mode: life.state.focus_mode
-                    || vita.state().desktop_rhythm.protects_focused_work(),
+                focus_mode: life.state.focus_mode,
                 dt,
                 orb_physical,
             },
@@ -2055,6 +2057,10 @@ struct PetRuntime {
     window: Arc<Window>,
     renderer: Renderer,
     ecology_renderer: EcologyRenderer,
+    birth_scene: pet_body::birth_scene::BirthScene,
+    birth: birth_runtime::BirthRuntime,
+    cradle_seat: cradle_runtime::CradleSeat,
+    birth_monitor: RectI,
     platform: Box<dyn PlatformBackend>,
     topology: DisplayTopology,
     normalizer: SensorNormalizer,
@@ -2417,6 +2423,10 @@ impl PetApplication {
             runtime.audio.callback_levels().rms,
             runtime.audio.visual_feedback().active,
         );
+        let growth = pet_body::birth_scene::growth_scale(runtime.birth.age_seconds());
+        runtime.body.set_presentation_scale(
+            production_presentation_scale(runtime.window.inner_size().height) / growth,
+        );
         runtime.body_accumulator += elapsed;
         runtime.life_accumulator += elapsed;
         runtime.sensor_accumulator += elapsed;
@@ -2588,7 +2598,8 @@ impl PetApplication {
             );
             let _ = runtime.platform.set_cursor_hittest(
                 &runtime.window,
-                accepts_cursor || runtime.feeding_seconds > 0.0,
+                (accepts_cursor || runtime.feeding_seconds > 0.0)
+                    && runtime.birth.started.is_none(),
             );
             runtime.sensors = runtime.normalizer.normalize(
                 &snapshot,
@@ -2860,6 +2871,44 @@ impl PetApplication {
                 .embodiment
                 .liquid
                 .set_launch_preparation(launch_axis, launch_strength);
+            let cradle_viewport = [
+                runtime.window.inner_size().width,
+                runtime.window.inner_size().height.max(1),
+            ];
+            let cradle_geometry = cradle_runtime::CradleGeometry::new(
+                virtual_normalized_to_physical(
+                    &runtime.topology,
+                    runtime.ecology.state().den.anchor,
+                ),
+                cradle_viewport,
+                runtime.ecology.state().den.size_scale,
+            );
+            let cradle_hull = runtime
+                .body
+                .main_liquid_contact_bounds_pixels(cradle_viewport[1] as f32);
+            let original_target =
+                virtual_normalized_to_physical(&runtime.topology, runtime.intent.target_position);
+            let wants_cradle = cradle_geometry.contains_target(original_target);
+            let cognitive_navigation = (
+                runtime.intent.target_position,
+                runtime.intent.locomotion,
+                runtime.intent.desired_speed,
+            );
+            if !runtime.sensors.pet_dragged
+                && runtime.birth.started.is_none()
+                && let Some(target) = runtime.cradle_seat.navigation(
+                    cradle_geometry,
+                    runtime.screen_body_center,
+                    cradle_hull.minimum,
+                    cradle_hull.maximum,
+                    original_target,
+                )
+            {
+                runtime.intent.target_position =
+                    physical_to_virtual_normalized(&runtime.topology, target);
+                runtime.intent.locomotion = LocomotionMode::Arrive;
+                runtime.intent.desired_speed = runtime.intent.desired_speed.clamp(0.24, 0.50);
+            }
             runtime.body.fixed_update(
                 &runtime.life.state.genome,
                 &runtime.intent,
@@ -2903,12 +2952,18 @@ impl PetApplication {
             runtime
                 .body
                 .set_feeding_mouth(food_mouth, orb_contact_height, body_dt);
-            runtime.ecology.fixed_update(
-                desktop_aspect,
-                runtime.vita.window_affordances(),
-                &runtime.body.simulation.feedback,
-                body_dt,
-            );
+            if runtime.birth.started.is_none() {
+                runtime.ecology.set_den_viewport([
+                    runtime.topology.virtual_physical_bounds.width().max(1) as u32,
+                    runtime.topology.virtual_physical_bounds.height().max(1) as u32,
+                ]);
+                runtime.ecology.fixed_update(
+                    desktop_aspect,
+                    runtime.vita.window_affordances(),
+                    &runtime.body.simulation.feedback,
+                    body_dt,
+                );
+            }
             runtime
                 .body
                 .set_embodied_environment(runtime.ecology.environment());
@@ -2991,6 +3046,37 @@ impl PetApplication {
             if screen_tick_step > jump_threshold {
                 runtime.screen_tick_jump_events = runtime.screen_tick_jump_events.saturating_add(1);
             }
+            let cradle_contact = runtime
+                .body
+                .main_liquid_contact_bounds_pixels(cradle_viewport[1] as f32);
+            runtime.cradle_seat.update(
+                cradle_geometry,
+                &mut runtime.screen_body_center,
+                &mut runtime.screen_velocity_px,
+                cradle_contact.minimum,
+                cradle_contact.maximum,
+                runtime.sensors.pet_dragged,
+                wants_cradle,
+            );
+            if runtime.cradle_seat.inside {
+                runtime.body.simulation.feedback.world_position =
+                    physical_to_virtual_normalized(&runtime.topology, runtime.screen_body_center);
+                runtime.body.simulation.feedback.velocity = runtime.screen_velocity_px / extent;
+            }
+            runtime.body.set_cradle_bounds_pixels(
+                runtime.cradle_seat.inside.then_some((
+                    Vec2::new(
+                        cradle_geometry.anchor.x - cradle_geometry.half_width,
+                        cradle_geometry.floor,
+                    ),
+                    Vec2::new(
+                        cradle_geometry.anchor.x + cradle_geometry.half_width,
+                        cradle_geometry.anchor.y - 300.0,
+                    ),
+                )),
+                runtime.screen_body_center,
+                cradle_viewport[1] as f32,
+            );
             let voice = voice_visual_state(&runtime.audio);
             runtime
                 .nervous_system
@@ -3006,6 +3092,12 @@ impl PetApplication {
             runtime
                 .nervous_system
                 .observe_body(&runtime.body, &runtime.intent, &body_sensors);
+            // Local approach waypoints must never replace the persistent cognitive goal.
+            (
+                runtime.intent.target_position,
+                runtime.intent.locomotion,
+                runtime.intent.desired_speed,
+            ) = cognitive_navigation;
             runtime.body_accumulator -= body_dt;
             physics_steps += 1;
         }
@@ -3309,8 +3401,7 @@ impl PetApplication {
                     drives: runtime.life.state.drives,
                     sensors: &runtime.sensors,
                     body: &runtime.body.simulation.feedback,
-                    focus_mode: runtime.life.state.focus_mode
-                        || runtime.vita.state().desktop_rhythm.protects_focused_work(),
+                    focus_mode: runtime.life.state.focus_mode,
                     dt: LIFE_DT,
                     orb_physical,
                 },
@@ -3753,14 +3844,57 @@ impl PetApplication {
                     motor_packet.fields.fill(None);
                 }
             }
+            // The cushion seat is a real local support patch using the existing
+            // V22 contact solver. Outside the nest the original physics is unchanged.
+            let den_anchor = runtime.ecology.state().den.anchor;
+            let in_nest = runtime.cradle_seat.inside
+                && !runtime.sensors.pet_dragged
+                && !motor_packet
+                    .program
+                    .is_some_and(|p| p.family() == pet_motor::ProgramFamily::DefenseIntegrity);
+            if in_nest {
+                let viewport = [
+                    runtime.topology.virtual_physical_bounds.width().max(1) as u32,
+                    runtime.topology.virtual_physical_bounds.height().max(1) as u32,
+                ];
+                let seat_y = den_anchor.y
+                    + pet_body::birth_scene::den_seat_depth_pixels(
+                        viewport,
+                        runtime.ecology.state().den.size_scale,
+                    ) / viewport[1] as f32;
+                motor_packet.support = Some(pet_motor::SurfaceAttachmentCommand {
+                    surface_id: lifecore::SurfaceId("den:cushion".into()),
+                    anchor_point: Vec2::new(den_anchor.x, seat_y),
+                    normal: -Vec2::Y,
+                    tangent: Vec2::X,
+                    target_contact_fraction: 0.32,
+                    normal_compliance: 0.35,
+                    tangent_friction: 0.7,
+                    adhesion: 0.0,
+                    load_fraction: 0.27,
+                    break_force: 0.7,
+                    release_half_life: 0.25,
+                });
+            }
             if runtime.emotion_burst.active {
                 motor_packet.fields.fill(None);
                 motor_packet.support = None;
             }
             if let Some(motion) = &runtime.voice_motion {
                 motor_packet.fields.fill(None);
-                motor_packet.support =
-                    motion.support(runtime.body.simulation.feedback.world_position);
+                // Home/settle must retain the actual cushion support instead
+                // of replacing it with the taskbar plane or an empty command.
+                if !(in_nest
+                    && matches!(
+                        motion.cue,
+                        desktop_host::CueKind::Home
+                            | desktop_host::CueKind::Sit
+                            | desktop_host::CueKind::Sleep
+                    ))
+                {
+                    motor_packet.support =
+                        motion.support(runtime.body.simulation.feedback.world_position);
+                }
             }
             runtime.nervous_system.apply_motor_actuation(
                 &mut runtime.life,
@@ -4452,6 +4586,7 @@ impl PetApplication {
                     },
                     "capabilities": runtime.platform.capabilities(),
                 });
+                debug_details["cradle_inside"] = serde_json::json!(runtime.cradle_seat.inside);
                 debug_details["den_background_mode"] =
                     serde_json::json!(if runtime.platform.overlay_background_excludes_pet() {
                         "clean_capture"
@@ -4511,7 +4646,7 @@ impl ApplicationHandler for PetApplication {
             }
             return;
         }
-        let Some(prepared) = self.prepared.take() else {
+        let Some(mut prepared) = self.prepared.take() else {
             event_loop.exit();
             return;
         };
@@ -4531,6 +4666,7 @@ impl ApplicationHandler for PetApplication {
         );
         let attributes = prepare_overlay_window_attributes(
             Window::default_attributes()
+                .with_window_icon(Some(desktop_host::application_icon()))
                 .with_title("Pet 2")
                 .with_inner_size(host_size)
                 .with_position(host_origin)
@@ -4623,6 +4759,42 @@ impl ApplicationHandler for PetApplication {
             renderer.surface_format(),
             renderer.premultiplied_output(),
         );
+        let birth_scene =
+            pet_body::birth_scene::BirthScene::new(renderer.device(), renderer.surface_format());
+        let birth = birth_runtime::BirthRuntime::load(
+            self.store.paths.state.parent().unwrap(),
+            prepared.life.state.genome.identity_seed,
+        );
+        let birth_monitor = topology
+            .primary()
+            .map_or(topology.virtual_physical_bounds, |m| m.physical_bounds);
+        let old_nest =
+            virtual_normalized_to_physical(&topology, prepared.ecology.state().den.anchor);
+        let nest_monitor = topology
+            .monitor_at(desktop_host::PhysicalDesktopPoint {
+                x: old_nest.x as i32,
+                y: old_nest.y as i32,
+            })
+            .map_or(birth_monitor, |m| m.working_area);
+        let inset_x = 170.0_f32.min(nest_monitor.width() as f32 * 0.25);
+        let inset_y = 105.0_f32.min(nest_monitor.height() as f32 * 0.25);
+        let mut nest = old_nest.clamp(
+            Vec2::new(
+                nest_monitor.minimum.x as f32 + inset_x,
+                nest_monitor.minimum.y as f32 + inset_y,
+            ),
+            Vec2::new(
+                nest_monitor.maximum.x as f32 - inset_x,
+                nest_monitor.maximum.y as f32 - inset_y,
+            ),
+        );
+        let den_width = (310.0 * prepared.ecology.state().den.size_scale)
+            .min(window.inner_size().width as f32 * 0.8)
+            .min(window.inner_size().height as f32 * 0.65);
+        nest.y = nest_monitor.maximum.y as f32 - den_width * 0.292;
+        prepared
+            .ecology
+            .set_den_anchor(physical_to_virtual_normalized(&topology, nest));
         // A hidden Win32 composition surface may never become presentable, which would
         // deadlock the old "show after Presented" startup path. At this point the GPU
         // surface, transparent clear color, pipeline, and mesh are all ready, so making
@@ -4640,6 +4812,10 @@ impl ApplicationHandler for PetApplication {
             window,
             renderer,
             ecology_renderer,
+            birth_scene,
+            birth,
+            cradle_seat: cradle_runtime::CradleSeat::default(),
+            birth_monitor,
             platform,
             topology,
             normalizer: SensorNormalizer::default(),
@@ -4916,6 +5092,9 @@ impl ApplicationHandler for PetApplication {
                     runtime.feeding_seconds = 0.0;
                     runtime.ecology.cancel_user_food();
                 }
+                if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
+                    runtime.birth.started = None;
+                }
                 if runtime.modifiers.super_key() && runtime.modifiers.alt_key() {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyF) => {
@@ -5049,16 +5228,88 @@ impl ApplicationHandler for PetApplication {
                     .as_secs_f32()
                     .clamp(0.0, 0.05);
                 runtime.last_present = present_now;
+                let birth_time = runtime.birth.elapsed();
+                let growth = pet_body::birth_scene::growth_scale(runtime.birth.age_seconds());
+                let visible_growth = birth_time.map_or(growth, |t| {
+                    (0.58 + 0.24 * pet_body::birth_scene::smooth(7.96, 9.25, t))
+                        + (growth - 0.82) * pet_body::birth_scene::smooth(11.2, 14.0, t)
+                });
+                runtime.body.set_presentation_scale(
+                    production_presentation_scale(runtime.window.inner_size().height)
+                        / visible_growth,
+                );
+                // Hold the presentation at the selected monitor centre through emergence,
+                // then blend back to the live organism without changing its memory or age.
+                let mut center = virtual_normalized_to_physical(
+                    &runtime.topology,
+                    runtime.body.simulation.feedback.world_position,
+                );
+                if let Some(t) = birth_time {
+                    let m = runtime.birth_monitor;
+                    let capsule_center = Vec2::new(
+                        (m.minimum.x + m.maximum.x) as f32 * 0.5,
+                        (m.minimum.y + m.maximum.y) as f32 * 0.5,
+                    );
+                    center =
+                        capsule_center.lerp(center, pet_body::birth_scene::smooth(11.2, 14.0, t));
+                }
+                runtime.body.set_presentation_offset_pixels(
+                    body_offset_for_origin(
+                        center,
+                        runtime.acknowledged_window_origin,
+                        runtime.window.inner_size(),
+                    ),
+                    runtime.window.inner_size().height as f32,
+                );
                 runtime.body.presentation_update(present_dt);
                 let mut parameters = runtime.body.render_parameters(
                     &runtime.life.state.genome,
                     runtime.life.state.affect.arousal,
                 );
+                parameters.birth_roundness =
+                    birth_time.map_or(0.0, |t| 1.0 - pet_body::birth_scene::smooth(11.2, 14.0, t));
+                if birth_time.is_some_and(|t| t < 11.2) {
+                    parameters.gaze = Vec2::ZERO;
+                    parameters.blink_left = 0.0;
+                    parameters.blink_right = 0.0;
+                    parameters.brow_tension = 0.0;
+                    parameters.brow_raise = 0.15;
+                    parameters.mouth_tension = 0.0;
+                    parameters.mouth_curve = 0.28;
+                    parameters.mouth_open = 0.0;
+                }
                 parameters.render_scale = PRODUCTION_RENDER_SCALE;
+                parameters.material_bloom_strength = 0.05;
+                parameters.shadow_color = glam::Vec3::new(0.008, 0.012, 0.020);
+                parameters.shadow_opacity = 0.16;
+                parameters.shadow_feather = 32.0;
+                parameters.shadow_horizontal_offset = 0.0;
+                parameters.shadow_vertical_offset = 0.0;
+                parameters.exposure = 1.0;
+                parameters.presentation_visibility =
+                    birth_time.map_or(1.0, |t| pet_body::birth_scene::smooth(7.96, 8.65, t));
                 let render_started = Instant::now();
                 let bounds = runtime.topology.virtual_physical_bounds;
                 let desktop_aspect = bounds.width().max(1) as f32 / bounds.height().max(1) as f32;
                 let ecology_state = runtime.ecology.state();
+                let birth_scene = std::cell::RefCell::new(&mut runtime.birth_scene);
+                let seated_in_cradle = runtime.cradle_seat.inside;
+                let m = runtime.birth_monitor;
+                let birth_frame = birth_time.map(|t| {
+                    (
+                        t,
+                        [
+                            (m.minimum.x - bounds.minimum.x) as f32,
+                            (m.minimum.y - bounds.minimum.y) as f32,
+                            m.width() as f32,
+                            m.height() as f32,
+                        ],
+                    )
+                });
+                let viewport = [
+                    runtime.window.inner_size().width,
+                    runtime.window.inner_size().height,
+                ];
                 let ecology_renderer = &mut runtime.ecology_renderer;
                 ecology_renderer.set_den_tuning(runtime.body.tuning_profile().den);
                 let ecology_time = runtime.normalizer.monotonic_seconds() as f32;
@@ -5077,15 +5328,59 @@ impl ApplicationHandler for PetApplication {
                     || runtime.normalizer.monotonic_seconds() > BACKGROUND_CAPTURE_FALLBACK_SECONDS;
                 let render_outcome = runtime.renderer.render_with_layers(
                     parameters,
-                    |_device, _queue, encoder, view| {
-                        if ecology_ready {
-                            ecology_renderer.render_prepared_den(encoder, view);
+                    |device, queue, encoder, view| {
+                        if ecology_ready && birth_time.is_none() {
                             ecology_renderer.render_background_objects(encoder, view);
+                            if !seated_in_cradle {
+                                let mut scene = birth_scene.borrow_mut();
+                                scene.render(
+                                    device,
+                                    queue,
+                                    encoder,
+                                    view,
+                                    viewport,
+                                    ecology_state.den.anchor.to_array(),
+                                    ecology_state.den.size_scale,
+                                    None,
+                                );
+                                scene.render_den_front(
+                                    device,
+                                    queue,
+                                    encoder,
+                                    view,
+                                    viewport,
+                                    ecology_state.den.anchor.to_array(),
+                                    ecology_state.den.size_scale,
+                                );
+                            }
                         }
                     },
-                    |_device, _queue, encoder, view| {
-                        if ecology_ready {
+                    |device, queue, encoder, view| {
+                        if seated_in_cradle || birth_time.is_some() {
+                            birth_scene.borrow_mut().render(
+                                device,
+                                queue,
+                                encoder,
+                                view,
+                                viewport,
+                                ecology_state.den.anchor.to_array(),
+                                ecology_state.den.size_scale,
+                                birth_frame,
+                            );
+                        }
+                        if ecology_ready && birth_time.is_none() {
                             ecology_renderer.render_foreground_objects(encoder, view);
+                        }
+                        if seated_in_cradle || birth_time.is_some() {
+                            birth_scene.borrow_mut().render_den_front(
+                                device,
+                                queue,
+                                encoder,
+                                view,
+                                viewport,
+                                ecology_state.den.anchor.to_array(),
+                                ecology_state.den.size_scale,
+                            );
                         }
                     },
                 );
@@ -5595,6 +5890,19 @@ fn poll_lab_control(
                 true
             }
         }
+        LabControlCommand::ReplayBirth => {
+            runtime.birth.replay();
+            runtime.birth_monitor = runtime
+                .topology
+                .monitor_at(desktop_host::PhysicalDesktopPoint {
+                    x: runtime.screen_body_center.x as i32,
+                    y: runtime.screen_body_center.y as i32,
+                })
+                .map_or(runtime.topology.virtual_physical_bounds, |m| {
+                    m.physical_bounds
+                });
+            true
+        }
         LabControlCommand::ClearDrivePulses => {
             let changed = !runtime.lab_interventions.active_pulses.is_empty();
             runtime.lab_interventions.active_pulses.clear();
@@ -5699,6 +6007,7 @@ const fn lab_command_name(command: &LabControlCommand) -> &'static str {
         LabControlCommand::DrivePulse { .. } => "drive_pulse",
         LabControlCommand::Reward { .. } => "reward",
         LabControlCommand::FocusMode { .. } => "focus_mode",
+        LabControlCommand::ReplayBirth => "replay_birth",
         LabControlCommand::ClearDrivePulses => "clear_drive_pulses",
         LabControlCommand::StimulatePointerGesture { .. } => "stimulate_pointer_gesture",
         LabControlCommand::RunMotorProgram { .. } => "run_motor_program",
@@ -7250,6 +7559,18 @@ fn load_restore_body_state(store: &StateStore, body: &mut ProceduralBody) -> Res
 /// material remain available inside Body Lab for diagnostics, but a stale user
 /// profile must not silently switch the desktop organism back to either lane.
 fn production_liquid_tuning(mut profile: LiquidTuningProfile) -> LiquidTuningProfile {
+    if (profile.pbf.viscosity - 0.015).abs() < 1e-6
+        && (profile.pbf.surface_tension - 2.5).abs() < 1e-5
+    {
+        profile.pbf.viscosity = 0.009;
+        profile.pbf.surface_tension = 2.0;
+        profile.pbf.bond_compliance = 0.0012;
+        profile.pbf.bond_relaxation_time = 0.18;
+        profile.pbf.flight_inertia = 0.72;
+        profile.pbf.flight_damping = 3.2;
+        profile.profile_revision = profile.profile_revision.saturating_add(1);
+    }
+
     // Migrate only the exact previous stock pair; retain authored overrides.
     if (profile.nervous.expression_gain - 1.28).abs() < 0.0001
         && (profile.nervous.motion_gain - 1.20).abs() < 0.0001

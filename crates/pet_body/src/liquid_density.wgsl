@@ -95,3 +95,35 @@ fn particle_fragment(input: DensityOutput) -> DensityTargets {
     output.flow = density * input.material_flow;
     return output;
 }
+
+// Broad, smooth optical kernels follow every real particle. Their analytic
+// gradients have no ray/axis discontinuities at concavities or screen contact.
+// The compact quartic has a continuous zero gradient at its support boundary.
+@vertex
+fn optical_vertex(
+    @builtin(vertex_index) vertex_index: u32,
+    @location(0) geometry_a: vec4<f32>,
+    @location(1) geometry_b: vec4<f32>,
+    @location(2) particle_material: vec4<f32>,
+    @location(3) material_flow: vec4<f32>,
+) -> DensityOutput {
+    let corner=quad_corner(vertex_index);
+    let axis=normalize(geometry_b.xy+vec2<f32>(0.000001,0.0));
+    let perpendicular=vec2<f32>(-axis.y,axis.x);
+    let radii=max(geometry_a.zw*4.5,vec2<f32>(0.20));
+    let point=geometry_a.xy+axis*corner.x*radii.x+perpendicular*corner.y*radii.y;
+    var output:DensityOutput;
+    output.clip_position=vec4<f32>(local_to_clip(point),0.0,1.0);
+    output.kernel_coordinate=corner;
+    output.material=vec4<f32>(geometry_b.z*geometry_a.z*geometry_a.w/(radii.x*radii.y),0.0,0.0,0.0);
+    output.material_flow=vec4<f32>(axis/radii.x,perpendicular/radii.y);
+    return output;
+}
+@fragment
+fn optical_fragment(input:DensityOutput)->@location(0) vec4<f32> {
+    let q=input.kernel_coordinate;let r2=dot(q,q);
+    let support=max(0.0,1.0-r2);
+    let outward=(input.material_flow.xy*q.x+input.material_flow.zw*q.y)
+        *8.0*support*support*support*input.material.x;
+    return vec4<f32>(0.0,0.0,outward);
+}

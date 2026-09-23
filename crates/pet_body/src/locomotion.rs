@@ -298,9 +298,10 @@ impl BodySimulation {
             * (1.0 + purposeful_response * 0.85);
         let maximum_acceleration = unclamped_maximum_acceleration.min(1.85 * reference_span);
         let jerk_per_reference_span = match intent.locomotion {
-            LocomotionMode::Seek | LocomotionMode::Flee | LocomotionMode::Orbit => 48.0,
-            LocomotionMode::Landing | LocomotionMode::Sleep | LocomotionMode::Cocoon => 18.0,
-            _ => 32.0,
+            LocomotionMode::Flee => 14.0,
+            LocomotionMode::Seek | LocomotionMode::Orbit => 8.0,
+            LocomotionMode::Landing | LocomotionMode::Sleep | LocomotionMode::Cocoon => 5.0,
+            _ => 6.0,
         };
         let maximum_jerk = jerk_per_reference_span * reference_span;
 
@@ -372,7 +373,13 @@ impl BodySimulation {
             .lerp(pressure, 1.0 - (-7.0 * dt).exp());
         let velocity_response = 5.8 + purposeful_response * 3.2;
         self.motor_velocity = (desired_velocity / scale).clamp_length_max(1.0);
-        let requested_motor_acceleration = (desired_velocity - velocity) * velocity_response;
+        // Account for momentum gained while acceleration slews to its next value.
+        // This damps the acceleration state instead of overshooting the speed goal.
+        let acceleration_horizon = (maximum_acceleration / maximum_jerk.max(1.0)) * 0.5 + 0.125;
+        let predicted_velocity =
+            velocity + self.commanded_acceleration_px_s2 * acceleration_horizon;
+        let requested_motor_acceleration =
+            (desired_velocity - predicted_velocity) * velocity_response;
         let acceleration_limited =
             requested_motor_acceleration.length() > maximum_acceleration + 1.0e-4;
         let motor_acceleration =
@@ -400,7 +407,10 @@ impl BodySimulation {
             requested_acceleration.clamp_length_max(maximum_acceleration * 1.10);
         let previous_acceleration = self.commanded_acceleration_px_s2;
         let maximum_acceleration_delta = maximum_jerk * dt;
-        let requested_delta = requested_acceleration - previous_acceleration;
+        // A slew cap alone is bang-bang control and changes jerk abruptly.
+        // First-order actuator dynamics approach the demand continuously.
+        let requested_delta =
+            (requested_acceleration - previous_acceleration) * (1.0 - (-8.0 * dt).exp());
         let jerk_limited = requested_delta.length() > maximum_acceleration_delta + 1.0e-4;
         let acceleration =
             previous_acceleration + requested_delta.clamp_length_max(maximum_acceleration_delta);
@@ -521,7 +531,7 @@ fn jerk_aware_braking_speed(
     // Reserve the distance travelled while acceleration slews from its current
     // sign toward braking. The remaining distance uses the ordinary constant-
     // acceleration stopping bound. This is conservative and frame invariant.
-    let slew_seconds = maximum_acceleration / maximum_jerk;
+    let slew_seconds = maximum_acceleration / maximum_jerk + 0.125;
     let slew_distance = current_speed.max(0.0) * slew_seconds * 0.5;
     let usable_distance = (distance.max(0.0) - slew_distance).max(0.0);
     (2.0 * maximum_acceleration * usable_distance).sqrt()
@@ -999,7 +1009,7 @@ mod tests {
         let seek_speed = (regular_seek.feedback.velocity * regular_scale).length();
         let ultrawide_seek_speed = (ultrawide_seek.feedback.velocity * ultrawide_scale).length();
         assert!(
-            (900.0..=1300.0).contains(&seek_speed),
+            (900.0..=1450.0).contains(&seek_speed),
             "2x seek={seek_speed} px/s"
         );
         assert!((seek_speed - ultrawide_seek_speed).abs() < 0.75);
@@ -1046,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn purposeful_launch_and_brake_are_quick_but_never_reverse_or_teleport_in_one_step() {
+    fn purposeful_launch_and_brake_slew_smoothly_without_reversal_or_teleport() {
         let genome = Genome::from_seed(0x000B_2A4E);
         let scale = Vec2::new(1_920.0, 1_080.0);
         let mut simulation = BodySimulation::new(0x000B_2A4E);
@@ -1068,7 +1078,12 @@ mod tests {
             simulation.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
         }
         let launch_speed = (simulation.feedback.velocity * scale).length();
-        assert!(launch_speed > 350.0, "2x launch={launch_speed} px/s");
+        // The liquid now ramps propulsion over several frames, rather than
+        // reaching the old >350 px/s snap-launch band after 250 ms.
+        assert!(
+            (200.0..330.0).contains(&launch_speed),
+            "soft launch={launch_speed} px/s"
+        );
         assert!(
             simulation
                 .embodied_target
@@ -1081,10 +1096,13 @@ mod tests {
         simulation.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 30.0);
         let one_step_velocity = simulation.feedback.velocity.x * scale.x;
         assert!(before_velocity > 0.0 && one_step_velocity > 0.0);
-        assert!(one_step_velocity < before_velocity);
+        // Finite jerk allows a bounded carry-over while positive acceleration
+        // crosses zero. It must not instantly flip velocity or acceleration.
+        assert!(one_step_velocity - before_velocity < 65.0);
+        assert!(simulation.diagnostics.jerk_px_s3.length() <= 8.01 * scale.y);
         assert!(simulation.feedback.world_position.distance(before_position) < 0.01);
 
-        for _ in 0..30 {
+        for _ in 0..72 {
             simulation.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
         }
         let braked_speed = (simulation.feedback.velocity * scale).length();

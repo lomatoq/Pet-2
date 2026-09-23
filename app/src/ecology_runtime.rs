@@ -60,6 +60,7 @@ pub struct EcologyRuntime {
     episode_tick_microseconds: f64,
     object_physics_microseconds: f64,
     desktop_aspect: f32,
+    den_viewport: [u32; 2],
     food_floors: Vec<(f32, f32, f32)>,
     food_physical: Option<PhysicalGrabFrame>,
     food_caught: Option<ObjectId>,
@@ -164,6 +165,32 @@ fn desktop_distance(left: Vec2, right: Vec2, desktop_aspect: f32) -> f32 {
     .length()
 }
 
+fn den_orb_rest_position(anchor: Vec2, scale: f32, viewport: [u32; 2], radius: f32) -> Vec2 {
+    let height = viewport[1].max(1) as f32;
+    let seat = pet_body::birth_scene::den_seat_depth_pixels(viewport, scale) / height;
+    // One fixed physical/render radius across storage, pickup and release.
+    let visible_radius = radius / REFERENCE_DESKTOP_HEIGHT_PX;
+    (anchor + Vec2::Y * (seat - visible_radius)).clamp(Vec2::ZERO, Vec2::ONE)
+}
+
+fn settle_stored_orb(object: &mut WorldObject, target: Vec2, aspect: f32, dt: f32) {
+    let dt = if dt.is_finite() {
+        dt.clamp(0.0, 1.0 / 30.0)
+    } else {
+        0.0
+    };
+    let metric = Vec2::new(aspect, 1.0);
+    let error = (object.position - target) * metric;
+    let spring = object.velocity + error * 7.0;
+    let decay = (-7.0 * dt).exp();
+    object.position = target + (error + spring * dt) * decay / metric;
+    object.velocity = (object.velocity - spring * (7.0 * dt)) * decay;
+    if (object.position - target).length() < 0.00001 && object.velocity.length() < 0.0001 {
+        object.position = target;
+        object.velocity = Vec2::ZERO;
+    }
+}
+
 fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
     let hue = hue.rem_euclid(1.0) * 6.0;
     let saturation = saturation.clamp(0.0, 1.0);
@@ -256,6 +283,7 @@ impl EcologyRuntime {
             episode_tick_microseconds: 0.0,
             object_physics_microseconds: 0.0,
             desktop_aspect: 1.0,
+            den_viewport: [1920, 1080],
             food_floors: Vec::new(),
             food_physical: None,
             food_caught: None,
@@ -608,6 +636,8 @@ impl EcologyRuntime {
         }
         let mut orb_has_opposing_contacts = false;
         let den_anchor = self.state.den.anchor;
+        let den_scale = self.state.den.size_scale;
+        let den_viewport = self.den_viewport;
         let previous_orb = self
             .state
             .objects
@@ -660,6 +690,23 @@ impl EcologyRuntime {
         }
         let measured_orb = self.measured_orb_contact.take();
         for object in &mut self.state.objects {
+            let before_motion = object.position;
+            let resting_position = den_orb_rest_position(
+                den_anchor,
+                den_scale,
+                den_viewport,
+                object.radius_px_at_reference,
+            );
+            if object.lifecycle == ObjectLifecycle::StoredInDen {
+                let previous = object.position;
+                settle_stored_orb(object, resting_position, aspect, dt);
+                crate::orb_cradle::constrain(object, previous, den_anchor, den_scale, den_viewport);
+                if object.kind == ObjectKind::Orb {
+                    self.environment.orb_position = Some(object.position);
+                    self.environment.orb_grounded = true;
+                }
+                continue;
+            }
             if let Some(grip) = self
                 .pet_grips
                 .iter()
@@ -756,20 +803,46 @@ impl EcologyRuntime {
                     contact,
                 );
             }
+            crate::orb_cradle::constrain(
+                object,
+                before_motion,
+                den_anchor,
+                den_scale,
+                den_viewport,
+            );
+            let before_attraction = object.position;
             // A deliberate release needs time to physically leave the latch.
             // Otherwise the first substep erases its impulse at the den center.
-            if !self.release_grace.iter().any(|(id, _)| *id == object.id)
-                && step_den_attraction(object, den_anchor, config, dt)
+            let latch_requested = !self.release_grace.iter().any(|(id, _)| *id == object.id)
+                && step_den_attraction(object, resting_position, config, dt);
+            crate::orb_cradle::constrain(
+                object,
+                before_attraction,
+                den_anchor,
+                den_scale,
+                den_viewport,
+            );
+            if latch_requested
+                && desktop_distance(object.position, resting_position, aspect)
+                    * REFERENCE_DESKTOP_HEIGHT_PX
+                    < 0.05
                 && let Some(slot) = orb_slot
             {
                 object.lifecycle = ObjectLifecycle::StoredInDen;
                 object.home_slot = Some(slot);
                 captured_orb = Some((object.id, slot));
             }
+            crate::orb_cradle::constrain(
+                object,
+                before_attraction,
+                den_anchor,
+                den_scale,
+                den_viewport,
+            );
             if object.kind == ObjectKind::Orb {
                 self.environment.orb_position = Some(object.position);
                 if object.lifecycle == ObjectLifecycle::StoredInDen {
-                    self.environment.orb_grounded = false;
+                    self.environment.orb_grounded = true;
                 }
             }
         }
@@ -778,7 +851,7 @@ impl EcologyRuntime {
             self.state.den.slots[usize::from(slot)] = Some(object_id);
             self.state.den.visits = self.state.den.visits.saturating_add(1);
             self.state.den.familiarity = (self.state.den.familiarity + 0.004).clamp(0.0, 1.0);
-            self.environment.orb_grounded = false;
+            self.environment.orb_grounded = true;
             self.environment.orb_position = self
                 .state
                 .objects
@@ -791,9 +864,17 @@ impl EcologyRuntime {
             .objects
             .iter()
             .find(|object| object.kind == ObjectKind::Orb)
-            .map(|orb| (orb.position, orb.velocity.length(), orb.lifecycle));
-        if let Some((position, speed, lifecycle)) = current_orb {
-            let field_now = desktop_distance(position, den_anchor, self.desktop_aspect)
+            .map(|orb| {
+                (
+                    orb.position,
+                    orb.velocity.length(),
+                    orb.lifecycle,
+                    orb.radius_px_at_reference,
+                )
+            });
+        if let Some((position, speed, lifecycle, radius)) = current_orb {
+            let field_center = den_orb_rest_position(den_anchor, den_scale, den_viewport, radius);
+            let field_now = desktop_distance(position, field_center, self.desktop_aspect)
                 * reference_height
                 <= DEN_ATTRACTION_RADIUS_PX;
             let stored_now = lifecycle == ObjectLifecycle::StoredInDen;
@@ -1511,6 +1592,14 @@ impl EcologyRuntime {
             self.drag_velocity = self.drag_velocity.lerp(height_velocity, 0.58);
             object.velocity = self.drag_velocity;
             object.lifecycle = ObjectLifecycle::GrabbedByUser;
+            crate::orb_cradle::constrain(
+                object,
+                previous_position,
+                self.state.den.anchor,
+                self.state.den.size_scale,
+                self.den_viewport,
+            );
+            self.drag_velocity = object.velocity;
             object.last_interaction_seconds = timestamp.max(0.0);
         }
         let touched = pressed && self.grabbed_object.is_some();
@@ -1546,6 +1635,20 @@ impl EcologyRuntime {
     #[must_use]
     pub const fn is_dragging_object(&self) -> bool {
         self.grabbed_object.is_some()
+    }
+
+    pub fn set_den_anchor(&mut self, anchor: Vec2) {
+        let delta = anchor - self.state.den.anchor;
+        for object in &mut self.state.objects {
+            if object.lifecycle == ObjectLifecycle::StoredInDen {
+                object.position = (object.position + delta).clamp(Vec2::ZERO, Vec2::ONE);
+            }
+        }
+        self.state.den.anchor = anchor;
+    }
+
+    pub fn set_den_viewport(&mut self, viewport: [u32; 2]) {
+        self.den_viewport = [viewport[0].max(1), viewport[1].max(1)];
     }
 
     #[must_use]
@@ -1886,7 +1989,12 @@ mod tests {
             runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
         }
         assert!(runtime.release_grace.is_empty());
-        runtime.state.objects[0].position = start;
+        runtime.state.objects[0].position = den_orb_rest_position(
+            start,
+            runtime.state.den.size_scale,
+            runtime.den_viewport,
+            runtime.state.objects[0].radius_px_at_reference,
+        );
         runtime.state.objects[0].velocity = Vec2::ZERO;
         runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
         assert_eq!(
@@ -1948,12 +2056,12 @@ mod tests {
         runtime.last_body_position = start;
         runtime.last_orb_physical = PhysicalGrabFrame {
             contact: true,
-            socket_position: start - Vec2::new(0.06, 0.0),
+            socket_position: start - Vec2::new(0.0, 0.10),
             ..PhysicalGrabFrame::default()
         };
         output.object_commands[0] = ObjectCommand::MoveToward {
             object_id: id,
-            target: start - Vec2::new(0.06, 0.0),
+            target: start - Vec2::new(0.0, 0.10),
             speed: 5.0,
         };
         runtime.apply_object_commands(&output, 0.05);
@@ -1985,7 +2093,15 @@ mod tests {
             previous = orb.position;
             previous_velocity = orb.velocity;
         }
-        assert!((runtime.state.objects[0].position.x - (start.x - 0.06)).abs() < 0.003);
+        // A compliant grip carries weight: vertical equilibrium includes spring sag.
+        let sag = pet_ecology::ORB_SCREEN_GRAVITY * runtime.state.objects[0].mass
+            / (8.5_f32.powi(2) * 0.72);
+        assert!(
+            (runtime.state.objects[0].position.y - (start.y - 0.10 + sag)).abs() < 0.003,
+            "pickup position {:?}, target {:?}",
+            runtime.state.objects[0].position,
+            start - Vec2::Y * 0.10
+        );
         output.object_commands[0] = ObjectCommand::Release {
             object_id: id,
             velocity: Vec2::new(-1.2, 0.0),
@@ -2177,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn released_orb_inside_den_is_pulled_smoothly_to_center_then_latched() {
+    fn released_orb_inside_den_is_pulled_smoothly_to_cushion_then_latched() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
         let mut runtime = EcologyRuntime::load_or_create(&store, 81, true).unwrap();
@@ -2212,7 +2328,15 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(runtime.state.objects[0].position, runtime.state.den.anchor);
+        assert_eq!(
+            runtime.state.objects[0].position,
+            den_orb_rest_position(
+                runtime.state.den.anchor,
+                runtime.state.den.size_scale,
+                runtime.den_viewport,
+                runtime.state.objects[0].radius_px_at_reference,
+            )
+        );
         assert_eq!(runtime.state.objects[0].velocity, Vec2::ZERO);
         assert_eq!(
             runtime.state.objects[0].lifecycle,
@@ -2220,6 +2344,57 @@ mod tests {
         );
         assert_eq!(runtime.state.den.slots[0], Some(orb_id));
         runtime.state.validate().unwrap();
+    }
+
+    #[test]
+    fn stored_orb_settles_on_visible_cushion_without_a_grab_coordinate_jump() {
+        for viewport in [[1920, 1080], [3440, 1440], [800, 1280]] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = StateStore::at(directory.path());
+            let mut runtime = EcologyRuntime::load_or_create(&store, 812, true).unwrap();
+            runtime.set_den_viewport(viewport);
+            runtime.state.den.anchor = Vec2::new(0.7, 0.8);
+            let anchor = runtime.state.den.anchor;
+            let orb = &mut runtime.state.objects[0];
+            orb.position = anchor;
+            orb.velocity = Vec2::ZERO;
+            orb.lifecycle = ObjectLifecycle::StoredInDen;
+            orb.home_slot = Some(0);
+            runtime.state.den.slots[0] = Some(orb.id);
+            let aspect = viewport[0] as f32 / viewport[1] as f32;
+            let body = BodyFeedback {
+                world_position: Vec2::splat(0.2),
+                ..Default::default()
+            };
+            let windows = WindowAffordanceFrame::default();
+            let mut previous = anchor;
+            for _ in 0..480 {
+                runtime.fixed_update(aspect, &windows, &body, 1.0 / 120.0);
+                let current = runtime.state.objects[0].position;
+                assert!((current - previous).length() * (viewport[1] as f32) < 1.0);
+                previous = current;
+            }
+            let orb = &runtime.state.objects[0];
+            let height = viewport[1] as f32;
+            let visible_bottom = (orb.position.y - anchor.y) * height
+                + orb.radius_px_at_reference / REFERENCE_DESKTOP_HEIGHT_PX * height;
+            let seat = pet_body::birth_scene::den_seat_depth_pixels(
+                viewport,
+                runtime.state.den.size_scale,
+            );
+            assert!((visible_bottom - seat).abs() < 0.05);
+            let physical_center = orb.position;
+            assert!(runtime.hit_test(physical_center, aspect, height, 0.0));
+            assert!(runtime.observe_pointer(
+                Some(physical_center),
+                true,
+                true,
+                aspect,
+                height,
+                1.0
+            ));
+            assert_eq!(runtime.state.objects[0].position, physical_center);
+        }
     }
 
     #[test]
@@ -2320,7 +2495,15 @@ mod tests {
             }
         }
         assert_eq!(runtime.state.den.slots, [None, None, Some(orb_id)]);
-        assert_eq!(runtime.state.objects[0].position, runtime.state.den.anchor);
+        assert_eq!(
+            runtime.state.objects[0].position,
+            den_orb_rest_position(
+                runtime.state.den.anchor,
+                runtime.state.den.size_scale,
+                runtime.den_viewport,
+                runtime.state.objects[0].radius_px_at_reference,
+            )
+        );
         runtime.state.validate().unwrap();
     }
 
@@ -2392,7 +2575,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
         let mut runtime = EcologyRuntime::load_or_create(&store, 82, true).unwrap();
-        let den = runtime.state.den.anchor;
+        let den = den_orb_rest_position(
+            runtime.state.den.anchor,
+            runtime.state.den.size_scale,
+            runtime.den_viewport,
+            runtime.state.objects[0].radius_px_at_reference,
+        );
         let orb = &mut runtime.state.objects[0];
         orb.position = (den + Vec2::new(0.0, -0.16)).clamp(Vec2::ZERO, Vec2::ONE);
         orb.velocity = Vec2::ZERO;

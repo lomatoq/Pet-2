@@ -149,13 +149,22 @@ fn footprint_shadow(uv: vec2<f32>) -> f32 {
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let organism = tone_map_premultiplied(
-        cinematic_bloom(input.uv, resolved_organism(input.uv)),
+        cinematic_bloom(input.uv, resolved_organism(input.uv))*globals.post.w,
     );
-    let blurred_alpha = footprint_shadow(input.uv);
+    let blurred_alpha = footprint_shadow(input.uv)*globals.post.w;
     let shadow_alpha = blurred_alpha * globals.shadow.z * (1.0 - organism.a);
     let shadow_premultiplied = globals.shadow_style.yzw * shadow_alpha;
-    let combined_rgb = organism.rgb + shadow_premultiplied;
-    let combined_alpha = clamp(organism.a + shadow_alpha, 0.0, 1.0);
+    // Further broaden the already Gaussian-filtered silhouette. The faint
+    // pearl halo sits behind the dark shadow, preserving contrast on white.
+    let spread=globals.output_mode.zw*globals.shadow_style.x*0.9;
+    let glow_field=(footprint_shadow(input.uv)*0.40
+        +footprint_shadow(input.uv+vec2<f32>(spread.x,0.0))*0.15
+        +footprint_shadow(input.uv-vec2<f32>(spread.x,0.0))*0.15
+        +footprint_shadow(input.uv+vec2<f32>(0.0,spread.y))*0.15
+        +footprint_shadow(input.uv-vec2<f32>(0.0,spread.y))*0.15)*globals.post.w;
+    let glow_alpha=glow_field*globals.post.z*(1.0-organism.a)*(1.0-shadow_alpha);
+    let combined_rgb = organism.rgb + shadow_premultiplied+vec3<f32>(0.64,0.59,0.90)*glow_alpha;
+    let combined_alpha = clamp(organism.a + shadow_alpha+glow_alpha, 0.0, 1.0);
     let background = review_background(input.uv);
     if (background.a > 0.5) {
         return vec4<f32>(combined_rgb + background.rgb * (1.0 - combined_alpha), 1.0);

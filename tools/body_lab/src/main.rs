@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+mod birth_capture;
 mod companion_menu;
 mod face_capture;
 use std::{
@@ -71,6 +73,14 @@ const BACKGROUNDS: [ReviewBackground; 6] = [
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::args().nth(1).as_deref() == Some("--birth-captures") {
+        return birth_capture::run(
+            env::args()
+                .nth(2)
+                .unwrap_or_else(|| "birth-captures".into())
+                .into(),
+        );
+    }
     if env::args().nth(1).as_deref() == Some("--face-captures") {
         return face_capture::run(
             env::args()
@@ -589,6 +599,7 @@ impl ApplicationHandler for BodyLab {
         }
         let window = match event_loop.create_window(
             Window::default_attributes()
+                .with_window_icon(Some(desktop_host::application_icon()))
                 .with_title(if self.pet_menu {
                     "Персик — забота и обучение"
                 } else {
@@ -3021,6 +3032,7 @@ fn build_lab_control_envelope(
         } => ((*duration_seconds * 1_000.0).ceil() as u32).saturating_add(2_000),
         LabControlCommand::Reward { .. }
         | LabControlCommand::FocusMode { .. }
+        | LabControlCommand::ReplayBirth
         | LabControlCommand::ClearDrivePulses
         | LabControlCommand::RunMotorProgram { .. }
         | LabControlCommand::SetFacePose { .. }
@@ -3064,6 +3076,7 @@ fn lab_control_description(command: &LabControlCommand) -> String {
         LabControlCommand::FocusMode { enabled } => {
             format!("focus mode {}", if *enabled { "on" } else { "off" })
         }
+        LabControlCommand::ReplayBirth => "replay birth (age and memory preserved)".into(),
         LabControlCommand::ClearDrivePulses => "clear temporary drive pulses".into(),
         LabControlCommand::StimulatePointerGesture {
             gesture,

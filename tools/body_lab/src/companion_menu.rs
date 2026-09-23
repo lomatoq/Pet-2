@@ -61,6 +61,8 @@ pub(super) fn show(
         egui::ScrollArea::vertical().show(ui, |ui| { ui.add_enabled_ui(ready, |ui| {
             if state.page == 0 {
                 ui.heading("Давай пообщаемся");
+                if ui.button("Рождение · посмотреть ещё раз").clicked() { command=Some(LabControlCommand::ReplayBirth); state.close=true; }
+                ui.small("Повтор анимации сохраняет возраст и память Бендера.");
                 if ui.button("Кормить · светящиеся крошки").clicked() { command = Some(LabControlCommand::Feeding { enabled:true }); state.waiting_for_feed=true; }
                 ui.small("Esc или правый клик — отменить кормление. Старые крошки убираются, новые продолжают сыпаться.");
                 if ui.button("Отменить кормление · убрать крошки").clicked() { command=Some(LabControlCommand::Feeding { enabled:false }); }

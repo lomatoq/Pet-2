@@ -1197,6 +1197,21 @@ fn drive_episode(
     }
     match active.goal {
         EpisodeGoal::ReturnHome | EpisodeGoal::SleepInDen => {
+            // A completed physiological need must release the old route even
+            // when the pet woke up before reaching the cushion.
+            if active.goal == EpisodeGoal::SleepInDen
+                && !frame.sleeping
+                && frame.selected_action != ActionId::Sleep
+                && active.elapsed_seconds > 0.5
+            {
+                return EpisodeStep::Complete;
+            }
+            if active.goal == EpisodeGoal::ReturnHome
+                && active.reason_code == EpisodeReason::FocusModeRetreat
+                && !frame.focus_mode
+            {
+                return EpisodeStep::Complete;
+            }
             output.body_intent.target_position = state.den.anchor;
             output.body_intent.gaze_target = Some(state.den.anchor);
             output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.34);
@@ -2731,6 +2746,29 @@ mod tests {
             click_rhythm: None,
             timestamp: 1.0,
         }
+    }
+
+    #[test]
+    fn waking_far_from_home_releases_a_stale_sleep_route() {
+        let mut state = EcologyState::new(28);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::Sleep);
+        frame.sleeping = true;
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.1);
+        assert_eq!(
+            director.active_episode().unwrap().goal,
+            EpisodeGoal::SleepInDen
+        );
+        for _ in 0..8 {
+            let _ = director.tick(&mut state, frame, representative_intent(), 0.1);
+        }
+        frame.sleeping = false;
+        frame.selected_action = ActionId::ExploreScreen;
+        let output = director.tick(&mut state, frame, representative_intent(), 0.1);
+        assert!(
+            output.outcomes[..output.outcome_count]
+                .contains(&EcologyOutcome::EpisodeCompleted(EpisodeGoal::SleepInDen))
+        );
     }
 
     #[test]

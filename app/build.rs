@@ -1,6 +1,9 @@
+#[path = "../scripts/windows_icon_build.rs"]
+mod icon;
 use std::{env, path::PathBuf};
 
 fn main() {
+    icon::embed(PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join(".."));
     println!("cargo:rerun-if-changed=../assets/windows/app.manifest");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())

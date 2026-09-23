@@ -2,6 +2,7 @@
 //! This crate intentionally contains no platform-specific APIs.
 
 mod animation;
+pub mod birth_scene;
 mod blink_controller;
 mod companion_expression_director;
 mod droplets;
@@ -844,7 +845,7 @@ impl ProceduralBody {
     pub fn set_presentation_scale(&mut self, scale: f32) {
         if scale.is_finite() && scale > 0.0 {
             let previous_projection = self.projection_scale();
-            self.presentation_scale = scale.clamp(0.50, 3.0);
+            self.presentation_scale = scale.clamp(0.50, 12.0);
             self.preserve_projection_anchor(previous_projection);
         }
     }
@@ -889,6 +890,24 @@ impl ProceduralBody {
         self.embodiment
             .liquid
             .set_local_containment_bounds(Some((a.min(b), a.max(b))));
+    }
+
+    /// An admitted pet has a physical cradle; unrelated detached droplets stay free.
+    /// Coordinates are absolute desktop pixels, converted relative to the moving root.
+    pub fn set_cradle_bounds_pixels(
+        &mut self,
+        bounds: Option<(Vec2, Vec2)>,
+        center: Vec2,
+        height: f32,
+    ) {
+        let scale = 2.0 * self.projection_scale() / height.max(1.0);
+        self.embodiment
+            .liquid
+            .set_cradle_bounds(bounds.map(|(a, b)| {
+                let a = (a - center) * Vec2::new(scale, -scale);
+                let b = (b - center) * Vec2::new(scale, -scale);
+                (a.min(b), a.max(b))
+            }));
     }
 
     #[must_use]
@@ -1002,12 +1021,33 @@ impl ProceduralBody {
     /// frame do not reconstruct the contour again.
     #[must_use]
     pub fn liquid_contact_bounds_pixels(&self, viewport_height: f32) -> LiquidPhysicalHull {
+        self.material_contact_bounds_pixels(viewport_height, false)
+    }
+
+    /// The coherent character alone; free spray cannot block cradle admission.
+    #[must_use]
+    pub fn main_liquid_contact_bounds_pixels(&self, viewport_height: f32) -> LiquidPhysicalHull {
+        self.material_contact_bounds_pixels(viewport_height, true)
+    }
+
+    fn material_contact_bounds_pixels(
+        &self,
+        viewport_height: f32,
+        main_only: bool,
+    ) -> LiquidPhysicalHull {
         if !viewport_height.is_finite() || viewport_height <= 0.0 {
             return LiquidPhysicalHull::default();
         }
         use std::hash::{Hash, Hasher};
         let liquid = self.embodiment.liquid.render_state();
-        let particles = &liquid.particles[..liquid.particle_count];
+        let all = &liquid.particles[..liquid.particle_count];
+        let main: Vec<_>;
+        let particles = if main_only {
+            main = all.iter().copied().filter(|p| p.main_component).collect();
+            main.as_slice()
+        } else {
+            all
+        };
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         self.tuning.pbf.iso_threshold.to_bits().hash(&mut hash);
         for p in particles {
@@ -1148,7 +1188,7 @@ impl ProceduralBody {
         // Exact same bounded divisor as renderer::globals_for_resolved. Omitting
         // the apparent scale moved both the body and its floor toward the host
         // center, despite a reported zero contact gap.
-        (self.presentation_scale * self.fast_phenotype.apparent_scale).clamp(0.50, 3.0)
+        (self.presentation_scale * self.fast_phenotype.apparent_scale).clamp(0.50, 12.0)
     }
 
     fn preserve_projection_anchor(&mut self, previous_projection: f32) {
@@ -1224,6 +1264,8 @@ impl ProceduralBody {
             render_mode: profile.render_mode,
             render_scale: profile.compositor.render_scale,
             presentation_scale: self.effective_presentation_scale(),
+            presentation_visibility: 1.0,
+            birth_roundness: 0.0,
             presentation_offset: self.presentation_offset,
             debug_view: DebugView::Material,
             time: self.animation.time,
@@ -1247,7 +1289,9 @@ impl ProceduralBody {
             } else {
                 genome.body.eye_size
             } * profile.face.eye_size_scale,
-            eye_scales: pose.eye_scales,
+            eye_scales: pose
+                .eye_scales
+                .map(|scale| scale * if cinematic { pose.eye_scale } else { 1.0 }),
             eye_spacing: if cinematic {
                 BODY_LAB_EYE_SPACING
             } else {
@@ -1549,7 +1593,7 @@ mod tests {
                 let shader_divisor = renderer::projection_scale(
                     renderer::organism_scale(&body.mesh),
                     params.render_mode,
-                ) * params.presentation_scale.clamp(0.5, 3.0);
+                ) * params.presentation_scale.clamp(0.5, 12.0);
                 let shader_offset =
                     Vec2::new(params.presentation_offset.x, -params.presentation_offset.y)
                         * (height / (2.0 * shader_divisor));
@@ -1587,7 +1631,7 @@ mod tests {
             let shader_divisor = renderer::projection_scale(
                 renderer::organism_scale(&body.mesh),
                 params.render_mode,
-            ) * params.presentation_scale.clamp(0.5, 3.0);
+            ) * params.presentation_scale.clamp(0.5, 12.0);
             let (minimum, _) = contact_surface_bounds(
                 &params.liquid.particles[..params.liquid.particle_count],
                 params.liquid_iso_threshold,
@@ -1778,7 +1822,7 @@ mod tests {
         assert!(liquid_surface.contains("expressive_mouth_distance"));
         assert!(liquid_surface.contains("fn mouth_lip_contours"));
         assert!(liquid_surface.contains("expressive_mouth_y(x, curve, tension)"));
-        assert!(liquid_surface.contains("let cheek_left"));
+        assert!(liquid_surface.contains("fn pearl_eye"));
         assert!(!liquid_surface.contains("globals.viewport_time.y * 0.03"));
         let renderer_source = include_str!("renderer.rs");
         assert!(!renderer_source.contains("liquid_bubble.wgsl"));

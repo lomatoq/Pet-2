@@ -36,6 +36,7 @@ pub struct NervousSystemRuntime {
     voice_feedback: VoiceFeedbackV1,
     previous_voice_energy: f32,
     voice_mouth_open: f32,
+    startle_face: f32,
     companion_expression: Option<CompanionExpressionDirector>,
     blink_owner: pet_body::BlinkOwner,
     blink_reason: pet_body::BlinkReason,
@@ -67,6 +68,7 @@ impl Default for NervousSystemRuntime {
             voice_feedback: VoiceFeedbackV1::default(),
             previous_voice_energy: 0.0,
             voice_mouth_open: 0.0,
+            startle_face: 0.0,
             companion_expression: None,
             blink_owner: pet_body::BlinkOwner::Physiological,
             blink_reason: pet_body::BlinkReason::None,
@@ -441,6 +443,7 @@ impl NervousSystemRuntime {
             intent.expression.eye_aperture = 1.0;
         }
         restore_managed_asymmetry(&mut intent.expression, managed_asymmetry);
+        apply_startle_face(&mut intent.expression, self.startle_face);
         // Motor/VITA may overwrite the director's already-filtered gaze above.
         // Reconcile the selected attention AFTER every writer, so no raw cursor
         // or body-center target can bypass fixation continuity on presentation.
@@ -643,6 +646,24 @@ impl NervousSystemRuntime {
         calibration: NervousReadabilityTuning,
         dt: f32,
     ) -> FastPhenotypeActuation {
+        let startle_target = if motor_actuation.program
+            == Some(pet_motor::BehaviorProgramId::DefenseStartleOrientFreeze)
+        {
+            if motor_actuation.phase_name == "startle_recover" {
+                1.0 - motor_actuation.phase_progress
+            } else {
+                1.0
+            }
+        } else {
+            0.0
+        };
+        let rate = if startle_target > self.startle_face {
+            24.0
+        } else {
+            5.0
+        };
+        self.startle_face +=
+            (startle_target - self.startle_face) * (1.0 - (-rate * dt.clamp(0.0, 0.1)).exp());
         let source = self.source(life, vita, morph, soft_touch_pressure_max, calibration);
         let mut actuation = self.phenotype.tick(&source, self.snapshot, dt);
         merge_interaction(&mut actuation.interaction, vita_interaction);
@@ -666,7 +687,8 @@ impl NervousSystemRuntime {
                 audio_mouth_open: self.voice_mouth_open,
                 audio_active: self.voice_feedback.phonating,
                 target_velocity: self.body_feedback.motion.velocity,
-                protective_reflex: self.snapshot.felt.startle > 0.55
+                protective_reflex: self.startle_face > 0.25
+                    || self.snapshot.felt.startle > 0.55
                     || self.snapshot.felt.restraint > 0.72,
                 pain_like: self.snapshot.felt.pain_like,
             },
@@ -798,6 +820,46 @@ fn restore_managed_asymmetry(expression: &mut lifecore::ExpressionState, asymmet
     } else {
         0.0
     };
+}
+
+// The defensive motor bout is the shared cause of the recoil and the face.
+// Acoustic onsets already reject the pet's own voice in HearingBridge.
+fn apply_startle_face(expression: &mut lifecore::ExpressionState, strength: f32) {
+    let weight = strength.clamp(0.0, 1.0);
+    let startled = lifecore::FacePose::Startled.expression();
+    let blend = |from: f32, to: f32| from + (to - from) * weight;
+    expression.eye_aperture = blend(expression.eye_aperture, 1.0);
+    expression.squint *= 1.0 - weight;
+    expression.brow_raise = blend(expression.brow_raise, startled.brow_raise.max(0.8));
+    expression.brow_tension = blend(expression.brow_tension, 0.12);
+    expression.mouth_curve = blend(expression.mouth_curve, 0.0);
+    expression.mouth_open = blend(expression.mouth_open, expression.mouth_open.max(0.48));
+    for eye in 0..2 {
+        for channel in 0..4 {
+            expression.geometry.lids[eye][channel] = blend(
+                expression.geometry.lids[eye][channel],
+                startled.geometry.lids[eye][channel],
+            );
+            expression.geometry.brows[eye][channel] = blend(
+                expression.geometry.brows[eye][channel],
+                startled.geometry.brows[eye][channel],
+            );
+        }
+    }
+}
+
+#[test]
+fn motor_startle_recruits_eyes_brows_and_mouth_without_erasing_blinks() {
+    let original = lifecore::FacePose::Boundary.expression();
+    let mut expression = original;
+    apply_startle_face(&mut expression, 0.0);
+    assert_eq!(expression, original);
+    expression.blink_left = 0.7;
+    apply_startle_face(&mut expression, 1.0);
+    assert!(expression.brow_raise >= 0.8 && expression.squint < 0.01);
+    assert!(expression.geometry.lids[0][0] > 0.1);
+    assert!(expression.mouth_open >= 0.48);
+    assert_eq!(expression.blink_left, 0.7);
 }
 
 fn apply_companion_expression(

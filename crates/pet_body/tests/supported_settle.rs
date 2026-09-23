@@ -69,14 +69,18 @@ fn check_supported_profile(startle: f32, hz: u64, production_tuning: bool) {
     let mut neutral = ProceduralBody::generate(&genome).unwrap();
     for body in [&mut loaded, &mut neutral] {
         if production_tuning {
-            // Explicit fixture of the relevant native v8 settings; never read or
+            // Explicit fixture of the current First Light fluid settings; never read or
             // mutate a user's settings from a regression test.
             let mut profile = body.tuning_profile().clone();
             profile.pbf.fixed_hz = 120.0;
             profile.pbf.density_iterations = 6;
-            profile.pbf.surface_tension = 2.5;
+            profile.pbf.surface_tension = 2.0;
+            profile.pbf.bond_compliance = 0.0012;
+            profile.pbf.bond_relaxation_time = 0.18;
+            profile.pbf.flight_inertia = 0.72;
+            profile.pbf.flight_damping = 3.2;
             profile.pbf.return_strength = 0.05;
-            profile.pbf.viscosity = 0.015;
+            profile.pbf.viscosity = 0.009;
             profile.pbf.numerical_xsph = 0.014;
             profile.pbf.spacing_scale = 0.88;
             profile.pbf.kernel_radius_scale = 1.14;

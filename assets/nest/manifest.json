@@ -1,0 +1,83 @@
+{
+  "generator": "built-in image_gen.imagegen",
+  "assets": [
+    {
+      "asset": "nest-pearl-v28",
+      "size": [
+        1536,
+        1024
+      ],
+      "sha256_png": "7cd7c54ea3cd834403dd19133d09d8fe2022c1358415f621bd4bdea3eabd0342",
+      "transparent_pixels": 897869,
+      "coverage_bounds_alpha_over_128": [
+        65,
+        255,
+        1474,
+        846
+      ],
+      "sha256_rgba": "4f3b0fc2cce21234c26e095f5ae3789abf7d8faaab82cfcbad153faa53758bf8",
+      "rgba_matches_source_pixels": true
+    },
+    {
+      "asset": "orb-pearl-v28",
+      "size": [
+        1254,
+        1254
+      ],
+      "sha256_png": "91b77247d9d0bdba4ca6c6aee96e7364b6c026762cbd07bbc36b36df423a476e",
+      "transparent_pixels": 704585,
+      "coverage_bounds_alpha_over_128": [
+        105,
+        97,
+        1149,
+        1135
+      ],
+      "sha256_rgba": "0b4e6e7b24a98314876f426798627fa1baab1f440434b1113c226b205e8b7384",
+      "rgba_matches_source_pixels": true
+    },
+    {
+      "asset": "nest-back-v29",
+      "size": [
+        1536,
+        1024
+      ],
+      "sha256_png": "e5b78602357c86475af3a4107c9f8cf02c54818478576b02b12cffc59afb3257",
+      "transparent_pixels": 1242186,
+      "coverage_bounds_alpha_over_128": [
+        66,
+        255,
+        1473,
+        662
+      ]
+    },
+    {
+      "asset": "nest-front-v29",
+      "size": [
+        1536,
+        1024
+      ],
+      "sha256_png": "0a7f79ef637fbbfddd2f4bcc9975126d774201338f180a5869f6d8f33597c80b",
+      "transparent_pixels": 1223487,
+      "coverage_bounds_alpha_over_128": [
+        65,
+        436,
+        1474,
+        846
+      ]
+    }
+  ],
+  "nest_layers": {
+    "source": "nest-pearl-v28.rgba",
+    "back": "rear shell and cushion, alpha complement",
+    "front": "actual near shell/rim, depth gated by physical inside/outside state",
+    "exports": [
+      "nest-back-v29.png",
+      "nest-front-v29.png"
+    ],
+    "front_mask": "shape-preserving cubic from rim-contour-v29.json; smoothstep(edge-.0018,edge+.0018,v)",
+    "seat_depth_fraction_of_width": 0.2,
+    "base_depth_fraction_of_width": 0.292,
+    "sprite_center_offset_fraction_of_width": 0.0745521,
+    "contour": "rim-contour-v29.json"
+  }
+}

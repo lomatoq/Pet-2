@@ -1,0 +1,16 @@
+{
+  "size": [
+    1536,
+    1024
+  ],
+  "max_recomposed_alpha_error_in_u8_levels": 0.4941176470588396,
+  "source_rgb_preserved_exactly": true,
+  "formula": "A_front=A_source*mask; A_back=(A_source-A_front)/(1-A_front)",
+  "layers": [
+    "nest-back-v29.png",
+    "nest-front-v29.png"
+  ],
+  "contour": "rim-contour-v29.json",
+  "interpolation_preserves_monotonicity_without_overshoot": true,
+  "center_rim_y": 659.9997731344328
+}

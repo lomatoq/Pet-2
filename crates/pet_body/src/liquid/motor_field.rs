@@ -87,12 +87,68 @@ pub fn apply_posture_field(
     energy / count as f32
 }
 
+/// Rotation-invariant, area-preserving limit on the coherent mass's affine strain.
+/// Unlike rest-pose springs it does not assign a target to each fluid particle:
+/// particles may circulate and the tapered tail remains a non-affine deformation.
+/// Apply only to unsupported, ungrabbed flight, before density/contact projection.
+pub fn preserve_flight_core(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    main_component: u8,
+    dt: f32,
+    drive: f32,
+) {
+    let mut center = Vec2::ZERO;
+    let mut mass = 0.0;
+    for p in &particles[..count] {
+        if p.component_id == main_component && p.inverse_mass > 0.0 {
+            let m = p.inverse_mass.recip();
+            center += p.predicted_position * m;
+            mass += m;
+        }
+    }
+    if mass <= 0.0 {
+        return;
+    }
+    center /= mass;
+    let (mut xx, mut yy, mut xy) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for p in &particles[..count] {
+        if p.component_id == main_component && p.inverse_mass > 0.0 {
+            let q = p.predicted_position - center;
+            let m = p.inverse_mass.recip();
+            xx += q.x * q.x * m;
+            yy += q.y * q.y * m;
+            xy += q.x * q.y * m;
+        }
+    }
+    let trace = xx + yy;
+    let disc = ((xx - yy).powi(2) + 4.0 * xy * xy).sqrt();
+    let ratio = ((trace - disc) / (trace + disc).max(1e-8)).max(0.0).sqrt();
+    if !(1e-4..0.68).contains(&ratio) {
+        return;
+    }
+    let major = Vec2::from_angle(0.5 * (2.0 * xy).atan2(xx - yy));
+    let minor = major.perp();
+    let blend = (1.0 - (-18.0 * dt).exp()) * drive.clamp(0.0, 1.0);
+    let expansion = ((0.68 / ratio).sqrt().ln() * blend).exp();
+    for p in &mut particles[..count] {
+        if p.component_id == main_component && p.inverse_mass > 0.0 {
+            let q = p.predicted_position - center;
+            p.predicted_position =
+                center + major * q.dot(major) / expansion + minor * q.dot(minor) * expansion;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CharacterFieldParameters {
     /// Elliptical equipotential radii in body-local units.
     pub radii: Vec2,
     /// Asymptotic acceleration of the permanent character well.
     pub well_acceleration: f32,
+    /// Optional smooth outer confinement. Zero preserves the base well.
+    /// The near-body liquid remains soft while distant released material returns.
+    pub far_field_acceleration: f32,
     /// Scale applied to the comoving-frame inertial load.
     pub inertia_scale: f32,
     /// Hard physical bound on inertial acceleration, not a particle speed cap.
@@ -107,6 +163,8 @@ pub struct CharacterFieldParameters {
     pub flight_aspect: f32,
     /// Signed travel direction times the smoothed comet strength.
     pub comet: Vec2,
+    /// Signed trailing centerline curvature, driven by continuous turning.
+    pub tail_bend: f32,
 }
 
 impl Default for CharacterFieldParameters {
@@ -114,32 +172,36 @@ impl Default for CharacterFieldParameters {
         Self {
             radii: Vec2::new(0.35, 0.43),
             well_acceleration: 3.0,
+            far_field_acceleration: 0.0,
             inertia_scale: 0.90,
             maximum_inertial_acceleration: 6.0,
             velocity_damping: 1.4,
             flight_axis: Vec2::Y,
             flight_aspect: 1.0,
             comet: Vec2::ZERO,
+            tail_bend: 0.0,
         }
     }
 }
 
 /// A smooth conservative coordinate warp: rounded leading mass and a longer,
 /// narrower trailing well. Its Jacobian keeps forces consistent with the potential.
-fn comet_warp(local: Vec2, comet: Vec2) -> (Vec2, glam::Mat2) {
+fn comet_warp(local: Vec2, comet: Vec2, bend: f32) -> (Vec2, glam::Mat2) {
     let strength = comet.length().clamp(0.0, 1.0);
     let axis = comet.normalize_or(Vec2::X);
     let side = Vec2::new(-axis.y, axis.x);
     let x = local.dot(axis);
     let y = local.dot(side);
-    let t = (x * 4.0).tanh();
+    let t = ((x + 0.16) * 6.0).tanh();
     let rear = (1.0 - t) * 0.5;
-    let derivative = -2.0 * (1.0 - t * t);
+    let derivative = -3.0 * (1.0 - t * t);
     let length = 1.0 + 1.20 * strength * rear;
     let taper = 1.0 + 0.95 * strength * rear;
-    let warped = axis * (x / length) + side * (y * taper);
+    let centerline = bend * rear * rear;
+    let centerline_derivative = bend * 2.0 * rear * derivative;
+    let warped = axis * (x / length) + side * ((y - centerline) * taper);
     let dx = axis * (1.0 / length - x * 1.20 * strength * derivative / (length * length))
-        + side * (y * 0.95 * strength * derivative);
+        + side * ((y - centerline) * 0.95 * strength * derivative - centerline_derivative * taper);
     let dy = side * taper;
     let basis = glam::Mat2::from_cols(axis, side);
     (warped, glam::Mat2::from_cols(dx, dy) * basis.transpose())
@@ -213,17 +275,20 @@ pub fn apply_character_field(
 
     for particle in &mut particles[..count] {
         let local = particle.position - body_origin;
-        let (warped, jacobian) = comet_warp(local, parameters.comet);
+        let (warped, jacobian) = comet_warp(local, parameters.comet, parameters.tail_bend);
         let (elliptical_radius, metric_gradient) = elliptical_metric(
             warped,
             radii,
             parameters.flight_axis,
             parameters.flight_aspect,
         );
-        // Smooth harmonic behaviour at the center, asymptotically bounded far
-        // away. This is the analytic gradient of
-        // A*r_min*(sqrt(1 + q^2) - 1), so the well itself cannot add energy.
-        // There is no activation radius or component-dependent return mode.
+        // Continuous radial confinement in the same warped metric. Increasing
+        // the outer slope gathers long released threads without stiffening the
+        // near-body field or switching forces on component membership.
+        let outer = ((elliptical_radius - 1.4) / 1.8).clamp(0.0, 1.0);
+        let outer = outer * outer * (3.0 - 2.0 * outer);
+        let well_acceleration = well_acceleration
+            + (parameters.far_field_acceleration - well_acceleration).max(0.0) * outer;
         let well_force =
             (-(jacobian.transpose() * metric_gradient) * well_acceleration * radii.min_element()
                 / (1.0 + elliptical_radius.powi(2)).sqrt())
@@ -236,10 +301,38 @@ pub fn apply_character_field(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn core_strain_limit_preserves_center_area_and_rotation() {
+        for angle in [0.0_f32, 0.7, 2.1] {
+            let mut particles = [super::LiquidParticle::default(); super::MAX_LIQUID_PARTICLES];
+            let axis = glam::Vec2::from_angle(angle);
+            let center = glam::Vec2::new(0.3, -0.2);
+            for (i, p) in particles[..4].iter_mut().enumerate() {
+                p.inverse_mass = 1.0;
+                p.component_id = 0;
+                p.predicted_position = center
+                    + axis * if i % 2 == 0 { 0.4 } else { -0.4 }
+                    + axis.perp() * if i < 2 { 0.08 } else { -0.08 };
+            }
+            let before = particles;
+            super::preserve_flight_core(&mut particles, 4, 0, 1.0 / 120.0, 1.0);
+            let mean = particles[..4]
+                .iter()
+                .map(|p| p.predicted_position)
+                .sum::<glam::Vec2>()
+                / 4.0;
+            assert!(mean.distance(center) < 1e-6);
+            let q = particles[0].predicted_position - center;
+            assert!((q.dot(axis) * q.dot(axis.perp()) - 0.4 * 0.08).abs() < 1e-6);
+            assert!(q.dot(axis).abs() < 0.4 && q.dot(axis.perp()).abs() > 0.08);
+            assert_eq!(particles[4], before[4]);
+        }
+    }
+
+    #[test]
     fn comet_has_long_tapered_rear_and_correct_force_gradient() {
         let c = glam::Vec2::X;
-        let front = super::comet_warp(glam::Vec2::new(0.4, 0.1), c).0;
-        let back = super::comet_warp(glam::Vec2::new(-0.4, 0.1), c).0;
+        let front = super::comet_warp(glam::Vec2::new(0.4, 0.1), c, 0.0).0;
+        let back = super::comet_warp(glam::Vec2::new(-0.4, 0.1), c, 0.0).0;
         assert!(front.x.abs() > back.x.abs() * 1.7);
         assert!(back.y > front.y * 1.6);
         for p in [
@@ -247,14 +340,14 @@ mod tests {
             glam::Vec2::new(0.0, -0.2),
             glam::Vec2::new(0.3, 0.1),
         ] {
-            let (_, j) = super::comet_warp(p, c);
+            let (_, j) = super::comet_warp(p, c, 0.12);
             for axis in [glam::Vec2::X, glam::Vec2::Y] {
-                let numeric = (super::comet_warp(p + axis * 0.0001, c).0
-                    - super::comet_warp(p - axis * 0.0001, c).0)
+                let numeric = (super::comet_warp(p + axis * 0.0001, c, 0.12).0
+                    - super::comet_warp(p - axis * 0.0001, c, 0.12).0)
                     / 0.0002;
                 assert!(numeric.distance(j * axis) < 0.002);
             }
-            assert!(super::comet_warp(p, glam::Vec2::ZERO).0.distance(p) < 1.0e-6);
+            assert!(super::comet_warp(p, glam::Vec2::ZERO, 0.0).0.distance(p) < 1.0e-6);
         }
     }
 

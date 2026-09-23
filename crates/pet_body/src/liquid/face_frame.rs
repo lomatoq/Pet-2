@@ -43,6 +43,8 @@ pub struct FaceFrameRuntime {
     /// deliberately never follows whichever component happens to be largest.
     carrier_index: Option<usize>,
     target_origin: Vec2,
+    material_center: Option<(u8, Vec2)>,
+    pending_transport: Vec2,
     target_roll: f32,
     target_scale: Vec2,
     target_confidence: f32,
@@ -61,6 +63,8 @@ impl Default for FaceFrameRuntime {
             tuning: FaceTuning::default(),
             carrier_index: None,
             target_origin: DEFAULT_FACE_ORIGIN,
+            material_center: None,
+            pending_transport: Vec2::ZERO,
             target_roll: 0.0,
             target_scale: Vec2::ONE,
             target_confidence: 1.0,
@@ -104,6 +108,8 @@ impl FaceFrameRuntime {
         self.roll_velocity = 0.0;
         self.scale_velocity = Vec2::ZERO;
         self.recovery_remaining = RESET_RECOVERY_SECONDS;
+        self.material_center = None;
+        self.pending_transport = Vec2::ZERO;
     }
 
     /// Sets a brain-authored additive pose for the complete facial mask. This
@@ -196,6 +202,19 @@ impl FaceFrameRuntime {
             && raw_confidence >= 0.08;
         if enough_support {
             component_center /= component_count as f32;
+            if let Some((component, previous)) = self.material_center {
+                let delta = component_center - previous;
+                // Coherent substep translation travels with the body. Discontinuous
+                // topology/reset jumps still use the bounded recovery path.
+                if Some(component) == carrier_component
+                    && delta.length() < 0.08
+                    && self.recovery_remaining == 0.0
+                {
+                    self.pending_transport += delta;
+                    self.target_origin += delta;
+                }
+            }
+            self.material_center = carrier_component.map(|c| (c, component_center));
 
             // The neutral semantic face follows the permanent carrier's center
             // plus its authored upright offset. Face-weighted material is used
@@ -259,6 +278,8 @@ impl FaceFrameRuntime {
         // Exact critically damped integration remains stable across a 50 ms
         // presentation hitch. The final hard caps are a second safety boundary:
         // topology changes can move the target, never teleport the rendered face.
+        self.frame.origin += self.pending_transport;
+        self.pending_transport = Vec2::ZERO;
         let origin_before = self.frame.origin;
         let origin_frequency = self.tuning.translation_smoothing.clamp(0.5, 40.0);
         critical_damped_vec2(
@@ -432,6 +453,38 @@ mod tests {
     ) {
         runtime.update(particles, count, 0, Vec2::ZERO, Vec2::ZERO, dt);
         runtime.present(dt);
+    }
+
+    #[test]
+    fn face_travels_with_material_through_acceleration_and_direction_changes() {
+        let (mut particles, count) = initialize_particles(99);
+        let mut runtime = FaceFrameRuntime::default();
+        for _ in 0..240 {
+            update(&mut runtime, &particles, count, 1.0 / 120.0);
+        }
+        let initial_face = runtime.frame.origin;
+        let mut translated = Vec2::ZERO;
+        for frame in 0..360 {
+            let before = runtime.frame;
+            for substep in 0..2 {
+                let t = (frame * 2 + substep) as f32 / 120.0;
+                let shift = Vec2::new((t * 2.7).sin() * 0.009, (t * 1.9).cos() * 0.006);
+                for p in &mut particles[..count] {
+                    p.render_position += shift;
+                }
+                translated += shift;
+                runtime.sample_target(&particles, count, 0, Vec2::ZERO, Vec2::ZERO, 1.0 / 120.0);
+            }
+            assert_eq!(
+                runtime.frame, before,
+                "fixed sampling must not advance presentation"
+            );
+            runtime.present(1.0 / 60.0);
+            assert!(
+                (runtime.frame.origin - initial_face - translated).length() < 0.001,
+                "face lagged behind the same rendered liquid at frame {frame}"
+            );
+        }
     }
 
     #[test]

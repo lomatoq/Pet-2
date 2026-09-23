@@ -1,0 +1,13 @@
+{
+  "size": [
+    1536,
+    1024
+  ],
+  "max_recomposed_alpha_error_in_u8_levels": 0.6431372549019732,
+  "source_rgb_preserved_exactly": true,
+  "formula": "A_front=A_source*mask; A_back=(A_source-A_front)/(1-A_front)",
+  "layers": [
+    "nest-back-v28.png",
+    "nest-front-v28.png"
+  ]
+}

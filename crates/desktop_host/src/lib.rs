@@ -28,3 +28,8 @@ pub use platform::{
 };
 pub use sensors::*;
 pub use storage::*;
+
+/// The authored application icon, shared by the companion and its control window.
+pub fn application_icon() -> winit::window::Icon {
+    winit::window::Icon::from_rgba(include_bytes!("../../../assets/windows/app-icon.rgba").to_vec(), 64, 64).expect("embedded 64px RGBA icon")
+}

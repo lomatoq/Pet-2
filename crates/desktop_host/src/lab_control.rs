@@ -99,6 +99,7 @@ pub enum LabControlCommand {
     FocusMode {
         enabled: bool,
     },
+    ReplayBirth,
     ClearDrivePulses,
     StimulatePointerGesture {
         gesture: LabGesture,
@@ -207,6 +208,7 @@ impl LabControlCommand {
             }
             Self::CloseSession
             | Self::FocusMode { .. }
+            | Self::ReplayBirth
             | Self::ClearDrivePulses
             | Self::RunMotorProgram { .. }
             | Self::SetFacePose { .. }

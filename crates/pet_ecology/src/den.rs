@@ -15,8 +15,9 @@ const DEN_ATTRACTION_MAX_SPEED: f32 = 0.58;
 /// 31 px radius. This center-radius keeps the entire orb inside the lens before
 /// the den latches it, while remaining forgiving of a real drag/carry handoff.
 pub const DEN_LATCH_RADIUS_PX: f32 = 72.0;
-const STORED_ORB_HOVER_X_PX: f32 = 2.4;
-const STORED_ORB_HOVER_Y_PX: f32 = 1.5;
+// Almost imperceptible cushion settling, rather than levitation above the seat.
+const STORED_ORB_HOVER_X_PX: f32 = 0.35;
+const STORED_ORB_HOVER_Y_PX: f32 = 0.18;
 const STORED_ORB_HOVER_X_PERIOD_SECONDS: f32 = 17.0;
 const STORED_ORB_HOVER_Y_PERIOD_SECONDS: f32 = 23.0;
 
@@ -244,7 +245,7 @@ pub fn stored_orb_hover_offset(
     } else {
         16.0 / 9.0
     };
-    let seed_phase = (object_id as u32) as f32 * 0.000_13 * std::f32::consts::TAU;
+    let seed_phase = ((object_id % 65536) as f32 / 65536.0) * std::f32::consts::TAU;
     let hover_x = (time_seconds * std::f32::consts::TAU / STORED_ORB_HOVER_X_PERIOD_SECONDS
         + seed_phase)
         .sin()
@@ -267,6 +268,23 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_identity_does_not_quantize_hover_into_visible_steps() {
+        let id = 3614934214399815864;
+        let aspect = 3440.0 / 1440.0;
+        let mut previous = stored_orb_hover_offset(id, 0.0, aspect);
+        for tick in 1..7200 {
+            let current = stored_orb_hover_offset(id, tick as f32 / 120.0, aspect);
+            let displacement =
+                (current - previous) * Vec2::new(aspect, 1.0) * crate::REFERENCE_DESKTOP_HEIGHT_PX;
+            assert!(
+                displacement.length() < 0.01,
+                "visible hover step {displacement:?}"
+            );
+            previous = current;
+        }
+    }
 
     #[test]
     fn stored_hover_target_moves_less_than_one_pixel_per_second() {

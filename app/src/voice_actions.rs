@@ -246,6 +246,7 @@ mod tests {
 #[derive(Default)]
 pub struct EmotionBurst {
     pub active: bool,
+    discharged: bool,
     elapsed: f32,
     cooldown: f32,
     origin: Vec2,
@@ -262,12 +263,21 @@ impl EmotionBurst {
         dt: f32,
     ) {
         self.cooldown = (self.cooldown - dt).max(0.0);
+        if frustration < 0.45 {
+            self.discharged = false;
+        }
         if !allowed || frustration < 0.25 {
             self.active = false;
             return;
         }
-        if !self.active && self.cooldown <= 0.0 && frustration > 0.65 && arousal > 0.55 {
+        if !self.active
+            && !self.discharged
+            && self.cooldown <= 0.0
+            && frustration > 0.65
+            && arousal > 0.55
+        {
             self.active = true;
+            self.discharged = true;
             self.elapsed = 0.0;
             self.cooldown = 14.0;
             self.origin = position;
@@ -293,12 +303,14 @@ impl EmotionBurst {
         if !self.active {
             return;
         }
-        let toward = (self.elapsed * 2.8).fract() < 0.5;
-        intent.target_position = (self.origin
-            + self.direction * if toward { 0.14 } else { -0.065 })
-        .clamp(Vec2::splat(0.02), Vec2::splat(0.98));
+        // One bounded discharge per rise in frustration. Reversing the goal
+        // 5.6 times a second used to inject contradictory flight accelerations.
+        let phase = (self.elapsed / 1.25).clamp(0.0, 1.0);
+        let excursion = (std::f32::consts::PI * phase).sin().powi(2);
+        intent.target_position = (self.origin + self.direction * (0.045 * excursion))
+            .clamp(Vec2::splat(0.02), Vec2::splat(0.98));
         intent.locomotion = LocomotionMode::Seek;
-        intent.desired_speed = 1.0;
+        intent.desired_speed = 0.20 + 0.30 * excursion;
         intent.pose = PoseIntent::Compact;
         intent.interaction_target = None;
         intent.expression.brow_tension = intent.expression.brow_tension.max(0.7);
@@ -309,6 +321,40 @@ impl EmotionBurst {
 #[cfg(test)]
 mod emotion_tests {
     use super::*;
+    #[test]
+    fn sustained_frustration_does_not_repeat_or_flip_the_flight_target() {
+        let mut burst = EmotionBurst::default();
+        let origin = Vec2::splat(0.5);
+        let mut previous = origin;
+        for step in 0..4000 {
+            burst.update(0.9, 0.9, true, origin, 1.8, 0.01);
+            if step > 125 {
+                assert!(!burst.active, "persistent frustration retriggered");
+            }
+            if burst.active {
+                let mut intent = lifecore::BodyIntent {
+                    target_position: origin,
+                    target_surface: None,
+                    desired_speed: 0.0,
+                    facing_direction: 1.0,
+                    locomotion: LocomotionMode::Hover,
+                    gaze_target: None,
+                    pose: PoseIntent::Neutral,
+                    expression: lifecore::ExpressionState::default(),
+                    interaction_target: None,
+                };
+                burst.apply(&mut intent);
+                assert!(intent.target_position.distance(previous) < 0.003);
+                assert!(intent.target_position.distance(origin) <= 0.046);
+                assert!(intent.desired_speed <= 0.501);
+                previous = intent.target_position;
+            }
+        }
+        assert!(burst.discharged);
+        burst.update(0.3, 0.5, true, origin, 1.8, 0.01);
+        burst.update(0.9, 0.9, true, origin, 1.8, 0.01);
+        assert!(burst.active);
+    }
     #[test]
     fn frustration_requires_context_and_releases_with_a_refractory_period() {
         let mut burst = EmotionBurst::default();
@@ -350,7 +396,8 @@ impl ActivityRecovery {
         };
         self.effort = (self.effort + expenditure * dt).clamp(0.0, 60.0);
         let budget = 14.0 + (1.0 - fatigue.clamp(0.0, 1.0)) * 12.0 + arousal.clamp(0.0, 1.0) * 6.0;
-        if available && (self.effort >= budget || self.available_seconds > 24.0 + arousal * 12.0) {
+        let tired_idle = fatigue > 0.65 && self.available_seconds > 32.0 + arousal * 12.0;
+        if available && (self.effort >= budget || tired_idle) {
             self.available_seconds = 0.0;
             self.effort = 0.0;
             true
@@ -364,7 +411,7 @@ impl ActivityRecovery {
 mod recovery_tests {
     use super::*;
     #[test]
-    fn activity_or_long_idle_requests_rest_but_short_quiet_and_busy_do_not() {
+    fn exertion_or_tired_idle_requests_rest_without_parking_an_awake_pet() {
         let mut recovery = ActivityRecovery::default();
         for _ in 0..100 {
             assert!(!recovery.update(0.0, 0.5, 0.5, true, 0.1));
@@ -374,7 +421,10 @@ mod recovery_tests {
         }
         assert!(recovery.update(0.5, 0.5, 0.5, true, 0.1));
         assert!(!recovery.update(0.0, 0.5, 0.5, true, 0.1));
-        assert!((0..400).any(|_| recovery.update(0.0, 0.5, 0.5, true, 0.1)));
+        for _ in 0..6000 {
+            assert!(!recovery.update(0.0, 0.5, 0.5, true, 0.1));
+        }
+        assert!(recovery.update(0.0, 0.75, 0.5, true, 0.1));
     }
 }
 

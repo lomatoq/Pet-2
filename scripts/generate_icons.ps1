@@ -10,40 +10,15 @@ function New-PetIconPng([int]$Size) {
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $graphics.Clear([System.Drawing.Color]::Transparent)
-    $scale = $Size / 256.0
-
-    function Rect([float]$x, [float]$y, [float]$w, [float]$h) {
-        [System.Drawing.RectangleF]::new($x * $scale, $y * $scale, $w * $scale, $h * $scale)
-    }
-
-    $wing = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(235, 73, 218, 205))
-    $body = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 77, 61, 130))
-    $belly = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 126, 100, 188))
-    $eye = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 242, 255, 217))
-    $pupil = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 24, 31, 51))
-    $glow = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(220, 126, 255, 218), [Math]::Max(1.0, 6.0 * $scale))
-
-    $graphics.FillEllipse($wing, (Rect 13 75 104 94))
-    $graphics.FillEllipse($wing, (Rect 139 75 104 94))
-    $graphics.FillEllipse($body, (Rect 55 34 146 184))
-    $graphics.FillEllipse($belly, (Rect 80 94 96 104))
-    $graphics.DrawEllipse($glow, (Rect 58 37 140 178))
-    $graphics.FillEllipse($eye, (Rect 85 78 30 38))
-    $graphics.FillEllipse($eye, (Rect 141 78 30 38))
-    $graphics.FillEllipse($pupil, (Rect 96 89 11 18))
-    $graphics.FillEllipse($pupil, (Rect 149 89 11 18))
-    $graphics.FillEllipse($wing, (Rect 118 132 20 13))
+    $source = [System.Drawing.Image]::FromFile((Join-Path $workspace 'assets/windows/app.png'))
+    $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $graphics.DrawImage($source, 0, 0, $Size, $Size)
+    $source.Dispose()
 
     $stream = [System.IO.MemoryStream]::new()
     $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
     $bytes = $stream.ToArray()
     $stream.Dispose()
-    $glow.Dispose()
-    $pupil.Dispose()
-    $eye.Dispose()
-    $belly.Dispose()
-    $body.Dispose()
-    $wing.Dispose()
     $graphics.Dispose()
     $bitmap.Dispose()
     return ,$bytes
@@ -59,7 +34,7 @@ function Write-BigEndianUInt32([System.IO.Stream]$Stream, [uint32]$Value) {
     $Stream.Write($bytes, 0, 4)
 }
 
-$icoSizes = @(16, 32, 48, 64, 128, 256)
+$icoSizes = @(16, 24, 32, 48, 64, 128, 256)
 $icoImages = @($icoSizes | ForEach-Object { New-PetIconPng $_ })
 $icoStream = [System.IO.MemoryStream]::new()
 $icoWriter = [System.IO.BinaryWriter]::new($icoStream)

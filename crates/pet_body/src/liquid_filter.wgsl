@@ -89,9 +89,10 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // One wide cross is intentionally cheaper than the old 13-tap Poisson
     // kernel. The source is already a smooth particle field, so the extra ring
     // only spent bandwidth without changing the macro silhouette.
-    return field_at(input.uv) * 0.46
+    let filtered=field_at(input.uv) * 0.46
         + field_at(input.uv + vec2<f32>(radius * texel.x, 0.0)) * 0.135
         + field_at(input.uv - vec2<f32>(radius * texel.x, 0.0)) * 0.135
         + field_at(input.uv + vec2<f32>(0.0, radius * texel.y)) * 0.135
         + field_at(input.uv - vec2<f32>(0.0, radius * texel.y)) * 0.135;
+    return vec4<f32>(filtered.rg,0.0,0.0);
 }

@@ -280,6 +280,10 @@ pub struct LiquidMorphRuntime {
     face_frame: FaceFrameRuntime,
     /// Unoriented major axis of the area-preserving character-field ellipse.
     flight_comet: Vec2,
+    flight_tail_bend: f32,
+    attention_mass_bias: Vec2,
+    detached_carrier_velocity: [Vec2; MAX_LIQUID_PARTICLES],
+    was_detached: [bool; MAX_LIQUID_PARTICLES],
     exploratory_pressure: Vec2,
     flight_field_axis: Vec2,
     /// Ratio of major/minor field metric radii. One is the neutral field.
@@ -287,6 +291,7 @@ pub struct LiquidMorphRuntime {
     diagnostics: LiquidDiagnostics,
     navigation_anchor_strength: f32,
     local_containment_bounds: Option<(Vec2, Vec2)>,
+    cradle_bounds: Option<(Vec2, Vec2)>,
     relaxation_elapsed: f32,
     idle_fragments: [IdleFragment; MAX_IDLE_FRAGMENTS],
     idle_fragment_timer: f32,
@@ -414,12 +419,17 @@ impl LiquidMorphRuntime {
             components,
             face_frame: FaceFrameRuntime::default(),
             flight_comet: Vec2::ZERO,
+            flight_tail_bend: 0.0,
+            attention_mass_bias: Vec2::ZERO,
+            detached_carrier_velocity: [Vec2::ZERO; MAX_LIQUID_PARTICLES],
+            was_detached: [false; MAX_LIQUID_PARTICLES],
             exploratory_pressure: Vec2::ZERO,
             flight_field_axis: Vec2::Y,
             flight_field_aspect: 1.0,
             diagnostics: LiquidDiagnostics::default(),
             navigation_anchor_strength: 1.0,
             local_containment_bounds: None,
+            cradle_bounds: None,
             relaxation_elapsed: 0.0,
             idle_fragments: [IdleFragment::default(); MAX_IDLE_FRAGMENTS],
             idle_fragment_timer: 1.6 + deterministic_unit(seed, 0, 0x71) * 2.2,
@@ -517,6 +527,7 @@ impl LiquidMorphRuntime {
             replacement.face_frame.begin_recovery();
             replacement.face_frame.set_tuning(face);
             replacement.flight_comet = flight_comet;
+            replacement.flight_tail_bend = self.flight_tail_bend;
             replacement.flight_field_axis = flight_field_axis;
             replacement.flight_field_aspect = flight_field_aspect;
             replacement.cinematic_features = material_variant == MaterialVariant::CinematicJelly;
@@ -568,6 +579,11 @@ impl LiquidMorphRuntime {
 
     pub fn set_embodied_environment(&mut self, environment: &EmbodiedEnvironmentFrame) {
         self.environment = environment.clone();
+    }
+
+    pub fn set_cradle_bounds(&mut self, bounds: Option<(Vec2, Vec2)>) {
+        self.cradle_bounds =
+            bounds.filter(|(a, b)| a.is_finite() && b.is_finite() && b.x - a.x > 0.25);
     }
 
     pub fn set_runtime_actuation(&mut self, actuation: PbfRuntimeActuation) {
@@ -704,11 +720,16 @@ impl LiquidMorphRuntime {
         self.tuning.idle_lean_rate * self.runtime_actuation.idle_lean_rate_multiplier
     }
 
-    /// Supplies the brain-authored target for the complete permanent face
-    /// carrier. This changes presentation only; particles and components are
-    /// never selected or forced by attention.
+    /// Supplies the same attention direction to the face carrier and a gentle
+    /// distributed liquid potential. No particle teleporting or re-selection:
+    /// actual mass relaxes toward the face, subordinate to flight and contact.
     pub fn set_face_attention_pose(&mut self, offset: Vec2, roll: f32) {
         self.face_frame.set_attention_pose(offset, roll);
+        self.attention_mass_bias = if offset.is_finite() {
+            (offset / Vec2::new(0.030, 0.022)).clamp_length_max(1.0) * 0.32
+        } else {
+            Vec2::ZERO
+        };
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -766,7 +787,7 @@ impl LiquidMorphRuntime {
         if dt <= f32::EPSILON {
             return;
         }
-        self.keep_detached_mass_in_desktop_frame(motion.presentation_displacement);
+        self.transport_detached_in_world(motion.presentation_displacement, dt);
         if self.component_lifecycle.is_stable()
             && let Some(pending) = self.pending_structural_tuning.take()
         {
@@ -863,8 +884,14 @@ impl LiquidMorphRuntime {
                     let supported = smoothstep01(
                         ((self.flight_field_aspect - 1.34) / (2.4 - 1.34)).clamp(0.0, 1.0),
                     );
-                    authored + (3.0 - authored).max(0.0) * supported
+                    let acceleration_support =
+                        (motion.acceleration.length() * effective_flight_inertia * 1.8).min(6.0);
+                    let moving_well = (2.4 * self.flight_comet.length()).max(acceleration_support);
+                    authored
+                        + (3.0 - authored).max(0.0) * supported
+                        + (moving_well - authored).max(0.0) * (1.0 - supported)
                 },
+                far_field_acceleration: 4.8,
                 inertia_scale: effective_flight_inertia,
                 maximum_inertial_acceleration: 6.0,
                 velocity_damping: {
@@ -875,6 +902,7 @@ impl LiquidMorphRuntime {
                 flight_axis: self.flight_field_axis,
                 flight_aspect: self.flight_field_aspect,
                 comet: self.flight_comet,
+                tail_bend: self.flight_tail_bend,
             },
         );
         let supported_softness =
@@ -883,6 +911,44 @@ impl LiquidMorphRuntime {
                     .mul_add(2.5, 0.0)
                     .clamp(0.0, 1.0),
             );
+        // Detached parcels use an inertial screen frame: root acceleration
+        // must not be applied again after the coordinate transport above.
+        let inertial_load = (-motion.acceleration * effective_flight_inertia).clamp_length_max(6.0);
+        for (i, particle) in self.particles[..self.particle_count].iter_mut().enumerate() {
+            if self.was_detached[i] {
+                particle.force -= inertial_load;
+            }
+        }
+        // Damp only coherent translation during driven flight. Damping every
+        // particle strongly would erase liquid waves; leaving the bulk mode
+        // underdamped resonates with repeated steering and makes a long tail.
+        if !self.material_grab.is_active() {
+            let drive = self
+                .flight_comet
+                .length()
+                .max((motion.acceleration.length() / 2.0).clamp(0.0, 1.0));
+            let main = self.components.main_component;
+            let mut momentum = Vec2::ZERO;
+            let mut mass = 0.0;
+            for p in &self.particles[..self.particle_count] {
+                if p.component_id == main && p.inverse_mass > 0.0 {
+                    let m = p.inverse_mass.recip();
+                    momentum += p.velocity * m;
+                    mass += m;
+                }
+            }
+            let drag = momentum / mass.max(0.001) * (3.4 * drive);
+            for p in &mut self.particles[..self.particle_count] {
+                if p.component_id == main {
+                    // Propulsion carries the coherent core along with the root.
+                    // Previously the full fictitious frame load pushed all mass
+                    // into one side of the well during sustained turning, flattening
+                    // it there. Retain a quarter for compliant inertial lag; the
+                    // rotating, curved field still redistributes the actual liquid.
+                    p.force -= drag + inertial_load * (0.75 * drive);
+                }
+            }
+        }
         let supported_tension = parameters.surface_tension
             + (parameters.surface_tension.min(0.48) - parameters.surface_tension)
                 * supported_softness;
@@ -897,6 +963,7 @@ impl LiquidMorphRuntime {
             kernel_radius,
             self.rest_density,
             supported_tension
+                * (1.0 - 0.55 * self.flight_comet.length())
                 * (1.0 + sensors.interaction_actuation.cohesion_delta).clamp(0.75, 1.25)
                 * cooperative_separation_scale,
         );
@@ -1047,6 +1114,23 @@ impl LiquidMorphRuntime {
                         .all()
                         .then_some((minimum, maximum))
                 });
+        if !self.material_grab.is_active()
+            && measured_load.is_none()
+            && !sensors.interaction_actuation.allow_intentional_bud
+        {
+            motor_field::preserve_flight_core(
+                &mut self.particles,
+                self.particle_count,
+                self.components.main_component,
+                dt,
+                self.flight_comet.length() * (1.0 - self.compliant_support_load).clamp(0.0, 1.0),
+            );
+        }
+        let cradle = self.cradle_bounds.map(|(a, b)| xpbd::CradleBoundary {
+            minimum: self.body_origin + a + Vec2::splat(kernel_radius * 0.48),
+            maximum: self.body_origin + b - Vec2::splat(kernel_radius * 0.48),
+            component_id: self.components.main_component,
+        });
         solve_density_constraints(
             &mut self.particles,
             self.particle_count,
@@ -1066,6 +1150,7 @@ impl LiquidMorphRuntime {
                 dt,
                 containment_bounds,
                 support_plane,
+                cradle,
             },
         );
         if self.interaction_tuning.topology_mode == TopologyConstraintMode::Viscoelastic {
@@ -1104,6 +1189,7 @@ impl LiquidMorphRuntime {
         // Bond/topology corrections may follow the density pass; the wall
         // remains authoritative after those writers and before velocity commit.
         xpbd::project_support_plane(&mut self.particles, self.particle_count, support_plane);
+        xpbd::project_cradle(&mut self.particles, self.particle_count, cradle);
 
         // This is a circuit breaker, not normal material behavior. Acceptance
         // requires the counter to stay at zero in every replay.
@@ -1523,6 +1609,7 @@ impl LiquidMorphRuntime {
         replacement.local_containment_bounds = local_containment_bounds;
         replacement.cinematic_features = cinematic_features;
         replacement.flight_comet = flight_comet;
+        replacement.flight_tail_bend = self.flight_tail_bend;
         replacement.flight_field_axis = flight_field_axis;
         replacement.flight_field_aspect = flight_field_aspect;
         replacement.failsafe_hits = failsafe_hits;
@@ -1617,7 +1704,7 @@ impl LiquidMorphRuntime {
             measured
                 && (matches!(
                     support.surface_id.0.as_str(),
-                    "screen:bottom_edge" | "voice:taskbar" | "food:taskbar"
+                    "screen:bottom_edge" | "voice:taskbar" | "food:taskbar" | "den:cushion"
                 ) || awake_cling)
         }) else {
             self.support_plane_clearance = None;
@@ -1667,14 +1754,40 @@ impl LiquidMorphRuntime {
         let comet_drive = if measured_load.is_some() {
             0.0
         } else {
-            smoothstep01(((motion.velocity.length() - 0.30) / 0.70).clamp(0.0, 1.0))
+            smoothstep01(((motion.velocity.length() - 0.12) / 0.88).clamp(0.0, 1.0))
         };
-        let comet_target = motion.velocity.normalize_or_zero()
-            * comet_drive
+        let attention_bias = if measured_load.is_some() {
+            Vec2::ZERO
+        } else {
+            self.attention_mass_bias * (1.0 - comet_drive).powi(2)
+        };
+        let comet_target = (motion.velocity.normalize_or_zero() * comet_drive + attention_bias)
             * (self.effective_flight_stretch() * 0.65).clamp(0.0, 1.0);
-        self.flight_comet = self
+        // Rotate a directed frame instead of blending opposite vectors through zero.
+        // Strength and heading are independent; tail curvature retains turn history.
+        let strength = self.flight_comet.length();
+        let target_strength = comet_target.length();
+        let current_axis = self
             .flight_comet
-            .lerp(comet_target, 1.0 - (-5.5 * dt).exp());
+            .normalize_or(comet_target.normalize_or(Vec2::X));
+        let target_axis = comet_target.normalize_or(current_axis);
+        let mut angle_error = current_axis
+            .perp_dot(target_axis)
+            .atan2(current_axis.dot(target_axis));
+        if angle_error.abs() > 3.0 {
+            angle_error = angle_error.abs()
+                * if self.flight_tail_bend.abs() > 0.001 {
+                    -self.flight_tail_bend.signum()
+                } else {
+                    1.0
+                };
+        }
+        let turn = (angle_error * (1.0 - (-6.0 * dt).exp())).clamp(-4.5 * dt, 4.5 * dt);
+        let axis = Vec2::from_angle(current_axis.y.atan2(current_axis.x) + turn);
+        let strength = strength + (target_strength - strength) * (1.0 - (-8.0 * dt).exp());
+        self.flight_comet = axis * strength;
+        let bend_target = -(turn / dt.max(0.0001) / 4.5).clamp(-1.0, 1.0) * strength * 0.18;
+        self.flight_tail_bend += (bend_target - self.flight_tail_bend) * (1.0 - (-5.0 * dt).exp());
         let speed_drive = smoothstep01(((motion.velocity.length() - 0.12) / 0.88).clamp(0.0, 1.0));
         let acceleration_drive =
             smoothstep01(((motion.acceleration.length() - 0.16) / 1.34).clamp(0.0, 1.0));
@@ -1845,24 +1958,33 @@ impl LiquidMorphRuntime {
     /// detached component is free material in desktop space. Counter-translating
     /// all of its position buffers prevents the presentation transform from
     /// kinematically parenting a released parcel back to the body.
-    fn keep_detached_mass_in_desktop_frame(&mut self, presentation_displacement: Vec2) {
-        if self.components.component_count <= 1
-            || !presentation_displacement.is_finite()
-            || presentation_displacement.length_squared() <= f32::EPSILON
-        {
+    fn transport_detached_in_world(&mut self, displacement: Vec2, dt: f32) {
+        if !displacement.is_finite() || dt <= f32::EPSILON {
             return;
         }
-        let displacement = presentation_displacement.clamp_length_max(0.48);
-        let main_component = self.components.main_component;
-        for (index, particle) in self.particles[..self.particle_count].iter_mut().enumerate() {
-            if particle.component_id == main_component {
-                continue;
+        let root_velocity = (displacement / dt).clamp_length_max(16.0);
+        let decay = (-0.85 * dt).exp();
+        for (i, particle) in self.particles[..self.particle_count].iter_mut().enumerate() {
+            let detached = particle.component_id != self.components.main_component;
+            if detached {
+                if !self.was_detached[i] {
+                    // Initial velocity inheritance, exactly once at separation.
+                    self.detached_carrier_velocity[i] = root_velocity;
+                }
+                let transport =
+                    self.detached_carrier_velocity[i] * ((1.0 - decay) / 0.85) - displacement;
+                self.detached_carrier_velocity[i] *= decay;
+                particle.position += transport;
+                particle.previous_position += transport;
+                particle.predicted_position += transport;
+                particle.render_position += transport;
+                self.presentation_recovery_from[i].0 += transport;
+            } else if self.was_detached[i] {
+                // Convert momentum back into the character frame at rejoining.
+                particle.velocity += self.detached_carrier_velocity[i] - root_velocity;
+                self.detached_carrier_velocity[i] = Vec2::ZERO;
             }
-            particle.position -= displacement;
-            particle.previous_position -= displacement;
-            particle.predicted_position -= displacement;
-            particle.render_position -= displacement;
-            self.presentation_recovery_from[index].0 -= displacement;
+            self.was_detached[i] = detached;
         }
     }
 
@@ -2973,16 +3095,16 @@ impl LiquidMorphRuntime {
             let angular_error = current_axis
                 .perp_dot(target_axis)
                 .atan2(current_axis.dot(target_axis));
-            let angular_step =
-                angular_error.clamp(-240.0_f32.to_radians() * dt, 240.0_f32.to_radians() * dt);
+            // Near-isotropic covariance has no meaningful heading. Let the
+            // splat relax instead of chasing an unstable eigenvector.
+            let axis_confidence = smoothstep01(((target_aspect - 1.0) / 0.24).clamp(0.0, 1.0));
+            let angular_step = (angular_error * shape_blend * axis_confidence)
+                .clamp(-240.0_f32.to_radians() * dt, 240.0_f32.to_radians() * dt);
             particle.render_axis_major = Vec2::from_angle(angular_step).rotate(current_axis);
-            particle.render_aspect = if target_aspect <= 1.000_1 {
-                1.0
-            } else {
-                let desired_step = (target_aspect - particle.render_aspect) * shape_blend;
-                (particle.render_aspect + desired_step.clamp(-2.0 * dt, 2.0 * dt))
-                    .clamp(1.0, self.tuning.anisotropy_max.min(2.15))
-            };
+            let desired_step = (target_aspect - particle.render_aspect) * shape_blend;
+            particle.render_aspect = (particle.render_aspect
+                + desired_step.clamp(-2.0 * dt, 2.0 * dt))
+            .clamp(1.0, self.tuning.anisotropy_max.min(2.15));
             particle.render_surface_score = (particle.render_surface_score
                 + (particle.surface_score - particle.render_surface_score) * shape_blend)
                 .clamp(0.0, 1.0);
@@ -3699,6 +3821,34 @@ mod flight_field_tests {
             assert!(runtime.flight_field_axis.y.abs() > 0.95);
             assert!(runtime.flight_field_aspect < 1.35);
         }
+    }
+
+    #[test]
+    fn face_mass_attention_yields_to_flight_and_loaded_contact() {
+        let mut runtime = LiquidMorphRuntime::new(42);
+        runtime.tuning.flight_stretch = 1.9; // Active desktop profile.
+        runtime.set_face_attention_pose(Vec2::new(-0.030, 0.0), 0.0);
+        for _ in 0..240 {
+            runtime.update_field_shape(DropletMotion::default(), 1.0 / 120.0, None);
+        }
+        assert!(runtime.flight_comet.x < -0.20);
+        let before = runtime.flight_comet;
+        runtime.update_field_shape(motion(Vec2::X * 1.4, Vec2::ZERO), 1.0 / 120.0, None);
+        assert!(runtime.flight_comet.distance(before) < 0.12);
+        for _ in 0..240 {
+            runtime.update_field_shape(motion(Vec2::X * 1.4, Vec2::ZERO), 1.0 / 120.0, None);
+        }
+        assert!(
+            runtime.flight_comet.x > 0.8,
+            "flight must override an opposite look"
+        );
+        for _ in 0..240 {
+            runtime.update_field_shape(DropletMotion::default(), 1.0 / 120.0, Some((Vec2::X, 0.4)));
+        }
+        assert!(
+            runtime.flight_comet.length() < 0.001,
+            "attention must not pull against support"
+        );
     }
 
     #[test]

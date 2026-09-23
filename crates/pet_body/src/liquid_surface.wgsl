@@ -109,7 +109,10 @@ fn hsv_to_rgb(hsv: vec3<f32>) -> vec3<f32> {
 }
 
 fn density_at(uv: vec2<f32>) -> vec4<f32> {
-    return textureSample(density_texture, density_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+    var field=textureSample(density_texture, density_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+    let round_density=globals.liquid_meta.z*exp(clamp((0.38-length(local_point(uv)))*18.0,-20.0,8.0));
+    field.r=mix(field.r,round_density,globals.cinematic_h.w);
+    return field;
 }
 
 fn macro_at(uv: vec2<f32>) -> vec4<f32> {
@@ -416,8 +419,91 @@ fn face_space(point: vec2<f32>) -> vec2<f32> {
     let delta = point - globals.face_frame_a.xy;
     let axis_x = normalize(globals.face_frame_a.zw + vec2<f32>(0.000001, 0.0));
     let axis_y = normalize(globals.face_frame_b.xy + vec2<f32>(0.0, 0.000001));
-    return vec2<f32>(dot(delta, axis_x), dot(delta, axis_y))
-        / max(globals.face_frame_b.zw, vec2<f32>(0.01));
+    return mix(vec2<f32>(dot(delta, axis_x), dot(delta, axis_y))
+        / max(globals.face_frame_b.zw, vec2<f32>(0.01)), point, globals.cinematic_h.w);
+}
+
+// Whole-eye gaze: no independent pupils. The signed upper lid has opposite
+// slopes for anger (inner corners down) and sadness (inner corners up).
+// Read continuous semantic lid/brow controls, never phoneme amplitude.
+fn pearl_emotion()->vec3<f32> {
+    let lids=(globals.face_lids[0]+globals.face_lids[1])*0.5;
+    let brows=(globals.face_brows[0]+globals.face_brows[1])*0.5;
+    let surprise=smoothstep(0.16,0.76,globals.lids_brows.w)*smoothstep(0.04,0.34,(lids.x+lids.y)*0.5);
+    let inner_lowering=smoothstep(0.06,0.36,brows.y-brows.x);
+    let anger=inner_lowering*smoothstep(0.28,0.72,globals.brow_mouth.x)*(1.0-surprise);
+    let sadness=saturate(-globals.brow_mouth.w*1.7)*(1.0-anger);
+    return vec3<f32>(anger,sadness,surprise);
+}
+fn pearl_eye_center(side:f32)->vec2<f32> {
+    return vec2<f32>(side*0.126,0.006)+globals.gaze_pupil.xy*vec2<f32>(0.052,0.038);
+}
+fn pearl_eye_ink(point:vec2<f32>,side:f32)->vec3<f32> {
+    // A continuous dark well, not a separate pupil. Its center leads the
+    // whole-eye turn, leaving only a faint violet crescent on the opposite side.
+    let gaze=globals.gaze_pupil.xy;
+    let q=(point-pearl_eye_center(side))/vec2<f32>(0.036,0.055);
+    let dark_center=clamp(gaze*vec2<f32>(0.95,0.72),vec2<f32>(-0.72),vec2<f32>(0.72));
+    let delta=q-dark_center;
+    let edge=1.0-exp(-0.65*dot(delta,delta));
+    return mix(vec3<f32>(0.008,0.003,0.018),vec3<f32>(0.160,0.020,0.320),edge);
+}
+fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
+    let index=select(1u,0u,side<0.0);
+    let blink=select(globals.lids_brows.x,globals.lids_brows.y,side>0.0);
+    let emotion=pearl_emotion();let angry=emotion.x;let sad=emotion.y;let surprise=emotion.z;
+    let gaze=globals.gaze_pupil.xy;
+    let center=pearl_eye_center(side);
+    let authored=clamp(select(globals.face_eye_scales.zw,globals.face_eye_scales.xy,side<0.0),vec2<f32>(0.78),vec2<f32>(1.25));
+    let lids=globals.face_lids[index];
+    let shortening=clamp(smoothstep(0.20,0.70,globals.lids_brows.z)*0.95
+        +smoothstep(0.35,0.85,1.0-globals.face_eye.x)*0.45,0.0,1.0);
+    // A slight stylized far-eye enlargement makes a pupil-free turn legible.
+    let turn_scale=1.0+max(0.0,side*gaze.x)*0.075;
+    let asymmetric=clamp(1.0+(lids.x+lids.y)*0.045+globals.brow_mouth.y*(-side)*0.045,0.91,1.10);
+    let radius=mix(vec2<f32>(0.033,0.052),vec2<f32>(0.048,0.060),surprise)*authored*turn_scale*asymmetric;
+    // Shorten the straight segment; keep round caps at the same physical radius.
+    // Only a full blink switches to the closed curved-lid mark.
+    let lid_recruitment=clamp((lids.x+lids.y)*0.12-lids.z*0.14,-0.18,0.15)*(1.0-surprise);
+    let effective_height=mix(radius.y*(1.0+lid_recruitment),radius.x*0.42,shortening);
+    let cap_radius=min(radius.x,effective_height);
+    let straight=vec2<f32>(radius.x,effective_height)-vec2<f32>(cap_radius);
+    let local=point-center;
+    var q=local/vec2<f32>(radius.x,effective_height);
+    q.x-=gaze.x*q.y*0.11;
+    // Upper/lower recruitment and the gaze continuously taper opposite ends.
+    let taper=clamp(0.11*gaze.y+0.13*sad-0.17*angry+0.12*lids.z,-0.27,0.27);
+    q.x/=max(0.72,1.0+taper*clamp(q.y,-1.0,1.0));
+    let capsule=length(max(abs(q)*vec2<f32>(radius.x,effective_height)-straight,vec2<f32>(0.0)))/cap_radius;
+    let distance=mix(capsule,length(q),surprise);
+    let oval=1.0-smoothstep(0.93,1.05,distance);
+    let inner_to_outer=clamp(side*q.x*0.5+0.5,0.0,1.0);
+    let semantic_upper=mix(lids.x,lids.y,inner_to_outer);
+    let top=1.06-globals.lids_brows.z*0.35+(semantic_upper*0.95)*(0.30+0.70*angry)
+        -angry*(0.50-0.44*side*q.x)+0.14*lids.w*(1.0-min(q.x*q.x,1.0));
+    let bottom=-1.16+max(gaze.y,0.0)*0.44+lids.z*0.48+sad*0.16-0.12*(1.0-min(q.x*q.x,1.0));
+    let opened=oval*(1.0-smoothstep(top-0.06,top+0.06,q.y))*smoothstep(bottom-0.05,bottom+0.05,q.y);
+    let arc_x=clamp(local.x,-0.038,0.038);
+    let arc_y=-0.013+0.015*pow(arc_x/0.038,2.0);
+    let closed=1.0-smoothstep(0.003,0.006,length(local-vec2<f32>(arc_x,arc_y)));
+    return mix(opened,closed,smoothstep(0.45,0.92,blink));
+}
+fn pearl_brow(point:vec2<f32>,side:f32)->f32 {
+    let e=pearl_emotion();let shape=globals.face_brows[select(1u,0u,side<0.0)];
+    // Shared gaze translation, with softer brow travel and independent muscle curves.
+    let center=pearl_eye_center(side)-globals.gaze_pupil.xy*vec2<f32>(0.006,0.004)
+        +vec2<f32>(0.0,0.086+globals.lids_brows.w*0.019+e.z*0.011);
+    let local=point-center;let x=clamp(local.x,-0.044,0.044);
+    let u=clamp(side*x/0.088+0.5,0.0,1.0);
+    let pleasant=max(globals.brow_mouth.w,0.0)*(1.0-e.x)*(1.0-e.z);
+    let inner=shape.x*0.048-e.x*0.014+e.y*0.018;
+    let outer=shape.y*0.048+e.x*0.006-e.y*0.010;
+    let arch=shape.z*0.032+pleasant*0.012-e.x*0.010;
+    let y=mix(inner,outer,u)+arch*4.0*u*(1.0-u)+pleasant*0.004;
+    let thickness=clamp(shape.w,0.65,1.45);
+    let distance=length(local-vec2<f32>(x,y));
+    // Soft subdermal shading: twice the former footprint, no ink-like edge.
+    return exp(-pow(distance/(0.0075*thickness),2.0))*0.40;
 }
 
 fn neutral_eye_radii() -> vec2<f32> {
@@ -1259,82 +1345,63 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Local contrast backing suppresses internal pattern only behind the features.
     let face_region = 1.0 - smoothstep(0.22, 0.34, length(face_space(point)));
     color = mix(color, color * 0.76, face_region * globals.face_tuning.x);
-    let body_face_color = color;
+    // First Light pearl material, on the existing particle-derived surface normal.
+    // Broad pastel scattering and a soft coat preserve every simulated liquid edge.
+    // Broad continuous optical curvature is carried by the liquid particles.
+    // No axis-dependent boundary search and no face-centred sphere.
+    let optical_xy=macro_at(input.uv).ba;
+    let fluid_normal=normalize(vec3<f32>(optical_xy*0.16,1.0));
+    // Only the deliberately spherical birth presentation uses a spherical normal.
+    let birth_xy=point/0.38;
+    let birth_normal=normalize(vec3<f32>(birth_xy,sqrt(max(0.025,1.0-dot(birth_xy,birth_xy)))));
+    let pearl_normal=normalize(mix(fluid_normal,birth_normal,globals.cinematic_h.w));
+    let pearl_light = max(0.0, dot(pearl_normal, normalize(vec3<f32>(-0.45,0.58,0.85))));
+    color = mix(vec3<f32>(0.54,0.54,0.75), vec3<f32>(0.99,0.965,1.0), 0.26+0.73*pearl_light);
+    let reference_point = mix(material_coordinate*2.25,birth_xy*0.89,globals.cinematic_h.w);
+    let rose = exp(-dot(reference_point-vec2<f32>(0.23,-0.16),reference_point-vec2<f32>(0.23,-0.16))*3.2);
+    color = mix(color,vec3<f32>(0.91,0.74,0.90),rose*0.27);
+    let blue = exp(-dot(reference_point-vec2<f32>(-0.45,-0.10),reference_point-vec2<f32>(-0.45,-0.10))*6.0);
+    color += vec3<f32>(0.04,0.12,0.14)*blue;
+    color = mix(color,vec3<f32>(0.83,0.89,1.0),pow(1.0-pearl_normal.z,3.2)*0.7);
+    color = mix(color,vec3<f32>(1.0),pow(max(0.0,dot(pearl_normal,normalize(vec3<f32>(-0.35,0.48,1.0)))),19.0)*0.18);
+    // Reference colors are display-referred. Invert the compositor tone curve
+    // so the original pearl palette survives the native linear HDR pipeline.
+    let pearl_linear=pow(color,vec3<f32>(2.2));
+    let pearl_luma=dot(pearl_linear,vec3<f32>(0.2126,0.7152,0.0722));
+    let pearl_hdr=8.0*(pearl_luma-1.0+sqrt(pow(1.0-pearl_luma,2.0)+pearl_luma*0.25));
+    color=pearl_linear*pearl_hdr/max(pearl_luma,0.001);
     let face_point = face_space(point);
-    let highlight_shift = select(
-        vec2<f32>(0.0),
-        cinematic_screen_probe.xy * 0.72,
-        CINEMATIC,
-    );
-    let left_socket = eye_socket_relief(face_point, -1.0) * globals.face_tuning.x;
-    let right_socket = eye_socket_relief(face_point, 1.0) * globals.face_tuning.x;
-    if (CINEMATIC) {
-        let socket = max(left_socket, right_socket);
-        color *= 1.0 - socket.x * globals.cinematic_h.x * 0.34;
-        color += mix(vec3<f32>(1.08, 1.10, 1.09), pigment, globals.cinematic_f.x)
-            * socket.y
-            * globals.cinematic_h.x
-            * 0.30;
-    }
-    let cheek_y = eye_center(-1.0).y - eye_radii(-1.0).y * 0.86;
-    let cheek_left = length(
-        (face_point - vec2<f32>(eye_center(-1.0).x, cheek_y)) / vec2<f32>(0.066, 0.038),
-    );
-    let cheek_right = length(
-        (face_point - vec2<f32>(eye_center(1.0).x, cheek_y)) / vec2<f32>(0.066, 0.038),
-    );
-    let cheek = (1.0 - smoothstep(0.48, 1.0, min(cheek_left, cheek_right)))
-        * globals.mouth_voice.y
-        * coverage
-        * globals.face_tuning.x;
-    let cheek_color = mix(body_face_color * 1.06, glow_color * 1.12, 0.72);
-    color = mix(color, cheek_color, cheek * select(0.20, 0.28, CINEMATIC));
-    let left_eye = eye_layer(face_point, -1.0, color, secondary, glow_color, highlight_shift);
-    let right_eye = eye_layer(face_point, 1.0, color, secondary, glow_color, highlight_shift);
-    color = mix(color, left_eye.rgb, left_eye.a * coverage * globals.face_tuning.x);
-    color = mix(color, right_eye.rgb, right_eye.a * coverage * globals.face_tuning.x);
-    let left_brow_distance = brow_distance(face_point, -1.0);
-    let right_brow_distance = brow_distance(face_point, 1.0);
-    let brow_distance_field = min(left_brow_distance, right_brow_distance);
-    let brow = (1.0 - smoothstep(0.008, 0.016, brow_distance_field))
-        * coverage
-        * globals.face_tuning.x;
-    var brow_color = secondary * 0.38;
-    if (CINEMATIC) {
-        let brow_shadow = max(
-            brow_mask(face_point + vec2<f32>(-0.004, 0.005), -1.0),
-            brow_mask(face_point + vec2<f32>(-0.004, 0.005), 1.0),
-        ) * coverage * globals.face_tuning.x;
-        let brow_wet = max(
-            brow_mask(face_point + vec2<f32>(0.003, -0.004), -1.0),
-            brow_mask(face_point + vec2<f32>(0.003, -0.004), 1.0),
-        ) * coverage * globals.face_tuning.x;
-        color *= 1.0 - brow_shadow * globals.cinematic_h.y * 0.16;
-        brow_color = jelly_relief_material(
-            body_face_color,
-            glow_color,
-            brow_distance_field - 0.012,
-            1.0,
-        );
-        // A softly lit contour remains legible on black jelly independently of halo.
-        brow_color = max(brow_color, vec3<f32>(0.32, 0.34, 0.35));
-        brow_color += chroma_preserving_rim(
-            pigment,
-            glow_color,
-            globals.cinematic_h.z,
-            1.10,
-        ) * brow_wet * globals.cinematic_h.y * 0.32;
-    }
-    color = mix(
-        color,
-        brow_color,
-        brow * 0.70 * select(0.52 + globals.brow_mouth.x * 0.18, 0.72, CINEMATIC),
-    );
-    let mouth = mouth_layer(face_point, body_face_color, secondary, glow_color);
-    color = mix(color, mouth.rgb, mouth.a * coverage * globals.face_tuning.x);
-    let face_coverage = saturate(max(max(left_eye.a, right_eye.a), max(brow, mouth.a)))
-        * coverage
-        * globals.face_tuning.x;
+    let left_eye = pearl_eye(face_point,-1.0);
+    let right_eye = pearl_eye(face_point,1.0);
+    let eyes = max(left_eye,right_eye)*globals.face_tuning.x;
+    let eye_ink=mix(pearl_eye_ink(face_point,-1.0),pearl_eye_ink(face_point,1.0),step(0.0,face_point.x));
+    color = mix(color,eye_ink,eyes);
+    let brows=max(pearl_brow(face_point,-1.0),pearl_brow(face_point,1.0))*globals.face_tuning.x;
+    color=mix(color,vec3<f32>(0.08,0.05,0.12),brows);
+    // Mouth, eyes and brow share the same gaze/yaw frame. Lower-face travel
+    // is slightly softer and its horizontal projection shortens on a turn.
+    let face_gaze=globals.gaze_pupil.xy;
+    let mouth_center=vec2<f32>(0.0,-0.090)+face_gaze*vec2<f32>(0.040,0.028);
+    let mouth_delta=face_point-mouth_center;
+    let mouth_local=vec2<f32>(mouth_delta.x/(1.0-0.19*abs(face_gaze.x)),
+        mouth_delta.y-mouth_delta.x*face_gaze.x*0.13);
+    let expression=pearl_emotion();
+    let smile_curve=clamp(globals.brow_mouth.w*1.15-expression.x*0.45,-1.0,1.0);
+    let opening=smoothstep(0.06,0.78,globals.brow_mouth.z);
+    let happiness=max(globals.brow_mouth.w,0.0)*(1.0-expression.z);
+    let width=mix(0.045,mix(0.039+0.015*happiness,0.025,expression.z),opening)
+        *clamp(globals.face_mouth.x,0.72,1.25);
+    let x=clamp(mouth_local.x,-width,width);
+    let profile=sqrt(max(0.0,1.0-pow(x/width,2.0)));
+    let corner_bias=mix(globals.face_mouth.y,globals.face_mouth.z,x/width*0.5+0.5)*0.010*pow(x/width,2.0);
+    let centerline=-0.030*smile_curve*(1.0-pow(x/width,2.0))*(1.0-opening*0.45)-opening*0.005+corner_bias;
+    let half_height=opening*(0.032+expression.z*0.014)*profile;
+    // One continuous rounded contour from closed curved slit to open mouth.
+    // No independently fading oval and no closed-mouth stroke over it.
+    let mouth_distance=length(vec2<f32>(mouth_local.x-x,max(abs(mouth_local.y-centerline)-half_height,0.0)));
+    let mouth=(1.0-smoothstep(0.003,0.006,mouth_distance))*globals.face_tuning.x;
+    color=mix(color,vec3<f32>(0.025,0.016,0.048),mouth*0.96);
+    let face_coverage = max(eyes,mouth)*coverage;
 
     let volume_alpha = 1.0 - exp(
         -(globals.material_a.x * 0.68 + globals.material_a.y * 0.32)
@@ -1343,9 +1410,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let membrane_alpha = fresnel * 0.28;
     let material_alpha = saturate(volume_alpha + membrane_alpha * (1.0 - volume_alpha))
         * globals.material_d.y;
-    let refractive_alpha = select(material_alpha, 1.0, background.a > 0.5);
+    let refractive_alpha = max(material_alpha, 0.985);
     let shape_alpha = coverage * visibility * max(refractive_alpha, face_coverage * 0.99);
-    let halo_alpha = halo_coverage * visibility * 0.18 * (1.0 - shape_alpha);
+    let halo_alpha = halo_coverage * visibility * 0.008 * (1.0 - shape_alpha);
     let final_alpha = saturate(shape_alpha + halo_alpha);
     // Deliberately HDR and linear. Compose unpremultiplies, tone-maps, then
     // premultiplies again, so bright wet highlights retain their shape.

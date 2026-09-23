@@ -208,6 +208,8 @@ pub struct RenderParameters {
     pub render_mode: BodyRenderMode,
     pub render_scale: u32,
     pub presentation_scale: f32,
+    pub presentation_visibility: f32,
+    pub birth_roundness: f32,
     pub presentation_offset: Vec2,
     pub debug_view: DebugView,
     pub time: f32,
@@ -507,6 +509,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     liquid_particle_pipeline: wgpu::RenderPipeline,
+    liquid_optical_pipeline: wgpu::RenderPipeline,
     liquid_filter_pipeline: wgpu::RenderPipeline,
     liquid_surface_pipeline: wgpu::RenderPipeline,
     liquid_surface_safe_pipeline: wgpu::RenderPipeline,
@@ -1273,6 +1276,36 @@ impl Renderer {
                 multiview: None,
                 cache: None,
             });
+        let liquid_optical_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("broad smooth optical gradient accumulation"),
+                layout: Some(&density_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &density_shader,
+                    entry_point: Some("optical_vertex"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[vertex_layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &density_shader,
+                    entry_point: Some("optical_fragment"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: INTERMEDIATE_FORMAT,
+                        blend: Some(additive),
+                        write_mask: wgpu::ColorWrites::BLUE | wgpu::ColorWrites::ALPHA,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            });
         let liquid_filter_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("stable macro liquid reconstruction shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("liquid_filter.wgsl").into()),
@@ -1521,6 +1554,7 @@ impl Renderer {
             config,
             pipeline,
             liquid_particle_pipeline,
+            liquid_optical_pipeline,
             liquid_filter_pipeline,
             liquid_surface_pipeline,
             liquid_surface_safe_pipeline,
@@ -1962,10 +1996,23 @@ impl Renderer {
     where
         F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
     {
+        self.render_capture_with_layers(parameters, |_, _, _, _| {}, overlay)
+    }
+
+    pub fn render_capture_with_layers<B, F>(
+        &mut self,
+        parameters: RenderParameters,
+        background: B,
+        overlay: F,
+    ) -> Result<CapturedFrame, RendererCaptureError>
+    where
+        B: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+        F: FnOnce(&wgpu::Device, &wgpu::Queue, &mut wgpu::CommandEncoder, &wgpu::TextureView),
+    {
         if !self.config.usage.contains(wgpu::TextureUsages::COPY_SRC) {
             return Err(RendererCaptureError::UnsupportedSurface);
         }
-        let (outcome, capture) = self.render_internal(parameters, |_, _, _, _| {}, overlay, true);
+        let (outcome, capture) = self.render_internal(parameters, background, overlay, true);
         match outcome {
             RenderOutcome::Presented => {
                 capture.expect("a presented capture request always produces a capture result")
@@ -2239,6 +2286,10 @@ impl Renderer {
             pass.set_pipeline(&self.liquid_filter_pipeline);
             pass.set_bind_group(0, &self.liquid_filter_bind_group, &[]);
             pass.draw(0..3, 0..1);
+            pass.set_pipeline(&self.liquid_optical_pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.particle_instance_buffer.slice(..));
+            pass.draw(0..6, 0..particle_count as u32);
         }
         {
             let scaled = scale_scissor(
@@ -2563,7 +2614,7 @@ fn liquid_scissor_rect(
     mesh_scale: f32,
 ) -> [u32; 4] {
     let organism_scale = projection_scale(mesh_scale, parameters.render_mode)
-        * bounded(parameters.presentation_scale, 0.50, 3.0, 1.0);
+        * bounded(parameters.presentation_scale, 0.50, 12.0, 1.0);
     let aspect = config.width as f32 / config.height.max(1) as f32;
     let mut minimum = Vec2::splat(f32::INFINITY);
     let mut maximum = Vec2::splat(f32::NEG_INFINITY);
@@ -3233,8 +3284,12 @@ fn compose_globals_for(
                 0.0
             },
             render_scale.clamp(1, SUPERSAMPLE_SCALE) as f32,
-            0.0,
-            0.0,
+            if parameters.material_variant == MaterialVariant::CinematicJelly {
+                0.014
+            } else {
+                0.0
+            },
+            parameters.presentation_visibility.clamp(0.0, 1.0),
         ],
     }
 }
@@ -3245,6 +3300,8 @@ impl Default for RenderParameters {
             render_mode: BodyRenderMode::AnalyticJelly,
             render_scale: SUPERSAMPLE_SCALE,
             presentation_scale: 1.0,
+            presentation_visibility: 1.0,
+            birth_roundness: 0.0,
             presentation_offset: Vec2::ZERO,
             debug_view: DebugView::Material,
             time: 0.0,
@@ -3446,7 +3503,7 @@ fn globals_for_resolved(
     background_freshness: f32,
 ) -> Globals {
     let organism_scale = projection_scale(organism_scale, parameters.render_mode)
-        * bounded(parameters.presentation_scale, 0.50, 3.0, 1.0);
+        * bounded(parameters.presentation_scale, 0.50, 12.0, 1.0);
     let aspect = config.width as f32 / config.height.max(1) as f32;
     let features = internal_features.unwrap_or_else(|| {
         let (orb_position_radius, orb_color_intensity) = internal_glow_orbs(&parameters);
@@ -3482,8 +3539,8 @@ fn globals_for_resolved(
             [
                 parameters.body_width.clamp(0.35, 1.2),
                 parameters.body_length.clamp(0.55, 1.5),
-                bounded(parameters.presentation_offset.x, -8.0, 8.0, 0.0),
-                bounded(parameters.presentation_offset.y, -8.0, 8.0, 0.0),
+                bounded(parameters.presentation_offset.x, -64.0, 64.0, 0.0),
+                bounded(parameters.presentation_offset.y, -64.0, 64.0, 0.0),
             ]
         } else {
             [
@@ -3810,7 +3867,7 @@ fn globals_for_resolved(
             bounded(parameters.face_eye_socket_strength, 0.0, 1.0, 0.18),
             bounded(parameters.face_relief_strength, 0.0, 1.5, 0.55),
             bounded(parameters.material_rim_saturation, 0.0, 1.6, 1.15),
-            0.0,
+            parameters.birth_roundness.clamp(0.0, 1.0),
         ],
         cinematic_i: [
             bounded(parameters.face_relief_darkness, 0.35, 0.95, 0.72),

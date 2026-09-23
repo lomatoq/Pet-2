@@ -5,6 +5,23 @@ use super::*;
 
 const DT: f32 = 1.0 / 120.0;
 
+#[test]
+fn a_separated_splat_relaxes_without_an_aspect_or_heading_pop() {
+    let (_, mut runtime) = migrated_runtime(0x28A5);
+    runtime.particle_count = 1;
+    runtime.presentation_recovery_remaining = 0.0;
+    runtime.particles[0].render_aspect = 1.8;
+    runtime.particles[0].render_axis_major = Vec2::Y;
+    for _ in 0..240 {
+        let previous = runtime.particles[0].render_aspect;
+        runtime.update_render_proxies(DT);
+        let particle = &runtime.particles[0];
+        assert!((previous - particle.render_aspect).abs() <= 2.01 * DT);
+        assert!(particle.render_axis_major.distance(Vec2::Y) < 0.0001);
+    }
+    assert!(runtime.particles[0].render_aspect < 1.005);
+}
+
 fn neutral_intent() -> BodyIntent {
     BodyIntent {
         locomotion: LocomotionMode::Hover,
@@ -422,7 +439,7 @@ fn sharp_flick_raises_release_speed_and_slosh_without_fake_hold() {
 }
 
 #[test]
-fn real_detached_mass_keeps_desktop_position_when_body_root_translates() {
+fn real_detached_mass_preserves_inherited_flight_translation() {
     let (genome, mut runtime) = migrated_runtime(0xD37A_0B1E);
     settle(&mut runtime, &genome, 1.0);
 
@@ -466,7 +483,7 @@ fn real_detached_mass_keeps_desktop_position_when_body_root_translates() {
     assert_ne!(detached_component, main_component);
     let main_before = component_render_center(&runtime, main_component);
     let detached_before = component_render_center(&runtime, detached_component);
-    let body_displacement = Vec2::new(0.12, -0.035);
+    let body_displacement = Vec2::new(0.020, -0.005);
 
     step(
         &mut runtime,
@@ -482,6 +499,7 @@ fn real_detached_mass_keeps_desktop_position_when_body_root_translates() {
         DropletMotion {
             displacement: body_displacement,
             presentation_displacement: body_displacement,
+            velocity: body_displacement / DT,
             world_to_body_scale: Vec2::ONE,
             ..DropletMotion::default()
         },
@@ -497,8 +515,29 @@ fn real_detached_mass_keeps_desktop_position_when_body_root_translates() {
         "main body did not follow its presentation root: {main_world_step:?}"
     );
     assert!(
-        detached_world_step.length() < 0.02,
-        "free material inherited the body root translation: {detached_world_step:?}"
+        detached_world_step.distance(body_displacement) < 0.003,
+        "detached material lost its inherited flight translation: {detached_world_step:?}"
+    );
+    // Reverse the emitter immediately. The detached parcel must keep its
+    // initial world momentum, rather than reversing with the character.
+    let world_before = component_render_center(&runtime, detached_component) + body_displacement;
+    step(
+        &mut runtime,
+        &genome,
+        &SensorFrame::default(),
+        &BodyFeedback::default(),
+        DropletMotion {
+            displacement: -body_displacement,
+            presentation_displacement: -body_displacement,
+            velocity: -body_displacement / DT,
+            world_to_body_scale: Vec2::ONE,
+            ..DropletMotion::default()
+        },
+    );
+    let world_step = component_render_center(&runtime, detached_component) - world_before;
+    assert!(
+        world_step.x > 0.012,
+        "free parcel followed the reversed emitter: {world_step:?}"
     );
 }
 
@@ -1071,4 +1110,329 @@ fn production_fixed_120_replay_is_independent_of_30_60_144hz_presentation() {
         maximum_set_distance <= tolerance,
         "maximum particle-set delta {maximum_set_distance} exceeded {tolerance}"
     );
+}
+#[test]
+fn production_flight_shape_and_reversal_measurement() {
+    let genome = Genome::from_seed(42);
+    let profile: crate::LiquidTuningProfile = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/embodiment/active-liquid-profile-r11.json"
+    )))
+    .unwrap();
+    let mut runtime = LiquidMorphRuntime::new(42);
+    runtime.set_tuning(
+        profile.pbf,
+        profile.interaction,
+        profile.face,
+        profile.material.variant,
+    );
+    settle(&mut runtime, &genome, 2.0);
+    for (phase, velocity, seconds) in [
+        ("right", Vec2::X * 1.4, 3.0),
+        ("left", Vec2::NEG_X * 1.4, 3.0),
+        ("rest", Vec2::ZERO, 4.0),
+    ] {
+        let mut maximum_step = 0.0_f32;
+        let mut previous = particle_center(&runtime);
+        for _ in 0..(seconds * 120.0) as usize {
+            step(
+                &mut runtime,
+                &genome,
+                &SensorFrame::default(),
+                &BodyFeedback::default(),
+                DropletMotion {
+                    velocity,
+                    world_to_body_scale: Vec2::ONE,
+                    ..Default::default()
+                },
+            );
+            runtime.presentation_update(DT);
+            let center = particle_center(&runtime);
+            maximum_step = maximum_step.max(center.distance(previous));
+            previous = center;
+        }
+        let center = particle_center(&runtime);
+        let axis = velocity.normalize_or(Vec2::X);
+        let side = axis.perp();
+        let mut front_width = 0.0_f32;
+        let mut rear_width = 0.0_f32;
+        let mut front = 0.0_f32;
+        let mut rear = 0.0_f32;
+        for p in &runtime.particles[..runtime.particle_count] {
+            let q = p.position - center;
+            let x = q.dot(axis);
+            let y = q.dot(side).abs();
+            if x > 0.10 {
+                front_width = front_width.max(y);
+            }
+            if x < -0.10 {
+                rear_width = rear_width.max(y);
+            }
+            front = front.max(x);
+            rear = rear.max(-x);
+        }
+        println!(
+            "{phase}: center={center:?}, front={front:.4} rear={rear:.4}, widths={front_width:.4}/{rear_width:.4}, max_center_step={maximum_step:.5}, components={}",
+            runtime.diagnostics.component_count
+        );
+        assert!(
+            maximum_step < 0.003,
+            "unbounded material translation: {maximum_step}"
+        );
+        if velocity.length() > 0.0 {
+            assert!(
+                front_width > rear_width * 1.15,
+                "leading mass must be wider than the trailing material"
+            );
+            assert!(rear > front * 1.10, "tail must extend behind travel");
+        } else {
+            assert!(center.length() < 0.03, "liquid must gather after flight");
+        }
+        assert_eq!(runtime.diagnostics.component_count, 1);
+        assert!(runtime.diagnostics.finite);
+        assert_eq!(runtime.diagnostics.recovery_count, 0);
+        assert_eq!(runtime.diagnostics.failsafe_hits, 0);
+    }
+}
+
+#[test]
+fn released_vertical_trail_gathers_while_root_flies_without_losing_mass() {
+    let genome = Genome::from_seed(42);
+    let profile: crate::LiquidTuningProfile = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/embodiment/active-liquid-profile-r11.json"
+    )))
+    .unwrap();
+    let mut runtime = LiquidMorphRuntime::new(42);
+    runtime.set_tuning(
+        profile.pbf,
+        profile.interaction,
+        profile.face,
+        profile.material.variant,
+    );
+    settle(&mut runtime, &genome, 1.0);
+    let count = runtime.particle_count;
+    for (i, p) in runtime.particles[count - 32..count].iter_mut().enumerate() {
+        p.position = Vec2::new((i % 4) as f32 * 0.032 - 0.048, 0.85 + (i / 4) as f32 * 0.30);
+        p.previous_position = p.position;
+        p.predicted_position = p.position;
+        p.render_position = p.position;
+        p.velocity = Vec2::ZERO;
+    }
+    let mass = runtime.particles[..count]
+        .iter()
+        .map(|p| p.inverse_mass.recip())
+        .sum::<f32>();
+    let mut final_radius = 0.0_f32;
+    for tick in 0..960 {
+        let velocity = if tick < 480 {
+            Vec2::new(0.65, 0.0)
+        } else {
+            Vec2::ZERO
+        };
+        step(
+            &mut runtime,
+            &genome,
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            DropletMotion {
+                velocity,
+                presentation_displacement: velocity * DT,
+                world_to_body_scale: Vec2::ONE,
+                ..DropletMotion::default()
+            },
+        );
+        assert_eq!(
+            runtime.particles[..count]
+                .iter()
+                .map(|p| p.inverse_mass.recip())
+                .sum::<f32>(),
+            mass
+        );
+        assert!(runtime.diagnostics.finite);
+        final_radius = runtime.particles[..count]
+            .iter()
+            .map(|p| p.position.distance(runtime.body_origin))
+            .fold(0.0, f32::max);
+    }
+    eprintln!(
+        "released trail final radius={final_radius} components={}",
+        runtime.components.component_count
+    );
+    assert!(
+        final_radius < 0.70,
+        "released trail did not return to the moving body"
+    );
+    assert_eq!(runtime.diagnostics.recovery_count, 0);
+    assert_eq!(runtime.diagnostics.failsafe_hits, 0);
+}
+
+#[test]
+fn repeated_fast_flight_reversals_keep_a_short_cohesive_body() {
+    let genome = Genome::from_seed(42);
+    let profile: crate::LiquidTuningProfile = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/embodiment/active-liquid-profile-r11.json"
+    )))
+    .unwrap();
+    let mut runtime = LiquidMorphRuntime::new(42);
+    runtime.set_tuning(
+        profile.pbf,
+        profile.interaction,
+        profile.face,
+        profile.material.variant,
+    );
+    settle(&mut runtime, &genome, 1.0);
+    let mut maximum_radius = 0.0_f32;
+    let mut maximum_components = 0;
+    for tick in 0..960 {
+        let t = tick as f32 * DT;
+        let velocity = Vec2::Y * (1.4 * (3.0 * t).sin());
+        let acceleration = Vec2::Y * (4.2 * (3.0 * t).cos());
+        step(
+            &mut runtime,
+            &genome,
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            DropletMotion {
+                velocity,
+                acceleration,
+                presentation_displacement: velocity * DT,
+                world_to_body_scale: Vec2::ONE,
+                ..DropletMotion::default()
+            },
+        );
+        maximum_radius = maximum_radius.max(
+            runtime.particles[..runtime.particle_count]
+                .iter()
+                .map(|p| p.position.distance(runtime.body_origin))
+                .fold(0.0, f32::max),
+        );
+        maximum_components = maximum_components.max(runtime.components.component_count);
+    }
+    eprintln!("fast reversal radius={maximum_radius} components={maximum_components}");
+    assert!(
+        maximum_radius < 0.85,
+        "main flight stretched into a long bead chain"
+    );
+    assert_eq!(maximum_components, 1, "ordinary flight shed the main body");
+    assert_eq!(runtime.diagnostics.recovery_count, 0);
+    assert_eq!(runtime.diagnostics.failsafe_hits, 0);
+}
+
+#[test]
+fn curved_flight_preserves_a_volumetric_core_through_turns() {
+    let genome = Genome::from_seed(42);
+    let profile: crate::LiquidTuningProfile = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/embodiment/active-liquid-profile-r11.json"
+    )))
+    .unwrap();
+    let mut runtime = LiquidMorphRuntime::new(42);
+    runtime.set_tuning(
+        profile.pbf,
+        profile.interaction,
+        profile.face,
+        profile.material.variant,
+    );
+    settle(&mut runtime, &genome, 1.0);
+    let mut min_ratio = 1.0_f32;
+    let mut max_offset = 0.0_f32;
+    let mut max_bend = 0.0_f32;
+    let mut max_components = 0;
+    let mut min_main_fraction = 1.0_f32;
+    for tick in 0..960 {
+        let t = tick as f32 * DT;
+        let angle = if t < 2.0 { 0.0 } else { (t - 2.0) * 3.0 };
+        let axis = Vec2::from_angle(angle);
+        let velocity = axis * 1.4;
+        let acceleration = if t < 2.0 {
+            Vec2::ZERO
+        } else {
+            axis.perp() * 4.2
+        };
+        step(
+            &mut runtime,
+            &genome,
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            DropletMotion {
+                velocity,
+                acceleration,
+                presentation_displacement: velocity * DT,
+                world_to_body_scale: Vec2::ONE,
+                ..Default::default()
+            },
+        );
+        let center = particle_center(&runtime);
+        let (mut xx, mut yy, mut xy) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for p in &runtime.particles[..runtime.particle_count] {
+            let q = p.position - center;
+            xx += q.x * q.x;
+            yy += q.y * q.y;
+            xy += q.x * q.y;
+        }
+        let disc = ((xx - yy).powi(2) + 4.0 * xy * xy).sqrt();
+        let ratio = ((xx + yy - disc) / (xx + yy + disc)).max(0.0).sqrt();
+        min_ratio = min_ratio.min(ratio);
+        max_offset = max_offset.max(center.length());
+        max_bend = max_bend.max(runtime.flight_tail_bend.abs());
+        max_components = max_components.max(runtime.components.component_count);
+        let main_count = runtime.particles[..runtime.particle_count]
+            .iter()
+            .filter(|p| p.component_id == runtime.components.main_component)
+            .count();
+        min_main_fraction =
+            min_main_fraction.min(main_count as f32 / runtime.particle_count as f32);
+    }
+    eprintln!(
+        "curved flight min thickness ratio={min_ratio}, max center offset={max_offset}, tail bend={max_bend}, components={max_components}, main fraction={min_main_fraction}"
+    );
+    // A real small spray parcel is allowed; the coherent character must not split.
+    assert!(
+        min_main_fraction >= 0.95,
+        "main body broke apart: {min_main_fraction}"
+    );
+    assert!(
+        min_ratio > 0.52,
+        "turn flattened the liquid core: {min_ratio}"
+    );
+    assert!(max_offset < 0.30, "core left the root: {max_offset}");
+    assert!(max_bend > 0.04, "turn never reached trailing material");
+    assert_eq!(runtime.diagnostics.recovery_count, 0);
+}
+
+#[test]
+fn occupied_cradle_contains_liquid_during_repeated_lateral_and_downward_loads() {
+    let (genome, mut runtime) = migrated_runtime(0x29c);
+    settle(&mut runtime, &genome, 0.5);
+    let lower = Vec2::new(-0.45, -0.28);
+    let upper = Vec2::new(0.45, 2.0);
+    runtime.set_cradle_bounds(Some((lower, upper)));
+    for tick in 0..600 {
+        let force = Vec2::new((tick as f32 * 0.025).sin() * 1.2, -0.9);
+        step(
+            &mut runtime,
+            &genome,
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            DropletMotion {
+                acceleration: force,
+                world_to_body_scale: Vec2::ONE,
+                ..Default::default()
+            },
+        );
+        for p in &runtime.particles[..runtime.particle_count] {
+            if p.component_id == runtime.components.main_component {
+                let q = p.position - runtime.body_origin;
+                assert!(
+                    q.x >= lower.x - 0.005 && q.x <= upper.x + 0.005,
+                    "wall: {q:?}"
+                );
+                assert!(q.y >= lower.y - 0.005, "floor: {q:?}");
+            }
+        }
+    }
+    assert_eq!(runtime.diagnostics.recovery_count, 0);
+    assert!(runtime.diagnostics.finite);
 }
