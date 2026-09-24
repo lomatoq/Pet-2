@@ -3031,21 +3031,6 @@ impl PetApplication {
                 &mut runtime.screen_edge_contact,
                 body_dt,
             );
-            if !runtime.sensors.pet_dragged
-                && let Some(support) = runtime.ecology.feeding_support()
-            {
-                let hull = runtime
-                    .body
-                    .liquid_contact_bounds_pixels(runtime.window.inner_size().height as f32);
-                let floor =
-                    virtual_normalized_to_physical(&runtime.topology, support.anchor_point).y;
-                runtime.screen_body_center.y = floor - hull.maximum.y;
-                runtime.body.simulation.feedback.world_position =
-                    physical_to_virtual_normalized(&runtime.topology, runtime.screen_body_center);
-                runtime.body.simulation.feedback.velocity.y = 0.0;
-                runtime.body.simulation.feedback.grounded = true;
-                runtime.screen_velocity_px.y = 0.0;
-            }
             if runtime.body.simulation.feedback.collision.is_some() {
                 runtime.collision_impulse_count = runtime.collision_impulse_count.saturating_add(1);
             }
@@ -3104,6 +3089,11 @@ impl PetApplication {
             runtime
                 .nervous_system
                 .advance_eye_presentation(&mut runtime.intent, body_dt);
+            if runtime.ecology.feeding_navigation().is_some() && !runtime.sensors.pet_dragged {
+                let mut feeding_actuation = runtime.last_motor_packet.clone();
+                feeding_actuation.support = runtime.ecology.feeding_support();
+                runtime.body.set_somatic_actuation(feeding_actuation);
+            }
             runtime.body.embodied_update(
                 &runtime.intent,
                 &runtime.sensors,
@@ -3112,6 +3102,13 @@ impl PetApplication {
                 voice,
                 body_dt,
             );
+            if !runtime.sensors.pet_dragged && runtime.ecology.settle_food_body(
+                &mut runtime.body, orb_contact_height, body_dt,
+            ) {
+                runtime.screen_body_center = virtual_normalized_to_physical(
+                    &runtime.topology, runtime.body.simulation.feedback.world_position);
+                runtime.screen_velocity_px = runtime.body.simulation.feedback.velocity * extent;
+            }
             runtime
                 .nervous_system
                 .observe_body(&runtime.body, &runtime.intent, &body_sensors);

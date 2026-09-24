@@ -66,6 +66,8 @@ pub struct EcologyRuntime {
     food_caught: Option<ObjectId>,
     food_ingress_origin: Option<(ObjectId, Vec2)>,
     food_mouth_position: Vec2,
+    food_rest: Option<(ObjectId, Vec2)>,
+    food_grounded: bool,
     user_food_seconds: f32,
 }
 
@@ -298,6 +300,8 @@ impl EcologyRuntime {
             food_caught: None,
             food_ingress_origin: None,
             food_mouth_position: Vec2::ZERO,
+            food_rest: None,
+            food_grounded: false,
             user_food_seconds: 0.0,
         })
     }
@@ -502,17 +506,14 @@ impl EcologyRuntime {
     pub fn feeding_support(&self) -> Option<pet_motor::SurfaceAttachmentCommand> {
         let contact = self.food_physical?;
         let id = self.director.active_episode()?.object_id?;
-        let food = self
-            .state
-            .objects
-            .iter()
-            .find(|o| o.id == id && o.lifecycle == ObjectLifecycle::Sleeping)?;
-        let floor = self.food_floor(food);
+        let (rest_id, rest) = self.food_rest?;
+        if id != rest_id { return None; }
+        let floor = rest.y;
         if (contact.body_surface_position.y - floor).abs() > 0.006 {
             return None;
         }
         Some(pet_motor::SurfaceAttachmentCommand {
-            surface_id: lifecore::SurfaceId("food:support".into()),
+            surface_id: lifecore::SurfaceId("food:taskbar".into()),
             anchor_point: Vec2::new(contact.body_surface_position.x, floor),
             normal: -Vec2::Y,
             tangent: Vec2::X,
@@ -530,15 +531,59 @@ impl EcologyRuntime {
         self.food_floors = floors;
     }
 
+    /// Final approach to a real food support plane. The visible main body lands,
+    /// not a detached droplet or the invisible particle kernel skirt.
+    pub fn settle_food_body(&mut self, body: &mut ProceduralBody, height: f32, dt: f32) -> bool {
+        let Some((id, rest)) = self.food_rest else { return false; };
+        if !self.director.active_episode().is_some_and(|e| e.object_id == Some(id)
+            && matches!(e.goal, EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel)) { return false; }
+        let hull = body.main_liquid_contact_bounds_pixels(height);
+        let center = body.simulation.feedback.world_position;
+        let dx = (rest.x - center.x) * height * self.desktop_aspect;
+        let gap = (rest.y - center.y) * height - hull.maximum.y;
+        if dx < hull.minimum.x || dx > hull.maximum.x || !(-12.0..=64.0).contains(&gap) {
+            self.food_grounded = false;
+            return false;
+        }
+        self.food_grounded |= gap.abs() <= 2.0;
+        let step = if self.food_grounded { gap } else {
+            (gap * (1.0 - (-12.0 * dt).exp())).clamp(-120.0 * dt, 120.0 * dt)
+        };
+        body.simulation.feedback.world_position.y += step / height;
+        if self.food_grounded { body.simulation.feedback.velocity.y = 0.0; }
+        else { body.simulation.feedback.velocity.y *= (-16.0 * dt).exp(); }
+        body.simulation.feedback.grounded = self.food_grounded;
+        if let Some(contact) = &mut self.food_physical {
+            contact.body_surface_position.y = body.simulation.feedback.world_position.y + hull.maximum.y / height;
+        }
+        true
+    }
+
     pub fn update_food_contact(&mut self, body: &ProceduralBody, height: f32) -> Option<Vec2> {
         let active = self.director.active_episode().filter(|e| {
             matches!(e.goal, EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel)
-                && e.phase != pet_ecology::EpisodePhase::Recover
         });
+        let active_id = active.and_then(|e| e.object_id);
+        let eating = active.is_some_and(|e| e.goal == EpisodeGoal::EatMorsel);
+        if self.food_rest.is_some_and(|(id, _)| Some(id) != active_id) {
+            self.food_rest = None;
+            self.food_grounded = false;
+        }
         let food = active
             .and_then(|e| e.object_id)
             .and_then(|id| self.state.objects.iter().find(|o| o.id == id));
         let Some(food) = food else {
+            if let Some((_, rest)) = self.food_rest {
+                let center = body.simulation.feedback.world_position;
+                let foot = body.main_liquid_contact_bounds_pixels(height).maximum.y;
+                self.food_physical = Some(PhysicalGrabFrame {
+                    contact: true,
+                    socket_position: Vec2::new(center.x, rest.y - foot / height),
+                    body_surface_position: Vec2::new(center.x, center.y + foot / height),
+                    ..Default::default()
+                });
+                return Some(Vec2::new(body.feeding_mouth_rest_pixels(height).x, foot));
+            }
             if let Some(id) = self.food_caught.take()
                 && let Some(o) = self.state.objects.iter_mut().find(|o| o.id == id)
                 && o.lifecycle == ObjectLifecycle::CarriedByPet {
@@ -548,10 +593,21 @@ impl EcologyRuntime {
             self.food_ingress_origin = None;
             return None;
         };
+        if food.lifecycle == ObjectLifecycle::GrabbedByUser {
+            self.food_rest = None;
+            self.food_grounded = false;
+            self.food_physical = None;
+            self.food_caught = None;
+            self.food_ingress_origin = None;
+            return None;
+        }
         let center = body.simulation.feedback.world_position;
         let scale = Vec2::new(height * self.desktop_aspect, height);
         let relative = (food.position - center) * scale;
-        let settled = food.lifecycle == ObjectLifecycle::Sleeping;
+        if food.lifecycle == ObjectLifecycle::Sleeping {
+            self.food_rest = Some((food.id, Vec2::new(food.position.x, self.food_floor(food))));
+        }
+        let settled = self.food_rest.is_some_and(|(id, _)| id == food.id);
         let direction = if settled {
             Vec2::Y
         } else {
@@ -560,7 +616,8 @@ impl EcologyRuntime {
         let radius = food.radius_px_at_reference * height / REFERENCE_DESKTOP_HEIGHT_PX;
         let hit = body.liquid_physical_circle_contact_pixels(relative, relative, radius, height);
         let support = if settled {
-            body.liquid_physical_support_pixels(Vec2::Y, height)
+            Vec2::new(body.feeding_mouth_rest_pixels(height).x,
+                body.main_liquid_contact_bounds_pixels(height).maximum.y)
         } else {
             hit.map_or_else(
                 || body.liquid_physical_support_pixels(direction, height),
@@ -568,10 +625,10 @@ impl EcologyRuntime {
             )
         };
         let desired_center = if settled {
-            let floor = self.food_floor(food);
+            let rest = self.food_rest.unwrap().1;
             Vec2::new(
-                food.position.x - body.feeding_mouth_rest_pixels(height).x / scale.x,
-                floor - support.y / scale.y,
+                rest.x - body.feeding_mouth_rest_pixels(height).x / scale.x,
+                rest.y - support.y / scale.y,
             )
         } else {
             // Intercept airborne food with the face, not by sending the mouth
@@ -582,11 +639,8 @@ impl EcologyRuntime {
         };
         let mouth_contact =
             (body.feeding_mouth_tip_pixels(height) - relative).length() <= radius + 3.0;
-        let touching = if settled {
-            hit.is_some() && mouth_contact
-        } else {
-            (hit.is_some() && mouth_contact) || self.food_caught == Some(food.id)
-        };
+        let touching = (!settled || self.food_grounded)
+            && ((hit.is_some() && mouth_contact) || self.food_caught == Some(food.id));
         let id = food.id;
         self.food_mouth_position = center + body.feeding_mouth_rest_pixels(height) / scale;
         if touching {
@@ -596,7 +650,7 @@ impl EcologyRuntime {
         } else {
             self.food_ingress_origin = None;
         }
-        let catch = touching && !settled && food.lifecycle != ObjectLifecycle::GrabbedByUser;
+        let catch = touching && (!settled || eating) && food.lifecycle != ObjectLifecycle::GrabbedByUser;
         if catch {
             self.food_caught = Some(id);
             if let Some(food) = self.state.objects.iter_mut().find(|o| o.id == id) {
@@ -984,6 +1038,9 @@ impl EcologyRuntime {
             .retain(|o| o.kind != ObjectKind::Morsel || o.radius_px_at_reference > 3.0);
         self.food_caught = None;
         self.food_physical = None;
+        self.food_rest = None;
+        self.food_grounded = false;
+        self.food_ingress_origin = None;
     }
 
     pub fn sprinkle_food(&mut self, position: Vec2, timestamp: f64) -> usize {
@@ -1836,6 +1893,12 @@ mod tests {
 
     #[test]
     fn floor_food_has_visible_ingress_before_consumption_without_changing_portion() {
+        for (height, gap) in [(720.0, 30.0), (1080.0, 30.0), (1440.0, 45.0)] {
+            exercise_floor_food_landing(height, gap);
+        }
+    }
+
+    fn exercise_floor_food_landing(height: f32, gap: f32) {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
         let mut runtime = EcologyRuntime::load_or_create(&store, 42, true).unwrap();
@@ -1853,44 +1916,73 @@ mod tests {
         food.position = Vec2::new(0.3, 0.96 - radius / REFERENCE_DESKTOP_HEIGHT_PX);
         food.velocity = Vec2::ZERO;
         food.lifecycle = ObjectLifecycle::Sleeping;
-        let support = body.liquid_physical_support_pixels(Vec2::Y, 1080.0);
-        body.simulation.feedback.world_position = Vec2::new(0.3, 0.96 - support.y / 1080.0);
+        let support = body.liquid_physical_support_pixels(Vec2::Y, height);
+        body.simulation.set_motion_space_pixels(Vec2::new(height * (16.0 / 9.0), height));
+        body.set_desktop_motion_space(Vec2::new(height * (16.0 / 9.0), height), height);
+        body.simulation.feedback.world_position = Vec2::new(0.3, 0.96 - (support.y + gap) / height);
         let sensors = SensorFrame::default();
         let mut saw_ingress = false;
         let mut consumed = false;
+        let mut supported = false;
+        let mut intent = BodyIntent {
+            locomotion: lifecore::LocomotionMode::Arrive,
+            target_position: body.simulation.feedback.world_position,
+            target_surface: None, desired_speed: 0.5, facing_direction: 1.0,
+            gaze_target: None, pose: lifecore::PoseIntent::Neutral,
+            expression: Default::default(), interaction_target: None,
+        };
         for tick in 0..1200 {
             if tick == 1 {
                 let food = runtime.state.objects.iter_mut().find(|o| o.id == id).unwrap();
                 let resting = food.position;
                 food.position = body.simulation.feedback.world_position - Vec2::Y * 0.06;
                 food.lifecycle = ObjectLifecycle::Free;
-                assert!(runtime.update_food_contact(&body, 1080.0).is_none(), "falling food must not stretch the face");
+                assert!(runtime.update_food_contact(&body, height).is_none(), "falling food must not stretch the face");
                 let food = runtime.state.objects.iter_mut().find(|o| o.id == id).unwrap();
                 food.position = resting;
                 food.lifecycle = ObjectLifecycle::Sleeping;
             }
-            let target = runtime.update_food_contact(&body, 1080.0);
-            body.set_feeding_mouth(target, 1080.0, 1.0 / 120.0);
+            let target = runtime.update_food_contact(&body, height);
+            body.set_feeding_mouth(target, height, 1.0 / 120.0);
+            if let Some((target, contact)) = runtime.feeding_navigation() {
+                intent.target_position = target;
+                intent.locomotion = lifecore::LocomotionMode::Arrive;
+                intent.desired_speed = if contact { 0.12 } else { 0.8 };
+            }
+            body.fixed_update(&genome, &intent, &sensors, 1.0 / 120.0);
+            body.set_somatic_actuation(pet_motor::SomaticActuationPacket {
+                support: runtime.feeding_support(), ..Default::default()
+            });
+            body.embodied_update(&intent, &sensors, lifecore::AffectState::default(),
+                pet_body::VisualMindInput::default(), pet_body::VoiceVisualState::default(), 1.0 / 120.0);
+            runtime.settle_food_body(&mut body, height, 1.0 / 120.0);
             body.presentation_update(1.0 / 120.0);
+            supported |= body.embodiment.liquid.diagnostics().support_field_load > 0.0;
             if tick % 6 == 0 {
-                let intent = BodyIntent {
+                let idle = BodyIntent {
                     locomotion: lifecore::LocomotionMode::Hover,
                     target_position: body.simulation.feedback.world_position,
                     target_surface: None, desired_speed: 0.0, facing_direction: 1.0,
                     gaze_target: None, pose: lifecore::PoseIntent::Neutral,
                     expression: Default::default(), interaction_target: None,
                 };
-                let _ = runtime.resolve_intent(intent, EcologyResolveFrame {
+                let output = runtime.resolve_intent(idle, EcologyResolveFrame {
                     social_contact: Default::default(), selected_action: ActionId::IdleHover,
                     drives: Drives::initial(&genome.temperament), sensors: &sensors,
                     body: &body.simulation.feedback, focus_mode: false, dt: 0.05,
                     orb_physical: Default::default(),
                 });
+                // Keep the episode's actual mouth commands during the approach.
+                intent = output.body_intent;
             }
             if let Some(snapshot) = runtime.feeding_render_state() {
                 let shown = snapshot.objects.iter().find(|o| o.id == id).unwrap();
                 if shown.radius_px_at_reference < radius * 0.9 {
                     saw_ingress = true;
+                    let foot = body.main_liquid_contact_bounds_pixels(height).maximum.y;
+                    let gap = (0.96 - body.simulation.feedback.world_position.y) * height - foot;
+                    assert!(runtime.food_grounded);
+                    assert!(gap.abs() < 0.05, "bite while floating: gap={gap}px at height={height}");
                     assert_eq!(runtime.state.objects.iter().find(|o| o.id == id).unwrap().radius_px_at_reference, radius);
                     assert!(shown.position.distance(runtime.food_mouth_position)
                         <= runtime.food_ingress_origin.unwrap().1.distance(runtime.food_mouth_position));
@@ -1898,8 +1990,9 @@ mod tests {
             }
             if !runtime.state.objects.iter().any(|o| o.id == id) { consumed = true; break; }
         }
-        assert!(saw_ingress, "no ingress: episode={:?}, contact={:?}, tip={:?}, support={:?}, consumed={}", runtime.director.active_episode(), runtime.food_physical, body.feeding_mouth_tip_pixels(1080.0), support, consumed);
-        assert!(consumed, "floor food never reached the mouth");
+        assert!(saw_ingress, "no ingress: episode={:?}, contact={:?}, tip={:?}, support={:?}, consumed={}", runtime.director.active_episode(), runtime.food_physical, body.feeding_mouth_tip_pixels(height), support, consumed);
+        assert!(consumed, "floor food never reached the mouth at {height}px");
+        assert!(supported, "feeding never acquired a physical support plane at {height}px");
     }
 
     #[test]

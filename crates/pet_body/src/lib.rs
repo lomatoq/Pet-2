@@ -338,33 +338,9 @@ impl ProceduralBody {
 
     /// The same constrained mouth center is used by drawing and food contact.
     fn feeding_mouth_render_offset(&self) -> Vec2 {
-        if self.feeding_mouth_offset.length_squared() < 1e-8 {
-            return Vec2::ZERO;
-        }
-        let liquid = self.embodiment.liquid.render_state();
-        let frame = liquid.face_frame;
-        let origin = self.contained_face.origin.unwrap_or(frame.origin);
-        let base = origin - frame.axis_y * 0.1 * frame.scale.y;
-        let desired = frame.origin - frame.axis_y * 0.1 * frame.scale.y
-            + frame.axis_x * self.feeding_mouth_offset.x * frame.scale.x
-            + frame.axis_y * self.feeding_mouth_offset.y * frame.scale.y;
-        let residual = desired - base;
-        let residual = Vec2::new(residual.dot(frame.axis_x), residual.dot(frame.axis_y))
-            / frame.scale.max(Vec2::splat(0.01));
-        let residual = residual.clamp(Vec2::new(-0.025, -0.045), Vec2::new(0.025, 0.025));
-        let desired = base + frame.axis_x * residual.x * frame.scale.x
-            + frame.axis_y * residual.y * frame.scale.y;
-        let mouth = liquid::contain_mouth_origin(
-            &liquid.particles[..liquid.particle_count],
-            self.tuning.pbf.iso_threshold,
-            base,
-            desired,
-            frame.axis_x * frame.scale.x,
-            frame.axis_y * frame.scale.y,
-        );
-        let delta = mouth - base;
-        Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
-            / frame.scale.max(Vec2::splat(0.01))
+        // Feeding moves the shared face frame. Recomputing a separate lip
+        // residual against every contour ripple made the mouth twitch.
+        Vec2::ZERO
     }
 
     pub fn feeding_mouth_rest_pixels(&self, height: f32) -> Vec2 {
@@ -752,7 +728,7 @@ impl ProceduralBody {
         // Ignore small target ripples relative to the advected liquid mass.
         // Continuous deadband avoids a hold-then-jump threshold.
         let relative = desired - previous;
-        let deadband = 0.045 * (1.0 - 0.85 * self.feeding_mouth_activity);
+        let deadband = 0.045 * (1.0 - self.feeding_mouth_activity);
         let desired = previous
             + relative * ((relative.length() - deadband).max(0.0) / relative.length().max(0.0001));
         // Eyes stay inside the body while the lower lip can meet its boundary.
@@ -1578,7 +1554,7 @@ mod tests {
             tip.distance(support) < 4.0,
             "tip={tip:?}, support={support:?}"
         );
-        assert!(after.feeding_mouth_offset.y < 0.0);
+        assert_eq!(after.feeding_mouth_offset, Vec2::ZERO);
         assert!(after.feeding_mouth_offset.length() < 0.055, "mouth must stay close to face: {:?}", after.feeding_mouth_offset);
         for _ in 0..360 {
             body.set_feeding_mouth(None, 1080.0, 1.0 / 120.0);

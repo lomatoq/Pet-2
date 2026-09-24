@@ -7,7 +7,7 @@ mod components;
 mod contact_surface;
 pub use contact_surface::{
     SmoothFaceOrigin, contact_surface_bounds, contact_surface_circle, contact_surface_min_y,
-    contact_surface_support, contain_face_origin, contain_mouth_origin,
+    contact_surface_support, contain_face_origin,
 };
 mod density;
 mod face_frame;
