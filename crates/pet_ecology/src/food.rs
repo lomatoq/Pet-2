@@ -491,3 +491,10 @@ mod feeding_tests {
         assert!((1..80).any(|i| hungry.aperture(i as f32 * 0.02) > 0.02));
     }
 }
+
+/// Contact-to-swallow time: hungry bites are quicker, never instantaneous.
+pub fn ingestion_seconds(appetite: f32) -> f32 { 0.30 + (1.0 - appetite.clamp(0.0, 1.0)) * 0.32 }
+pub fn ingestion_progress(elapsed: f32, appetite: f32) -> f32 {
+    let t = (elapsed / ingestion_seconds(appetite)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}

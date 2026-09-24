@@ -782,7 +782,7 @@ impl EcologyRenderer {
 
 fn object_in_front(kind: ObjectKind, state: ObjectLifecycle) -> bool {
     state == ObjectLifecycle::GrabbedByUser
-        || (kind == ObjectKind::Morsel && state == ObjectLifecycle::Free)
+        || (kind == ObjectKind::Morsel && state != ObjectLifecycle::Consumed)
 }
 
 #[test]
@@ -798,7 +798,7 @@ fn food_and_toy_layers_follow_physical_ownership() {
             ObjectLifecycle::CarriedByPet,
             ObjectLifecycle::Consumed,
         ] {
-            assert!(!object_in_front(kind, state));
+            assert_eq!(object_in_front(kind, state), kind == ObjectKind::Morsel && state != ObjectLifecycle::Consumed);
         }
     }
     assert!(!object_in_front(ObjectKind::Orb, ObjectLifecycle::Free));

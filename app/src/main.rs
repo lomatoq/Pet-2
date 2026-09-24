@@ -804,7 +804,7 @@ impl AudioManager {
             || self.visual_feedback().active
             || self
                 .last_nonurgent_voice
-                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(8))
+                .is_some_and(|t| now.duration_since(t) < Duration::from_secs(25))
         {
             return false;
         }
@@ -840,12 +840,10 @@ impl AudioManager {
             self.recent_voice_accepts.pop_front();
         }
         let urgent = request.priority >= 220;
-        if !urgent
-            && (!self.pending_requests.is_empty()
-                || self.recent_voice_accepts.len() >= 6
-                || self
-                    .last_nonurgent_voice
-                    .is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(8)))
+        if !self.pending_requests.is_empty()
+            || self.recent_voice_accepts.len() >= 3
+            || self.last_nonurgent_voice.is_some_and(|instant|
+                now.duration_since(instant) < Duration::from_secs(if urgent { 8 } else { 25 }))
         {
             return false;
         }
@@ -5340,8 +5338,9 @@ impl ApplicationHandler for PetApplication {
                 let render_started = Instant::now();
                 let bounds = runtime.topology.virtual_physical_bounds;
                 let desktop_aspect = bounds.width().max(1) as f32 / bounds.height().max(1) as f32;
-                let mut startup_ecology = startup.active.then(|| runtime.ecology.state().clone());
-                if let Some(state) = &mut startup_ecology {
+                let mut startup_ecology = runtime.ecology.feeding_render_state()
+                    .or_else(|| startup.active.then(|| runtime.ecology.state().clone()));
+                if let Some(state) = &mut startup_ecology && startup.active {
                     if !startup.orb_visible { state.objects.retain(|o| o.kind != pet_ecology::ObjectKind::Orb); }
                     for object in &mut state.objects {
                         if object.kind == pet_ecology::ObjectKind::Orb {
@@ -9123,6 +9122,15 @@ mod tests {
         assert_eq!(manager.take_heard_request(), None);
         assert_eq!(manager.take_unheard_rejection(), None);
         assert!(manager.pending_requests.is_empty());
+        // Ordinary chatter and repeated alarm nominations share a finite budget.
+        assert!(!manager.enqueue(&voice, &second_motif, &second_request));
+        let urgent_request = lifecore::VocalRequest { priority: 255, ..second_request };
+        assert!(!manager.enqueue(&voice, &second_motif, &urgent_request));
+        manager.last_nonurgent_voice = Some(Instant::now() - Duration::from_secs(15));
+        assert!(!manager.enqueue(&voice, &second_motif, &second_request));
+        manager.last_nonurgent_voice = Some(Instant::now() - Duration::from_secs(30));
+        manager.recent_voice_accepts = VecDeque::from([Instant::now(); 3]);
+        assert!(!manager.enqueue(&voice, &second_motif, &urgent_request));
     }
 
     #[test]

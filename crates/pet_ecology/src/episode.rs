@@ -2163,9 +2163,9 @@ fn drive_episode(
                 output.body_intent.locomotion = LocomotionMode::Arrive;
                 output.body_intent.desired_speed = 0.12;
                 output.body_intent.pose = PoseIntent::Compact;
-                output.body_intent.expression.mouth_open = 0.35;
+                output.body_intent.expression.mouth_open = 0.42 * (1.0 - crate::ingestion_progress(active.phase_elapsed_seconds, state.metabolism.feeding_appetite()));
                 if active.phase_elapsed_seconds
-                    < 0.12 + (1.0 - state.metabolism.feeding_appetite()) * 0.3
+                    < crate::ingestion_seconds(state.metabolism.feeding_appetite())
                 {
                     return EpisodeStep::Continue;
                 }

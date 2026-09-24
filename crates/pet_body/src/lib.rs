@@ -326,9 +326,9 @@ impl ProceduralBody {
             let delta = local - frame.origin;
             (Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
                 / frame.scale.max(Vec2::splat(0.01))
-                - Vec2::new(0.0, -0.1))
+                - Vec2::new(0.0, -0.135))
             // This is a whole-face goal, never an independent mouth target.
-            .clamp(Vec2::new(-0.22, -1.8), Vec2::new(0.22, 0.30))
+            .clamp(Vec2::new(0.0, -1.8), Vec2::new(0.0, 0.0))
         });
         let alpha = 1.0 - (-12.0 * dt.max(0.0)).exp();
         self.feeding_mouth_offset = self.feeding_mouth_offset.lerp(target, alpha);
@@ -369,8 +369,10 @@ impl ProceduralBody {
 
     pub fn feeding_mouth_rest_pixels(&self, height: f32) -> Vec2 {
         let frame = self.embodiment.liquid.render_state().face_frame;
-        let local =
-            self.contained_face.origin.unwrap_or(frame.origin) - frame.axis_y * 0.1 * frame.scale.y;
+        let offset = self.feeding_mouth_render_offset();
+        let local = self.contained_face.origin.unwrap_or(frame.origin)
+            + frame.axis_x * offset.x * frame.scale.x
+            + frame.axis_y * (offset.y - 0.1) * frame.scale.y;
         local * Vec2::new(1.0, -1.0) * (height.max(1.0) / (2.0 * self.projection_scale()))
     }
 
@@ -754,7 +756,7 @@ impl ProceduralBody {
         let desired = previous
             + relative * ((relative.length() - deadband).max(0.0) / relative.length().max(0.0001));
         // Eyes stay inside the body while the lower lip can meet its boundary.
-        let feeding_lift = frame.axis_y * frame.scale.y * 0.065 * self.feeding_mouth_activity;
+        let feeding_lift = frame.axis_y * frame.scale.y * 0.105 * self.feeding_mouth_activity;
         let target = liquid::contain_face_origin(
             particles,
             self.tuning.pbf.iso_threshold,
@@ -1227,7 +1229,7 @@ impl ProceduralBody {
         let tissue = phase.sin() * 0.65 + (phase * 1.73 + 0.8).sin() * 0.35;
         let settle = (-(self.mouth_context_age - 3.0).max(0.0) * 1.4).exp();
         let voice_authority = pose.audio_envelope.clamp(0.0, 1.0);
-        pose.mouth_open *= settle.max(voice_authority);
+        pose.mouth_open *= settle.max(voice_authority).max(self.feeding_mouth_activity);
         // One brief tissue adjustment per long quiet interval, not a perpetual
         // mouth oscillator. Voice and food have independent opening authority.
         let cycle = (t + identity_phase).rem_euclid(8.5);

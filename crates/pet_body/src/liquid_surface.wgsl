@@ -1383,9 +1383,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let face_gaze=globals.gaze_pupil.xy;
     // Food contact and the visible mouth use the same constrained offset.
     let feeding_offset=globals.face_eye.zw;
-    let feeding_reach=smoothstep(0.0,0.08,length(feeding_offset));
-    let mouth_center=vec2<f32>(0.0,mix(-0.090,-0.100,feeding_reach))
-        +feeding_offset+face_gaze*vec2<f32>(0.040,0.028)*(1.0-feeding_reach);
+    // Gaze already moves the shared face frame. A second mouth-only translation
+    // makes the rendered lips disagree with the CPU food contact socket.
+    let mouth_center=vec2<f32>(0.0,-0.100)+feeding_offset;
     let mouth_delta=face_point-mouth_center;
     let mouth_local=vec2<f32>(mouth_delta.x/(1.0-0.19*abs(face_gaze.x)),
         mouth_delta.y-mouth_delta.x*face_gaze.x*0.13);

@@ -404,6 +404,7 @@ pub struct SynthVoice {
     tract_back_pressure: f32,
     last_glottal_openness: f32,
     emitted_energy: f32,
+    presentation_gain: f32,
     purr_frames_until_event: usize,
     purr_closure_remaining: usize,
     purr_closure_total: usize,
@@ -482,6 +483,7 @@ impl SynthVoice {
             tract_back_pressure: 0.0,
             last_glottal_openness: 0.55,
             emitted_energy: 0.0,
+            presentation_gain: 0.2,
             purr_frames_until_event: 0,
             purr_closure_remaining: 0,
             purr_closure_total: 1,
@@ -959,8 +961,14 @@ impl SynthVoice {
         let saturated = blocked / (1.0 + blocked.abs() * 0.12);
         let room = self.room.process(saturated);
         let output = soft_limit(room, maximum_loudness.clamp(0.72, 0.78));
+        if let Some(command) = self.current {
+            let shout = command.shout.clamp(0.0, 1.0);
+            let target = 0.2 + 0.8 * shout * shout;
+            self.presentation_gain += (target - self.presentation_gain)
+                * (1.0 - (-1.0 / (0.025 * self.sample_rate)).exp());
+        }
         if output.is_finite() {
-            output
+            output * self.presentation_gain
         } else {
             self.diagnostics.observe_non_finite_reset();
             0.0
@@ -1083,6 +1091,29 @@ fn seeded_unit(seed: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_gain_also_attenuates_resonator_tail_after_command_ends() {
+        let mut quiet = SynthVoice::new(Arc::new(SpscRing::new()), 48_000);
+        let mut reference = SynthVoice::new(Arc::new(SpscRing::new()), 48_000);
+        let voice = lifecore::Genome::from_seed(61).voice;
+        let motif = lifecore::generate_initial_motifs(&voice)[0].clone();
+        let command = VoiceCommand::prepare(&voice, &motif, &request(motif.id, VocalStyle::SocialContact));
+        quiet.start_command(command);
+        reference.start_command(command);
+        quiet.current = None;
+        reference.current = None;
+        reference.presentation_gain = 1.0;
+        let mut energy = 0.0;
+        for n in 0..4800 {
+            let input = if n < 240 { (n as f32 * 0.13).sin() * 0.1 } else { 0.0 };
+            let expected = reference.post_process_mono(input, 0.75);
+            let actual = quiet.post_process_mono(input, 0.75);
+            assert!((actual - expected * 0.2).abs() < 1e-6);
+            energy += actual.abs();
+        }
+        assert!(energy > 0.01);
+    }
 
     fn request(motif_id: u64, style: VocalStyle) -> VocalRequest {
         VocalRequest {

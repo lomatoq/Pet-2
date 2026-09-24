@@ -62,8 +62,8 @@ mod tests {
         let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
             / samples.len().max(1) as f32)
             .sqrt();
-        assert!((0.08..=0.75).contains(&peak), "peak={peak}");
-        assert!(rms >= 0.012, "rms={rms}");
+        assert!((0.016..=0.375).contains(&peak), "peak={peak}");
+        assert!(rms >= 0.0024, "rms={rms}");
     }
 
     #[test]

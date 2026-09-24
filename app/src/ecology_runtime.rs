@@ -64,6 +64,8 @@ pub struct EcologyRuntime {
     food_floors: Vec<(f32, f32, f32)>,
     food_physical: Option<PhysicalGrabFrame>,
     food_caught: Option<ObjectId>,
+    food_ingress_origin: Option<(ObjectId, Vec2)>,
+    food_mouth_position: Vec2,
     user_food_seconds: f32,
 }
 
@@ -294,6 +296,8 @@ impl EcologyRuntime {
             food_floors: Vec::new(),
             food_physical: None,
             food_caught: None,
+            food_ingress_origin: None,
+            food_mouth_position: Vec2::ZERO,
             user_food_seconds: 0.0,
         })
     }
@@ -541,6 +545,7 @@ impl EcologyRuntime {
                     o.lifecycle = ObjectLifecycle::Free;
                 }
             self.food_physical = None;
+            self.food_ingress_origin = None;
             return None;
         };
         let center = body.simulation.feedback.world_position;
@@ -583,6 +588,14 @@ impl EcologyRuntime {
             (hit.is_some() && mouth_contact) || self.food_caught == Some(food.id)
         };
         let id = food.id;
+        self.food_mouth_position = center + body.feeding_mouth_rest_pixels(height) / scale;
+        if touching {
+            if self.food_ingress_origin.is_none_or(|(old, _)| old != id) {
+                self.food_ingress_origin = Some((id, food.position));
+            }
+        } else {
+            self.food_ingress_origin = None;
+        }
         let catch = touching && !settled && food.lifecycle != ObjectLifecycle::GrabbedByUser;
         if catch {
             self.food_caught = Some(id);
@@ -598,11 +611,11 @@ impl EcologyRuntime {
             body_surface_position: center + support / scale,
             ..PhysicalGrabFrame::default()
         });
-        // Close food attracts the whole face. The renderer bounds the small
-        // residual lip stretch relative to that shared face, including in flight.
-        ((relative - support).length() < 120.0).then_some(if settled {
-            Vec2::new(body.feeding_mouth_rest_pixels(height).x, relative.y)
-        } else { relative })
+        // Only grounded food can lower the face. Falling food is intercepted
+        // by locomotion; it must never pull individual facial features upward.
+        (settled && (relative - support).length() < 80.0).then_some(
+            Vec2::new(body.feeding_mouth_rest_pixels(height).x, support.y)
+        )
     }
 
     pub fn fixed_update(
@@ -1688,6 +1701,21 @@ impl EcologyRuntime {
         &self.state
     }
 
+    /// Presentation only: nutritional size and physical contact stay unchanged.
+    pub fn feeding_render_state(&self) -> Option<EcologyState> {
+        let (id, origin) = self.food_ingress_origin?;
+        let active = self.director.active_episode()?;
+        if active.object_id != Some(id) { return None; }
+        let progress = if active.goal == EpisodeGoal::EatMorsel {
+            pet_ecology::ingestion_progress(active.phase_elapsed_seconds, self.state.metabolism.feeding_appetite())
+        } else { 0.0 };
+        let mut state = self.state.clone();
+        let food = state.objects.iter_mut().find(|o| o.id == id)?;
+        food.position = origin.lerp(self.food_mouth_position, progress);
+        food.radius_px_at_reference *= (1.0 - progress).max(0.025);
+        Some(state)
+    }
+
     /// Converts the portable habitat into the bounded, anonymous object slots
     /// expected by Thandorcat/morph. Labels and hidden object kinds never cross
     /// this boundary; the neural side receives appearance, motion, familiarity,
@@ -1805,6 +1833,74 @@ impl EcologyRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_food_has_visible_ingress_before_consumption_without_changing_portion() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 42, true).unwrap();
+        let genome = lifecore::Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.set_presentation_scale(2.0);
+        body.presentation_update(1.0 / 60.0);
+        runtime.desktop_aspect = 16.0 / 9.0;
+        runtime.set_food_floors(vec![(0.0, 1.0, 0.96)]);
+        runtime.sprinkle_food(Vec2::new(0.3, 0.9), 1.0);
+        let id = runtime.state.objects.iter().find(|o| o.kind == ObjectKind::Morsel).unwrap().id;
+        runtime.state.objects.retain(|o| o.id == id || o.kind == ObjectKind::Orb);
+        let food = runtime.state.objects.iter_mut().find(|o| o.id == id).unwrap();
+        let radius = food.radius_px_at_reference;
+        food.position = Vec2::new(0.3, 0.96 - radius / REFERENCE_DESKTOP_HEIGHT_PX);
+        food.velocity = Vec2::ZERO;
+        food.lifecycle = ObjectLifecycle::Sleeping;
+        let support = body.liquid_physical_support_pixels(Vec2::Y, 1080.0);
+        body.simulation.feedback.world_position = Vec2::new(0.3, 0.96 - support.y / 1080.0);
+        let sensors = SensorFrame::default();
+        let mut saw_ingress = false;
+        let mut consumed = false;
+        for tick in 0..1200 {
+            if tick == 1 {
+                let food = runtime.state.objects.iter_mut().find(|o| o.id == id).unwrap();
+                let resting = food.position;
+                food.position = body.simulation.feedback.world_position - Vec2::Y * 0.06;
+                food.lifecycle = ObjectLifecycle::Free;
+                assert!(runtime.update_food_contact(&body, 1080.0).is_none(), "falling food must not stretch the face");
+                let food = runtime.state.objects.iter_mut().find(|o| o.id == id).unwrap();
+                food.position = resting;
+                food.lifecycle = ObjectLifecycle::Sleeping;
+            }
+            let target = runtime.update_food_contact(&body, 1080.0);
+            body.set_feeding_mouth(target, 1080.0, 1.0 / 120.0);
+            body.presentation_update(1.0 / 120.0);
+            if tick % 6 == 0 {
+                let intent = BodyIntent {
+                    locomotion: lifecore::LocomotionMode::Hover,
+                    target_position: body.simulation.feedback.world_position,
+                    target_surface: None, desired_speed: 0.0, facing_direction: 1.0,
+                    gaze_target: None, pose: lifecore::PoseIntent::Neutral,
+                    expression: Default::default(), interaction_target: None,
+                };
+                let _ = runtime.resolve_intent(intent, EcologyResolveFrame {
+                    social_contact: Default::default(), selected_action: ActionId::IdleHover,
+                    drives: Drives::initial(&genome.temperament), sensors: &sensors,
+                    body: &body.simulation.feedback, focus_mode: false, dt: 0.05,
+                    orb_physical: Default::default(),
+                });
+            }
+            if let Some(snapshot) = runtime.feeding_render_state() {
+                let shown = snapshot.objects.iter().find(|o| o.id == id).unwrap();
+                if shown.radius_px_at_reference < radius * 0.9 {
+                    saw_ingress = true;
+                    assert_eq!(runtime.state.objects.iter().find(|o| o.id == id).unwrap().radius_px_at_reference, radius);
+                    assert!(shown.position.distance(runtime.food_mouth_position)
+                        <= runtime.food_ingress_origin.unwrap().1.distance(runtime.food_mouth_position));
+                }
+            }
+            if !runtime.state.objects.iter().any(|o| o.id == id) { consumed = true; break; }
+        }
+        assert!(saw_ingress, "no ingress: episode={:?}, contact={:?}, tip={:?}, support={:?}, consumed={}", runtime.director.active_episode(), runtime.food_physical, body.feeding_mouth_tip_pixels(1080.0), support, consumed);
+        assert!(consumed, "floor food never reached the mouth");
+    }
 
     #[test]
     fn falling_food_interception_leads_velocity_and_stops_at_support() {
