@@ -1659,6 +1659,18 @@ impl EcologyRuntime {
         self.state.den.anchor = anchor;
     }
 
+    pub fn prepare_startup_orb(&mut self, viewport: [u32; 2]) {
+        self.set_den_viewport(viewport);
+        if let Some(orb) = self.state.objects.iter_mut().find(|o| o.kind == ObjectKind::Orb) {
+            let slot = orb.home_slot.unwrap_or(0);
+            self.state.den.slots[usize::from(slot)] = Some(orb.id);
+            orb.home_slot = Some(slot);
+            orb.lifecycle = ObjectLifecycle::StoredInDen;
+            orb.velocity = Vec2::ZERO;
+            orb.position = den_orb_rest_position(self.state.den.anchor, self.state.den.size_scale, viewport, orb.radius_px_at_reference);
+        }
+    }
+
     pub fn set_den_viewport(&mut self, viewport: [u32; 2]) {
         self.den_viewport = [viewport[0].max(1), viewport[1].max(1)];
     }
@@ -1785,6 +1797,21 @@ impl EcologyRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_orb_is_seated_without_recreating_its_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 42, true).unwrap();
+        let before = runtime.state.objects.iter().find(|o| o.kind == ObjectKind::Orb).unwrap().clone();
+        runtime.prepare_startup_orb([1920, 1080]);
+        let after = runtime.state.objects.iter().find(|o| o.kind == ObjectKind::Orb).unwrap();
+        assert_eq!(before.id, after.id);
+        assert_eq!(before.familiarity, after.familiarity);
+        assert_eq!(after.lifecycle, ObjectLifecycle::StoredInDen);
+        assert_eq!(after.velocity, Vec2::ZERO);
+        runtime.state.validate().unwrap();
+    }
 
     #[test]
     fn food_lands_on_cradle_and_navigation_uses_its_seat_not_taskbar() {

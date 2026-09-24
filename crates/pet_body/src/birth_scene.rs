@@ -21,6 +21,7 @@ pub struct BirthScene {
     textures: Vec<wgpu::BindGroup>,
     buffer: wgpu::Buffer,
     den_front_buffer: wgpu::Buffer,
+    den_reveal: [f32; 3],
 }
 
 const IMAGES: [&[u8]; 6] = [
@@ -135,7 +136,19 @@ impl BirthScene {
             textures: Vec::new(),
             buffer,
             den_front_buffer,
+            den_reveal: [0.0, 1.0, 0.0],
         }
+    }
+
+    /// Translation, alpha and lower clipping edge shared by both nest layers.
+    pub fn set_den_reveal(&mut self, offset_y: f32, alpha: f32, clip_bottom: f32) {
+        self.den_reveal = [offset_y, alpha.clamp(0.0, 1.0), clip_bottom];
+    }
+    fn revealed_den(&self, mut sprite: Sprite) -> Sprite {
+        sprite.rect[1] += self.den_reveal[0];
+        sprite.style[1] *= self.den_reveal[1];
+        sprite.effect[2] = self.den_reveal[2];
+        sprite
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -217,7 +230,7 @@ impl BirthScene {
         let w = viewport[0].max(1) as f32;
         let h = viewport[1].max(1) as f32;
         let mut sprites = Vec::new();
-        sprites.push(den_sprite(viewport, den, den_scale, false));
+        sprites.push(self.revealed_den(den_sprite(viewport, den, den_scale, false)));
         if let Some((t, monitor)) = birth {
             let pose = vfx::Pose::new(t, monitor);
             for (x, y, sw, sh, side) in [
@@ -337,7 +350,7 @@ impl BirthScene {
         den_scale: f32,
     ) {
         self.upload(device, queue);
-        let sprite = den_sprite(viewport, den, den_scale, true);
+        let sprite = self.revealed_den(den_sprite(viewport, den, den_scale, true));
         // A distinct buffer matters: queue writes happen before submitted render
         // passes and must not replace the capsule instances prepared above.
         queue.write_buffer(&self.den_front_buffer, 0, bytemuck::bytes_of(&sprite));

@@ -55,6 +55,7 @@ fn nest_front_rim_y(u: f32) -> f32 {
 
 @fragment fn fragment_main(input:Out)->@location(0) vec4<f32> {
     if input.effect.y < -0.5 {
+        if input.effect.z > 0.0 && input.position.y > input.effect.z { discard; }
         // Aligned cushion/rim layers. Follow the physical near-rim contour.
         // Solve back alpha so source-over
         // recomposition restores the original alpha even through the feather.

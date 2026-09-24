@@ -6,6 +6,7 @@
 
 mod activity_glance;
 mod birth_runtime;
+mod startup_reveal;
 mod companion_runtime;
 mod cradle_runtime;
 mod ecology_runtime;
@@ -2067,6 +2068,9 @@ struct PetRuntime {
     ecology_renderer: EcologyRenderer,
     birth_scene: pet_body::birth_scene::BirthScene,
     birth: birth_runtime::BirthRuntime,
+    startup: startup_reveal::StartupReveal,
+    startup_center: Vec2,
+    startup_floor: f32,
     cradle_seat: cradle_runtime::CradleSeat,
     birth_monitor: RectI,
     platform: Box<dyn PlatformBackend>,
@@ -4680,7 +4684,7 @@ impl ApplicationHandler for PetApplication {
         }
         let (host_origin, host_size) = desktop_host_geometry(desktop_bounds);
         let initial = topology.remap(&prepared.position);
-        let initial_center = safe_body_center(
+        let mut initial_center = safe_body_center(
             &topology,
             Vec2::new(initial.x as f32, initial.y as f32),
             host_size,
@@ -4816,6 +4820,14 @@ impl ApplicationHandler for PetApplication {
         prepared
             .ecology
             .set_den_anchor(physical_to_virtual_normalized(&topology, nest));
+        let startup = startup_reveal::StartupReveal::new(birth.started.is_none());
+        if birth.started.is_none() {
+            let side = if nest.x - nest_monitor.minimum.x as f32 > nest_monitor.maximum.x as f32 - nest.x { -1.0 } else { 1.0 };
+            initial_center = safe_body_center(&topology, nest + Vec2::new(side * (den_width * 0.5 + 85.0), -8.0), host_size);
+            body.simulation.feedback.world_position = physical_to_virtual_normalized(&topology, initial_center);
+            body.simulation.feedback.velocity = Vec2::ZERO;
+            prepared.ecology.prepare_startup_orb([window.inner_size().width, window.inner_size().height]);
+        }
         // A hidden Win32 composition surface may never become presentable, which would
         // deadlock the old "show after Presented" startup path. At this point the GPU
         // surface, transparent clear color, pipeline, and mesh are all ready, so making
@@ -4835,6 +4847,12 @@ impl ApplicationHandler for PetApplication {
             ecology_renderer,
             birth_scene,
             birth,
+            startup,
+            startup_center: initial_center,
+            startup_floor: (if cfg!(target_os = "macos") {
+                topology.monitor_at(desktop_host::PhysicalDesktopPoint { x: nest.x as i32, y: nest.y as i32 })
+                    .map_or(nest_monitor.maximum.y, |m| m.physical_bounds.maximum.y)
+            } else { nest_monitor.maximum.y }) as f32 - desktop_bounds.minimum.y as f32,
             cradle_seat: cradle_runtime::CradleSeat::default(),
             birth_monitor,
             platform,
@@ -5250,6 +5268,9 @@ impl ApplicationHandler for PetApplication {
                     .clamp(0.0, 0.05);
                 runtime.last_present = present_now;
                 let birth_time = runtime.birth.elapsed();
+                let ecology_ready = runtime.background_clean_seed_frames >= BACKGROUND_CLEAN_SEED_FRAMES
+                    || runtime.normalizer.monotonic_seconds() > BACKGROUND_CAPTURE_FALLBACK_SECONDS;
+                let startup = runtime.startup.frame(ecology_ready, birth_time.is_some());
                 let growth = pet_body::birth_scene::growth_scale(runtime.birth.age_seconds());
                 let visible_growth = birth_time.map_or(growth, |t| {
                     (0.58 + 0.24 * pet_body::birth_scene::smooth(7.96, 9.25, t))
@@ -5265,6 +5286,7 @@ impl ApplicationHandler for PetApplication {
                     &runtime.topology,
                     runtime.body.simulation.feedback.world_position,
                 );
+                if startup.active { center = runtime.startup_center.lerp(center, startup.release); }
                 if let Some(t) = birth_time {
                     let m = runtime.birth_monitor;
                     let capsule_center = Vec2::new(
@@ -5287,6 +5309,12 @@ impl ApplicationHandler for PetApplication {
                     &runtime.life.state.genome,
                     runtime.life.state.affect.arousal,
                 );
+                // Scale only the rendered image; keep the liquid/contact solver
+                // at its ordinary size throughout the launch presentation.
+                let launch_scale = (parameters.presentation_scale / startup.pet_scale).min(12.0)
+                    / parameters.presentation_scale;
+                parameters.presentation_scale *= launch_scale;
+                parameters.presentation_offset *= launch_scale;
                 parameters.birth_roundness =
                     birth_time.map_or(0.0, |t| 1.0 - pet_body::birth_scene::smooth(11.2, 14.0, t));
                 if birth_time.is_some_and(|t| t < 11.2) {
@@ -5308,13 +5336,26 @@ impl ApplicationHandler for PetApplication {
                 parameters.shadow_vertical_offset = 0.0;
                 parameters.exposure = 1.0;
                 parameters.presentation_visibility =
-                    birth_time.map_or(1.0, |t| pet_body::birth_scene::smooth(7.96, 8.65, t));
+                    birth_time.map_or(startup.pet_alpha, |t| pet_body::birth_scene::smooth(7.96, 8.65, t));
                 let render_started = Instant::now();
                 let bounds = runtime.topology.virtual_physical_bounds;
                 let desktop_aspect = bounds.width().max(1) as f32 / bounds.height().max(1) as f32;
-                let ecology_state = runtime.ecology.state();
+                let mut startup_ecology = startup.active.then(|| runtime.ecology.state().clone());
+                if let Some(state) = &mut startup_ecology {
+                    if !startup.orb_visible { state.objects.retain(|o| o.kind != pet_ecology::ObjectKind::Orb); }
+                    for object in &mut state.objects {
+                        if object.kind == pet_ecology::ObjectKind::Orb {
+                            object.position.y += startup.orb_drop / bounds.height().max(1) as f32;
+                            if startup.orb_drop < -1.0 { object.lifecycle = pet_ecology::ObjectLifecycle::Free; }
+                        }
+                    }
+                }
+                let ecology_state = startup_ecology.as_ref().unwrap_or_else(|| runtime.ecology.state());
+                let den_width = (310.0 * ecology_state.den.size_scale).min(bounds.width() as f32 * 0.8).min(bounds.height() as f32 * 0.65);
+                runtime.birth_scene.set_den_reveal(startup.den_drop * den_width * 0.72, startup.den_alpha,
+                    if startup.active { runtime.startup_floor } else { 0.0 });
                 let birth_scene = std::cell::RefCell::new(&mut runtime.birth_scene);
-                let seated_in_cradle = runtime.cradle_seat.inside;
+                let seated_in_cradle = runtime.cradle_seat.inside || startup.active;
                 let m = runtime.birth_monitor;
                 let birth_frame = birth_time.map(|t| {
                     (
@@ -5344,9 +5385,6 @@ impl ApplicationHandler for PetApplication {
                 // The first asynchronous screen capture is the clean history
                 // seed. Do not draw the den into that seed; unsupported capture
                 // platforms fall back after a short bounded startup delay.
-                let ecology_ready = runtime.background_clean_seed_frames
-                    >= BACKGROUND_CLEAN_SEED_FRAMES
-                    || runtime.normalizer.monotonic_seconds() > BACKGROUND_CAPTURE_FALLBACK_SECONDS;
                 let render_outcome = runtime.renderer.render_with_layers(
                     parameters,
                     |device, queue, encoder, view| {
