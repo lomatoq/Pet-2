@@ -2885,6 +2885,7 @@ impl PetApplication {
                 runtime.body.simulation.feedback.world_position,
                 runtime.body.simulation.feedback.velocity.length(),
                 runtime.sensors.pet_dragged
+                    || runtime.ecology.feeding_navigation().is_some()
                     || runtime.hearing.name_attention()
                     || runtime.hearing.training(),
                 body_dt,
@@ -2969,9 +2970,12 @@ impl PetApplication {
                     })
                     .collect(),
             );
-            let food_mouth = runtime
-                .ecology
-                .update_food_contact(&runtime.body, orb_contact_height);
+            let food_mouth = if runtime.sensors.pet_dragged {
+                runtime.ecology.release_food_support();
+                None
+            } else {
+                runtime.ecology.update_food_contact(&runtime.body, orb_contact_height)
+            };
             runtime
                 .body
                 .set_feeding_mouth(food_mouth, orb_contact_height, body_dt);
@@ -8165,9 +8169,10 @@ fn apply_screen_domain(
     let visual = body.liquid_visual_bounds_pixels(overlay_size.height.max(1) as f32);
     let contact = body.liquid_contact_bounds_pixels(overlay_size.height.max(1) as f32);
     if bottom_edge_sleep && supported_rest_active {
-        // A verified support attachment follows the changing contact silhouette.
-        // Shrinking/recovering lobes must not leave the resting body in mid-air.
-        proposed.y = topology.virtual_physical_bounds.maximum.y as f32 - contact.maximum.y.max(1.0);
+        // Keep the acquired support frame stationary. Moving the root down for
+        // every contour ripple raises the local particle wall again, pumping
+        // the liquid upward and preventing a stable flattened contact patch.
+        proposed.y = previous_center.y;
     }
     let observed_half_extent = visual
         .main_minimum
@@ -8207,7 +8212,13 @@ fn apply_screen_domain(
     // Collision geometry cannot change merely because a behavior changes.
     // Switching from the actual lower silhouette to the taller upper lobe's
     // symmetric radius on leaving rest projected the pet upward by >60 px.
-    bounds_maximum.y = contact.maximum.y.max(1.0);
+    bounds_maximum.y = if bottom_edge_sleep && supported_rest_active {
+        // The particle wall owns the lower boundary after acquisition; do not
+        // add a second contour projection on top of that physical constraint.
+        (topology.virtual_physical_bounds.maximum.y as f32 - previous_center.y).max(1.0)
+    } else {
+        contact.maximum.y.max(1.0)
+    };
     let constrained = constrain_center_swept(
         topology,
         *previous_center,
@@ -9420,9 +9431,10 @@ mod tests {
         assert_eq!(body.simulation.feedback.velocity, Vec2::ZERO);
         assert!(body.simulation.feedback.collision.is_none());
 
-        // A loaded attachment follows silhouette recovery without acquiring
-        // artificial upward speed or leaving a new air gap.
+        // A loaded attachment must not chase a changed render skirt. The
+        // physical support solver owns deformation relative to this frame.
         center.y -= 12.0;
+        let support_frame_y = center.y;
         body.simulation.feedback.world_position = physical_to_virtual_normalized(&topology, center);
         apply_screen_domain(
             &mut body,
@@ -9437,7 +9449,7 @@ mod tests {
             1.0 / 120.0,
         );
         let bounds = body.liquid_contact_bounds_pixels(1_080.0);
-        assert!((1_080.0 - center.y - bounds.maximum.y).abs() < 0.02);
+        assert!((center.y - support_frame_y).abs() < 0.02);
         assert_eq!(velocity, Vec2::ZERO);
         assert!(body.simulation.feedback.grounded);
 
@@ -9461,6 +9473,59 @@ mod tests {
             assert!(center.distance(settled_center) < 0.02);
             assert_eq!(velocity, Vec2::ZERO);
         }
+    }
+
+    #[test]
+    fn supported_rest_forms_a_flat_patch_without_moving_its_reference_frame() {
+        let genome = Genome::from_seed(5784121873664838231);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.apply_tuning_profile(production_liquid_tuning(approved_production_liquid_tuning(genome.identity_seed))).unwrap();
+        body.set_presentation_scale(2.0);
+        let topology = two_monitor_topology();
+        let size = PhysicalSize::new(3840, 1080);
+        let height = 1080.0;
+        let span = Vec2::new(3840.0, height);
+        body.simulation.set_motion_space_pixels(span);
+        body.set_desktop_motion_space(span, height);
+        let foot = body.main_liquid_contact_bounds_pixels(height).maximum.y;
+        let mut center = Vec2::new(1000.0, height - foot);
+        let start_y = center.y;
+        body.simulation.feedback.world_position = physical_to_virtual_normalized(&topology, center);
+        let mut velocity = Vec2::ZERO;
+        let mut extent = Vec2::ZERO;
+        let mut contact = false;
+        let mut packet = SomaticActuationPacket::default();
+        packet.support = Some(pet_motor::SurfaceAttachmentCommand {
+            surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
+            anchor_point: Vec2::new(center.x / span.x, 1.0), normal: -Vec2::Y, tangent: Vec2::X,
+            target_contact_fraction: 0.30, normal_compliance: 0.3, tangent_friction: 0.7,
+            adhesion: 0.0, load_fraction: 0.30, break_force: 0.75, release_half_life: 0.2,
+        });
+        body.set_somatic_actuation(packet);
+        let mut intent = BodyIntent { locomotion: LocomotionMode::Sleep,
+            target_position: body.simulation.feedback.world_position,
+            target_surface: None, desired_speed: 0.0, facing_direction: 1.0,
+            gaze_target: None, pose: PoseIntent::Neutral, expression: Default::default(), interaction_target: None };
+        let sensors = SensorFrame::default();
+        for _ in 0..720 {
+            intent.target_position = body.simulation.feedback.world_position;
+            body.fixed_update(&genome, &intent, &sensors, 1.0 / 120.0);
+            apply_screen_domain(&mut body, &topology, size, true, true,
+                &mut center, &mut velocity, &mut extent, &mut contact, 1.0 / 120.0);
+            body.embodied_update(&intent, &sensors, Default::default(), Default::default(), Default::default(), 1.0 / 120.0);
+            body.presentation_update(1.0 / 120.0);
+        }
+        let hull = body.main_liquid_contact_bounds_pixels(height);
+        let floor = height - center.y;
+        let half_patch = (hull.maximum.x - hull.minimum.x) * 0.20;
+        for x in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+            let p = Vec2::new(x * half_patch, floor - 2.0);
+            assert!(body.liquid_physical_circle_contact_pixels(p, p, 1.0, height).is_some(),
+                "rounded/concave support at x={}: floor={floor}, hull={hull:?}", p.x);
+        }
+        assert!((center.y - start_y).abs() < 0.1, "rest reference drifted by {}px", center.y - start_y);
+        assert!((floor - hull.maximum.y).abs() < 2.0, "visible surface left floor");
+        assert!(body.embodiment.liquid.diagnostics().detached_mass < 1.0);
     }
 
     #[test]

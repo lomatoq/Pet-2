@@ -849,7 +849,7 @@ impl LiquidMorphRuntime {
         self.measured_support_load = measured_load.map_or(0.0, |(_, load)| load);
         self.update_field_shape(motion, dt, measured_load);
         let support_plane =
-            self.measured_support_plane(motion, feedback.world_position, measured_load.is_some());
+            self.measured_support_plane(motion, feedback.world_position, measured_load.is_some(), dt);
         let field_scale = self.tuning.character_field_radius_scale;
         if self.launch_preparation.1 > 0.0 {
             motor_field::apply_posture_field(
@@ -1693,6 +1693,7 @@ impl LiquidMorphRuntime {
         motion: DropletMotion,
         body_world_position: Vec2,
         measured: bool,
+        dt: f32,
     ) -> Option<SupportPlane> {
         let Some(support) = self.somatic_actuation.support.as_ref().filter(|support| {
             let awake_cling = self.somatic_actuation.program
@@ -1734,6 +1735,22 @@ impl LiquidMorphRuntime {
                 return None;
             }
             self.support_plane_clearance = Some((key, clearance));
+        }
+        // Kernel anisotropy changes the visible skirt as a round drop spreads.
+        // Correct one shared wall clearance, never the host root or individual
+        // particle rest positions. This keeps the density contour on the solid
+        // plane without the root/constraint feedback that pumped the body apart.
+        let render = self.render_state();
+        let main: Vec<_> = render.particles[..render.particle_count].iter()
+            .copied().filter(|p| p.main_component).collect();
+        if let Some(contour) = contact_surface::contact_surface_support(
+            &main, self.tuning.iso_threshold, -normal,
+        ) {
+            let error = -(self.body_origin + contour - point).dot(normal);
+            if let Some((_, clearance)) = &mut self.support_plane_clearance {
+                *clearance = (*clearance + error * (1.0 - (-6.0 * dt).exp()))
+                    .clamp(0.0, KERNEL_RADIUS * self.tuning.kernel_radius_scale * 1.5);
+            }
         }
         Some(SupportPlane {
             point,
@@ -4203,7 +4220,7 @@ mod flight_field_tests {
             );
             assert!(
                 runtime
-                    .measured_support_plane(motion, body_world, measured.is_some())
+                    .measured_support_plane(motion, body_world, measured.is_some(), 1.0 / 120.0)
                     .is_some(),
                 "{surface_id} did not create a physical support plane"
             );
@@ -4217,7 +4234,7 @@ mod flight_field_tests {
             assert!(runtime.measured_surface_load(motion, body_world).is_none());
             assert!(
                 runtime
-                    .measured_support_plane(motion, body_world, false)
+                    .measured_support_plane(motion, body_world, false, 1.0 / 120.0)
                     .is_none(),
                 "{surface_id} retained support after release"
             );
