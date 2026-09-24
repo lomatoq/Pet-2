@@ -21,6 +21,8 @@ mod rescue_tests;
 #[cfg(test)]
 mod shape_homeostasis;
 mod surface_tension;
+#[cfg(test)]
+mod surface_reconstruction_tests;
 mod topology_guard;
 mod viscoelastic_bonds;
 mod viscosity;
@@ -2990,16 +2992,27 @@ impl LiquidMorphRuntime {
         let support_squared = support * support;
         let mut mean = Vec2::ZERO;
         let mut mean_weight = 0.0;
+        let mut local_mean = Vec2::ZERO;
+        let mut local_weight = 0.0;
         let mut reliable_weight = 0.0;
         let mut reliable_weight_squared = 0.0;
         for other in &self.particles[..self.particle_count] {
+            if other.component_id != particle.component_id {
+                continue;
+            }
             let delta_from_particle = other.position - particle.position;
             let distance_squared = delta_from_particle.length_squared();
             if distance_squared >= support_squared {
                 continue;
             }
             let distance = distance_squared.sqrt();
-            let weight = (1.0 - distance / support).powi(3);
+            // Yu-Turk WPCA uses 1-q^3, not (1-q)^3. The latter effectively
+            // discards the outer neighbours and exposes individual bumps.
+            let q = distance / support;
+            let weight = 1.0 - q.powi(3);
+            let local = (1.0 - q).powi(3);
+            local_mean += other.position * local;
+            local_weight += local;
             mean += other.position * weight;
             mean_weight += weight;
             if distance_squared > 1.0e-10 {
@@ -3017,12 +3030,15 @@ impl LiquidMorphRuntime {
         let mut yy = 0.0;
         if mean_weight > 1.0e-5 {
             for other in &self.particles[..self.particle_count] {
+                if other.component_id != particle.component_id {
+                    continue;
+                }
                 let delta_from_particle = other.position - particle.position;
                 let distance_squared = delta_from_particle.length_squared();
                 if distance_squared >= support_squared {
                     continue;
                 }
-                let weight = (1.0 - distance_squared.sqrt() / support).powi(3);
+                let weight = 1.0 - (distance_squared.sqrt() / support).powi(3);
                 let centered = other.position - mean;
                 xx += centered.x * centered.x * weight;
                 xy += centered.x * centered.y * weight;
@@ -3063,12 +3079,14 @@ impl LiquidMorphRuntime {
         let aspect = if effective_neighbors < 6.0 {
             1.0
         } else {
-            (1.0 + anisotropy_confidence * particle.surface_score * (covariance_aspect - 1.0))
+            // Covariance already measures exposure. Multiplying it by the
+            // noisy density surface score left alternating round/flat splats.
+            (1.0 + anisotropy_confidence * 0.75 * (covariance_aspect - 1.0))
                 .clamp(1.0, authored_cap)
         };
         let render_center = particle
             .position
-            .lerp(mean, self.tuning.render_center_smoothing);
+            .lerp(local_mean / local_weight.max(1.0e-6), self.tuning.render_center_smoothing);
         (render_center, axis, aspect)
     }
 
