@@ -327,9 +327,8 @@ impl ProceduralBody {
             (Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
                 / frame.scale.max(Vec2::splat(0.01))
                 - Vec2::new(0.0, -0.1))
-            // Feeding may lower the face, never pull the mouth sideways or
-            // above the eyes to chase an airborne crumb.
-            .clamp(Vec2::new(0.0, -1.8), Vec2::ZERO)
+            // This is a whole-face goal, never an independent mouth target.
+            .clamp(Vec2::new(-0.22, -1.8), Vec2::new(0.22, 0.30))
         });
         let alpha = 1.0 - (-12.0 * dt.max(0.0)).exp();
         self.feeding_mouth_offset = self.feeding_mouth_offset.lerp(target, alpha);
@@ -349,6 +348,12 @@ impl ProceduralBody {
         let desired = frame.origin - frame.axis_y * 0.1 * frame.scale.y
             + frame.axis_x * self.feeding_mouth_offset.x * frame.scale.x
             + frame.axis_y * self.feeding_mouth_offset.y * frame.scale.y;
+        let residual = desired - base;
+        let residual = Vec2::new(residual.dot(frame.axis_x), residual.dot(frame.axis_y))
+            / frame.scale.max(Vec2::splat(0.01));
+        let residual = residual.clamp(Vec2::new(-0.025, -0.045), Vec2::new(0.025, 0.025));
+        let desired = base + frame.axis_x * residual.x * frame.scale.x
+            + frame.axis_y * residual.y * frame.scale.y;
         let mouth = liquid::contain_mouth_origin(
             &liquid.particles[..liquid.particle_count],
             self.tuning.pbf.iso_threshold,
@@ -737,7 +742,7 @@ impl ProceduralBody {
         // Feeding carries eyes, brows and mouth down together. The same full-face
         // density footprint keeps the eyes within the liquid; the mouth may reach
         // a little farther to make actual food contact.
-        let feeding = self.feeding_mouth_offset * 0.68;
+        let feeding = self.feeding_mouth_offset;
         let desired = frame.origin
             + frame.axis_x * feeding.x * frame.scale.x
             + frame.axis_y * feeding.y * frame.scale.y;
@@ -745,34 +750,37 @@ impl ProceduralBody {
         // Ignore small target ripples relative to the advected liquid mass.
         // Continuous deadband avoids a hold-then-jump threshold.
         let relative = desired - previous;
+        let deadband = 0.045 * (1.0 - 0.85 * self.feeding_mouth_activity);
         let desired = previous
-            + relative * ((relative.length() - 0.045).max(0.0) / relative.length().max(0.0001));
+            + relative * ((relative.length() - deadband).max(0.0) / relative.length().max(0.0001));
+        // Eyes stay inside the body while the lower lip can meet its boundary.
+        let feeding_lift = frame.axis_y * frame.scale.y * 0.065 * self.feeding_mouth_activity;
         let target = liquid::contain_face_origin(
             particles,
             self.tuning.pbf.iso_threshold,
-            previous,
-            desired,
+            previous + feeding_lift,
+            desired + feeding_lift,
             frame.axis_x,
             frame.axis_y,
             frame.scale,
-        );
+        ) - feeding_lift;
         let smooth = self.contained_face.advance(target, dt);
         // The target has a larger interior margin than the emergency boundary.
         // Ordinary contour ripples therefore do not repeatedly clamp the spring.
         let supported = liquid::contain_face_origin(
             particles,
             self.tuning.pbf.iso_threshold * 0.85,
-            previous,
-            smooth,
+            previous + feeding_lift,
+            smooth + feeding_lift,
             frame.axis_x,
             frame.axis_y,
             frame.scale,
-        );
+        ) - feeding_lift;
         if supported.distance_squared(smooth) > 0.000001 {
             self.contained_face.velocity = Vec2::ZERO;
         }
         self.contained_face.origin =
-            Some(previous + (supported - previous).clamp_length_max(0.65 * dt.clamp(0.0, 0.05)));
+            Some(previous + (supported - previous).clamp_length_max((0.65 + 0.75 * self.feeding_mouth_activity) * dt.clamp(0.0, 0.05)));
     }
 
     #[must_use]
@@ -1527,7 +1535,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feeding_target_cannot_pull_mouth_above_or_beside_face() {
+    fn feeding_target_moves_face_without_detaching_mouth() {
         let genome = Genome::from_seed(42);
         for target in [Vec2::new(120.0, -100.0), Vec2::new(-120.0, -100.0)] {
             let mut body = ProceduralBody::generate(&genome).unwrap();
@@ -1536,8 +1544,9 @@ mod tests {
                 body.set_feeding_mouth(Some(target), 1080.0, 1.0 / 120.0);
                 body.presentation_update(1.0 / 120.0);
             }
-            assert_eq!(body.feeding_mouth_offset, Vec2::ZERO);
-            assert_eq!(body.feeding_mouth_render_offset(), Vec2::ZERO);
+            let offset = body.feeding_mouth_render_offset();
+            assert!(offset.x.abs() <= 0.026);
+            assert!((-0.046..=0.026).contains(&offset.y));
         }
     }
 
@@ -1568,6 +1577,7 @@ mod tests {
             "tip={tip:?}, support={support:?}"
         );
         assert!(after.feeding_mouth_offset.y < 0.0);
+        assert!(after.feeding_mouth_offset.length() < 0.055, "mouth must stay close to face: {:?}", after.feeding_mouth_offset);
         for _ in 0..360 {
             body.set_feeding_mouth(None, 1080.0, 1.0 / 120.0);
             body.presentation_update(1.0 / 120.0);

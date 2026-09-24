@@ -165,6 +165,13 @@ fn desktop_distance(left: Vec2, right: Vec2, desktop_aspect: f32) -> f32 {
     .length()
 }
 
+fn food_intercept_position(position: Vec2, velocity: Vec2, aspect: f32, distance_px: f32, height: f32, speed: f32, floor: f32) -> Vec2 {
+    let lead = (distance_px / (height.max(1.0) * speed.max(0.1))).clamp(0.04, 0.32);
+    let predicted = position + Vec2::new(velocity.x / aspect.max(0.25), velocity.y) * lead
+        + Vec2::Y * (0.5 * pet_ecology::ORB_SCREEN_GRAVITY * lead * lead);
+    Vec2::new(predicted.x.clamp(0.0, 1.0), predicted.y.min(floor))
+}
+
 fn den_orb_rest_position(anchor: Vec2, scale: f32, viewport: [u32; 2], radius: f32) -> Vec2 {
     let height = viewport[1].max(1) as f32;
     let seat = pet_body::birth_scene::den_seat_depth_pixels(viewport, scale) / height;
@@ -564,7 +571,9 @@ impl EcologyRuntime {
         } else {
             // Intercept airborne food with the face, not by sending the mouth
             // to an arbitrary point on the body's silhouette.
-            food.position - body.feeding_mouth_tip_pixels(height) / scale
+            let predicted = food_intercept_position(food.position, food.velocity, self.desktop_aspect,
+                relative.length(), height, 0.45 + 0.50 * self.state.metabolism.feeding_appetite(), self.food_floor(food) - radius / height);
+            predicted - body.feeding_mouth_tip_pixels(height) / scale
         };
         let mouth_contact =
             (body.feeding_mouth_tip_pixels(height) - relative).length() <= radius + 3.0;
@@ -589,12 +598,11 @@ impl EcologyRuntime {
             body_surface_position: center + support / scale,
             ..PhysicalGrabFrame::default()
         });
-        // Lower-face reach is only for food resting on a surface. Falling
-        // crumbs move the pet's navigation target; the mouth stays with its face.
-        (settled && (relative - support).length() < 120.0).then_some(Vec2::new(
-            body.feeding_mouth_rest_pixels(height).x,
-            relative.y,
-        ))
+        // Close food attracts the whole face. The renderer bounds the small
+        // residual lip stretch relative to that shared face, including in flight.
+        ((relative - support).length() < 120.0).then_some(if settled {
+            Vec2::new(body.feeding_mouth_rest_pixels(height).x, relative.y)
+        } else { relative })
     }
 
     pub fn fixed_update(
@@ -1797,6 +1805,17 @@ impl EcologyRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn falling_food_interception_leads_velocity_and_stops_at_support() {
+        let p = Vec2::new(0.5, 0.3);
+        let right = food_intercept_position(p, Vec2::new(0.4, 0.5), 2.0, 180.0, 1080.0, 0.8, 0.9);
+        let left = food_intercept_position(p, Vec2::new(-0.4, 0.5), 2.0, 180.0, 1080.0, 0.8, 0.9);
+        assert!(right.x > p.x && left.x < p.x);
+        assert!(right.y > p.y && right.y < 0.9);
+        let near_floor = food_intercept_position(Vec2::new(0.5,0.85), Vec2::new(0.0,2.0), 2.0, 300.0,1080.0,0.5,0.9);
+        assert_eq!(near_floor.y, 0.9);
+    }
 
     #[test]
     fn startup_orb_is_seated_without_recreating_its_identity() {

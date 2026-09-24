@@ -2090,6 +2090,11 @@ fn drive_episode(
             } else {
                 LocomotionMode::Hover
             };
+            if active.phase == EpisodePhase::Approach {
+                let target = frame.food_physical.map_or(morsel_position, |f| f.socket_position);
+                let proximity = (1.0 - desktop_distance(frame.pet_position, target, frame.desktop_aspect) / 0.12).clamp(0.0, 1.0);
+                output.body_intent.expression.mouth_open = proximity * (0.18 + 0.62 * state.metabolism.feeding_appetite());
+            }
             output.visual_context.active_target = Some(morsel_position);
         }
         EpisodeGoal::EatMorsel => {

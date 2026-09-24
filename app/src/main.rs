@@ -3969,7 +3969,7 @@ impl PetApplication {
                 output.body_intent.target_position =
                     physical_to_virtual_normalized(&runtime.topology, center);
                 output.body_intent.locomotion = LocomotionMode::Arrive;
-                output.body_intent.desired_speed = if contact { 0.12 } else { 0.85 };
+                output.body_intent.desired_speed = if contact { 0.12 } else { 0.45 + 0.50 * runtime.ecology.state().metabolism.feeding_appetite() };
             }
             runtime.nervous_system.commit_intent(
                 &mut runtime.life,
