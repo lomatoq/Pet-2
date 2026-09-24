@@ -331,6 +331,7 @@ pub struct LiquidMorphRuntime {
     /// Shared kernel-to-wall clearance, calibrated once per physical contact.
     support_plane_clearance: Option<(u64, f32)>,
     contact_plane: Option<SupportPlane>,
+    support_well_offset: Vec2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -469,6 +470,7 @@ impl LiquidMorphRuntime {
             object_contact_impulse: 0.0,
             support_plane_clearance: None,
             contact_plane: None,
+            support_well_offset: Vec2::ZERO,
         };
         runtime.snap_render_proxies();
         runtime
@@ -855,6 +857,17 @@ impl LiquidMorphRuntime {
             self.measured_support_plane(motion, feedback.world_position, measured_load.is_some(), dt);
         self.contact_plane = support_plane.filter(|_| !self.material_grab.is_active());
         let field_scale = self.tuning.character_field_radius_scale;
+        // The root is a stable desktop reference, not the center of a seated
+        // puddle. Keeping the well at that old height suspends a rounded upper
+        // lobe above the contact skirt. Let the force field settle with support;
+        // particle positions and volume are still owned by the liquid solver.
+        let support_offset = self.contact_plane.map_or(Vec2::ZERO, |plane| {
+            let resting_depth = 0.43 * field_scale / self.flight_field_aspect.sqrt() * 0.55;
+            let current_depth = (self.body_origin - plane.point).dot(plane.normal);
+            plane.normal * (plane.clearance + resting_depth - current_depth).min(0.0)
+        });
+        self.support_well_offset += (support_offset - self.support_well_offset)
+            * (1.0 - (-6.0 * dt).exp());
         if self.launch_preparation.1 > 0.0 {
             motor_field::apply_posture_field(
                 &mut self.particles,
@@ -872,7 +885,7 @@ impl LiquidMorphRuntime {
         apply_character_field(
             &mut self.particles,
             self.particle_count,
-            self.body_origin,
+            self.body_origin + self.support_well_offset,
             motion.acceleration,
             CharacterFieldParameters {
                 radii: Vec2::new(0.35, 0.43) * field_scale,

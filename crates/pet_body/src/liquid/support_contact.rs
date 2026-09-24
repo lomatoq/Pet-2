@@ -1,4 +1,4 @@
-//! No-slip boundary layer of the loaded liquid; the free surface stays dynamic.
+//! Dissipative boundary layer of the loaded liquid; the free surface stays dynamic.
 use super::{
     particles::{LiquidParticle, MAX_LIQUID_PARTICLES},
     xpbd::SupportPlane,
@@ -32,7 +32,9 @@ pub(super) fn settle_contact_layer(
             // tiny pressure/breath impulse as a new upward surface wave.
             let slip = (p.predicted_position - p.position).dot(tangent);
             p.predicted_position -= n * new_gap;
-            p.predicted_position -= tangent * slip * (1.0 - (-90.0 * dt).exp());
+            // Dissipate sliding without pinning x: pressure must still spread
+            // the footprint as the upper volume settles onto the wall.
+            p.predicted_position -= tangent * slip * (1.0 - (-8.0 * dt).exp());
         }
     }
 }
@@ -60,7 +62,7 @@ mod tests {
         settle_contact_layer(&mut particles, 3, 0, Some(plane), 1.0 / 120.0);
         assert!((particles[0].predicted_position.y - 0.1).abs() < 1e-6);
         assert!(
-            particles[0].predicted_position.x > 0.0 && particles[0].predicted_position.x < 0.008
+            particles[0].predicted_position.x > 0.007 && particles[0].predicted_position.x < 0.008
         );
         assert_eq!(particles[1].predicted_position, bulk);
         assert_eq!(particles[2].predicted_position, detached);

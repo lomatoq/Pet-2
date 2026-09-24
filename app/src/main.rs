@@ -9487,7 +9487,9 @@ mod tests {
         let span = Vec2::new(3840.0, height);
         body.simulation.set_motion_space_pixels(span);
         body.set_desktop_motion_space(span, height);
-        let foot = body.main_liquid_contact_bounds_pixels(height).maximum.y;
+        let initial_hull = body.main_liquid_contact_bounds_pixels(height);
+        let initial_span = initial_hull.maximum - initial_hull.minimum;
+        let foot = initial_hull.maximum.y;
         let mut center = Vec2::new(1000.0, height - foot);
         let start_y = center.y;
         body.simulation.feedback.world_position = physical_to_virtual_normalized(&topology, center);
@@ -9531,6 +9533,15 @@ mod tests {
                 &mut center, &mut velocity, &mut extent, &mut contact, 1.0 / 120.0);
             body.embodied_update(&intent, &sensors, Default::default(), Default::default(), Default::default(), 1.0 / 120.0);
             body.presentation_update(1.0 / 120.0);
+            if tick == 360 {
+                let settled = body.main_liquid_contact_bounds_pixels(height);
+                let span = settled.maximum - settled.minimum;
+                assert!(span.x > initial_span.x * 1.40,
+                    "supported bulk remains narrow: {initial_span:?} -> {span:?}");
+                assert!(span.y < initial_span.y * 0.62,
+                    "upper lobe does not settle with the liquid: {initial_span:?} -> {span:?}");
+                assert_eq!(settled.particle_count, initial_hull.particle_count);
+            }
             if tick >= 720 && tick % 12 == 0 {
                 for (i, x) in [-40.0, -20.0, 0.0, 20.0, 40.0].iter().enumerate() {
                     let p = Vec2::new(*x, height - center.y + 10.0);
