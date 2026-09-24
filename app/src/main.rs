@@ -9501,20 +9501,48 @@ mod tests {
             target_contact_fraction: 0.30, normal_compliance: 0.3, tangent_friction: 0.7,
             adhesion: 0.0, load_fraction: 0.30, break_force: 0.75, release_half_life: 0.2,
         });
-        body.set_somatic_actuation(packet);
+        packet.fields[0] = Some(pet_motor::LocalSomaticField {
+            kind: pet_motor::SomaticFieldKind::Flatten,
+            space: pet_motor::FieldSpace::SurfaceTangentNormal,
+            center: Vec2::Y * 0.24, axis: Vec2::Y, radius: 0.68,
+            strength: 0.34, falloff: 2.0, frequency_hz: 0.0,
+            phase_01: 1.0, target_component: None,
+        });
+        packet.fields[1] = Some(pet_motor::LocalSomaticField {
+            kind: pet_motor::SomaticFieldKind::Wave,
+            space: pet_motor::FieldSpace::SurfaceTangentNormal,
+            center: Vec2::ZERO, axis: Vec2::X, radius: 0.54,
+            strength: 0.10, falloff: 2.0, frequency_hz: 0.7,
+            phase_01: 0.0, target_component: None,
+        });
         let mut intent = BodyIntent { locomotion: LocomotionMode::Sleep,
             target_position: body.simulation.feedback.world_position,
             target_surface: None, desired_speed: 0.0, facing_direction: 1.0,
             gaze_target: None, pose: PoseIntent::Neutral, expression: Default::default(), interaction_target: None };
         let sensors = SensorFrame::default();
-        for _ in 0..720 {
+        let mut contact_min = [f32::INFINITY; 5];
+        let mut contact_max = [f32::NEG_INFINITY; 5];
+        for tick in 0..1200 {
+            packet.fields[1].as_mut().unwrap().phase_01 = (tick as f32 / 120.0 * 0.7).fract();
+            body.set_somatic_actuation(packet.clone());
             intent.target_position = body.simulation.feedback.world_position;
             body.fixed_update(&genome, &intent, &sensors, 1.0 / 120.0);
             apply_screen_domain(&mut body, &topology, size, true, true,
                 &mut center, &mut velocity, &mut extent, &mut contact, 1.0 / 120.0);
             body.embodied_update(&intent, &sensors, Default::default(), Default::default(), Default::default(), 1.0 / 120.0);
             body.presentation_update(1.0 / 120.0);
+            if tick >= 720 && tick % 12 == 0 {
+                for (i, x) in [-40.0, -20.0, 0.0, 20.0, 40.0].iter().enumerate() {
+                    let p = Vec2::new(*x, height - center.y + 10.0);
+                    let hit = body.liquid_physical_circle_contact_pixels(p, p, 24.0, height).unwrap();
+                    contact_min[i] = contact_min[i].min(hit.body_point.y);
+                    contact_max[i] = contact_max[i].max(hit.body_point.y);
+                }
+            }
         }
+        let jitter = (0..5).map(|i| contact_max[i] - contact_min[i]).fold(0.0_f32, f32::max);
+        eprintln!("contact temporal range: {jitter}px, min={contact_min:?}, max={contact_max:?}");
+        assert!(jitter < 0.05, "resting contact keeps boiling: {jitter}px");
         let hull = body.main_liquid_contact_bounds_pixels(height);
         let floor = height - center.y;
         let half_patch = (hull.maximum.x - hull.minimum.x) * 0.20;

@@ -5,6 +5,7 @@ mod collisions;
 mod component_lifecycle;
 mod components;
 mod contact_surface;
+mod support_contact;
 pub use contact_surface::{
     SmoothFaceOrigin, contact_surface_bounds, contact_surface_circle, contact_surface_min_y,
     contact_surface_support, contain_face_origin,
@@ -329,6 +330,7 @@ pub struct LiquidMorphRuntime {
     object_contact_impulse: f32,
     /// Shared kernel-to-wall clearance, calibrated once per physical contact.
     support_plane_clearance: Option<(u64, f32)>,
+    contact_plane: Option<SupportPlane>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -466,6 +468,7 @@ impl LiquidMorphRuntime {
             object_load: 0.0,
             object_contact_impulse: 0.0,
             support_plane_clearance: None,
+            contact_plane: None,
         };
         runtime.snap_render_proxies();
         runtime
@@ -850,6 +853,7 @@ impl LiquidMorphRuntime {
         self.update_field_shape(motion, dt, measured_load);
         let support_plane =
             self.measured_support_plane(motion, feedback.world_position, measured_load.is_some(), dt);
+        self.contact_plane = support_plane.filter(|_| !self.material_grab.is_active());
         let field_scale = self.tuning.character_field_radius_scale;
         if self.launch_preparation.1 > 0.0 {
             motor_field::apply_posture_field(
@@ -1188,6 +1192,10 @@ impl LiquidMorphRuntime {
 
         // Bond/topology corrections may follow the density pass; the wall
         // remains authoritative after those writers and before velocity commit.
+        support_contact::settle_contact_layer(
+            &mut self.particles, self.particle_count, self.components.main_component,
+            self.contact_plane, dt,
+        );
         xpbd::project_support_plane(&mut self.particles, self.particle_count, support_plane);
         xpbd::project_cradle(&mut self.particles, self.particle_count, cradle);
 
@@ -2952,6 +2960,15 @@ impl LiquidMorphRuntime {
 
     fn anisotropy_target(&self, index: usize) -> (Vec2, Vec2, f32) {
         let particle = self.particles[index];
+        if let Some(plane) = self.contact_plane
+            && particle.component_id == self.components.main_component
+            && (particle.position - plane.point).dot(plane.normal) - plane.clearance <= 0.012
+        {
+            // The solid boundary supplies the reconstruction frame here.
+            // Neighbour covariance from breathing gel must not rotate/resize
+            // splats underneath a physically stationary contact row.
+            return (particle.position, plane.normal.perp(), 1.5_f32.min(self.tuning.anisotropy_max));
+        }
         let kernel_radius = KERNEL_RADIUS * self.tuning.kernel_radius_scale;
         // Yu-Turk reconstruction needs a wider, weighted neighbourhood than the
         // physical density solve. Sparse samples are explicitly isotropic below;
