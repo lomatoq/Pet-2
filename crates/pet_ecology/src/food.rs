@@ -297,6 +297,15 @@ pub fn evaluate_food_utility(
     }
 }
 
+/// One appetite/taste decision shared by contact capture and episode selection.
+pub fn accepts_morsel(metabolism: &MetabolicState, taste: &TasteProfile,
+    morsel: &MorselProfile, threat: f32, crumb: bool) -> bool {
+    let utility = evaluate_food_utility(metabolism, taste, morsel, threat).total;
+    metabolism.satiation < 0.88 && (if crumb {
+        metabolism.feeding_appetite() * 0.8 + utility * 0.2 > 0.10
+    } else { utility >= 0.08 })
+}
+
 fn bounded_lerp(current: f32, target: f32, amount: f32) -> f32 {
     (current + (target - current) * amount.clamp(0.0, 1.0)).clamp(-1.0, 1.0)
 }
@@ -493,7 +502,7 @@ mod feeding_tests {
 }
 
 /// Contact-to-swallow time: hungry bites are quicker, never instantaneous.
-pub fn ingestion_seconds(appetite: f32) -> f32 { 0.30 + (1.0 - appetite.clamp(0.0, 1.0)) * 0.32 }
+pub fn ingestion_seconds(appetite: f32) -> f32 { 0.12 + (1.0 - appetite.clamp(0.0, 1.0)) * 0.18 }
 pub fn ingestion_progress(elapsed: f32, appetite: f32) -> f32 {
     let t = (elapsed / ingestion_seconds(appetite)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)

@@ -20,6 +20,14 @@ use pet_ecology::{
 };
 use pet_motor::MotorWorldEvent;
 
+fn food_touches_mouth(body: &ProceduralBody, food: Vec2, radius: f32, height: f32) -> bool {
+    let center = body.feeding_mouth_rest_pixels(height);
+    let lip = body.feeding_mouth_tip_pixels(height);
+    let axis = lip - center;
+    let t = ((food - center).dot(axis) / axis.length_squared().max(1e-6)).clamp(0.0, 1.0);
+    food.distance(center + axis * t) <= radius + 3.0
+}
+
 /// Application integration boundary for the portable habitat. Native input,
 /// rendering and body physics stay in their existing owners.
 pub struct EcologyRuntime {
@@ -586,6 +594,17 @@ impl EcologyRuntime {
     }
 
     pub fn update_food_contact(&mut self, body: &ProceduralBody, height: f32) -> Option<Vec2> {
+        let mouth_scale = Vec2::new(height * self.desktop_aspect, height);
+        let center = body.simulation.feedback.world_position;
+        let touched = self.state.objects.iter().filter(|food|
+            food.kind == ObjectKind::Morsel && food.preference >= -0.01
+                && matches!(food.lifecycle, ObjectLifecycle::Free | ObjectLifecycle::Sleeping))
+            .filter(|food| food_touches_mouth(body, (food.position - center) * mouth_scale,
+                food.radius_px_at_reference * height / REFERENCE_DESKTOP_HEIGHT_PX, height))
+            .min_by(|a,b| ((a.position-center)*mouth_scale).distance_squared(body.feeding_mouth_rest_pixels(height))
+                .total_cmp(&((b.position-center)*mouth_scale).distance_squared(body.feeding_mouth_rest_pixels(height))))
+            .map(|food| food.id);
+        if let Some(id) = touched { self.director.observe_mouth_contact(&mut self.state, id); }
         let active = self.director.active_episode().filter(|e| {
             matches!(e.goal, EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel)
         });
@@ -670,10 +689,10 @@ impl EcologyRuntime {
                 relative.length(), height, 0.45 + 0.50 * self.state.metabolism.feeding_appetite(), self.food_floor(food) - radius / height);
             predicted - body.feeding_mouth_tip_pixels(height) / scale
         };
-        let mouth_contact =
-            (body.feeding_mouth_tip_pixels(height) - relative).length() <= radius + 3.0;
-        let touching = (!settled || self.food_grounded)
-            && ((hit.is_some() && mouth_contact) || self.food_caught == Some(food.id));
+        let mouth_contact = food_touches_mouth(body, relative, radius, height);
+        // The rendered mouth is authoritative even inside the liquid contour.
+        // A separate grounded/skin veto can leave a visible bite uneaten.
+        let touching = mouth_contact || self.food_caught == Some(food.id);
         let id = food.id;
         self.food_mouth_position = center + body.feeding_mouth_rest_pixels(height) / scale;
         if touching {
@@ -683,7 +702,10 @@ impl EcologyRuntime {
         } else {
             self.food_ingress_origin = None;
         }
-        let catch = touching && (!settled || eating) && food.lifecycle != ObjectLifecycle::GrabbedByUser;
+        let willing = eating || food.morsel_profile.as_ref().is_some_and(|profile|
+            pet_ecology::accepts_morsel(&self.state.metabolism, &self.state.taste,
+                profile, 0.0, food.radius_px_at_reference <= 3.0));
+        let catch = touching && willing && food.lifecycle != ObjectLifecycle::GrabbedByUser;
         if catch {
             self.food_caught = Some(id);
             if let Some(food) = self.state.objects.iter_mut().find(|o| o.id == id) {
@@ -2987,4 +3009,37 @@ mod tests {
         runtime.fixed_update(16.0 / 9.0, &windows, &body, 1.0 / 120.0);
         assert_eq!(runtime.take_den_event(), Some(MotorWorldEvent::OrbStored));
     }
+    #[test]
+    fn food_contact_covers_mouth_center_and_lip_but_not_the_cheek() {
+        let height = 1080.0;
+        let genome = lifecore::Genome::from_seed(5784121873664838231);
+        let body = ProceduralBody::generate(&genome).unwrap();
+        let center = body.feeding_mouth_rest_pixels(height);
+        let lip = body.feeding_mouth_tip_pixels(height);
+        assert!(food_touches_mouth(&body, center, 2.5, height));
+        assert!(food_touches_mouth(&body, lip, 2.5, height));
+        assert!(!food_touches_mouth(&body, center + Vec2::X * 30.0, 2.5, height));
+        for (satiation, held) in [(0.1, false), (0.96, false), (0.1, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut runtime = EcologyRuntime::load_or_create(&StateStore::at(directory.path()), 42, true).unwrap();
+            runtime.desktop_aspect = 16.0 / 9.0;
+            runtime.state.metabolism.satiation = satiation;
+            let position = body.simulation.feedback.world_position
+                + center / Vec2::new(height * runtime.desktop_aspect, height);
+            runtime.sprinkle_food(position, 1.0);
+            let id = runtime.state.objects.iter().find(|o| o.kind == ObjectKind::Morsel).unwrap().id;
+            runtime.state.objects.retain(|o| o.kind != ObjectKind::Morsel || o.id == id);
+            let food = runtime.state.objects.iter_mut().find(|o| o.id == id).unwrap();
+            food.position = position;
+            food.lifecycle = if held { ObjectLifecycle::GrabbedByUser } else { ObjectLifecycle::Free };
+            runtime.update_food_contact(&body, height);
+            if held { assert!(runtime.director.active_episode().is_none()); }
+            else {
+                assert!(runtime.food_physical.unwrap().contact);
+                assert_eq!(runtime.food_caught, if satiation < 0.5 { Some(id) } else { None });
+            }
+        }
+
+    }
+
 }

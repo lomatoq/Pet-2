@@ -378,6 +378,43 @@ impl Default for EpisodeDirector {
 }
 
 impl EpisodeDirector {
+    /// A measured bite can select the crumb actually at the lips, even when
+    /// attention was aimed at a different crumb. Never restart chewing/refusal.
+    pub fn observe_mouth_contact(&mut self, state: &mut EcologyState, object_id: ObjectId) {
+        if self.active.is_some_and(|a| matches!(a.goal,
+            EpisodeGoal::EscapePressure | EpisodeGoal::RecoverAfterPressure |
+            EpisodeGoal::SleepInDen | EpisodeGoal::RefuseMorsel)
+            || (a.goal == EpisodeGoal::EatMorsel && (a.phase == EpisodePhase::Recover
+                || a.object_id == Some(object_id)
+                || state.objects.iter().any(|o| Some(o.id) == a.object_id
+                    && o.lifecycle == ObjectLifecycle::CarriedByPet)))) { return; }
+        let Some(food) = state.objects.iter().find(|o| o.id == object_id
+            && o.kind == ObjectKind::Morsel && o.morsel_profile.is_some()
+            && matches!(o.lifecycle, ObjectLifecycle::Free | ObjectLifecycle::Sleeping)) else { return; };
+        let target = food.position;
+        if let Some(active) = &mut self.active
+            && active.goal == EpisodeGoal::InspectMorsel && active.object_id == Some(object_id) {
+            set_phase(active, EpisodePhase::Evaluate);
+            return;
+        }
+        if let Some(interrupted) = self.active.take() {
+            state.episode_stats.aborted[interrupted.goal.index()] += 1;
+        }
+        let goal = EpisodeGoal::InspectMorsel;
+        let id = state.episode_stats.next_episode_id;
+        state.episode_stats.next_episode_id = id.saturating_add(1).max(1);
+        state.episode_stats.started[goal.index()] += 1;
+        self.active = Some(ActivityEpisode {
+            feeding_bite: crate::FeedingBite::default(), id, goal,
+            phase: EpisodePhase::Evaluate, object_id: Some(object_id),
+            target_position: Some(target), reason_code: EpisodeReason::FoodOpportunity,
+            elapsed_seconds: 0.0, phase_elapsed_seconds: 0.0,
+            commitment_remaining: commitment_for(goal), attempts: 0,
+            prediction_confidence: 1.0, bout_play_drive: 0.0, bout_fatigue: 0.0,
+            contact_side: 0.0, expected_outcome: expected_outcome_for(goal),
+        });
+    }
+
     /// Measured latch result, never a Store command acknowledgement. Repeated
     /// event identities cannot reinforce a preference multiple times.
     pub fn observe_placement_result(
@@ -2020,6 +2057,10 @@ fn drive_episode(
             };
             output.body_intent.gaze_target = Some(morsel_position);
             output.body_intent.pose = PoseIntent::Curious;
+            // Mouth contact is already a taste observation: no inspection wait.
+            if frame.food_physical.is_some_and(|contact| contact.contact) {
+                set_phase(active, EpisodePhase::Evaluate);
+            }
             match active.phase {
                 EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.24 => {
                     set_phase(active, EpisodePhase::Approach);
@@ -2053,11 +2094,11 @@ fn drive_episode(
                         .object_id
                         .and_then(|id| state.objects.iter().find(|o| o.id == id))
                         .is_some_and(|o| o.radius_px_at_reference <= 3.0);
-                    let next_goal = if state.metabolism.satiation < 0.88
-                        && (offered_crumb || utility.total >= 0.08)
+                    let next_goal = if crate::accepts_morsel(&state.metabolism,
+                        &state.taste, &profile, frame.window_pressure, offered_crumb)
                     {
                         EpisodeGoal::EatMorsel
-                    } else if utility.total <= -0.10 {
+                    } else if offered_crumb || utility.total <= -0.10 {
                         EpisodeGoal::RefuseMorsel
                     } else {
                         EpisodeGoal::StoreMorsel
@@ -2202,30 +2243,45 @@ fn drive_episode(
             return EpisodeStep::Continue;
         }
         EpisodeGoal::RefuseMorsel => {
-            let Some(morsel) = active
-                .object_id
-                .and_then(|id| state.objects.iter_mut().find(|object| object.id == id))
-            else {
+            let Some(morsel) = active.object_id.and_then(|id|
+                state.objects.iter_mut().find(|object| object.id == id)) else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
-            morsel.preference = (morsel.preference - 0.18).clamp(-1.0, 1.0);
-            morsel.novelty = (morsel.novelty - 0.12).clamp(0.0, 1.0);
-            morsel.last_interaction_seconds = frame.timestamp.max(0.0);
-            let away = (morsel.position - frame.pet_position)
-                .normalize_or_zero()
-                .lerp(Vec2::new(0.12, -0.08), 0.25)
-                .normalize_or_zero();
-            push_command(
-                output,
-                ObjectCommand::ApplyImpulse {
+            if morsel.lifecycle == ObjectLifecycle::GrabbedByUser {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            }
+            let refusal = (1.0 - state.metabolism.feeding_appetite()).clamp(0.0, 1.0);
+            // Push along the support, not down through a floor crumb.
+            let side = if (morsel.position.x - frame.pet_position.x).abs() > 0.001 {
+                (morsel.position.x - frame.pet_position.x).signum()
+            } else if active.id.is_multiple_of(2) { 1.0 } else { -1.0 };
+            if active.attempts == 0 {
+                morsel.preference = (morsel.preference - 0.18).clamp(-1.0, 1.0);
+                morsel.novelty = (morsel.novelty - 0.12).clamp(0.0, 1.0);
+                morsel.last_interaction_seconds = frame.timestamp.max(0.0);
+                push_command(output, ObjectCommand::ApplyImpulse {
                     object_id: morsel.id,
-                    impulse: away * 0.055,
-                },
-            );
+                    impulse: Vec2::new(side * (0.08 + 0.07 * refusal) / frame.desktop_aspect.max(0.1), -0.035)
+                        * morsel.mass.max(0.05),
+                });
+                output.vocal_trigger = Some(EcologyVocalTrigger::FoodRefused);
+                active.attempts = 1;
+            }
+            let ease = 1.0 - (-active.phase_elapsed_seconds * 8.0).exp();
+            output.body_intent.target_position = frame.pet_position;
+            output.body_intent.desired_speed = 0.0;
+            output.body_intent.locomotion = LocomotionMode::Hover;
             output.body_intent.pose = PoseIntent::Neutral;
-            output.body_intent.gaze_target = Some(frame.cursor_position);
-            output.vocal_trigger = Some(EcologyVocalTrigger::FoodRefused);
-            return EpisodeStep::Complete;
+            output.body_intent.gaze_target = Some((frame.pet_position
+                + Vec2::new(-side * 0.045 / frame.desktop_aspect.max(0.1), -0.035) * ease)
+                .clamp(Vec2::ZERO, Vec2::ONE));
+            output.body_intent.expression.mouth_open = 0.0;
+            output.body_intent.expression.mouth_compression = 0.25 + 0.35 * refusal;
+            output.body_intent.expression.mouth_curve = -0.06 - 0.12 * refusal;
+            output.body_intent.expression.squint = (0.12 + 0.22 * refusal) * ease;
+            return if active.phase_elapsed_seconds >= 0.55 + 0.40 * refusal {
+                EpisodeStep::Complete
+            } else { EpisodeStep::Continue };
         }
         EpisodeGoal::StoreMorsel => {
             let Some(morsel_id) = active.object_id else {
@@ -3794,4 +3850,43 @@ mod tests {
         assert_eq!(output.vocal_trigger, Some(EcologyVocalTrigger::RhythmEcho));
         assert_eq!(output.body_intent.pose, PoseIntent::Display);
     }
+    #[test]
+    fn mouth_contact_starts_intake_without_inspection_and_satiety_has_a_visible_refusal() {
+        for satiation in [0.1, 0.96] {
+            let mut state = EcologyState::new(100);
+            state.metabolism.satiation = satiation;
+            let id = state.spawn_morsel(Vec2::splat(0.5), test_morsel(0.31), 1.0).unwrap();
+            state.objects.iter_mut().find(|o| o.id == id).unwrap().radius_px_at_reference = 2.5;
+            let mut frame = behavior_frame(ActionId::IdleHover);
+            frame.timestamp = 12.0;
+            frame.pet_position = Vec2::splat(0.5);
+            frame.food_physical = Some(PhysicalGrabFrame { contact: true,
+                socket_position: frame.pet_position, ..Default::default() });
+            let mut director = EpisodeDirector::default();
+            director.observe_mouth_contact(&mut state, id);
+            let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+            assert_eq!(output.debug.active_goal, Some(if satiation < 0.5 {
+                EpisodeGoal::EatMorsel } else { EpisodeGoal::RefuseMorsel }));
+            let mut consumed = 0;
+            let mut impulses = 0;
+            let mut visible_refusal_frames = 0;
+            for tick in 0..18 {
+                let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+                consumed += output.outcomes[..output.outcome_count].iter()
+                    .filter(|o| matches!(o, EcologyOutcome::MorselConsumed(_))).count();
+                impulses += output.object_commands[..output.object_command_count].iter()
+                    .filter(|c| matches!(c, ObjectCommand::ApplyImpulse { .. })).count();
+                if output.debug.active_goal == Some(EpisodeGoal::RefuseMorsel) {
+                    assert_eq!(output.body_intent.expression.mouth_open, 0.0);
+                    assert!(output.body_intent.expression.mouth_compression > 0.25);
+                    visible_refusal_frames += 1;
+                }
+                if satiation < 0.5 && tick == 5 { assert_eq!(consumed, 1, "mouth contact stalled intake"); }
+            }
+            if satiation < 0.5 { assert_eq!(consumed, 1); assert_eq!(impulses, 0); }
+            else { assert_eq!(consumed, 0); assert_eq!(impulses, 1);
+                assert!(visible_refusal_frames >= 8); assert_eq!(state.metabolism.satiation, satiation); }
+        }
+    }
+
 }
