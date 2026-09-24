@@ -15,12 +15,14 @@ pub const ORB_SCREEN_GRAVITY: f32 = 0.72;
 pub fn step_compliant_grip(
     object: &mut WorldObject,
     target: Vec2,
+    carrier_velocity: Vec2,
     strength: f32,
     config: ObjectPhysicsConfig,
     dt: f32,
 ) {
     if object.lifecycle != ObjectLifecycle::CarriedByPet
         || !target.is_finite()
+        || !carrier_velocity.is_finite()
         || !dt.is_finite()
         || dt <= 0.0
     {
@@ -42,8 +44,12 @@ pub fn step_compliant_grip(
     };
     let stiffness = omega * omega * 0.72;
     let damping = 1.35 * (stiffness * mass).sqrt();
+    // Preload supports most of the toy's weight while leaving mass-dependent
+    // sag. Without it, sag exceeds the shallow embedding depth and loses touch.
     let grip_force =
-        ((target - position) * stiffness - object.velocity * damping).clamp_length_max(4.32);
+        ((target - position) * stiffness - (object.velocity - carrier_velocity) * damping
+            - Vec2::Y * ORB_SCREEN_GRAVITY * mass * 0.6)
+            .clamp_length_max(4.32);
     let acceleration = (grip_force / mass + Vec2::Y * ORB_SCREEN_GRAVITY).clamp_length_max(6.0);
     object.velocity = (object.velocity + acceleration * dt).clamp_length_max(MAX_OBJECT_SPEED);
     position = (position + object.velocity * dt).clamp(minimum, maximum);
@@ -818,7 +824,7 @@ mod tests {
             orb.mass = 1.44;
             for _ in 0..hz * 4 {
                 let before = orb.position;
-                step_compliant_grip(&mut orb, target, 5.0, config, 1.0 / hz as f32);
+                step_compliant_grip(&mut orb, target, Vec2::ZERO, 5.0, config, 1.0 / hz as f32);
                 assert!(orb.position.is_finite() && orb.velocity.is_finite());
                 assert!((orb.position - before).length() < 0.03);
             }

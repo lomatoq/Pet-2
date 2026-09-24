@@ -974,7 +974,11 @@ fn select_episode(
         && orb.novelty > 0.04
     {
         return Some((
-            EpisodeGoal::SoloOrbPlay,
+            if orb.lifecycle == ObjectLifecycle::StoredInDen {
+                EpisodeGoal::RetrieveOrb
+            } else {
+                EpisodeGoal::SoloOrbPlay
+            },
             EpisodeReason::AutonomousPlay,
             Some(orb.id),
         ));
@@ -1024,7 +1028,11 @@ fn select_episode(
             Some(orb.id),
         )),
         ActionId::SelfPlay if orb.lifecycle != ObjectLifecycle::GrabbedByUser => Some((
-            EpisodeGoal::SoloOrbPlay,
+            if orb.lifecycle == ObjectLifecycle::StoredInDen {
+                EpisodeGoal::RetrieveOrb
+            } else {
+                EpisodeGoal::SoloOrbPlay
+            },
             EpisodeReason::AutonomousPlay,
             Some(orb.id),
         )),
@@ -1463,8 +1471,12 @@ fn drive_episode(
                 }
                 output.body_intent.target_position = frame.pet_position;
                 output.body_intent.desired_speed = 0.0;
-                output.body_intent.locomotion = LocomotionMode::Hover;
+                output.body_intent.locomotion = LocomotionMode::Arrive;
                 output.body_intent.interaction_target = Some(InteractionTarget::ProceduralOrb);
+                if active.phase == EpisodePhase::Manipulate {
+                    output.body_intent.target_position = active.target_position.unwrap_or(frame.pet_position);
+                    output.body_intent.desired_speed = 0.20 + active.bout_play_drive * 0.12;
+                }
                 let held = frame.orb_physical.contact
                     && desktop_distance(
                         orb.position,
@@ -1473,10 +1485,12 @@ fn drive_episode(
                     ) < 0.04
                     && (orb.velocity - frame.pet_velocity * Vec2::new(frame.desktop_aspect, 1.0))
                         .length()
-                        < 0.05;
+                        < 0.12;
                 if active.phase == EpisodePhase::Manipulate
                     && held
                     && active.phase_elapsed_seconds >= 0.18
+                    && (desktop_distance(output.body_intent.target_position, frame.pet_position,
+                        frame.desktop_aspect) < 0.025 || active.phase_elapsed_seconds >= 1.2)
                 {
                     active.target_position = Some(
                         frame
@@ -1537,12 +1551,21 @@ fn drive_episode(
             }
             if active.goal == EpisodeGoal::SoloOrbPlay
                 && active.attempts == 0
-                && frame.play_drive > 0.5
-                && active.id.is_multiple_of(4)
+                // A slow toy can be picked up; a fast one is batted/chased.
+                // Readiness comes from the bout's drive and fatigue rather
+                // than only one out of every four episode IDs.
+                && active.bout_play_drive * (1.0 - active.bout_fatigue * 0.6) > 0.5
+                && (orb.velocity - frame.pet_velocity * Vec2::new(frame.desktop_aspect, 1.0)).length() < 0.18
                 && frame.orb_physical.contact
                 && orb.lifecycle != ObjectLifecycle::GrabbedByUser
             {
                 set_phase(active, EpisodePhase::Manipulate);
+                let scale = Vec2::new(frame.desktop_aspect.clamp(0.25, 8.0), 1.0);
+                let direction = ((frame.cursor_position - frame.pet_position) * scale)
+                    .normalize_or(Vec2::NEG_Y);
+                active.target_position = Some((frame.pet_position
+                    + (direction * (0.07 + active.bout_play_drive * 0.05) - Vec2::Y * 0.025) / scale)
+                    .clamp(Vec2::splat(0.08), Vec2::splat(0.92)));
                 push_command(
                     output,
                     ObjectCommand::MoveToward {
@@ -1723,16 +1746,21 @@ fn drive_episode(
             let Some(orb_id) = active.object_id else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
-            let Some(orb_position) = state
+            let Some((orb_position, orb_lifecycle)) = state
                 .objects
                 .iter()
                 .find(|object| object.id == orb_id)
-                .map(|object| object.position)
+                .map(|object| (object.position, object.lifecycle))
             else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
-            output.body_intent.target_position = state.den.anchor;
-            output.body_intent.gaze_target = Some(state.den.anchor);
+            let target = if orb_lifecycle == ObjectLifecycle::CarriedByPet {
+                state.den.anchor
+            } else {
+                orb_position
+            };
+            output.body_intent.target_position = target;
+            output.body_intent.gaze_target = Some(target);
             output.body_intent.locomotion = LocomotionMode::Arrive;
             output.body_intent.pose = PoseIntent::Compact;
             output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.38);
@@ -1886,7 +1914,7 @@ fn drive_episode(
             output.body_intent.gaze_target = Some(orb_position);
             output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.34);
             if matches!(active.phase, EpisodePhase::Orient | EpisodePhase::Approach) {
-                output.body_intent.target_position = state.den.anchor;
+                output.body_intent.target_position = orb_position;
                 output.body_intent.locomotion = LocomotionMode::Arrive;
                 if frame.orb_physical.contact {
                     active.target_position = Some(den_exit_target(
@@ -1913,6 +1941,14 @@ fn drive_episode(
                 output.body_intent.target_position = target;
                 output.body_intent.gaze_target = Some(target);
                 output.body_intent.locomotion = LocomotionMode::Arrive;
+                // Lift clear of the bowl before travelling sideways. The orb
+                // obeys its walls even when held, so a diagonal exit can pin it.
+                if orb_position.y > state.den.anchor.y - 0.06
+                    && (orb_position.x - state.den.anchor.x).abs() * frame.desktop_aspect < 0.16
+                {
+                    output.body_intent.target_position = Vec2::new(
+                        frame.pet_position.x, (frame.pet_position.y - 0.14).max(0.08));
+                }
                 if orb_lifecycle == ObjectLifecycle::CarriedByPet || frame.orb_physical.contact {
                     push_command(
                         output,
@@ -3139,6 +3175,31 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_play_lifts_stored_orb_before_leaving_the_bowl() {
+        for autonomous in [false, true] {
+            let mut state = EcologyState::new(9101);
+            state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
+            state.objects[0].position = state.den.anchor;
+            let mut director = EpisodeDirector::default();
+            let mut frame = behavior_frame(ActionId::SelfPlay);
+            frame.autonomous_play_ready = autonomous;
+            frame.pet_position = state.den.anchor;
+            frame.orb_physical.contact = true;
+            frame.orb_physical.socket_position = state.objects[0].position;
+            let pickup = director.tick(&mut state, frame, representative_intent(), 0.05);
+            assert_eq!(pickup.debug.active_goal, Some(EpisodeGoal::RetrieveOrb));
+            assert!(pickup.object_commands[..pickup.object_command_count].iter()
+                .any(|c| matches!(c, ObjectCommand::MoveToward { .. })));
+            state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
+            let carry = director.tick(&mut state, frame, representative_intent(), 0.05);
+            assert!(carry.body_intent.target_position.y < frame.pet_position.y - 0.1);
+            assert_eq!(carry.body_intent.target_position.x, frame.pet_position.x);
+            assert!(!carry.object_commands[..carry.object_command_count].iter()
+                .any(|c| matches!(c, ObjectCommand::ApplyImpulse { .. } | ObjectCommand::Release { .. })));
+        }
+    }
+
+    #[test]
     fn solo_throw_requires_measured_hold_and_has_clearance_limited_plan() {
         for (held, aspect) in [(false, 1.0), (true, 0.5), (true, 1.0), (true, 3.0)] {
             let mut state = EcologyState::new(9101);
@@ -3147,7 +3208,7 @@ mod tests {
             state.episode_stats.next_episode_id = 4;
             let mut releases = 0;
             let mut saw_prepare = false;
-            for tick in 0..25 {
+            for tick in 0..60 {
                 let mut frame = behavior_frame(ActionId::SelfPlay);
                 frame.play_drive = 0.9;
                 frame.desktop_aspect = aspect;

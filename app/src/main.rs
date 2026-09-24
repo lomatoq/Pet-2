@@ -6723,6 +6723,9 @@ fn restore_orb_play_navigation(
             EpisodeGoal::SoloOrbPlay
                 | EpisodeGoal::ChaseOrb
                 | EpisodeGoal::InterceptOrb
+                | EpisodeGoal::RetrieveOrb
+                | EpisodeGoal::CarryOrbHome
+                | EpisodeGoal::OfferOrb
                 | EpisodeGoal::InspectMorsel
                 | EpisodeGoal::EatMorsel
         )
@@ -8537,15 +8540,14 @@ mod tests {
         projected.desired_speed = 0.02;
         projected.target_position = Vec2::ZERO;
         let mut packet = pet_motor::SomaticActuationPacket::default();
-        restore_orb_play_navigation(
-            Some(EpisodeGoal::SoloOrbPlay),
-            &packet,
-            &authored,
-            &mut projected,
-            false,
-        );
-        assert_eq!(projected.desired_speed, 0.82);
-        assert_eq!(projected.target_position, authored.target_position);
+        for goal in [EpisodeGoal::SoloOrbPlay, EpisodeGoal::RetrieveOrb,
+            EpisodeGoal::CarryOrbHome, EpisodeGoal::OfferOrb] {
+            projected.target_position = Vec2::ZERO;
+            projected.desired_speed = 0.02;
+            restore_orb_play_navigation(Some(goal), &packet, &authored, &mut projected, false);
+            assert_eq!(projected.desired_speed, 0.82);
+            assert_eq!(projected.target_position, authored.target_position);
+        }
         authored.desired_speed = 0.0;
         restore_orb_play_navigation(
             Some(EpisodeGoal::SoloOrbPlay),
