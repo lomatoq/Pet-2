@@ -1663,7 +1663,8 @@ impl EcologyRuntime {
             return false;
         }
         let aspect = desktop_aspect.clamp(0.25, 8.0);
-        self.state.objects.iter().any(|object| {
+        self.state.waste.hit_test(cursor, aspect, margin_px.max(0.0)/desktop_height_px)
+            || self.state.objects.iter().any(|object| {
             object.kind == ObjectKind::Orb
                 && object.lifecycle != ObjectLifecycle::Consumed
                 && Vec2::new(
@@ -1716,6 +1717,8 @@ impl EcologyRuntime {
                 self.grab_active = false;
                 self.drag_velocity = Vec2::ZERO;
                 self.last_pointer_seconds = timestamp;
+            } else {
+                self.state.waste.poke(cursor, aspect);
             }
         }
 
@@ -1979,6 +1982,30 @@ impl EcologyRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waste_click_is_interactive_once_per_press_without_orb_capture() {
+        let directory=tempfile::tempdir().unwrap();
+        let store=StateStore::at(directory.path());
+        let mut runtime=EcologyRuntime::load_or_create(&store,42,true).unwrap();
+        runtime.state.objects.clear();
+        runtime.state.metabolism.tract.bowel=0.3;
+        runtime.state.metabolism.tract.effort=10.0;
+        let frame=pet_ecology::DigestionFrame {settled:true,outlet:Vec2::new(0.4,0.85),floor:0.86,..Default::default()};
+        runtime.step_digestion(frame,1.0/120.0);
+        let c=&mut runtime.state.waste.chains[0];c.remaining=0.0;c.resting_seconds=10.0;
+        let point=c.nodes[0].position;
+        assert!(runtime.hit_test(point,1.0,1152.0,4.0));
+        assert!(!runtime.observe_pointer(Some(point),true,true,1.0,1152.0,1.0));
+        assert!(!runtime.is_dragging_object());
+        let first=runtime.state.waste.chains[0].nodes[0].velocity;
+        assert!(first.y< -0.05);
+        runtime.observe_pointer(Some(point),true,true,1.0,1152.0,1.1);
+        assert_eq!(runtime.state.waste.chains[0].nodes[0].velocity,first,"held mouse must not add a new kick every poll");
+        runtime.observe_pointer(Some(point),false,true,1.0,1152.0,1.2);
+        runtime.observe_pointer(Some(point),true,true,1.0,1152.0,1.3);
+        assert!(runtime.state.waste.chains[0].nodes[0].velocity.y<first.y);
+    }
 
     #[test]
     fn floor_food_has_visible_ingress_before_consumption_without_changing_portion() {

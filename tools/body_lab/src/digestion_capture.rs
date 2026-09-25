@@ -91,9 +91,19 @@ impl Capture {
         for (name, background, clean_time) in [
             ("white", ReviewBackground::White, 0),
             ("dark", ReviewBackground::Black, 0),
+            ("poke", ReviewBackground::White, 0),
             ("cleanup", ReviewBackground::White, 14),
         ] {
             renderer.set_review_background(background);
+            if name == "poke" {
+                let point=state.waste.chains[0].nodes[0].position;
+                assert!(state.waste.poke(point,1.6));
+                for _ in 0..18 {
+                    state.waste.step(&mut state.metabolism.tract, DigestionFrame {
+                        aspect:1.6,..Default::default()
+                    },1.0/120.0);
+                }
+            }
             if clean_time > 0 {
                 let cursor = state.waste.chains[0].nodes[0].position;
                 for _ in 0..clean_time {

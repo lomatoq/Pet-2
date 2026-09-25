@@ -63,3 +63,27 @@ single coverage/normal evaluation replaces overlapping individually shaded links
 Firm joints retain signed rest curvature with centre-of-mass-conserving angular
 constraints; wet chains yield to gravity. Rest curvature defaults to zero for old
 saves. These remain game physiology parameters, not biological claims.
+
+
+## V50 compact, interactive soft traces
+
+Pieces use shorter centreline lengths and smaller radii. The rest shape stores a
+separate angle at each joint, derived from bounded, irregular headings; uniform
+turns can no longer accumulate into a large circular arch. Each piece keeps its
+profile across saves. Existing V49 traces migrate once to a compact scale without
+removing traces or changing expelled mass.
+
+Bending uses compliant XPBD constraints. Floor contact includes damped restitution
+and friction; a left-click applies a local impulse and wakes the touched chain.
+Holding the button does not repeatedly inject energy. Picking a trace does not
+capture the orb or drag the pet, and normal clicks never activate cleanup.
+Explicit Cleanup retains its existing hover-to-vacuum behavior.
+
+Validation covers click-to-wake at 60/120 Hz, local bending and lift followed by
+settling, isolation of unhit pieces, bounded generated lengths, irregular rest
+angles, old-save migration and one impulse per mouse press. Native GPU fixtures
+include an after-poke frame using the same physics and continuous shading.
+
+References used for the visual/physical model:
+- Purina shape reference: https://www.purina.com.au/dog-poop-health-indicators.html
+- Position-based constraints: https://learn.physics-simulation.org/examples/pbd.html
