@@ -124,6 +124,7 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
         outlet: feedback.world_position
             + Vec2::new(bottom.x / extent.x, (bottom.y - 3.0) / extent.y),
         mouth: feedback.world_position + mouth / extent,
+        gas_outlet: feedback.world_position + runtime.body.liquid_physical_support_pixels(Vec2::new(1.0,0.45).normalize(),extent.y) / extent,
         body_velocity: feedback.velocity,
         floor,
         settled: settled && allowed,

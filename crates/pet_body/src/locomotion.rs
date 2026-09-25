@@ -54,6 +54,7 @@ pub struct BodySimulation {
     contact_caution: f32,
     blocked_effort: f32,
     pub exploratory_pressure: Vec2,
+    metabolic_mass: f32,
 }
 
 impl BodySimulation {
@@ -72,7 +73,14 @@ impl BodySimulation {
             contact_caution: 0.0,
             blocked_effort: 0.0,
             exploratory_pressure: Vec2::ZERO,
+            metabolic_mass: 1.0,
         }
+    }
+
+    /// Nutritional mass changes slowly; its neutral value preserves the
+    /// existing liquid solver and motion tuning.
+    pub fn set_metabolic_mass(&mut self, relative_mass: f32) {
+        self.metabolic_mass = if relative_mass.is_finite() {relative_mass.clamp(0.7,1.9)} else {1.0};
     }
 
     #[must_use]
@@ -197,7 +205,7 @@ impl BodySimulation {
             0.0
         };
         let speed_cap = (base_speed_cap + burst_reserve) * expression_effort * cruise;
-        let desired_speed = (intent.desired_speed * BODY_MOVEMENT_TEMPO * cruise)
+        let desired_speed = (intent.desired_speed * BODY_MOVEMENT_TEMPO * cruise / self.metabolic_mass.sqrt())
             .clamp(0.0, speed_cap)
             * reference_span;
         match intent.locomotion {
@@ -296,7 +304,7 @@ impl BodySimulation {
             // Purposeful launch/braking keeps its authored actuator reserve,
             // but it is no longer multiplied by the 2x travel tempo.
             * (1.0 + purposeful_response * 0.85);
-        let maximum_acceleration = unclamped_maximum_acceleration.min(1.85 * reference_span);
+        let maximum_acceleration = unclamped_maximum_acceleration.min(1.85 * reference_span) / self.metabolic_mass;
         let jerk_per_reference_span = match intent.locomotion {
             LocomotionMode::Flee => 14.0,
             LocomotionMode::Seek | LocomotionMode::Orbit => 8.0,

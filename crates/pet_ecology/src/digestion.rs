@@ -126,6 +126,8 @@ pub struct WasteChain {
     pub nodes: Vec<WasteNode>,
     pub hardness: f32,
     pub rest_length: f32,
+    #[serde(default)]
+    pub rest_turn: f32,
     pub remaining: f32,
     pub next_segment: f32,
     pub mass: f32,
@@ -160,6 +162,7 @@ pub struct WasteWorld {
 pub struct DigestionFrame {
     pub outlet: Vec2,
     pub mouth: Vec2,
+    pub gas_outlet: Vec2,
     pub body_velocity: Vec2,
     pub floor: f32,
     pub settled: bool,
@@ -171,6 +174,7 @@ impl Default for DigestionFrame {
         Self {
             outlet: Vec2::splat(0.5),
             mouth: Vec2::splat(0.5),
+            gas_outlet: Vec2::splat(0.5),
             body_velocity: Vec2::ZERO,
             floor: 1.0,
             settled: false,
@@ -190,6 +194,8 @@ impl WasteWorld {
                     && c.nodes.len() <= 24
                     && c.hardness.is_finite()
                     && (0.0..=1.0).contains(&c.hardness)
+                    && c.rest_turn.is_finite()
+                    && c.resting_seconds.is_finite()
                     && c.rest_length.is_finite()
                     && c.rest_length > 0.0
                     && c.remaining.is_finite()
@@ -252,6 +258,7 @@ impl WasteWorld {
                 }],
                 hardness: hard,
                 rest_length: radius * 1.5,
+                rest_turn: gut.phase.sin() * 0.42 * hard,
                 remaining: segments - 1.0,
                 next_segment: 0.0,
                 mass: amount,
@@ -266,7 +273,7 @@ impl WasteWorld {
                 false,
                 gut.fart,
                 self.last_fart,
-                f.outlet + Vec2::new(0.012 / aspect, -0.008),
+                f.gas_outlet,
             ),
         ] {
             if amplitude > previous + 0.05 {
@@ -277,9 +284,9 @@ impl WasteWorld {
                     }
                     let phase = gut.phase + i as f32 * 2.4;
                     self.bubbles.push(DigestiveBubble {
-                        position: origin,
-                        velocity: Vec2::new(phase.sin() * 0.025, -0.035 - amplitude * 0.045),
-                        radius: (2.5 + amplitude * 4.0 + phase.cos().abs() * 3.0) / 1152.0,
+                        position: origin + Vec2::new(i as f32*0.010/aspect, -(i as f32)*0.008),
+                        velocity: Vec2::new(0.035 + phase.sin() * 0.022, -0.028 - amplitude * 0.045 - i as f32 * 0.009),
+                        radius: (2.0 + amplitude * 6.0 * (0.3 + phase.cos().abs())) / 1152.0,
                         life: 1.6 + amplitude + i as f32 * 0.07,
                         burp: is_burp,
                     });
@@ -292,6 +299,19 @@ impl WasteWorld {
             b.life -= dt;
             b.velocity.y -= dt * 0.015;
             b.position += b.velocity / scale * dt;
+        }
+        // Soft separation keeps individual transparent rims from stacking.
+        for i in 0..self.bubbles.len() {
+            for j in i+1..self.bubbles.len() {
+                let d=(self.bubbles[j].position-self.bubbles[i].position)*scale;
+                let limit=(self.bubbles[i].radius+self.bubbles[j].radius)*1.2;
+                let length=d.length();
+                if length<limit {
+                    let push=d.normalize_or(Vec2::X)*(limit-length)*0.5;
+                    self.bubbles[i].position-=push/scale;
+                    self.bubbles[j].position+=push/scale;
+                }
+            }
         }
         self.bubbles.retain(|b| b.life > 0.0);
         for chain in &mut self.chains {
@@ -388,12 +408,26 @@ impl WasteWorld {
                         }
                     }
                 }
-                // A weak bending constraint distinguishes moist coils from firm capsules.
+                // Firm material retains its deposited curl; wet material yields.
                 for i in 2..chain.nodes.len() {
-                    let midpoint = (chain.nodes[i - 2].position + chain.nodes[i].position) * 0.5;
-                    chain.nodes[i - 1].position = chain.nodes[i - 1]
-                        .position
-                        .lerp(midpoint, chain.hardness * 0.12);
+                    let a=chain.nodes[i-2].position*scale;
+                    let b=chain.nodes[i-1].position*scale;
+                    let c=chain.nodes[i].position*scale;
+                    let first=b-a; let second=c-b;
+                    let perp=|v:Vec2|Vec2::new(-v.y,v.x);
+                    let ga=perp(first)/first.length_squared().max(1e-7);
+                    let gc=perp(second)/second.length_squared().max(1e-7);
+                    let gb=-ga-gc;
+                    let angle=first.perp_dot(second).atan2(first.dot(second));
+                    let error=(angle-chain.rest_turn+std::f32::consts::PI)
+                        .rem_euclid(std::f32::consts::TAU)-std::f32::consts::PI;
+                    let lambda=-error*chain.hardness.powi(3)*0.55
+                        /(ga.length_squared()+gb.length_squared()+gc.length_squared()).max(1e-6);
+                    // Equal-mass angular projection conserves the centre of
+                    // mass: the curl cannot propel itself across the desktop.
+                    chain.nodes[i-2].position+=ga*lambda/scale;
+                    chain.nodes[i-1].position+=gb*lambda/scale;
+                    chain.nodes[i].position+=gc*lambda/scale;
                 }
                 if chain.remaining > 0.0 && f.settled {
                     chain.nodes.last_mut().unwrap().position = f.outlet;
@@ -444,6 +478,45 @@ mod tests {
             novelty: 0.4,
         }
     }
+    #[test]
+    fn firm_curl_retains_volume_without_self_propulsion_and_wet_trace_yields() {
+        let mut heights=Vec::new();
+        for hardness in [0.08,0.95] {
+            let mut gut=DigestiveTract::default();
+            let radius=0.003;
+            let chain=WasteChain {
+                nodes:(0..16).map(|i| { let angle=i as f32*std::f32::consts::PI/15.0;
+                    WasteNode { position:Vec2::new(0.5+0.04*angle.cos(),0.9-radius-0.04*angle.sin()),velocity:Vec2::ZERO,radius }
+                }).collect(), hardness,rest_length:0.08*(std::f32::consts::PI/30.0).sin(),
+                rest_turn:-std::f32::consts::PI/15.0,remaining:0.0,next_segment:0.0,mass:0.2,floor:0.9,resting_seconds:0.0,suction:None,
+            };
+            let mut world=WasteWorld {chains:vec![chain],..Default::default()};
+            for _ in 0..2400 {world.step(&mut gut,DigestionFrame::default(),1.0/120.0);}
+            let nodes=&world.chains[0].nodes;
+            let center=nodes.iter().map(|n|n.position.x).sum::<f32>()/nodes.len() as f32;
+            assert!((center-0.5).abs()<0.03,"curl must not propel itself: {center}");
+            heights.push(0.9-nodes.iter().map(|n|n.position.y).fold(1.0_f32,f32::min));
+        }
+        assert!(heights[1]>heights[0]+0.008,"firm vs wet: {heights:?}");
+    }
+
+    #[test]
+    fn gas_bubbles_use_side_outlet_and_do_not_share_one_position() {
+        let mut gut=DigestiveTract {fart:0.9,..Default::default()};
+        let mut world=WasteWorld::default();
+        let frame=DigestionFrame {gas_outlet:Vec2::new(0.7,0.6),..Default::default()};
+        world.step(&mut gut,frame,1.0/120.0);
+        assert!(world.bubbles.len()>3);
+        let first=world.bubbles[0].radius;
+        assert!(world.bubbles.iter().any(|b|(b.radius-first).abs()>0.001));
+        for i in 0..world.bubbles.len() {
+            let a=&world.bubbles[i];assert!(a.position.x>0.68 && a.velocity.y<0.0);
+            for b in &world.bubbles[i+1..] {
+                assert!(a.position.distance(b.position)>(a.radius+b.radius)*0.85);
+            }
+        }
+    }
+
     #[test]
     fn empty_gut_never_invents_waste_and_food_mass_is_conserved() {
         let mut gut = DigestiveTract::default();
@@ -498,6 +571,7 @@ mod tests {
             ],
             hardness: 0.5,
             rest_length: 0.008,
+            rest_turn: 0.0,
             remaining: 0.0,
             next_segment: 0.0,
             mass: 0.1,

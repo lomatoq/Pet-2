@@ -35,3 +35,31 @@ persistent traces, targeted cleanup, native WGSL validation and real-liquid orb
 pickup in cursor chase. The Dev Console diagnostic
 `--digestion-captures <directory>` renders isolated GPU fixtures without reading
 or modifying the pet's save. `waste-fixture.json` records the simulated geometry.
+
+## State-dependent play and nutritional body condition (V49)
+
+The existing affect, felt nervous-system state and genome temperament now feed
+orb grip-versus-bat utility. Learned affinity, relative toy velocity, fatigue,
+reserve and stomach fullness contribute too. Bout drive/fatigue follow live state
+smoothly. Carrying ends on destination arrival or accumulated effort relative to
+current motivation; a 30-second watchdog is only a failure bound. Homeward return
+competes with continued play. Grip ownership survives brief silhouette-contact
+loss; new pickup still requires real contact and respects user ownership.
+`orb_motivation` telemetry exposes the competing utilities and effort rate.
+
+Saved `body_condition` changes from newly assimilated food minus active-time
+expenditure. It cannot jump on ingestion. Its bounded size factor multiplies age
+growth and the actual body projection used by contact. Relative volume/mass also
+modulates locomotion acceleration, speed and carrying effort. Offline absence
+preserves body condition. Old saves start at their current neutral size.
+
+Chewing owns mouth opening/compression after generic facial arbitration and keeps
+rendering authority after the idle-mouth fade. Amplitude depends on bolus size
+and cohesion; tempo still depends on appetite and processing progress. Gas exits
+from the measured lower-side body support, with varying radii and soft separation.
+
+Waste is drawn once per chain as distance to a continuous midpoint spline; a
+single coverage/normal evaluation replaces overlapping individually shaded links.
+Firm joints retain signed rest curvature with centre-of-mass-conserving angular
+constraints; wet chains yield to gravity. Rest curvature defaults to zero for old
+saves. These remain game physiology parameters, not biological claims.

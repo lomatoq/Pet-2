@@ -286,6 +286,7 @@ impl Lab {
             interaction_target: None,
         };
         let frame = EcologyBehaviorFrame {
+            play_state: Default::default(),
             social_contact: Default::default(),
             selected_action: self.selected_action,
             pet_position: self.pet_position,

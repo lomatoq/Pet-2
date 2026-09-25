@@ -247,6 +247,7 @@ pub struct EcologyOutput {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EcologyBehaviorFrame {
+    pub play_state: crate::OrbPlayState,
     pub social_contact: SocialContactFrame,
     pub selected_action: ActionId,
     pub pet_position: Vec2,
@@ -783,6 +784,8 @@ impl EpisodeDirector {
             output.visual_context = visual_context(state, None, frame);
             return output;
         };
+        active.bout_play_drive += (frame.play_drive-active.bout_play_drive)*(1.0-(-dt/0.8).exp());
+        active.bout_fatigue += (frame.social_contact.fatigue-active.bout_fatigue)*(1.0-(-dt/1.2).exp());
         active.elapsed_seconds += dt;
         active.phase_elapsed_seconds += dt;
         active.commitment_remaining = (active.commitment_remaining - dt).max(0.0);
@@ -971,7 +974,7 @@ fn select_episode(
     }
     if frame.autonomous_play_ready
         && frame.selected_action != ActionId::BringProceduralOrb
-        && orb.novelty > 0.04
+        && (orb.novelty > 0.04 || orb.preference > 0.1)
     {
         return Some((
             if orb.lifecycle == ObjectLifecycle::StoredInDen {
@@ -1425,6 +1428,10 @@ fn drive_episode(
             };
             let orb_distance =
                 desktop_distance(frame.pet_position, orb.position, frame.desktop_aspect);
+            let affinity=orb.preference.max(0.0)*orb.familiarity;
+            let relative_speed=(orb.velocity-frame.pet_velocity*Vec2::new(frame.desktop_aspect,1.0)).length();
+            let motivation=frame.play_state.motivation(&state.metabolism,active.bout_play_drive,active.bout_fatigue,affinity,relative_speed);
+            output.debug.orb_motivation=Some(motivation);
             let play_plan = crate::orb_play_plan(
                 active.id,
                 active.attempts,
@@ -1477,7 +1484,9 @@ fn drive_episode(
                     output.body_intent.target_position = active.target_position.unwrap_or(frame.pet_position);
                     output.body_intent.desired_speed = 0.20 + active.bout_play_drive * 0.12;
                 }
-                let held = frame.orb_physical.contact
+                // Ownership survives brief loss of silhouette contact while the
+                // liquid deforms. Acquire still requires real physical contact.
+                let held = orb.lifecycle == ObjectLifecycle::CarriedByPet
                     && desktop_distance(
                         orb.position,
                         frame.orb_physical.socket_position,
@@ -1488,10 +1497,23 @@ fn drive_episode(
                         < 0.12;
                 if active.phase == EpisodePhase::Manipulate
                     && held
-                    && active.phase_elapsed_seconds >= 0.18
                     && (desktop_distance(output.body_intent.target_position, frame.pet_position,
-                        frame.desktop_aspect) < 0.025 || active.phase_elapsed_seconds >= 1.2)
+                        frame.desktop_aspect) < 0.025
+                        || active.phase_elapsed_seconds * motivation.effort_rate > motivation.grip + motivation.explore)
                 {
+                    let wants_home = motivation.home > motivation.explore
+                        && desktop_distance(orb.position, state.den.anchor, frame.desktop_aspect) > DEN_EXIT_DISTANCE;
+                    if wants_home {
+                        state.episode_stats.completed[EpisodeGoal::SoloOrbPlay.index()] += 1;
+                        state.episode_stats.started[EpisodeGoal::CarryOrbHome.index()] += 1;
+                        push_outcome(output, EcologyOutcome::EpisodeCompleted(EpisodeGoal::SoloOrbPlay));
+                        active.goal = EpisodeGoal::CarryOrbHome;
+                        active.reason_code = EpisodeReason::ReturnToDen;
+                        active.elapsed_seconds = 0.0;
+                        active.commitment_remaining = commitment_for(EpisodeGoal::CarryOrbHome);
+                        set_phase(active, EpisodePhase::ReturnHome);
+                        return EpisodeStep::Continue;
+                    }
                     active.target_position = Some(
                         frame
                             .cursor_position
@@ -1507,7 +1529,7 @@ fn drive_episode(
                     active.id,
                 );
                 let preparation =
-                    (if plan.strong { 0.48 } else { 0.25 }) * bout_scale(active.id, 1);
+                    motivation.preparation * (1.0 + f32::from(plan.strong) * 0.4);
                 if active.phase == EpisodePhase::Prepare
                     && held
                     && active.phase_elapsed_seconds >= preparation
@@ -1544,7 +1566,9 @@ fn drive_episode(
                         },
                     );
                 }
-                if active.phase_elapsed_seconds > 1.8 {
+                // Watchdog only: ordinary release follows arrival or accumulated effort.
+                let timeout = if active.phase == EpisodePhase::Manipulate { 30.0 } else { 8.0 };
+                if active.phase_elapsed_seconds > timeout {
                     return EpisodeStep::Abort(EpisodeReason::TimedOut);
                 }
                 return EpisodeStep::Continue;
@@ -1554,9 +1578,7 @@ fn drive_episode(
                 // A slow toy can be picked up; a fast one is batted/chased.
                 // Readiness comes from the bout's drive and fatigue rather
                 // than only one out of every four episode IDs.
-                && (active.bout_play_drive * (1.0 - active.bout_fatigue * 0.6) > 0.5
-                    || (active.goal == EpisodeGoal::ChaseOrb && active.bout_fatigue < 0.7))
-                && (orb.velocity - frame.pet_velocity * Vec2::new(frame.desktop_aspect, 1.0)).length() < 0.18
+                && motivation.grip > motivation.bat
                 && frame.orb_physical.contact
                 && orb.lifecycle != ObjectLifecycle::GrabbedByUser
             {
@@ -1573,7 +1595,7 @@ fn drive_episode(
                 let direction = ((frame.cursor_position - frame.pet_position) * scale)
                     .normalize_or(Vec2::NEG_Y);
                 active.target_position = Some((frame.pet_position
-                    + (direction * (0.07 + active.bout_play_drive * 0.05) - Vec2::Y * 0.025) / scale)
+                    + (direction * motivation.travel - Vec2::Y * 0.045) / scale)
                     .clamp(Vec2::splat(0.08), Vec2::splat(0.92)));
                 push_command(
                     output,
@@ -1763,8 +1785,15 @@ fn drive_episode(
             else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
+            if orb_lifecycle == ObjectLifecycle::GrabbedByUser {
+                return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
+            }
+            if orb_lifecycle == ObjectLifecycle::StoredInDen {
+                return EpisodeStep::Complete;
+            }
             let target = if orb_lifecycle == ObjectLifecycle::CarriedByPet {
-                state.den.anchor
+                // Bring the grip socket to the bowl, not the body's centre.
+                state.den.anchor - (frame.orb_physical.socket_position - frame.pet_position)
             } else {
                 orb_position
             };
@@ -2189,7 +2218,8 @@ fn drive_episode(
                 output.body_intent.pose = PoseIntent::Compact;
                 output.body_intent.expression.mouth_open =
                     active.feeding_bite.aperture(active.phase_elapsed_seconds);
-                output.body_intent.expression.mouth_compression = 0.35;
+                output.body_intent.expression.mouth_compression =
+                    0.22*(1.0-output.body_intent.expression.mouth_open);
                 output.body_intent.expression.mouth_curve =
                     if active.feeding_bite.settling(active.phase_elapsed_seconds) {
                         -0.12
@@ -2853,6 +2883,7 @@ mod tests {
 
     fn behavior_frame(action: ActionId) -> EcologyBehaviorFrame {
         EcologyBehaviorFrame {
+            play_state: Default::default(),
             social_contact: SocialContactFrame::default(),
             selected_action: action,
             pet_position: Vec2::splat(0.5),
@@ -3090,7 +3121,8 @@ mod tests {
         for tick in 0..100 {
             let mut frame = behavior_frame(ActionId::IdleHover);
             frame.timestamp = tick as f64 * 0.05;
-            frame.play_drive = 0.48; // This fixture exercises the tap branch, not gripping/throwing.
+            frame.play_drive = 0.48;
+            state.objects[0].velocity = Vec2::new(0.3,0.0); // A moving toy is batted instead of held.
             frame.curiosity_drive = 0.52;
             frame.pet_position = orb_position;
             frame.orb_physical = PhysicalGrabFrame {
@@ -3117,10 +3149,74 @@ mod tests {
     }
 
     #[test]
+    fn familiar_favorite_remains_an_autonomous_play_opportunity() {
+        for stored in [false, true] {
+            let mut state = EcologyState::new(9101);
+            state.objects[0].novelty = 0.0;
+            state.objects[0].preference = 1.0;
+            state.objects[0].familiarity = 1.0;
+            state.objects[0].lifecycle = if stored { ObjectLifecycle::StoredInDen } else { ObjectLifecycle::Free };
+            let mut director = EpisodeDirector::default();
+            let mut frame = behavior_frame(ActionId::IdleHover);
+            frame.play_drive = 0.25;
+            for _ in 0..80 { director.tick(&mut state, frame, representative_intent(), 0.05); }
+            assert_eq!(director.active_episode().unwrap().goal,
+                if stored { EpisodeGoal::RetrieveOrb } else { EpisodeGoal::SoloOrbPlay });
+        }
+    }
+
+    #[test]
+    fn carrying_can_lead_home_or_to_a_throw_without_losing_a_deforming_grip() {
+        for play in [0.25, 0.8] {
+            let mut state = EcologyState::new(9101);
+            state.den.anchor = Vec2::new(0.9, 0.9);
+            state.objects[0].position = Vec2::splat(0.5);
+            state.objects[0].novelty = 0.0;
+            state.objects[0].preference = 1.0;
+            state.objects[0].familiarity = 1.0;
+            let mut director = EpisodeDirector::default();
+            let mut frame = behavior_frame(ActionId::SelfPlay);
+            frame.play_drive = play;
+            frame.orb_physical.contact = true;
+            let out = director.tick(&mut state, frame, representative_intent(), 0.05);
+            assert!(out.object_commands[..out.object_command_count].iter().any(|c| matches!(c,ObjectCommand::MoveToward {..})));
+            // Runtime has acquired the grip; a deforming surface briefly no
+            // longer reports contact. It must not time out or drop the toy.
+            state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
+            frame.orb_physical.contact = false;
+            let destination=director.active_episode().unwrap().target_position.unwrap();
+            frame.pet_position=destination;
+            frame.orb_physical.socket_position=destination;
+            state.objects[0].position=destination;
+            for _ in 0..1 { director.tick(&mut state, frame, representative_intent(), 0.05); }
+            let ep = director.active_episode().unwrap();
+            if play < 0.5 {
+                assert_eq!(ep.goal, EpisodeGoal::CarryOrbHome);
+                frame.orb_physical.socket_position = frame.pet_position + Vec2::new(0.03, 0.04);
+                let home = director.tick(&mut state, frame, representative_intent(), 0.05);
+                assert!(home.body_intent.target_position.distance(Vec2::new(0.87,0.86)) < 1e-5);
+                state.objects[0].position = state.den.anchor;
+                let placed = director.tick(&mut state, frame, representative_intent(), 0.05);
+                assert!(placed.object_commands[..placed.object_command_count].iter().any(|c| matches!(c,ObjectCommand::Store {..})));
+            } else {
+                assert_eq!(ep.goal, EpisodeGoal::SoloOrbPlay);
+                assert_eq!(ep.phase, EpisodePhase::Prepare);
+                let mut released = false;
+                for _ in 0..15 {
+                    let out = director.tick(&mut state, frame, representative_intent(), 0.05);
+                    released |= out.object_commands[..out.object_command_count].iter().any(|c| matches!(c,ObjectCommand::Release {..}));
+                }
+                assert!(released);
+            }
+        }
+    }
+
+    #[test]
     fn familiar_orb_play_has_real_spaced_impulses_and_fatigue_rest() {
         for fatigue in [0.0, 0.9] {
             let mut state = EcologyState::new(9101);
             state.objects[0].novelty = 0.0;
+            state.objects[0].velocity = Vec2::new(0.3,0.0);
             state.objects[0].familiarity = 1.0;
             let mut director = EpisodeDirector::default();
             let mut hits = Vec::new();
@@ -3168,6 +3264,7 @@ mod tests {
                     frame.orb_physical.contact = contact;
                     let output = director.tick(&mut state, frame, representative_intent(), 0.05);
                     for command in &output.object_commands[..output.object_command_count] {
+                        if matches!(command,ObjectCommand::MoveToward {..}) { hits += 1; }
                         if let ObjectCommand::ApplyImpulse { impulse, .. } = command {
                             hits += 1;
                             assert!(impulse.is_finite() && impulse.length() <= 0.31);
@@ -3217,7 +3314,7 @@ mod tests {
             state.episode_stats.next_episode_id = 4;
             let mut releases = 0;
             let mut saw_prepare = false;
-            for tick in 0..60 {
+            for tick in 0..480 {
                 let mut frame = behavior_frame(ActionId::SelfPlay);
                 frame.play_drive = 0.9;
                 frame.desktop_aspect = aspect;
@@ -3229,7 +3326,7 @@ mod tests {
                 let output = director.tick(&mut state, frame, representative_intent(), 0.05);
                 saw_prepare |= output.debug.active_phase == Some(EpisodePhase::Prepare);
                 for command in &output.object_commands[..output.object_command_count] {
-                    if matches!(command, ObjectCommand::MoveToward { .. }) {
+                    if held && matches!(command, ObjectCommand::MoveToward { .. }) {
                         state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
                     }
                     if let ObjectCommand::Release { velocity, .. } = command {
@@ -3321,8 +3418,8 @@ mod tests {
         let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
         let continued = director.active_episode().unwrap();
         assert_eq!(continued.id, original.id);
-        assert_eq!(continued.bout_play_drive, original.bout_play_drive);
-        assert_eq!(continued.bout_fatigue, original.bout_fatigue);
+        assert!(continued.bout_play_drive > original.bout_play_drive && continued.bout_play_drive < frame.play_drive);
+        assert!(continued.bout_fatigue > original.bout_fatigue && continued.bout_fatigue < frame.social_contact.fatigue);
     }
 
     #[test]

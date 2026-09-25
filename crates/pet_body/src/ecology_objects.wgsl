@@ -15,6 +15,10 @@ struct VertexOutput {
     @location(9) den_material: vec4<f32>,
     @location(10) den_mask: vec4<f32>,
     @location(11) background_uv_rect: vec4<f32>,
+    @location(12) waste0: vec4<f32>,
+    @location(13) waste1: vec4<f32>,
+    @location(14) waste2: vec4<f32>,
+    @location(15) waste3: vec4<f32>,
 }
 
 @group(0) @binding(0) var desktop_background: texture_2d<f32>;
@@ -67,6 +71,10 @@ fn vertex_main(
     @location(7) den_material: vec4<f32>,
     @location(8) den_mask: vec4<f32>,
     @location(9) background_uv_rect: vec4<f32>,
+    @location(10) waste0: vec4<f32>,
+    @location(11) waste1: vec4<f32>,
+    @location(12) waste2: vec4<f32>,
+    @location(13) waste3: vec4<f32>,
 ) -> VertexOutput {
     var corners = array<vec2<f32>, 6>(
         vec2<f32>(-1.50, -1.50),
@@ -91,6 +99,7 @@ fn vertex_main(
     output.den_material = den_material;
     output.den_mask = den_mask;
     output.background_uv_rect = background_uv_rect;
+    output.waste0=waste0; output.waste1=waste1; output.waste2=waste2; output.waste3=waste3;
     return output;
 }
 
@@ -247,6 +256,29 @@ fn den_virtual_backdrop(point: vec2<f32>, phase: f32) -> vec3<f32> {
     let soft = 0.5 + 0.5 * sin(dot(point, vec2<f32>(-0.34, 0.78)) * TAU - phase * 0.07 + 2.1);
     let luminance = saturate(0.22 + broad * 0.46 + soft * 0.20);
     return mix(vec3<f32>(0.18, 0.25, 0.38), vec3<f32>(0.57, 0.68, 0.79), luminance);
+}
+
+// A whole chain is one surface, with one coverage and one lighting evaluation.
+fn waste_distance(p:vec2<f32>,points:array<vec2<f32>,20>,count:u32,r:f32)->f32 {
+    var d=length(p-points[0])-r;
+    var start=points[0];
+    for(var i=0u;i<min(count,20u);i++) {
+        let control=points[i];
+        let end=(control+points[min(i+1u,count-1u)])*0.5;
+        var previous=start;
+        // Quadratic midpoint spline has continuous tangent through every joint.
+        // Distance to that one centreline gives a single continuous tube normal.
+        for(var j=1u;j<=3u;j++) {
+            let t=f32(j)/3.0;
+            let next=(1.0-t)*(1.0-t)*start+2.0*(1.0-t)*t*control+t*t*end;
+            let axis=next-previous;
+            let q=p-previous-axis*clamp(dot(p-previous,axis)/max(dot(axis,axis),0.000000001),0.0,1.0);
+            d=min(d,length(q)-r);
+            previous=next;
+        }
+        start=end;
+    }
+    return d;
 }
 
 @fragment
@@ -571,24 +603,23 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return encode_surface_output(vec4<f32>(mix(input.color.rgb,vec3<f32>(1.0),light)*alpha,alpha));
     }
     if kind > 2.5 {
-        let p=input.local*input.den_optics.xy;
-        let axis=input.den_surface.xy;
-        let along=clamp(dot(p,axis)/max(dot(axis,axis),0.00000001),-1.0,1.0);
-        let normal=(p-axis*along)/max(input.material.y,0.000001);
-        let distance=length(normal);
-        let aa=max(fwidth(distance),0.015);
-        let floor_mask=1.0-smoothstep(input.den_optics.z-0.0006,input.den_optics.z,input.screen_uv.y);
-        let alpha=(1.0-smoothstep(1.0-aa,1.0+aa,distance))*input.color.a*floor_mask;
-        // Cylinder lighting continues through a joint; endpoint sphere lighting
-        // on every overlapping capsule would make a string of shiny beads.
-        let tangent=normalize(axis+vec2<f32>(0.0000001,0.0));
-        let perpendicular=vec2<f32>(-tangent.y,tangent.x);
-        let side=clamp(dot(p,perpendicular)/max(input.material.y,0.000001),-1.0,1.0);
-        let tube_normal=perpendicular*side;
-        let z=sqrt(max(0.0,1.0-side*side));
-        let diffuse=0.72+z*0.22-tube_normal.x*0.10+tube_normal.y*0.10;
-        let spec=pow(max(0.0,dot(normalize(vec3<f32>(tube_normal,z+0.001)),normalize(vec3<f32>(-0.4,0.6,1.2)))),18.0)*0.14;
-        let rgb=input.color.rgb*diffuse+vec3<f32>(1.0,0.85,0.93)*spec;
+        let packed=array<vec4<f32>,10>(input.den_surface,input.den_optics,input.den_particles,input.den_noise,input.den_material,input.den_mask,input.background_uv_rect,input.waste0,input.waste1,input.waste2);
+        var points:array<vec2<f32>,20>;
+        for(var i=0u;i<10u;i++){points[i*2u]=packed[i].xy;points[i*2u+1u]=packed[i].zw;}
+        let p=input.local*input.waste3.xy;
+        let radius=max(input.material.y,0.000001);
+        let count=u32(input.material.w);
+        let d=waste_distance(p,points,count,radius);
+        let e=radius*0.025;
+        let gradient=vec2<f32>(waste_distance(p+vec2<f32>(e,0.0),points,count,radius)-waste_distance(p-vec2<f32>(e,0.0),points,count,radius),waste_distance(p+vec2<f32>(0.0,e),points,count,radius)-waste_distance(p-vec2<f32>(0.0,e),points,count,radius))/(2.0*e);
+        let radial=clamp(1.0+d/radius,0.0,1.0);
+        let normal=normalize(vec3<f32>(gradient*radial,sqrt(max(0.001,1.0-radial*radial))));
+        let lighting=0.73+0.25*max(0.0,dot(normal,normalize(vec3<f32>(-0.4,0.6,1.2))));
+        let spec=pow(max(0.0,dot(normal,normalize(vec3<f32>(-0.3,0.45,1.5)))),24.0)*0.10;
+        let aa=max(fwidth(d),0.00004);
+        let floor_mask=1.0-smoothstep(input.waste3.z-0.0006,input.waste3.z,input.screen_uv.y);
+        let alpha=(1.0-smoothstep(-aa,aa,d))*input.color.a*floor_mask;
+        let rgb=input.color.rgb*lighting+vec3<f32>(1.0,0.85,0.93)*spec;
         return encode_surface_output(vec4<f32>(rgb*alpha,alpha));
     }
     if input.material.x > 1.5 {

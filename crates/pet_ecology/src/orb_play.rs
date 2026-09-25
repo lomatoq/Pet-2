@@ -167,3 +167,59 @@ mod tests {
         }
     }
 }
+
+/// Current physiology, not another action policy or a random animation timer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OrbPlayState {
+    pub affect: lifecore::AffectState,
+    pub felt: lifecore::FeltStateV1,
+    pub patience: f32,
+    pub persistence: f32,
+    pub playfulness: f32,
+}
+impl Default for OrbPlayState {
+    fn default() -> Self { Self { affect: Default::default(), felt: Default::default(), patience:0.5,persistence:0.5,playfulness:0.5 } }
+}
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct OrbMotivation {
+    pub grip: f32, pub bat: f32, pub home: f32, pub explore: f32,
+    pub travel: f32, pub effort_rate: f32, pub preparation: f32,
+}
+impl OrbPlayState {
+    pub fn motivation(self, metabolism:&crate::MetabolicState, play:f32, fatigue:f32,
+        affinity:f32, relative_speed:f32) -> OrbMotivation {
+        let vigor=(metabolism.reserve*(1.0-fatigue)* (1.0-self.affect.stress*0.7)).clamp(0.0,1.0);
+        let fullness=metabolism.satiation*metabolism.satiation;
+        let engage=play*0.7+self.playfulness*0.18+self.felt.play_readiness*0.35;
+        let security=self.affect.confidence*0.3+self.affect.valence.max(0.0)*0.15+affinity*0.5;
+        let grip=(engage+security+self.patience*0.13)*vigor*(1.0-fullness*0.3);
+        let bat=relative_speed*2.2+self.affect.arousal*0.24+(1.0-self.patience)*0.12+fatigue*0.22;
+        let home=affinity*(0.2+self.patience*0.25)+fatigue*0.4+fullness*0.2+self.affect.stress*0.3;
+        let explore=engage*vigor+self.felt.exploration_readiness*0.25;
+        OrbMotivation {grip,bat,home,explore,
+            travel:0.06+(self.persistence*0.12+explore*0.22)*(1.0-fullness*0.35),
+            effort_rate:0.035+(1.0-vigor)*0.20+fullness*0.06+self.felt.physical_load*0.12+(metabolism.relative_mass()-1.0).max(0.0)*0.08,
+            preparation:0.16+self.patience*0.35+(1.0-vigor)*0.25 }
+    }
+}
+
+#[cfg(test)]
+mod motivation_tests {
+    use super::*;
+    #[test]
+    fn appetite_mood_fatigue_and_character_change_grip_and_effort() {
+        let state=OrbPlayState::default();
+        let metabolism=crate::MetabolicState::default();
+        let calm=state.motivation(&metabolism,0.25,0.1,1.0,0.01);
+        let mut tired=state;tired.affect.stress=0.8;
+        let tired=tired.motivation(&metabolism,0.25,0.8,1.0,0.01);
+        assert!(calm.grip>calm.bat);
+        assert!(tired.grip<tired.bat && tired.effort_rate>calm.effort_rate);
+        let mut full=metabolism.clone();full.satiation=1.0;full.body_condition=0.8;
+        let full=state.motivation(&full,0.25,0.1,1.0,0.01);
+        assert!(full.grip<calm.grip && full.home>calm.home && full.effort_rate>calm.effort_rate);
+        let mut patient=state;patient.patience=0.95;patient.persistence=0.95;
+        let patient=patient.motivation(&metabolism,0.25,0.1,1.0,0.01);
+        assert!(patient.travel>calm.travel && patient.preparation>calm.preparation);
+    }
+}

@@ -68,6 +68,7 @@ struct EcologyInstance {
     den_material: [f32; 4],
     den_mask: [f32; 4],
     background_uv_rect: [f32; 4],
+    waste_points: [[f32; 4]; 4],
 }
 
 pub struct EcologyRenderer {
@@ -173,7 +174,11 @@ impl EcologyRenderer {
                         6 => Float32x4,
                         7 => Float32x4,
                         8 => Float32x4,
-                        9 => Float32x4
+                        9 => Float32x4,
+                        10 => Float32x4,
+                        11 => Float32x4,
+                        12 => Float32x4,
+                        13 => Float32x4
                     ],
                 }],
             },
@@ -570,6 +575,7 @@ impl EcologyRenderer {
             self.den_activity_integral_seconds,
         );
         instances[count] = EcologyInstance {
+                waste_points: [[0.0;4];4],
             center_radius: [
                 state.den.anchor.x * 2.0 - 1.0,
                 1.0 - state.den.anchor.y * 2.0,
@@ -658,6 +664,7 @@ impl EcologyRenderer {
                 object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * 2.0;
             let rgb = hsv_to_rgb(object.hue, object.saturation, object.value);
             instances[count] = EcologyInstance {
+                waste_points: [[0.0;4];4],
                 center_radius: [
                     object.position.x * 2.0 - 1.0,
                     1.0 - object.position.y * 2.0,
@@ -696,27 +703,30 @@ impl EcologyRenderer {
             let ease = t * t * (3.0 - 2.0 * t);
             let shrink = (1.0 - ease).max(0.001);
             let center = chain.nodes.iter().map(|n| n.position).sum::<Vec2>() / chain.nodes.len().max(1) as f32;
-            for i in 0..chain.nodes.len().saturating_sub(1).max(1) {
-                if count >= MAX_ECOLOGY_INSTANCES { break; }
-                let a = &chain.nodes[i];
-                let b = &chain.nodes[(i + 1).min(chain.nodes.len() - 1)];
-                let a_pos = center + (a.position - center) * shrink;
-                let b_pos = center + (b.position - center) * shrink;
-                let midpoint = (a_pos + b_pos) * 0.5;
-                let delta = (b_pos - a_pos) * Vec2::new(aspect, -1.0) * 0.5;
-                let radius = a.radius * shrink;
-                let extent = delta.abs() + Vec2::splat(radius * 1.12);
-                foreground_start.get_or_insert(count as u32);
-                instances[count] = EcologyInstance {
-                    center_radius: [midpoint.x*2.0-1.0, 1.0-midpoint.y*2.0, extent.x*2.0/aspect,extent.y*2.0],
-                    color: [0.96,0.43+chain.hardness*0.07,0.68,1.0-ease],
-                    material: [3.0,radius,chain.hardness,time_seconds],
-                    den_surface: [delta.x,delta.y,0.0,0.0],
-                    den_optics: [extent.x,extent.y,chain.floor,0.0],
-                    ..EcologyInstance::default()
-                };
-                count += 1;
+            if chain.nodes.is_empty() || count >= MAX_ECOLOGY_INSTANCES { continue; }
+            let points: Vec<_> = chain.nodes.iter().take(20)
+                .map(|n| center + (n.position - center) * shrink).collect();
+            let minimum = points.iter().copied().fold(Vec2::splat(f32::INFINITY), Vec2::min);
+            let maximum = points.iter().copied().fold(Vec2::splat(f32::NEG_INFINITY), Vec2::max);
+            let midpoint = (minimum + maximum) * 0.5;
+            let radius = chain.nodes[0].radius * shrink;
+            let extent = (maximum - minimum) * Vec2::new(aspect,1.0) * 0.5 + Vec2::splat(radius * 1.4);
+            let mut packed = [[0.0;4];11];
+            for (i,p) in points.iter().enumerate() {
+                let q=(*p-midpoint)*Vec2::new(aspect,-1.0);
+                packed[i/2][(i%2)*2]=q.x; packed[i/2][(i%2)*2+1]=q.y;
             }
+            packed[10]=[extent.x,extent.y,chain.floor,0.0];
+            foreground_start.get_or_insert(count as u32);
+            instances[count] = EcologyInstance {
+                center_radius: [midpoint.x*2.0-1.0,1.0-midpoint.y*2.0,extent.x*2.0/aspect,extent.y*2.0],
+                color: [0.96,0.43+chain.hardness*0.07,0.68,1.0-ease],
+                material: [3.0,radius,chain.hardness,points.len() as f32],
+                den_surface:packed[0],den_optics:packed[1],den_particles:packed[2],
+                den_noise:packed[3],den_material:packed[4],den_mask:packed[5],background_uv_rect:packed[6],
+                waste_points:[packed[7],packed[8],packed[9],packed[10]],
+            };
+            count += 1;
         }
         for bubble in &state.waste.bubbles {
             if count >= MAX_ECOLOGY_INSTANCES { break; }

@@ -11,6 +11,7 @@ pub struct GoalScore {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EcologyDecisionTrace {
     pub tick: u64,
+    pub orb_motivation: Option<crate::OrbMotivation>,
     pub active_goal: Option<EpisodeGoal>,
     pub active_phase: Option<EpisodePhase>,
     pub selected_reason: EpisodeReason,
@@ -23,6 +24,7 @@ impl Default for EcologyDecisionTrace {
     fn default() -> Self {
         Self {
             tick: 0,
+            orb_motivation: None,
             active_goal: None,
             active_phase: None,
             selected_reason: EpisodeReason::NoEligibleEpisode,

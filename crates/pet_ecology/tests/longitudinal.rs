@@ -21,6 +21,7 @@ fn intent(position: Vec2) -> BodyIntent {
 
 fn frame(action: ActionId, position: Vec2, timestamp: f64) -> EcologyBehaviorFrame {
     EcologyBehaviorFrame {
+        play_state: Default::default(),
         social_contact: Default::default(),
         selected_action: action,
         pet_position: position,

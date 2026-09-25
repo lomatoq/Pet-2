@@ -60,6 +60,8 @@ impl ConsumedMorselEffect {
 pub struct MetabolicState {
     #[serde(default)]
     pub tract: crate::DigestiveTract,
+    #[serde(default)]
+    pub body_condition: f32,
     pub reserve: f32,
     pub satiation: f32,
     pub digestion: f32,
@@ -70,6 +72,7 @@ impl Default for MetabolicState {
     fn default() -> Self {
         Self {
             tract: crate::DigestiveTract::default(),
+            body_condition: 0.0,
             reserve: 0.72,
             satiation: 0.32,
             digestion: 0.0,
@@ -87,7 +90,9 @@ impl MetabolicState {
     }
 
     pub fn validate(&self) -> Result<(), EcologyError> {
-        let bounded = self.reserve.is_finite()
+        let bounded = self.body_condition.is_finite()
+            && (-0.4..=1.0).contains(&self.body_condition)
+            && self.reserve.is_finite()
             && (METABOLIC_RESERVE_FLOOR..=1.0).contains(&self.reserve)
             && self.satiation.is_finite()
             && (0.0..=1.0).contains(&self.satiation)
@@ -114,17 +119,32 @@ impl MetabolicState {
         self.reserve = (self.reserve.max(METABOLIC_RESERVE_FLOOR) + seconds * (0.08 / 86_400.0))
             .clamp(METABOLIC_RESERVE_FLOOR, 1.0);
         self.satiation = (self.satiation - seconds * (0.18 / 86_400.0)).clamp(0.0, 1.0);
-        self.advance(seconds);
+        // Offline absence does not change body condition or fabricate meals.
+        self.advance_effect(seconds);
     }
 
-    pub fn advance(&mut self, dt: f32) {
+    pub fn size_multiplier(&self) -> f32 { 1.0 + self.body_condition * 0.22 }
+    pub fn relative_mass(&self) -> f32 { self.size_multiplier().powi(3) }
+    pub fn mobility(&self) -> f32 { self.relative_mass().sqrt().recip().clamp(0.74,1.12) }
+    pub fn advance(&mut self, dt: f32) { self.advance_with_activity(dt,0.0); }
+    pub fn advance_with_activity(&mut self, dt: f32, activity: f32) {
+        let dt=if dt.is_finite(){dt.clamp(0.0,0.25)}else{0.0};
+        let before=self.tract.absorbed;
         self.tract.advance(dt);
-        let dt = if dt.is_finite() {
-            dt.clamp(0.0, 60.0)
-        } else {
-            0.0
-        };
-        self.reserve = (self.reserve + dt * (0.006 / 60.0)).clamp(METABOLIC_RESERVE_FLOOR, 1.0);
+        let assimilated=(self.tract.absorbed-before).max(0.0) as f32;
+        let activity=if activity.is_finite(){activity.clamp(0.0,1.0)}else{0.0};
+        // Tissue changes only through assimilated nutrients and active-time
+        // expenditure. Bounds and rate limiting prevent a bite from resizing
+        // the physical hull abruptly.
+        let expenditure=dt*(0.000025+activity*0.000055);
+        let tissue_delta=(assimilated*0.32-expenditure).clamp(-dt*0.0001,dt*0.0008);
+        self.body_condition=(self.body_condition+tissue_delta).clamp(-0.4,1.0);
+        self.reserve=(self.reserve+assimilated*0.16-expenditure)
+            .clamp(METABOLIC_RESERVE_FLOOR,1.0);
+        self.advance_effect(dt);
+    }
+    fn advance_effect(&mut self, dt:f32) {
+        let dt=if dt.is_finite(){dt.clamp(0.0,31_536_000.0)}else{0.0};
         self.satiation = (self.satiation - dt * (0.012 / 60.0)).clamp(0.0, 1.0);
         if let Some(effect) = &mut self.active_effect {
             effect.remaining_seconds = (effect.remaining_seconds - dt).max(0.0);
@@ -333,6 +353,31 @@ mod tests {
     }
 
     #[test]
+    fn assimilated_food_changes_body_condition_gradually_and_persists() {
+        let mut fed=MetabolicState::default(); let mut lean=fed.clone();
+        fed.consume(&morsel(0.2));
+        assert_eq!(fed.body_condition,0.0,"a swallowed meal must not instantly grow tissue");
+        let mut previous=0.0_f32;
+        for tick in 0..54000 {
+            if tick%9000==0 { fed.consume(&morsel(0.2)); }
+            fed.advance_with_activity(1.0/30.0,0.2);
+            lean.advance_with_activity(1.0/30.0,0.2);
+            assert!((fed.body_condition-previous).abs() < 0.00003);
+            previous=fed.body_condition;
+        }
+        assert!(fed.size_multiplier()>1.05);
+        assert!(lean.size_multiplier()<1.0);
+        assert!(fed.relative_mass()>lean.relative_mass());
+        assert!(fed.mobility()<lean.mobility());
+        let encoded=serde_json::to_string(&fed).unwrap();
+        let mut restored:MetabolicState=serde_json::from_str(&encoded).unwrap();
+        let condition=restored.body_condition;
+        restored.apply_offline_seconds(86400.0);
+        assert_eq!(restored.body_condition,condition);
+        assert!(restored.validate().is_ok());
+    }
+
+    #[test]
     fn reserve_need_raises_utility_but_never_crosses_the_floor() {
         let taste = TasteProfile::default();
         let mut low = MetabolicState {
@@ -385,7 +430,7 @@ impl FeedingBite {
                 + food.cohesion_bias * 0.4
                 + settle_seconds,
             chew_hz: 1.4 + appetite * 1.7 - food.cohesion_bias * 0.3,
-            effort: 0.04 + load * 0.11 + food.cohesion_bias * 0.04,
+            effort: 0.18 + load * 0.28 + food.cohesion_bias * 0.12,
             settle_seconds,
             cohesion: food.cohesion_bias,
         }
@@ -412,7 +457,7 @@ impl FeedingBite {
             (1.0 - phase) / (1.0 - opening_share)
         };
         let smooth_jaw = jaw * jaw * (3.0 - 2.0 * jaw);
-        smooth_jaw * self.effort * (1.0 - progress * 0.7)
+        smooth_jaw * self.effort * (1.0 - progress * 0.45)
     }
 }
 
@@ -450,7 +495,7 @@ mod feeding_tests {
         assert_eq!(hasty.aperture(0.28 + hasty.settle_seconds * 0.5), 0.0);
         for i in 0..500 {
             let a = hasty.aperture(i as f32 * 0.01);
-            assert!(a.is_finite() && (0.0..=0.25).contains(&a));
+            assert!(a.is_finite() && (0.0..=0.6).contains(&a));
         }
         // Later jaw cycles accelerate as food softens instead of replaying a
         // constant-frequency clip. Compare successive maxima in the easy bite.

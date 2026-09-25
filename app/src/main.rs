@@ -2436,10 +2436,12 @@ impl PetApplication {
             runtime.audio.callback_levels().rms,
             runtime.audio.visual_feedback().active,
         );
-        let growth = pet_body::birth_scene::growth_scale(runtime.birth.age_seconds());
+        let growth = pet_body::birth_scene::growth_scale(runtime.birth.age_seconds())
+            * runtime.ecology.state().metabolism.size_multiplier();
         runtime.body.set_presentation_scale(
             production_presentation_scale(runtime.window.inner_size().height) / growth,
         );
+        runtime.body.simulation.set_metabolic_mass(runtime.ecology.state().metabolism.relative_mass());
         runtime.body_accumulator += elapsed;
         runtime.life_accumulator += elapsed;
         runtime.sensor_accumulator += elapsed;
@@ -2983,6 +2985,7 @@ impl PetApplication {
             runtime
                 .body
                 .set_feeding_mouth(food_mouth, orb_contact_height, body_dt);
+            runtime.body.set_feeding_expression_active(matches!(runtime.ecology.active_episode().map(|e|e.goal),Some(EpisodeGoal::EatMorsel)));
             if runtime.birth.started.is_none() {
                 runtime.ecology.set_den_viewport([
                     runtime.topology.virtual_physical_bounds.width().max(1) as u32,
@@ -3406,6 +3409,8 @@ impl PetApplication {
                 runtime.window.inner_size().height as f32,
                 LIFE_DT,
             );
+            runtime.ecology.set_play_state(runtime.life.state.affect,
+                runtime.nervous_system.snapshot().felt, &runtime.life.state.genome.temperament);
             let ecology_output = runtime.ecology.resolve_intent(
                 output.body_intent,
                 EcologyResolveFrame {
@@ -3924,6 +3929,7 @@ impl PetApplication {
                         motion.support(runtime.body.simulation.feedback.world_position);
                 }
             }
+            let feeding_expression = output.body_intent.expression;
             runtime.nervous_system.apply_motor_actuation(
                 &mut runtime.life,
                 &runtime.vita,
@@ -3954,6 +3960,14 @@ impl PetApplication {
             }
             keep_eyes_available_during_active_locomotion(&mut output.body_intent);
             repertoire_bridge::merge_face(&mut output.body_intent, &repertoire);
+            // Food owns the jaw while an actual bite is being processed. Generic
+            // mood/scene faces must not replace its close-chew-open trajectory.
+            if matches!(runtime.ecology.active_episode().map(|e|e.goal),Some(EpisodeGoal::EatMorsel))
+                && motor_goal.felt.startle < 0.35 && motor_goal.felt.pain_like < 0.2 {
+                output.body_intent.expression.mouth_open = feeding_expression.mouth_open;
+                output.body_intent.expression.mouth_compression = feeding_expression.mouth_compression;
+                output.body_intent.expression.mouth_curve = feeding_expression.mouth_curve;
+            }
             if let Some(pose) = runtime.lab_face_pose {
                 output.body_intent.expression = pose.expression();
             }
@@ -4616,6 +4630,8 @@ impl PetApplication {
                 });
                 debug_details["cleanup"] = serde_json::json!({"enabled":runtime.cleanup_mode,"traces":runtime.ecology.state().waste.chains.len()});
                 debug_details["digestion"] = serde_json::json!(runtime.ecology.state().metabolism.tract);
+                debug_details["orb_motivation"] = serde_json::json!(runtime.ecology.debug().orb_motivation);
+                debug_details["nutrition"] = serde_json::json!({"body_condition":runtime.ecology.state().metabolism.body_condition,"size_multiplier":runtime.ecology.state().metabolism.size_multiplier(),"relative_mass":runtime.ecology.state().metabolism.relative_mass()});
                 debug_details["cradle_inside"] = serde_json::json!(runtime.cradle_seat.inside);
                 debug_details["den_background_mode"] =
                     serde_json::json!(if runtime.platform.overlay_background_excludes_pet() {
@@ -5276,7 +5292,8 @@ impl ApplicationHandler for PetApplication {
                 let ecology_ready = runtime.background_clean_seed_frames >= BACKGROUND_CLEAN_SEED_FRAMES
                     || runtime.normalizer.monotonic_seconds() > BACKGROUND_CAPTURE_FALLBACK_SECONDS;
                 let startup = runtime.startup.frame(ecology_ready, birth_time.is_some());
-                let growth = pet_body::birth_scene::growth_scale(runtime.birth.age_seconds());
+                let growth = pet_body::birth_scene::growth_scale(runtime.birth.age_seconds())
+                    * runtime.ecology.state().metabolism.size_multiplier();
                 let visible_growth = birth_time.map_or(growth, |t| {
                     (0.58 + 0.24 * pet_body::birth_scene::smooth(7.96, 9.25, t))
                         + (growth - 0.82) * pet_body::birth_scene::smooth(11.2, 14.0, t)

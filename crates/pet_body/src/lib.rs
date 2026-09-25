@@ -205,6 +205,7 @@ pub struct ProceduralBody {
     ecology_visual_effect: EcologyVisualEffect,
     feeding_mouth_offset: Vec2,
     feeding_mouth_activity: f32,
+    feeding_expression_active: bool,
     mouth_context_age: f32,
     mouth_context_open: f32,
     contained_face: liquid::SmoothFaceOrigin,
@@ -241,6 +242,7 @@ impl ProceduralBody {
             ecology_visual_effect: EcologyVisualEffect::default(),
             feeding_mouth_offset: Vec2::ZERO,
             feeding_mouth_activity: 0.0,
+            feeding_expression_active: false,
             mouth_context_age: 0.0,
             mouth_context_open: 0.0,
             contained_face: liquid::SmoothFaceOrigin::default(),
@@ -317,6 +319,8 @@ impl ProceduralBody {
             self.tuning.schema_version,
         )
     }
+
+    pub fn set_feeding_expression_active(&mut self, active: bool) { self.feeding_expression_active=active; }
 
     pub fn set_feeding_mouth(&mut self, surface_pixels: Option<Vec2>, height: f32, dt: f32) {
         let target = surface_pixels.map_or(Vec2::ZERO, |p| {
@@ -1205,7 +1209,7 @@ impl ProceduralBody {
         let tissue = phase.sin() * 0.65 + (phase * 1.73 + 0.8).sin() * 0.35;
         let settle = (-(self.mouth_context_age - 3.0).max(0.0) * 1.4).exp();
         let voice_authority = pose.audio_envelope.clamp(0.0, 1.0);
-        pose.mouth_open *= settle.max(voice_authority).max(self.feeding_mouth_activity);
+        pose.mouth_open *= settle.max(voice_authority).max(self.feeding_mouth_activity).max(f32::from(self.feeding_expression_active));
         // One brief tissue adjustment per long quiet interval, not a perpetual
         // mouth oscillator. Voice and food have independent opening authority.
         let cycle = (t + identity_phase).rem_euclid(8.5);
@@ -1511,6 +1515,19 @@ mod tests {
     use lifecore::{BodyIntent, ExpressionState, Genome, LocomotionMode, PoseIntent, SensorFrame};
 
     use super::*;
+
+    #[test]
+    fn chewing_keeps_jaw_visible_after_idle_mouth_has_settled() {
+        let genome=Genome::from_seed(42);
+        let mut body=ProceduralBody::generate(&genome).unwrap();
+        body.mouth_context_age=9.0;
+        body.embodiment.pose.mouth_open=0.4;
+        body.embodiment.pose.audio_envelope=0.0;
+        let quiet=body.render_parameters(&genome,0.3).mouth_open;
+        body.set_feeding_expression_active(true);
+        let chewing=body.render_parameters(&genome,0.3).mouth_open;
+        assert!(chewing>quiet+0.25);
+    }
 
     #[test]
     fn feeding_target_moves_face_without_detaching_mouth() {

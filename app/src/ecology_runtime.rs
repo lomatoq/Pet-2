@@ -78,6 +78,7 @@ pub struct EcologyRuntime {
     food_grounded: bool,
     food_support_root_y: Option<f32>,
     user_food_seconds: f32,
+    play_state: pet_ecology::OrbPlayState,
 }
 
 struct PetObjectGrip {
@@ -313,6 +314,7 @@ impl EcologyRuntime {
             food_grounded: false,
             food_support_root_y: None,
             user_food_seconds: 0.0,
+            play_state: Default::default(),
         })
     }
 
@@ -350,6 +352,7 @@ impl EcologyRuntime {
             selected_action
         };
         let frame = EcologyBehaviorFrame {
+            play_state: self.play_state,
             social_contact,
             selected_action,
             pet_position: body.world_position,
@@ -741,6 +744,10 @@ impl EcologyRuntime {
         )
     }
 
+    pub fn set_play_state(&mut self, affect: lifecore::AffectState, felt: lifecore::FeltStateV1, temperament: &lifecore::TemperamentGenome) {
+        self.play_state=pet_ecology::OrbPlayState {affect,felt,patience:temperament.patience,persistence:temperament.persistence,playfulness:temperament.playfulness};
+    }
+
     pub fn step_digestion(&mut self, frame: pet_ecology::DigestionFrame, dt: f32) {
         self.state.waste.step(&mut self.state.metabolism.tract, frame, dt);
     }
@@ -1077,7 +1084,8 @@ impl EcologyRuntime {
         };
         self.environment.orb_trapped = self.orb_trapped_seconds >= 0.75;
         self.object_physics_microseconds = started.elapsed().as_secs_f64() * 1_000_000.0;
-        self.state.metabolism.advance(dt);
+        self.state.metabolism.advance_with_activity(dt,
+            (body.velocity * Vec2::new(self.desktop_aspect,1.0)).length() * 3.0);
         // Unattended crumbs lose freshness in simulated time. Holding/carrying
         // food suspends expiry, and expiry never credits nutrition.
         for food in &mut self.state.objects {
@@ -2462,6 +2470,63 @@ mod tests {
         }
         assert!(held_ticks>30,"chase must actually hold the object, held {held_ticks} ticks");
         assert!(travel>0.025,"the held toy must travel with the liquid body, distance={travel}");
+    }
+
+    #[test]
+    fn familiar_orb_is_carried_during_ordinary_low_drive_self_play() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let seed = 5784121873664838231;
+        let mut runtime = EcologyRuntime::load_or_create(&store, seed, true).unwrap();
+        runtime.desktop_aspect = 16.0 / 9.0;
+        runtime.state.den.anchor = Vec2::splat(0.95);
+        let genome = lifecore::Genome::from_seed(seed);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.apply_tuning_profile(crate::production_liquid_tuning(crate::approved_production_liquid_tuning(seed))).unwrap();
+        body.set_presentation_scale(2.0);
+        body.set_desktop_motion_space(Vec2::new(1920.0,1080.0),1080.0);
+        body.simulation.set_motion_space_pixels(Vec2::new(1920.0,1080.0));
+        body.simulation.feedback.world_position=Vec2::splat(0.5);
+        let sensors=SensorFrame {cursor_position:Vec2::new(0.7,0.3),..Default::default()};
+        let mut intent=BodyIntent {
+            locomotion:lifecore::LocomotionMode::Arrive,target_position:Vec2::splat(0.5),
+            target_surface:None,desired_speed:0.0,facing_direction:1.0,gaze_target:None,
+            pose:lifecore::PoseIntent::Neutral,expression:Default::default(),interaction_target:None,
+        };
+        for _ in 0..24 {
+            body.embodied_update(&intent,&sensors,Default::default(),Default::default(),Default::default(),1.0/120.0);
+        }
+        let support=body.liquid_physical_support_pixels(Vec2::X,1080.0);
+        let orb=&mut runtime.state.objects[0];
+        orb.position=body.simulation.feedback.world_position+Vec2::new((support.x+12.0)/1920.0,support.y/1080.0);
+        orb.velocity=Vec2::ZERO;orb.lifecycle=ObjectLifecycle::Free;orb.novelty=0.0;orb.preference=1.0;orb.familiarity=1.0;
+        let start=orb.position;
+        let mut held_ticks=0;
+        let mut travel=0.0_f32;
+        let mut drives=Drives::initial(&genome.temperament);drives.play=0.25;
+        for tick in 0..360 {
+            let contact=runtime.orb_physical_frame(&body,&body.simulation.feedback,1080.0,1.0/120.0);
+            if tick % 6 == 0 {
+                let out=runtime.resolve_intent(intent.clone(),EcologyResolveFrame {
+                    selected_action:ActionId::SelfPlay,drives,sensors:&sensors,
+                    body:&body.simulation.feedback,focus_mode:false,dt:0.05,
+                    orb_physical:contact,social_contact:Default::default(),
+                });
+                intent=out.body_intent;
+            }
+            body.fixed_update(&genome,&intent,&sensors,1.0/120.0);
+            runtime.set_measured_orb_contact(contact,1080.0);
+            runtime.fixed_update(16.0/9.0,&WindowAffordanceFrame::default(),&body.simulation.feedback,1.0/120.0);
+            body.set_embodied_environment(runtime.environment());
+            body.embodied_update(&intent,&sensors,Default::default(),Default::default(),Default::default(),1.0/120.0);
+            body.presentation_update(1.0/120.0);
+            if runtime.state.objects[0].lifecycle==ObjectLifecycle::CarriedByPet {
+                held_ticks+=1;
+                travel=travel.max(desktop_distance(start,runtime.state.objects[0].position,16.0/9.0));
+            }
+        }
+        assert!(held_ticks>120,"self-play must actually hold the object, held {held_ticks} ticks");
+        assert!(travel>0.06,"the held toy must travel with the liquid body, distance={travel}");
     }
 
     #[test]
