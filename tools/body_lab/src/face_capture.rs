@@ -56,6 +56,7 @@ impl Capture {
         let initial = ProceduralBody::generate(&genome)?;
         let mut renderer = pollster::block_on(Renderer::new(window.clone(), &initial.mesh))?;
         let mut records = Vec::new();
+        let eyes_only = std::env::args().any(|arg| arg == "--eye-emotions-only");
         for scale in [1.0_f32, 1.5, 2.0] {
             let pixels = (512.0 * scale) as u32;
             let _ = window.request_inner_size(PhysicalSize::new(pixels, pixels));
@@ -112,6 +113,21 @@ impl Capture {
                     ("RigAngryShout", angry_shout),
                 ] {
                     fixtures.push((name.to_owned(), expression, true));
+                }
+                if eyes_only {
+                    fixtures.clear();
+                    for (name, curve) in [("Neutral",0.0),("JoyMild",0.3),("JoyStrong",0.95),("SadMild",-0.25),("SadStrong",-0.85)] {
+                        let mut expression=FacePose::Awake.expression();
+                        expression.mouth_curve=curve;
+                        expression.brow_tension=0.0;
+                        expression.brow_raise=0.0;
+                        expression.squint=0.0;
+                        expression.blink_left=0.0;
+                        expression.blink_right=0.0;
+                        fixtures.push((name.to_owned(),expression,true));
+                    }
+                    fixtures.push(("AngerControl".into(),FacePose::Boundary.expression(),true));
+                    fixtures.push(("SurpriseControl".into(),FacePose::Startled.expression(),true));
                 }
                 for (fixture, expression, managed) in fixtures {
                     let mut body = Box::new(ProceduralBody::generate(&genome)?);
@@ -176,6 +192,10 @@ impl Capture {
                         "renderer_blink": [parameters.blink_left, parameters.blink_right]}));
                 }
             }
+        }
+        if eyes_only {
+            fs::write(self.output.join("channels.json"),serde_json::to_vec_pretty(&records)?)?;
+            return Ok(());
         }
         let _ = window.request_inner_size(PhysicalSize::new(512, 512));
         renderer.resize(PhysicalSize::new(512, 512));

@@ -452,6 +452,9 @@ fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     let index=select(1u,0u,side<0.0);
     let blink=select(globals.lids_brows.x,globals.lids_brows.y,side>0.0);
     let emotion=pearl_emotion();let angry=emotion.x;let sad=emotion.y;let surprise=emotion.z;
+    // Smile recruitment uses the smoothed expressive curve, not speech/jaw
+    // amplitude. Joy lifts the LOWER lid into the eye; sadness tilts the upper.
+    let joy=smoothstep(0.16,0.78,globals.brow_mouth.w)*(1.0-angry)*(1.0-surprise);
     let gaze=globals.gaze_pupil.xy;
     let center=pearl_eye_center(side);
     let authored=clamp(select(globals.face_eye_scales.zw,globals.face_eye_scales.xy,side<0.0),vec2<f32>(0.78),vec2<f32>(1.25));
@@ -480,11 +483,14 @@ fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     let inner_to_outer=clamp(side*q.x*0.5+0.5,0.0,1.0);
     let semantic_upper=mix(lids.x,lids.y,inner_to_outer);
     let top=1.06-globals.lids_brows.z*0.35+(semantic_upper*0.95)*(0.30+0.70*angry)
-        -angry*(0.50-0.44*side*q.x)+0.14*lids.w*(1.0-min(q.x*q.x,1.0));
-    let bottom=-1.16+max(gaze.y,0.0)*0.44+lids.z*0.48+sad*0.16-0.12*(1.0-min(q.x*q.x,1.0));
+        -angry*(0.50-0.44*side*q.x)-sad*(0.26+0.38*side*q.x)
+        +0.14*lids.w*(1.0-min(q.x*q.x,1.0));
+    let inner_arc=1.0-min(q.x*q.x,1.0);
+    let bottom=-1.16+max(gaze.y,0.0)*0.44+lids.z*0.48-0.12*inner_arc
+        +joy*(0.68+0.54*inner_arc);
     let opened=oval*(1.0-smoothstep(top-0.06,top+0.06,q.y))*smoothstep(bottom-0.05,bottom+0.05,q.y);
     let arc_x=clamp(local.x,-0.038,0.038);
-    let arc_y=-0.013+0.015*pow(arc_x/0.038,2.0);
+    let arc_y=(-0.013+0.015*pow(arc_x/0.038,2.0))*(1.0-2.0*joy);
     let closed=1.0-smoothstep(0.003,0.006,length(local-vec2<f32>(arc_x,arc_y)));
     return mix(opened,closed,smoothstep(0.45,0.92,blink));
 }
