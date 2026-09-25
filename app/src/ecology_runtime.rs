@@ -1107,19 +1107,6 @@ impl EcologyRuntime {
         self.den_events.push_back(event);
     }
 
-    pub fn cancel_user_food(&mut self) {
-        self.user_food_seconds = 0.0;
-        self.state
-            .objects
-            .retain(|o| o.kind != ObjectKind::Morsel || o.radius_px_at_reference > 3.0);
-        self.food_caught = None;
-        self.food_physical = None;
-        self.food_rest = None;
-        self.food_grounded = false;
-        self.food_support_root_y = None;
-        self.food_ingress_origin = None;
-    }
-
     pub fn sprinkle_food(&mut self, position: Vec2, timestamp: f64) -> usize {
         self.state
             .objects

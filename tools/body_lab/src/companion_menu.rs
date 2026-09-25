@@ -395,7 +395,7 @@ pub(super) fn show(
             if !ready{ui.label(RichText::new("Connecting to Bender…").small().color(MUTED));}
             ui.add_enabled_ui(ready,|ui|match page{
                 0=>{ui.label(RichText::new("Glowing crumbs").strong());ui.label(RichText::new("A little treat, right from your cursor.").color(MUTED));ui.add_space(5.0);if primary(ui,"Feed Bender"){command=Some(LabControlCommand::Feeding{enabled:true});state.waiting_for_feed=true;}
-if ui.button("Stop feeding & clear crumbs").clicked(){command=Some(LabControlCommand::Feeding{enabled:false});}ui.small("Press Esc or right-click to stop.");},
+if ui.button("Stop feeding").clicked(){command=Some(LabControlCommand::Feeding{enabled:false});}ui.small("Esc or right-click stops sprinkling. Crumbs stay.");},
                 5=>{ui.label(RichText::new("A little cleanup").strong());ui.label("Hover over a pink trace to gently vacuum it away.");ui.add_space(8.0);if primary(ui,"Start cleaning"){command=Some(LabControlCommand::Cleanup{enabled:true});state.waiting_for_cleanup=true;}
 if ui.button("Stop cleaning").clicked(){command=Some(LabControlCommand::Cleanup{enabled:false});}ui.small("Only hovered traces are removed. Esc to finish.");},
                 1|2=>{

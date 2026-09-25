@@ -2425,7 +2425,6 @@ impl PetApplication {
         if (runtime.feeding_seconds > 0.0 || runtime.cleanup_mode) && feeding_escape_down() {
             runtime.feeding_seconds = 0.0;
             runtime.cleanup_mode = false;
-            runtime.ecology.cancel_user_food();
         }
         runtime.window.set_cursor(if runtime.feeding_seconds > 0.0 || runtime.cleanup_mode {
             winit::window::CursorIcon::Crosshair
@@ -5075,9 +5074,6 @@ impl ApplicationHandler for PetApplication {
                 button: MouseButton::Right,
                 ..
             } => {
-                if runtime.feeding_seconds > 0.0 {
-                    runtime.ecology.cancel_user_food();
-                }
                 runtime.feeding_seconds = 0.0;
                 runtime.cleanup_mode = false;
                 let nest = virtual_normalized_to_physical(
@@ -5138,7 +5134,7 @@ impl ApplicationHandler for PetApplication {
             {
                 if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
                     runtime.feeding_seconds = 0.0;
-                    runtime.ecology.cancel_user_food();
+                    runtime.cleanup_mode = false;
                 }
                 if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
                     runtime.birth.started = None;
@@ -6039,15 +6035,14 @@ fn poll_lab_control(
         }
         LabControlCommand::Cleanup { enabled } => {
             runtime.cleanup_mode = enabled;
-            if enabled { runtime.feeding_seconds = 0.0; runtime.ecology.cancel_user_food(); }
+            if enabled { runtime.feeding_seconds = 0.0; }
             true
         }
         LabControlCommand::Feeding { enabled } => {
             runtime.cleanup_mode = false;
+            // This switches cursor sprinkling only. Existing food and any
+            // in-progress bite belong to the world, independently of the menu.
             runtime.feeding_seconds = if enabled { 90.0 } else { 0.0 };
-            if !enabled {
-                runtime.ecology.cancel_user_food();
-            }
             runtime.window.set_cursor(if enabled {
                 winit::window::CursorIcon::Crosshair
             } else {
