@@ -13,6 +13,7 @@ pub(super) struct MenuState {
     page: Option<usize>,
     selected: usize,
     pub waiting_for_feed: bool,
+    waiting_for_cleanup: bool,
     pub close: bool,
     pub hidden: bool,
     pub capture_done: bool,
@@ -24,8 +25,8 @@ pub(super) struct MenuState {
     volume: Option<u8>,
     last_volume_edit: Option<Instant>,
     restore_volume: u8,
-    press: [f32; 5],
-    press_velocity: [f32; 5],
+    press: [f32; 6],
+    press_velocity: [f32; 6],
 }
 impl MenuState {
     pub fn new(hidden: bool) -> Self {
@@ -61,6 +62,7 @@ impl MenuState {
         self.close = false;
         self.closing = None;
         self.waiting_for_feed = false;
+        self.waiting_for_cleanup = false;
         self.opened = Some(Instant::now());
         self.page = None;
         self.capture_done = false;
@@ -70,7 +72,7 @@ impl MenuState {
 const INK: Color32 = Color32::from_rgb(48, 43, 66);
 const MUTED: Color32 = Color32::from_rgb(113, 107, 133);
 const ACCENT: Color32 = Color32::from_rgb(114, 82, 165);
-const LABELS: [&str; 5] = ["Food", "Learn", "Name", "Voice", "Settings"];
+const LABELS: [&str; 6] = ["Food", "Learn", "Name", "Voice", "Settings", "Clean up"];
 const CUES: [&str; 21] = [
     "Name · Bender",
     "Quiet",
@@ -193,6 +195,11 @@ fn icon(p: &egui::Painter, c: egui::Pos2, index: usize, color: Color32) {
             line([7.0, 3.0], [7.0, -1.0]);
             line([0.0, 7.0], [0.0, 10.0]);
         }
+        5 => {
+            line([4.0,-9.0],[-2.0,2.0]);
+            line([-2.0,2.0],[-8.0,7.0]);line([-8.0,7.0],[4.0,10.0]);line([4.0,10.0],[4.0,3.0]);
+            line([-2.0,2.0],[4.0,3.0]);line([-2.0,5.0],[-4.0,8.0]);
+        }
         _ => {
             p.circle_stroke(c, 5.0, st);
             p.circle_stroke(c, 1.8, st);
@@ -231,24 +238,26 @@ pub(super) fn show(
     if state.waiting_for_feed && latest["details"]["feeding"]["enabled"].as_bool() == Some(true) {
         state.close = true;
     }
+    if state.waiting_for_cleanup && latest["details"]["cleanup"]["enabled"].as_bool() == Some(true) { state.close = true; }
     if state.close {
         state.closing.get_or_insert_with(Instant::now);
     }
     let closing = state.closing.map(|t| t.elapsed().as_secs_f32());
     let mut command = None;
     state.regions.clear();
-    let base = pos2((screen.width() - 320.0) * 0.5, screen.height() - 134.0);
+    let base = pos2((screen.width() - 340.0) * 0.5, screen.height() - 134.0);
     let specs = [
-        (vec2(20.0, 0.0), 94.0),
-        (vec2(130.0, 0.0), 110.0),
+        (vec2(0.0, 0.0), 94.0),
+        (vec2(108.0, 0.0), 110.0),
         (vec2(0.0, 62.0), 102.0),
         (vec2(118.0, 62.0), 106.0),
         (vec2(240.0, 62.0), 48.0),
+        (vec2(230.0, 0.0), 110.0),
     ];
     for (index, (offset, width)) in specs.iter().enumerate() {
-        let phase = ((elapsed - [0.16, 0.20, 0.0, 0.04, 0.08][index]) / 0.42).clamp(0.0, 1.0);
+        let phase = ((elapsed - [0.16, 0.20, 0.0, 0.04, 0.08, 0.24][index]) / 0.42).clamp(0.0, 1.0);
         let leaving = closing.map_or(0.0, |t| {
-            ease((t - [0.06, 0.10, 0.16, 0.20, 0.24][index]) / 0.38)
+            ease((t - [0.06, 0.10, 0.16, 0.20, 0.24, 0.02][index]) / 0.38)
         });
         let alpha = ease(phase) * (1.0 - leaving);
         let scale =
@@ -294,7 +303,7 @@ pub(super) fn show(
                     );
                 }
                 let center = rect.min + vec2(24.0, 24.0);
-                if index < 4 {
+                if index != 4 {
                     ui.painter().circle_filled(
                         center,
                         15.0,
@@ -302,7 +311,7 @@ pub(super) fn show(
                     );
                 }
                 icon(ui.painter(), center, index, ACCENT.gamma_multiply(alpha));
-                if index < 4 {
+                if index != 4 {
                     ui.painter().text(
                         rect.min + vec2(46.0, 24.0),
                         egui::Align2::LEFT_CENTER,
@@ -353,6 +362,7 @@ pub(super) fn show(
             1 => 346.0,
             2 => 268.0,
             3 => 282.0,
+            5 => 250.0,
             _ => 210.0,
         };
         let rect = Rect::from_min_size(
@@ -386,6 +396,8 @@ pub(super) fn show(
             ui.add_enabled_ui(ready,|ui|match page{
                 0=>{ui.label(RichText::new("Glowing crumbs").strong());ui.label(RichText::new("A little treat, right from your cursor.").color(MUTED));ui.add_space(5.0);if primary(ui,"Feed Bender"){command=Some(LabControlCommand::Feeding{enabled:true});state.waiting_for_feed=true;}
 if ui.button("Stop feeding & clear crumbs").clicked(){command=Some(LabControlCommand::Feeding{enabled:false});}ui.small("Press Esc or right-click to stop.");},
+                5=>{ui.label(RichText::new("A little cleanup").strong());ui.label("Hover over a pink trace to gently vacuum it away.");ui.add_space(8.0);if primary(ui,"Start cleaning"){command=Some(LabControlCommand::Cleanup{enabled:true});state.waiting_for_cleanup=true;}
+if ui.button("Stop cleaning").clicked(){command=Some(LabControlCommand::Cleanup{enabled:false});}ui.small("Only hovered traces are removed. Esc to finish.");},
                 1|2=>{
                     if page==1 {egui::ComboBox::from_id_salt("care-cue").width(245.0).selected_text(CUES[state.selected]).show_ui(ui,|ui|{for (i,label) in CUES.iter().enumerate().skip(1){ui.selectable_value(&mut state.selected,i,*label);}});}
                     else{ui.label(RichText::new("Bender / Benny").size(18.0).strong());ui.small("Teach him the sound of his name.");}
@@ -417,7 +429,7 @@ if ui.button("Close menu").clicked(){state.close=true;}}
     for layer in layers {
         if layer.order == egui::Order::Foreground || layer.order == egui::Order::Tooltip {
             if layer.id == egui::Id::new("care-panel")
-                || (0..5).any(|i| layer.id == egui::Id::new(("care-bubble", i)))
+                || (0..6).any(|i| layer.id == egui::Id::new(("care-bubble", i)))
             {
                 continue;
             }

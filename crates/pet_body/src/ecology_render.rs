@@ -5,7 +5,7 @@ use wgpu::util::DeviceExt;
 
 use crate::DenVisualTuning;
 
-const MAX_ECOLOGY_INSTANCES: usize = 25;
+const MAX_ECOLOGY_INSTANCES: usize = 25 + pet_ecology::MAX_WASTE_NODES + 48;
 const PEARL_BYTES: &[u8] = include_bytes!("../../../assets/nest/orb-pearl-v28.rgba");
 
 fn ecology_source_over_blend(premultiplied_output: bool) -> wgpu::BlendState {
@@ -688,6 +688,46 @@ impl EcologyRenderer {
                 background_uv_rect: [0.0; 4],
             };
             count += 1;
+        }
+        // Soft capsule links live in the foreground with crumbs. Their world
+        // positions belong to the persisted joint solver, never the pet transform.
+        for chain in &state.waste.chains {
+            let t = chain.suction.unwrap_or(0.0);
+            let ease = t * t * (3.0 - 2.0 * t);
+            let shrink = (1.0 - ease).max(0.001);
+            let center = chain.nodes.iter().map(|n| n.position).sum::<Vec2>() / chain.nodes.len().max(1) as f32;
+            for i in 0..chain.nodes.len().saturating_sub(1).max(1) {
+                if count >= MAX_ECOLOGY_INSTANCES { break; }
+                let a = &chain.nodes[i];
+                let b = &chain.nodes[(i + 1).min(chain.nodes.len() - 1)];
+                let a_pos = center + (a.position - center) * shrink;
+                let b_pos = center + (b.position - center) * shrink;
+                let midpoint = (a_pos + b_pos) * 0.5;
+                let delta = (b_pos - a_pos) * Vec2::new(aspect, -1.0) * 0.5;
+                let radius = a.radius * shrink;
+                let extent = delta.abs() + Vec2::splat(radius * 1.12);
+                foreground_start.get_or_insert(count as u32);
+                instances[count] = EcologyInstance {
+                    center_radius: [midpoint.x*2.0-1.0, 1.0-midpoint.y*2.0, extent.x*2.0/aspect,extent.y*2.0],
+                    color: [0.96,0.43+chain.hardness*0.07,0.68,1.0-ease],
+                    material: [3.0,radius,chain.hardness,time_seconds],
+                    den_surface: [delta.x,delta.y,0.0,0.0],
+                    den_optics: [extent.x,extent.y,chain.floor,0.0],
+                    ..EcologyInstance::default()
+                };
+                count += 1;
+            }
+        }
+        for bubble in &state.waste.bubbles {
+            if count >= MAX_ECOLOGY_INSTANCES { break; }
+            foreground_start.get_or_insert(count as u32);
+            let radius=bubble.radius*(1.0+(2.0-bubble.life).max(0.0)*0.25);
+            instances[count]=EcologyInstance {
+                center_radius:[bubble.position.x*2.0-1.0,1.0-bubble.position.y*2.0,radius*2.0/aspect,radius*2.0],
+                color: if bubble.burp {[0.94,0.83,0.98,bubble.life.min(1.0)*0.48]} else {[0.97,0.59,0.83,bubble.life.min(1.0)*0.42]},
+                material:[4.0,0.0,0.0,time_seconds], ..EcologyInstance::default()
+            };
+            count+=1;
         }
         if count == 0 {
             self.prepared_den_count = 0;

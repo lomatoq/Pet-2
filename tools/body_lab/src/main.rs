@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod birth_capture;
+mod digestion_capture;
 mod companion_glass;
 mod companion_instance;
 mod companion_menu;
@@ -75,6 +76,9 @@ const BACKGROUNDS: [ReviewBackground; 6] = [
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::args().nth(1).as_deref() == Some("--digestion-captures") {
+        return digestion_capture::run(env::args().nth(2).unwrap_or_else(|| "digestion-captures".into()).into());
+    }
     if env::args().nth(1).as_deref() == Some("--birth-captures") {
         return birth_capture::run(
             env::args()
@@ -3109,6 +3113,7 @@ fn build_lab_control_envelope(
         | LabControlCommand::RollbackGestureConventions { .. }
         | LabControlCommand::ClearGestureConventions
         | LabControlCommand::Feeding { .. }
+        | LabControlCommand::Cleanup { .. }
         | LabControlCommand::Hearing { .. } => 5_000,
         LabControlCommand::ShutdownForPromotion => 15_000,
         LabControlCommand::StimulatePointerGesture {
@@ -3140,6 +3145,7 @@ fn lab_control_description(command: &LabControlCommand) -> String {
             format!("{} drive {delta:+.2}", lab_drive_label(*drive))
         }
         LabControlCommand::Feeding { enabled } => format!("feeding {enabled}"),
+        LabControlCommand::Cleanup { enabled } => format!("cleanup {enabled}"),
         LabControlCommand::Reward { value } => format!("learning reward {value:+.2}"),
         LabControlCommand::FocusMode { enabled } => {
             format!("focus mode {}", if *enabled { "on" } else { "off" })

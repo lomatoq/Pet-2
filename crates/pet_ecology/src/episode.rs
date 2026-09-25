@@ -1549,17 +1549,26 @@ fn drive_episode(
                 }
                 return EpisodeStep::Continue;
             }
-            if active.goal == EpisodeGoal::SoloOrbPlay
+            if matches!(active.goal, EpisodeGoal::SoloOrbPlay | EpisodeGoal::ChaseOrb)
                 && active.attempts == 0
                 // A slow toy can be picked up; a fast one is batted/chased.
                 // Readiness comes from the bout's drive and fatigue rather
                 // than only one out of every four episode IDs.
-                && active.bout_play_drive * (1.0 - active.bout_fatigue * 0.6) > 0.5
+                && (active.bout_play_drive * (1.0 - active.bout_fatigue * 0.6) > 0.5
+                    || (active.goal == EpisodeGoal::ChaseOrb && active.bout_fatigue < 0.7))
                 && (orb.velocity - frame.pet_velocity * Vec2::new(frame.desktop_aspect, 1.0)).length() < 0.18
                 && frame.orb_physical.contact
                 && orb.lifecycle != ObjectLifecycle::GrabbedByUser
             {
                 set_phase(active, EpisodePhase::Manipulate);
+                if active.goal == EpisodeGoal::ChaseOrb {
+                    state.episode_stats.completed[EpisodeGoal::ChaseOrb.index()] += 1;
+                    state.episode_stats.started[EpisodeGoal::SoloOrbPlay.index()] += 1;
+                    push_outcome(output, EcologyOutcome::EpisodeCompleted(EpisodeGoal::ChaseOrb));
+                    active.elapsed_seconds = 0.0;
+                    active.commitment_remaining = commitment_for(EpisodeGoal::SoloOrbPlay);
+                }
+                active.goal = EpisodeGoal::SoloOrbPlay;
                 let scale = Vec2::new(frame.desktop_aspect.clamp(0.25, 8.0), 1.0);
                 let direction = ((frame.cursor_position - frame.pet_position) * scale)
                     .normalize_or(Vec2::NEG_Y);

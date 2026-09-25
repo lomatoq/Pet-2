@@ -81,6 +81,7 @@ pub enum LabControlCommand {
         lease_seconds: u32,
     },
     CloseSession,
+    Cleanup { enabled: bool },
     Feeding {
         enabled: bool,
     },
@@ -217,6 +218,7 @@ impl LabControlCommand {
             | Self::RollbackGestureConventions { .. }
             | Self::ClearGestureConventions
             | Self::Feeding { .. }
+            | Self::Cleanup { .. }
             | Self::Hearing { .. }
             | Self::ShutdownForPromotion => Ok(()),
         }

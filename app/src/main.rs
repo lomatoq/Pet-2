@@ -10,6 +10,7 @@ mod startup_reveal;
 mod companion_runtime;
 mod cradle_runtime;
 mod ecology_runtime;
+mod digestion_runtime;
 mod evolution_runner;
 mod hearing_bridge;
 mod local_voice_context;
@@ -2105,6 +2106,8 @@ struct PetRuntime {
     context_glance: voice_actions::ContextGlance,
     recognition_joy: f32,
     feeding_seconds: f32,
+    cleanup_mode: bool,
+    digestion_site: Option<Vec2>,
     food_click_cooldown: f32,
     companion_menu: Option<std::process::Child>,
     organic: organic_runtime::OrganicRuntime,
@@ -2419,11 +2422,12 @@ impl PetApplication {
         runtime.last_update = now;
         runtime.feeding_seconds = (runtime.feeding_seconds - elapsed).max(0.0);
         runtime.food_click_cooldown = (runtime.food_click_cooldown - elapsed).max(0.0);
-        if runtime.feeding_seconds > 0.0 && feeding_escape_down() {
+        if (runtime.feeding_seconds > 0.0 || runtime.cleanup_mode) && feeding_escape_down() {
             runtime.feeding_seconds = 0.0;
+            runtime.cleanup_mode = false;
             runtime.ecology.cancel_user_food();
         }
-        runtime.window.set_cursor(if runtime.feeding_seconds > 0.0 {
+        runtime.window.set_cursor(if runtime.feeding_seconds > 0.0 || runtime.cleanup_mode {
             winit::window::CursorIcon::Crosshair
         } else {
             winit::window::CursorIcon::Default
@@ -2583,7 +2587,7 @@ impl PetApplication {
                     4.0,
                 )
             });
-            let primary_down = runtime.feeding_seconds <= 0.0
+            let primary_down = !runtime.cleanup_mode && runtime.feeding_seconds <= 0.0
                 && snapshot.primary_button_down.unwrap_or(runtime.pointer.down);
             let pet_capture_active = runtime.pointer_tracker.captured;
             let petting_started = update_pointer_state(
@@ -2621,7 +2625,7 @@ impl PetApplication {
             );
             let _ = runtime.platform.set_cursor_hittest(
                 &runtime.window,
-                (accepts_cursor || den_hover || runtime.feeding_seconds > 0.0)
+                (accepts_cursor || den_hover || runtime.feeding_seconds > 0.0 || runtime.cleanup_mode)
                     && runtime.birth.started.is_none(),
             );
             runtime.sensors = runtime.normalizer.normalize(
@@ -2910,6 +2914,7 @@ impl PetApplication {
             let cradle_hull = runtime
                 .body
                 .main_liquid_contact_bounds_pixels(cradle_viewport[1] as f32);
+            digestion_runtime::update(runtime, body_dt);
             let original_target =
                 virtual_normalized_to_physical(&runtime.topology, runtime.intent.target_position);
             let wants_cradle = cradle_geometry.contains_target(original_target);
@@ -4610,6 +4615,8 @@ impl PetApplication {
                     },
                     "capabilities": runtime.platform.capabilities(),
                 });
+                debug_details["cleanup"] = serde_json::json!({"enabled":runtime.cleanup_mode,"traces":runtime.ecology.state().waste.chains.len()});
+                debug_details["digestion"] = serde_json::json!(runtime.ecology.state().metabolism.tract);
                 debug_details["cradle_inside"] = serde_json::json!(runtime.cradle_seat.inside);
                 debug_details["den_background_mode"] =
                     serde_json::json!(if runtime.platform.overlay_background_excludes_pet() {
@@ -4895,6 +4902,8 @@ impl ApplicationHandler for PetApplication {
                 self.arguments.listen,
             ),
             feeding_seconds: 0.0,
+            cleanup_mode: false,
+            digestion_site: None,
             food_click_cooldown: 0.0,
             companion_menu: spawn_companion_menu(&self.store.paths.root, true),
             organic: organic_runtime::OrganicRuntime::load(&self.store.paths.root),
@@ -5070,6 +5079,7 @@ impl ApplicationHandler for PetApplication {
                     runtime.ecology.cancel_user_food();
                 }
                 runtime.feeding_seconds = 0.0;
+                runtime.cleanup_mode = false;
                 let nest = virtual_normalized_to_physical(
                     &runtime.topology,
                     runtime.ecology.state().den.anchor,
@@ -6027,7 +6037,13 @@ fn poll_lab_control(
             }
             changed
         }
+        LabControlCommand::Cleanup { enabled } => {
+            runtime.cleanup_mode = enabled;
+            if enabled { runtime.feeding_seconds = 0.0; runtime.ecology.cancel_user_food(); }
+            true
+        }
         LabControlCommand::Feeding { enabled } => {
+            runtime.cleanup_mode = false;
             runtime.feeding_seconds = if enabled { 90.0 } else { 0.0 };
             if !enabled {
                 runtime.ecology.cancel_user_food();
@@ -6076,6 +6092,7 @@ const fn lab_command_name(command: &LabControlCommand) -> &'static str {
         LabControlCommand::RollbackGestureConventions { .. } => "rollback_gesture_conventions",
         LabControlCommand::ClearGestureConventions => "clear_gesture_conventions",
         LabControlCommand::Feeding { .. } => "feeding",
+        LabControlCommand::Cleanup { .. } => "cleanup",
         LabControlCommand::Hearing { .. } => "hearing",
         LabControlCommand::ShutdownForPromotion => "shutdown_for_promotion",
     }

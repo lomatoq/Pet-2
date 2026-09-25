@@ -562,6 +562,35 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         return encode_surface_output(vec4<f32>(rgb, alpha));
     }
 
+    if kind > 3.5 {
+        let r = length(input.local);
+        let rim = exp(-pow((r-0.82)*15.0,2.0));
+        let inside = 1.0-smoothstep(0.80,0.99,r);
+        let light = exp(-dot(input.local-vec2<f32>(-0.3,0.4),input.local-vec2<f32>(-0.3,0.4))*65.0);
+        let alpha = (rim*0.6+inside*0.08+light*0.5)*input.color.a;
+        return encode_surface_output(vec4<f32>(mix(input.color.rgb,vec3<f32>(1.0),light)*alpha,alpha));
+    }
+    if kind > 2.5 {
+        let p=input.local*input.den_optics.xy;
+        let axis=input.den_surface.xy;
+        let along=clamp(dot(p,axis)/max(dot(axis,axis),0.00000001),-1.0,1.0);
+        let normal=(p-axis*along)/max(input.material.y,0.000001);
+        let distance=length(normal);
+        let aa=max(fwidth(distance),0.015);
+        let floor_mask=1.0-smoothstep(input.den_optics.z-0.0006,input.den_optics.z,input.screen_uv.y);
+        let alpha=(1.0-smoothstep(1.0-aa,1.0+aa,distance))*input.color.a*floor_mask;
+        // Cylinder lighting continues through a joint; endpoint sphere lighting
+        // on every overlapping capsule would make a string of shiny beads.
+        let tangent=normalize(axis+vec2<f32>(0.0000001,0.0));
+        let perpendicular=vec2<f32>(-tangent.y,tangent.x);
+        let side=clamp(dot(p,perpendicular)/max(input.material.y,0.000001),-1.0,1.0);
+        let tube_normal=perpendicular*side;
+        let z=sqrt(max(0.0,1.0-side*side));
+        let diffuse=0.72+z*0.22-tube_normal.x*0.10+tube_normal.y*0.10;
+        let spec=pow(max(0.0,dot(normalize(vec3<f32>(tube_normal,z+0.001)),normalize(vec3<f32>(-0.4,0.6,1.2)))),18.0)*0.14;
+        let rgb=input.color.rgb*diffuse+vec3<f32>(1.0,0.85,0.93)*spec;
+        return encode_surface_output(vec4<f32>(rgb*alpha,alpha));
+    }
     if input.material.x > 1.5 {
         let pulse = 0.62 + 0.38 * sin(input.material.w * 1.65);
         let aa = max(fwidth(radial_distance), 0.03);

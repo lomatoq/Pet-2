@@ -58,6 +58,8 @@ impl ConsumedMorselEffect {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MetabolicState {
+    #[serde(default)]
+    pub tract: crate::DigestiveTract,
     pub reserve: f32,
     pub satiation: f32,
     pub digestion: f32,
@@ -67,6 +69,7 @@ pub struct MetabolicState {
 impl Default for MetabolicState {
     fn default() -> Self {
         Self {
+            tract: crate::DigestiveTract::default(),
             reserve: 0.72,
             satiation: 0.32,
             digestion: 0.0,
@@ -94,7 +97,7 @@ impl MetabolicState {
                 .active_effect
                 .as_ref()
                 .is_none_or(ConsumedMorselEffect::is_valid);
-        if bounded {
+        if bounded && self.tract.valid() {
             Ok(())
         } else {
             Err(EcologyError::InvalidMetabolism)
@@ -115,6 +118,7 @@ impl MetabolicState {
     }
 
     pub fn advance(&mut self, dt: f32) {
+        self.tract.advance(dt);
         let dt = if dt.is_finite() {
             dt.clamp(0.0, 60.0)
         } else {
@@ -145,6 +149,7 @@ impl MetabolicState {
         if !morsel.is_valid() {
             return;
         }
+        self.tract.swallow(morsel, portion, self.feeding_appetite());
         self.reserve = (self.reserve + (0.08 + morsel.value * 0.08) * portion)
             .clamp(METABOLIC_RESERVE_FLOOR, 1.0);
         self.satiation = (self.satiation + 0.28 * portion).clamp(0.0, 1.0);
