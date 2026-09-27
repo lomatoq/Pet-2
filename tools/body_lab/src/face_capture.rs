@@ -130,6 +130,21 @@ impl Capture {
                     }
                     fixtures.push(("AngerControl".into(),FacePose::Boundary.expression(),true));
                     fixtures.push(("SurpriseControl".into(),FacePose::Startled.expression(),true));
+                    for (name,curve,tension,raise) in [
+                        ("SmallFrown",-0.10,0.0,0.0),
+                        ("TenseFrown",-0.42,0.60,0.05),
+                        ("AlarmFrown",-0.42,0.68,0.70),
+                        ("JoyAlert",0.48,0.06,0.70),
+                    ] {
+                        let mut expression=FacePose::Awake.expression();
+                        expression.mouth_curve=curve;
+                        expression.brow_tension=tension;
+                        expression.brow_raise=raise;
+                        expression.mouth_open=0.35;
+                        expression.blink_left=0.0;
+                        expression.blink_right=0.0;
+                        fixtures.push((name.into(),expression,true));
+                    }
                 }
                 if care_only {
                     fixtures.clear();

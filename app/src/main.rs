@@ -1380,6 +1380,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
         let ecology_output = ecology.resolve_intent(
             output.body_intent,
             EcologyResolveFrame {
+                seated_in_den: false,
                 social_contact: pet_ecology::SocialContactFrame {
                     touched: sensors.pet_touched,
                     pleasantness: nervous.snapshot().felt.contact_pleasantness,
@@ -3414,6 +3415,7 @@ impl PetApplication {
             let ecology_output = runtime.ecology.resolve_intent(
                 output.body_intent,
                 EcologyResolveFrame {
+                    seated_in_den: runtime.cradle_seat.inside && !runtime.sensors.pet_dragged,
                     social_contact: pet_ecology::SocialContactFrame {
                         touched: runtime.sensors.pet_touched,
                         pleasantness: runtime.nervous_system.snapshot().felt.contact_pleasantness,
@@ -6604,6 +6606,10 @@ fn build_motor_context(runtime: &mut PetRuntime) -> BehaviorContextFrame {
     context.screen_edge_normal_velocity_px_s = runtime.screen_velocity_px.y;
     context.screen_edge_support_stable_seconds = runtime.screen_edge_support_stable_seconds;
     context.screen_edge_supported = runtime.screen_edge_supported;
+    context.den_supported = runtime.cradle_seat.inside
+        && !runtime.sensors.pet_dragged
+        && (runtime.body.simulation.feedback.velocity
+            * Vec2::new(desktop_size.x / desktop_size.y, 1.0)).length() < 0.035;
     context.surfaces.push(SurfaceCandidate {
         surface_id: SurfaceId("screen:bottom_edge".into()),
         minimum: Vec2::new(0.0, 1.0 - 1.0 / desktop_size.y),

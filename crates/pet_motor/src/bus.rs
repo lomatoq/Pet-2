@@ -369,6 +369,29 @@ mod tests {
     }
 
     #[test]
+    fn den_sleep_is_supported_even_when_desktop_floor_is_far_below() {
+        let mut context = BehaviorContextFrame::default();
+        context.surfaces.push(crate::SurfaceCandidate {
+            surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
+            minimum: Vec2::new(0.0, 0.999), maximum: Vec2::ONE,
+            velocity: Vec2::ZERO, familiarity: 1.0, recent_failed_landings: 0,
+        });
+        context.screen_edge_supported = false;
+        let mut packet = SomaticActuationPacket::default();
+        packet.locomotion.pose = MotorPoseIntent::SupportedSleep;
+        for supported in [false, true] {
+            context.den_supported = supported;
+            let mut actual = intent();
+            actual.desired_speed = 0.0;
+            SomaticActuationBus::apply_to_intent(&packet, &context, &mut actual);
+            assert_eq!(actual.locomotion, if supported { LocomotionMode::Sleep } else { LocomotionMode::Landing });
+            assert_eq!(actual.desired_speed, 0.0);
+        }
+        context.pet_dragged = true;
+        assert!(!context.support_confirmed());
+    }
+
+    #[test]
     fn locomotion_envelope_has_measured_semantic_consequences() {
         let mut packet = SomaticActuationPacket::default();
         packet.locomotion.target_position = Some(Vec2::new(0.80, 0.66));

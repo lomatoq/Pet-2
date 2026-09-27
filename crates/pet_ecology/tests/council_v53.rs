@@ -20,6 +20,7 @@ fn intent(position: Vec2) -> BodyIntent {
 
 fn frame(action: ActionId, position: Vec2, timestamp: f64) -> EcologyBehaviorFrame {
     EcologyBehaviorFrame {
+            seated_in_den: false,
         play_state: Default::default(),
         social_contact: Default::default(),
         selected_action: action,

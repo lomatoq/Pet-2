@@ -231,6 +231,7 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
 }
 
 pub(crate) struct EcologyResolveFrame<'a> {
+    pub seated_in_den: bool,
     pub social_contact: pet_ecology::SocialContactFrame,
     pub selected_action: ActionId,
     pub drives: Drives,
@@ -327,6 +328,7 @@ impl EcologyRuntime {
         frame: EcologyResolveFrame<'_>,
     ) -> EcologyOutput {
         let EcologyResolveFrame {
+            seated_in_den,
             social_contact,
             selected_action,
             drives,
@@ -354,6 +356,7 @@ impl EcologyRuntime {
             selected_action
         };
         let frame = EcologyBehaviorFrame {
+            seated_in_den,
             play_state: self.play_state,
             social_contact,
             selected_action,
@@ -2146,6 +2149,7 @@ mod tests {
                     expression: Default::default(), interaction_target: None,
                 };
                 let output = runtime.resolve_intent(idle, EcologyResolveFrame {
+                seated_in_den: false,
                     social_contact: Default::default(), selected_action: ActionId::IdleHover,
                     drives: Drives::initial(&genome.temperament), sensors: &sensors,
                     body: &body.simulation.feedback, focus_mode: false, dt: 0.05,
@@ -2508,6 +2512,7 @@ mod tests {
             let contact=runtime.orb_physical_frame(&body,&body.simulation.feedback,1080.0,1.0/120.0);
             if tick % 6 == 0 {
                 let out=runtime.resolve_intent(intent.clone(),EcologyResolveFrame {
+                seated_in_den: false,
                     selected_action:ActionId::PlayCursorChase,drives,sensors:&sensors,
                     body:&body.simulation.feedback,focus_mode:false,dt:0.05,
                     orb_physical:contact,social_contact:Default::default(),
@@ -2565,6 +2570,7 @@ mod tests {
             let contact=runtime.orb_physical_frame(&body,&body.simulation.feedback,1080.0,1.0/120.0);
             if tick % 6 == 0 {
                 let out=runtime.resolve_intent(intent.clone(),EcologyResolveFrame {
+                seated_in_den: false,
                     selected_action:ActionId::SelfPlay,drives,sensors:&sensors,
                     body:&body.simulation.feedback,focus_mode:false,dt:0.05,
                     orb_physical:contact,social_contact:Default::default(),
@@ -2839,6 +2845,7 @@ mod tests {
         let _ = runtime.resolve_intent(
             intent,
             EcologyResolveFrame {
+                seated_in_den: false,
                 social_contact: Default::default(),
                 selected_action: ActionId::BringProceduralOrb,
                 drives: Drives::initial(&lifecore::Genome::from_seed(78).temperament),

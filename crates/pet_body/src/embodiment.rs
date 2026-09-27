@@ -1077,7 +1077,12 @@ fn expressive_asymmetric_geometry(expression: lifecore::ExpressionState) -> life
     };
     let brow = signed(expression.brow_asymmetry);
     let knit = signed(expression.brow_tension).max(0.0);
-    let concern = (-signed(expression.mouth_curve)).max(0.0) * (1.0 - knit);
+    // Do not turn every small frown into worried inner brows. Effort and
+    // alertness keep their own face; quiet disappointment can recruit worry.
+    let ease = |x: f32| { let t=x.clamp(0.0,1.0); t*t*(3.0-2.0*t) };
+    let concern = ease((-signed(expression.mouth_curve)-0.12)/0.43)
+        * (1.0-ease((knit-0.25)/0.35))
+        * (1.0-ease((signed(expression.brow_raise)-0.30)/0.35));
     for (index, side) in [1.0, -1.0].into_iter().enumerate() {
         // Local action correctives, not rotation of a rigid brow: inner worry
         // lift and corrugator-like knitting compete; an inquisitive side raises
@@ -1317,6 +1322,26 @@ fn deterministic_unit(seed: u64, sequence: u64, salt: u64) -> f32 {
 mod tests {
     use super::*;
     use lifecore::{BodyIntent, Genome, LocomotionMode, PoseIntent};
+
+    #[test]
+    fn worry_brows_require_disappointment_not_small_frowns_or_alarm() {
+        let mut e = lifecore::ExpressionState::default();
+        e.brow_asymmetry = 0.0;
+        e.brow_tension = 0.0;
+        e.brow_raise = 0.0;
+        let base = expressive_asymmetric_geometry(e);
+        e.mouth_curve = -0.10;
+        assert_eq!(expressive_asymmetric_geometry(e).brows, base.brows);
+        e.mouth_curve = -0.70;
+        assert!(expressive_asymmetric_geometry(e).brows[0][0] > base.brows[0][0]+0.4);
+        e.brow_raise = 0.75;
+        assert_eq!(expressive_asymmetric_geometry(e).brows, base.brows);
+        e.brow_raise = 0.0;
+        e.brow_tension = 0.70;
+        let tense_frown = expressive_asymmetric_geometry(e);
+        e.mouth_curve = 0.0;
+        assert_eq!(tense_frown.brows, expressive_asymmetric_geometry(e).brows);
+    }
 
     #[test]
     fn managed_asymmetry_reaches_independent_rendered_curves_without_drift() {

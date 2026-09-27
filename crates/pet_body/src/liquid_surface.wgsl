@@ -435,7 +435,11 @@ fn pearl_emotion()->vec3<f32> {
     let surprise=max(smoothstep(0.16,0.76,globals.lids_brows.w)*authored_alert,semantic_alert);
     let inner_lowering=smoothstep(0.06,0.36,brows.y-brows.x);
     let anger=inner_lowering*smoothstep(0.28,0.72,globals.brow_mouth.x)*(1.0-surprise);
-    let sadness=saturate(-globals.brow_mouth.w*1.7)*(1.0-anger);
+    // A downturned mouth alone also means effort, boredom or alarm. Recruit
+    // worried lids only with a matching inner-brow lift and relaxed tension.
+    let worry_lift=smoothstep(0.03,0.25,brows.x-brows.y);
+    let sadness=smoothstep(0.12,0.55,-globals.brow_mouth.w)*worry_lift
+        *(1.0-smoothstep(0.25,0.60,globals.brow_mouth.x))*(1.0-surprise);
     return vec3<f32>(anger,sadness,surprise);
 }
 fn pearl_eye_center(side:f32)->vec2<f32> {
@@ -457,7 +461,7 @@ fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     let emotion=pearl_emotion();let angry=emotion.x;let sad=emotion.y;let surprise=emotion.z;
     // Smile recruitment uses the smoothed expressive curve, not speech/jaw
     // amplitude. Joy lifts the LOWER lid into the eye; sadness tilts the upper.
-    let joy=smoothstep(0.16,0.78,globals.brow_mouth.w)*(1.0-angry)*(1.0-surprise);
+    let joy=smoothstep(0.04,0.50,globals.brow_mouth.w)*(1.0-angry)*(1.0-0.30*surprise);
     let gaze=globals.gaze_pupil.xy;
     let center=pearl_eye_center(side);
     let authored=clamp(select(globals.face_eye_scales.zw,globals.face_eye_scales.xy,side<0.0),vec2<f32>(0.78),vec2<f32>(1.25));

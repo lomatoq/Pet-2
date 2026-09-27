@@ -254,6 +254,8 @@ pub struct EcologyBehaviorFrame {
     pub selected_action: ActionId,
     pub pet_position: Vec2,
     pub pet_velocity: Vec2,
+    /// Physical cradle admission; a seated center remains above the cushion anchor.
+    pub seated_in_den: bool,
     /// Desktop width / height. All proximity decisions use height-space so a
     /// threshold means the same physical distance on 16:9 and ultrawide hosts.
     pub desktop_aspect: f32,
@@ -1386,11 +1388,17 @@ fn drive_episode(
             {
                 return EpisodeStep::Complete;
             }
+            let seated = frame.seated_in_den
+                && Vec2::new(frame.pet_velocity.x * frame.desktop_aspect, frame.pet_velocity.y).length() < 0.035
+                && (frame.pet_position.x - state.den.anchor.x).abs() * frame.desktop_aspect < 0.10;
+            let arrival_radius = if active.goal == EpisodeGoal::SleepInDen { 0.04 } else { 0.035 };
+            let arrived = seated || frame.pet_position.distance(state.den.anchor) <= arrival_radius;
+            // Keep the semantic den target: native cradle navigation uses it to distinguish staying from exiting.
             output.body_intent.target_position = state.den.anchor;
             output.body_intent.gaze_target = Some(state.den.anchor);
-            output.body_intent.desired_speed = output.body_intent.desired_speed.max(0.34);
+            output.body_intent.desired_speed = if seated { 0.0 } else { output.body_intent.desired_speed.max(0.34) };
             output.body_intent.locomotion = if active.goal == EpisodeGoal::SleepInDen
-                && frame.pet_position.distance(state.den.anchor) <= 0.04
+                && arrived
             {
                 LocomotionMode::Sleep
             } else {
@@ -1402,7 +1410,7 @@ fn drive_episode(
                 PoseIntent::Neutral
             };
             if active.goal == EpisodeGoal::ReturnHome
-                && frame.pet_position.distance(state.den.anchor) <= 0.035
+                && arrived
             {
                 state.den.visits = state.den.visits.saturating_add(1);
                 state.den.familiarity = (state.den.familiarity + 0.006).clamp(0.0, 1.0);
@@ -1410,7 +1418,7 @@ fn drive_episode(
                 return EpisodeStep::Complete;
             }
             if active.goal == EpisodeGoal::SleepInDen
-                && frame.pet_position.distance(state.den.anchor) <= 0.04
+                && arrived
             {
                 state.den.comfort_value = (state.den.comfort_value + dt * 0.002).clamp(0.0, 1.0);
                 if !frame.sleeping && active.elapsed_seconds > 0.5 {
@@ -3083,6 +3091,7 @@ mod tests {
 
     fn behavior_frame(action: ActionId) -> EcologyBehaviorFrame {
         EcologyBehaviorFrame {
+            seated_in_den: false,
             play_state: Default::default(),
             social_contact: SocialContactFrame::default(),
             selected_action: action,
@@ -3118,6 +3127,37 @@ mod tests {
             autonomous_play_ready: false,
             click_rhythm: None,
             timestamp: 1.0,
+        }
+    }
+
+    #[test]
+    fn physical_den_seat_finishes_arrival_without_chasing_cushion_center() {
+        let mut state = EcologyState::new(28);
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::Sleep);
+        frame.sleeping = true;
+        frame.seated_in_den = true;
+        frame.pet_position = state.den.anchor - Vec2::new(0.0, 0.05246);
+        for _ in 0..2400 {
+            let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+            assert_eq!(output.body_intent.locomotion, LocomotionMode::Sleep);
+            assert_eq!(output.body_intent.target_position, state.den.anchor);
+            assert_eq!(output.body_intent.desired_speed, 0.0);
+            frame.timestamp += 0.05;
+        }
+    }
+
+    #[test]
+    fn airborne_or_wrong_side_is_not_a_den_arrival() {
+        for (seated, offset) in [(false, Vec2::new(0.0, -0.05246)), (true, Vec2::new(-0.2, -0.05246))] {
+            let mut state = EcologyState::new(28);
+            let mut director = EpisodeDirector::default();
+            let mut frame = behavior_frame(ActionId::Sleep);
+            frame.sleeping = true;
+            frame.seated_in_den = seated;
+            frame.pet_position = state.den.anchor + offset;
+            let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+            assert_eq!(output.body_intent.locomotion, LocomotionMode::Arrive);
         }
     }
 

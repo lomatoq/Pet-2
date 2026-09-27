@@ -628,6 +628,9 @@ pub struct BehaviorContextFrame {
     /// tolerance for the required dwell.
     #[serde(default)]
     pub screen_edge_supported: bool,
+    /// Physical cradle admission with settled motion, distinct from desktop floor contact.
+    #[serde(default)]
+    pub den_supported: bool,
     pub surfaces: Vec<SurfaceCandidate>,
     pub den_anchor: Option<Vec2>,
     pub den_familiarity: f32,
@@ -680,6 +683,7 @@ impl Default for BehaviorContextFrame {
             screen_edge_normal_velocity_px_s: 0.0,
             screen_edge_support_stable_seconds: 0.0,
             screen_edge_supported: false,
+            den_supported: false,
             surfaces: Vec::new(),
             den_anchor: None,
             den_familiarity: 0.0,
@@ -713,7 +717,9 @@ impl BehaviorContextFrame {
     /// performances retain the PBF contact/support feedback path.
     #[must_use]
     pub fn support_confirmed(&self) -> bool {
-        if self.has_bottom_screen_edge() {
+        if self.den_supported && !self.pet_dragged {
+            true
+        } else if self.has_bottom_screen_edge() {
             self.screen_edge_supported
         } else {
             self.somatic.supported
