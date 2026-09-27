@@ -4696,6 +4696,9 @@ impl ApplicationHandler for PetApplication {
             event_loop.exit();
             return;
         };
+        // Saved places remain familiar; an interrupted route must be planned
+        // again against today's monitor topology rather than resumed mid-flight.
+        prepared.life.state.exploration.resume_after_absence();
         let topology = topology_from_event_loop(event_loop, 1);
         let desktop_bounds = topology.virtual_physical_bounds;
         if !desktop_bounds.is_valid() {

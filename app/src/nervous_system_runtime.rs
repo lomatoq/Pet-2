@@ -43,6 +43,8 @@ pub struct NervousSystemRuntime {
     ordinary_blink_active: bool,
     pub observed_ordinary_blinks: u64,
     final_gaze: pet_body::GazeController,
+    gaze_object_sample: Option<(u64, glam::Vec2)>,
+    gaze_object_velocity: glam::Vec2,
     gesture: GestureFrameV1,
     gesture_age: f32,
     episode: EpisodeContextV1,
@@ -75,6 +77,8 @@ impl Default for NervousSystemRuntime {
             ordinary_blink_active: false,
             observed_ordinary_blinks: 0,
             final_gaze: pet_body::GazeController::default(),
+            gaze_object_sample: None,
+            gaze_object_velocity: glam::Vec2::ZERO,
             gesture: GestureFrameV1::default(),
             gesture_age: 0.0,
             episode: EpisodeContextV1::default(),
@@ -363,6 +367,9 @@ impl NervousSystemRuntime {
         dt: f32,
     ) {
         body.embodiment.managed_blink = true;
+        let observation=motor.as_ref().and_then(|m|m.context.orb_id.zip(m.context.orb_position));
+        self.gaze_object_velocity=measured_target_velocity(self.gaze_object_sample,observation,dt);
+        self.gaze_object_sample=observation;
         let tuning = body.tuning_profile();
         let calibration = tuning.nervous.for_live_runtime();
         let mut phenotype = self.resolve_actuation(
@@ -417,7 +424,7 @@ impl NervousSystemRuntime {
             phenotype.expression = pose.expression();
         }
         phenotype.apply_to_intent(intent, sensors, body.simulation.feedback.world_position);
-        if let Some(motor) = motor {
+        if let Some(motor) = &motor {
             SomaticActuationBus::apply_to_intent(motor.packet, motor.context, intent);
             body.set_somatic_actuation(motor.packet.clone());
         }
@@ -452,12 +459,25 @@ impl NervousSystemRuntime {
             .attention_target_position
             .or(intent.gaze_target)
             .or(Some(body.simulation.feedback.world_position));
+        let social_orb=motor.as_ref().filter(|m|
+            m.context.world_social_hold && !m.context.pet_dragged
+                && social_reference_allowed(final_gaze_mode,
+                    m.context.focus_mode || life.state.focus_mode, protective,
+                    self.body_feedback.environment.user_present, self.snapshot.derived.fatigue))
+            .and_then(|m|m.context.orb_position);
+        let predictive_orb=(final_gaze_mode==pet_body::FixationGazeMode::PredictiveIntercept)
+            .then(||motor.as_ref().and_then(|m|m.context.orb_position)).flatten();
         let gaze = self.final_gaze.tick(
             pet_body::GazePlan {
-                primary_target: selected_gaze,
-                mode: final_gaze_mode,
+                primary_target: social_orb.or(predictive_orb).or(selected_gaze),
+                secondary_target: social_orb.map(|_|sensors.cursor_position),
+                mode: if social_orb.is_some() {pet_body::FixationGazeMode::SocialReference} else {final_gaze_mode},
+                target_velocity: if predictive_orb.is_some() {self.gaze_object_velocity} else {glam::Vec2::ZERO},
+                lead_seconds: if predictive_orb.is_some() {0.10} else {0.0},
+                dwell_min:0.45,
+                dwell_max:1.2,
                 acquire_tau: 0.12,
-                confidence: 1.0,
+                confidence: vita.companion_intent().confidence,
                 ..pet_body::GazePlan::default()
             },
             dt,
@@ -686,7 +706,7 @@ impl NervousSystemRuntime {
                 motor_error: (actual - intended).length().clamp(0.0, 1.0),
                 audio_mouth_open: self.voice_mouth_open,
                 audio_active: self.voice_feedback.phonating,
-                target_velocity: self.body_feedback.motion.velocity,
+                target_velocity: self.gaze_object_velocity,
                 protective_reflex: self.startle_face > 0.25
                     || self.snapshot.felt.startle > 0.55
                     || self.snapshot.felt.restraint > 0.72,
@@ -763,6 +783,44 @@ impl NervousSystemRuntime {
         apply_input_sensitivity(&mut source, calibration);
         source
     }
+}
+
+fn social_reference_allowed(mode:pet_body::FixationGazeMode, focused:bool, protective:bool, user_present:bool, fatigue:f32)->bool {
+    mode==pet_body::FixationGazeMode::Track && !focused && !protective && user_present && fatigue<0.7
+}
+
+#[test]
+fn social_reference_never_overrides_sleep_tracking_danger_or_focus() {
+    use pet_body::FixationGazeMode as Mode;
+    assert!(social_reference_allowed(Mode::Track,false,false,true,0.2));
+    for mode in [Mode::Sleep,Mode::PredictiveIntercept,Mode::AvoidantCheck] {
+        assert!(!social_reference_allowed(mode,false,false,true,0.2));
+    }
+    assert!(!social_reference_allowed(Mode::Track,true,false,true,0.2));
+    assert!(!social_reference_allowed(Mode::Track,false,true,true,0.2));
+    assert!(!social_reference_allowed(Mode::Track,false,false,false,0.2));
+    assert!(!social_reference_allowed(Mode::Track,false,false,true,0.9));
+}
+
+// Object positions are normalized desktop coordinates. Never borrow the pet's
+// velocity as a proxy: a stationary ball stays a stationary visual target.
+fn measured_target_velocity(previous:Option<(u64,glam::Vec2)>, current:Option<(u64,glam::Vec2)>, dt:f32)->glam::Vec2 {
+    let (Some((old_id,old)),Some((id,point)))=(previous,current) else {return glam::Vec2::ZERO;};
+    if old_id!=id || !dt.is_finite() || !(0.001..=0.2).contains(&dt)
+        || !point.is_finite() || !old.is_finite() || point.distance(old)>0.10 {
+        return glam::Vec2::ZERO;
+    }
+    ((point-old)/dt).clamp_length_max(1.0)
+}
+
+#[test]
+fn gaze_velocity_is_measured_from_same_object_and_resets_on_switch_or_teleport() {
+    use glam::Vec2;
+    let p=Some((1,Vec2::splat(0.5)));
+    assert_eq!(measured_target_velocity(p,p,0.05),Vec2::ZERO);
+    assert!(measured_target_velocity(p,Some((1,Vec2::new(0.51,0.5))),0.05).x>0.19);
+    assert_eq!(measured_target_velocity(p,Some((2,Vec2::new(0.51,0.5))),0.05),Vec2::ZERO);
+    assert_eq!(measured_target_velocity(p,Some((1,Vec2::ONE)),0.05),Vec2::ZERO);
 }
 
 fn causal_gaze_mode(

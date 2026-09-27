@@ -266,6 +266,8 @@ impl EcologyRuntime {
                 .filter(|state| state.identity_seed == identity_seed)
                 .unwrap_or_else(|| EcologyState::new(identity_seed))
         };
+        let director = EpisodeDirector::from_memory(&state.episode_memory);
+        let adaptation_sequence = director.placement_event_sequence();
         Ok(Self {
             pet_grips: Vec::new(),
             measured_orb_contact: None,
@@ -273,8 +275,8 @@ impl EcologyRuntime {
             release_grace: Vec::new(),
             last_body_position: Vec2::ZERO,
             state,
-            director: EpisodeDirector::default(),
-            adaptation_sequence: 0,
+            director,
+            adaptation_sequence,
             placement_learning_attempt: None,
             pointer_down: false,
             grabbed_object: None,
@@ -1965,7 +1967,9 @@ impl EcologyRuntime {
 
     #[must_use]
     pub fn snapshot(&self) -> EcologyState {
-        self.state.snapshot()
+        let mut snapshot = self.state.snapshot();
+        snapshot.episode_memory = self.director.memory();
+        snapshot
     }
 
     pub fn prepare_shutdown(&mut self) {
@@ -1982,6 +1986,32 @@ impl EcologyRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interaction_learning_survives_real_store_reload_without_motor_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let mut runtime = EcologyRuntime::load_or_create(&store, 42, true).unwrap();
+        for event in 1..5 {
+            runtime.director.observe_game_response(event | (1u64 << 63), EpisodeGoal::OfferOrb, true);
+            runtime.director.observe_placement_result(event, -1.0, true);
+        }
+        runtime.director.observe_game_response(5 | (1u64 << 63), EpisodeGoal::OfferOrb, false);
+        let expected = runtime.director.memory();
+        store.save_ecology_state(&runtime.snapshot()).unwrap();
+        let mut restored = EcologyRuntime::load_or_create(&store, 42, false).unwrap();
+        assert_eq!(restored.director.memory(), expected);
+        assert!(restored.director.active_episode().is_none());
+        assert_eq!(restored.adaptation_sequence, 4);
+        restored.director.observe_game_response(5 | (1u64 << 63), EpisodeGoal::OfferOrb, true);
+        assert_eq!(restored.director.memory(), expected, "saved event dedup must survive restart");
+        restored.director.observe_placement_result(5, -1.0, true);
+        assert_ne!(restored.director.memory(), expected, "next placement remains eligible");
+        let mut legacy = serde_json::to_value(runtime.snapshot()).unwrap();
+        legacy.as_object_mut().unwrap().remove("episode_memory");
+        let legacy: EcologyState = serde_json::from_value(legacy).unwrap();
+        legacy.validate().unwrap();
+    }
 
     #[test]
     fn waste_click_is_interactive_once_per_press_without_orb_capture() {

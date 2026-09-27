@@ -11,6 +11,7 @@ mod bandit;
 mod companion;
 mod development;
 mod drives;
+mod exploration;
 mod face_geometry;
 mod genome;
 mod interaction;
@@ -38,6 +39,7 @@ pub use bandit::*;
 pub use companion::*;
 pub use development::*;
 pub use drives::*;
+pub use exploration::*;
 pub use face_geometry::*;
 pub use genome::*;
 pub use interaction::*;
@@ -155,6 +157,8 @@ impl LifeCore {
         }
         let seconds = seconds.min(30.0 * 86_400.0);
         self.state.elapsed_seconds += seconds;
+        self.state.exploration.recover(seconds);
+        self.state.exploration.pause();
         let logical_ticks = (seconds * f64::from(LIFECORE_HZ)).round() as u64;
         self.state.tick_count = self.state.tick_count.saturating_add(logical_ticks);
         self.state.development.lifetime.ticks_alive = self
@@ -298,7 +302,36 @@ impl LifeCore {
         let (strongest_drive, strongest_drive_value) = decision_drives.strongest();
         self.state.drives = natural_drives;
         let expression = ExpressionState::from_readouts(readouts.expressions, self.state.affect);
-        let body_intent = body_intent_for(self.state.current_action, sensors, body, expression);
+        let mut body_intent = body_intent_for(self.state.current_action, sensors, body, expression);
+        self.state.exploration.observe(
+            body.world_position,
+            self.state.genome.identity_seed,
+            dt,
+        );
+        if matches!(
+            self.state.current_action,
+            ActionId::ExploreScreen | ActionId::HideAndSeek | ActionId::SelfPlay
+        ) && !sensors.pet_dragged
+            && !self.state.focus_mode
+        {
+            let target = self.state.exploration.target(
+                body,
+                self.state.genome.identity_seed,
+                &self.state.genome.temperament,
+                &decision_drives,
+                self.state.affect,
+                dt,
+            );
+            body_intent.target_position = target;
+            body_intent.gaze_target = Some(target);
+            body_intent.facing_direction = if target.x >= body.world_position.x {
+                1.0
+            } else {
+                -1.0
+            };
+        } else {
+            self.state.exploration.pause();
+        }
         let vocal_request = if switched && self.state.current_action.is_vocal() {
             self.select_vocal_request(
                 VocalTrigger::Action(self.state.current_action),
@@ -1763,14 +1796,14 @@ fn body_intent_for(
         ),
         ActionId::SelfPlay => (
             LocomotionMode::Wander,
-            deterministic_wander_target(action, sensors.timestamp),
+            body.world_position,
             PoseIntent::Playful,
             None,
             0.08,
         ),
         ActionId::ExploreScreen | ActionId::HideAndSeek => (
             LocomotionMode::Wander,
-            deterministic_wander_target(action, sensors.timestamp),
+            body.world_position,
             PoseIntent::Curious,
             None,
             0.11,
@@ -1809,18 +1842,6 @@ fn body_intent_for(
         expression,
         interaction_target,
     }
-}
-
-fn deterministic_wander_target(action: ActionId, timestamp: f64) -> Vec2 {
-    // Exploration is a behavior bout, not a continuously moving waypoint. Holding a
-    // target gives the body time to arrive, observe, and visibly choose again instead
-    // of tracing a screen-wide Lissajous curve from corner to corner.
-    let bout = (timestamp.max(0.0) / 6.0).floor() as f32;
-    let phase = (bout * 1.987 + action.index() as f32 * 1.618).rem_euclid(std::f32::consts::TAU);
-    Vec2::new(
-        0.5 + phase.sin() * 0.26,
-        0.52 + (phase * 0.73 + 1.1).cos() * 0.20,
-    )
 }
 
 fn repetition_ratio(actions: &VecDeque<ActionId>, action: ActionId) -> f32 {
@@ -2358,19 +2379,6 @@ mod tests {
         let actions = run_ticks(&mut core, 400, &SensorFrame::default());
         let switches = actions.windows(2).filter(|pair| pair[0] != pair[1]).count();
         assert!(switches < 40, "unexpectedly high switch count: {switches}");
-    }
-
-    #[test]
-    fn exploration_target_is_stable_and_center_bounded_for_each_bout() {
-        let first = deterministic_wander_target(ActionId::ExploreScreen, 12.1);
-        let same_bout = deterministic_wander_target(ActionId::ExploreScreen, 17.9);
-        let next_bout = deterministic_wander_target(ActionId::ExploreScreen, 18.1);
-        assert_eq!(first, same_bout);
-        assert_ne!(first, next_bout);
-        for target in [first, next_bout] {
-            assert!((0.24..=0.76).contains(&target.x));
-            assert!((0.32..=0.72).contains(&target.y));
-        }
     }
 
     #[test]

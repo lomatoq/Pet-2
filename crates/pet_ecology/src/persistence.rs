@@ -38,6 +38,8 @@ pub enum EcologyError {
     InvalidObjectMemory,
     #[error("ecology episode statistics contain invalid data")]
     InvalidEpisodeStats,
+    #[error("invalid learned episode memory")]
+    InvalidEpisodeMemory,
     #[error("ecology RNG snapshot contains invalid data")]
     InvalidRng,
 }

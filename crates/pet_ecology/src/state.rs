@@ -101,6 +101,8 @@ impl SavedEcologyRng {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EcologyState {
     #[serde(default)]
+    pub episode_memory: crate::EpisodeMemory,
+    #[serde(default)]
     pub waste: crate::WasteWorld,
     #[serde(default)]
     pub successful_touch_sides: [u32; 2],
@@ -136,6 +138,7 @@ impl EcologyState {
             next_object_id = orb.id.wrapping_add(1).max(1);
         }
         Self {
+            episode_memory: crate::EpisodeMemory::default(),
             waste: crate::WasteWorld::default(),
             successful_touch_sides: [0; 2],
             schema_version: ECOLOGY_STATE_SCHEMA_VERSION,
@@ -187,6 +190,7 @@ impl EcologyState {
     }
 
     pub fn validate(&self) -> Result<(), EcologyError> {
+        if !self.episode_memory.is_valid() { return Err(EcologyError::InvalidEpisodeMemory); }
         if !matches!(self.schema_version, 1 | ECOLOGY_STATE_SCHEMA_VERSION) {
             return Err(EcologyError::UnsupportedSchema {
                 found: self.schema_version,

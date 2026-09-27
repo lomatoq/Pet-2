@@ -60,7 +60,7 @@ fn frame(action: ActionId, position: Vec2, timestamp: f64) -> EcologyBehaviorFra
 }
 
 #[test]
-fn accelerated_twenty_four_hour_habitat_stays_finite_and_non_coercive() {
+fn twenty_four_hours_of_director_and_metabolism_ticks_remain_bounded() {
     let mut state = EcologyState::new(24_024);
     let mut director = EpisodeDirector::default();
     let position = Vec2::splat(0.5);
@@ -86,45 +86,76 @@ fn accelerated_twenty_four_hour_habitat_stays_finite_and_non_coercive() {
     assert!(state.episode_stats.started[EpisodeGoal::SoloOrbPlay.index()] > 0);
 }
 
+// This is a policy/physiology replay, not a rendered or physical pet test.
+// Seven calendar days contain seven actual ten-minute active sessions; the
+// remaining time follows the product's explicit offline recovery semantics.
 #[test]
-fn fixed_seed_seven_day_schedule_change_is_replay_deterministic() {
-    fn replay() -> EcologyState {
+fn seven_daily_ten_minute_sessions_have_honest_active_and_offline_time() {
+    fn replay() -> (EcologyState, u64, f64) {
+        const DT: f32 = 0.05;
+        const SESSION_TICKS: usize = 12_000;
         let mut state = EcologyState::new(70_007);
         let mut director = EpisodeDirector::default();
         let position = state.den.anchor;
-        for slot in 0..(7 * 24 * 4) {
-            let day = slot / (24 * 4);
+        let mut active_ticks = 0_u64;
+        let mut offline_seconds = 0.0;
+        for day in 0..7 {
             let action = if day < 3 {
                 ActionId::BringProceduralOrb
             } else {
                 ActionId::SelfPlay
             };
-            let timestamp = slot as f64 * 900.0;
-            let orb_position = state.objects[0].position;
-            let mut behavior = frame(action, position, timestamp);
-            // This coarse 15-minute schedule intentionally keeps the pet at one
-            // position. Supply the measured overlap that the real runtime would
-            // publish instead of resurrecting the removed center-distance grab.
-            behavior.orb_physical = PhysicalGrabFrame {
-                contact: true,
-                socket_position: orb_position,
-                body_surface_position: orb_position,
-                normal_world: Vec2::X,
-                penetration_px: 8.0,
-                ..PhysicalGrabFrame::default()
-            };
-            let _ = director.tick(&mut state, behavior, intent(position), 0.25);
-            state.metabolism.advance(60.0);
+            for tick in 0..SESSION_TICKS {
+                let timestamp = f64::from(day) * 86_400.0 + (tick + 1) as f64 * f64::from(DT);
+                let output = director.tick(
+                    &mut state, frame(action, position, timestamp), intent(position), DT,
+                );
+                // No invented contact or movement: this fixture deliberately
+                // tests stalled policy recovery, not successful toy transport.
+                assert!(output.body_intent.target_position.is_finite());
+                state.metabolism.advance(DT);
+                active_ticks += 1;
+            }
+            if day < 6 {
+                let gap = 86_400.0 - SESSION_TICKS as f64 * f64::from(DT);
+                state.metabolism.apply_offline_seconds(gap);
+                offline_seconds += gap;
+            }
         }
-        state
+        (state, active_ticks, offline_seconds)
     }
-
     let first = replay();
     let second = replay();
     assert_eq!(first, second);
-    assert!(first.episode_stats.started[EpisodeGoal::OfferOrb.index()] > 0);
-    assert!(first.episode_stats.started[EpisodeGoal::SoloOrbPlay.index()] > 0);
-    first.validate().unwrap();
+    assert_eq!(first.1, 84_000);
+    assert!((first.1 as f64 * 0.05 + first.2 - (6.0 * 86_400.0 + 600.0)).abs() < 0.001);
+    assert!(first.0.episode_stats.started[EpisodeGoal::OfferOrb.index()] > 0);
+    // With no physical contact, retrieval must not pretend it completed play.
+    assert!(first.0.episode_stats.started.iter().sum::<u32>() > 1);
+    first.0.validate().unwrap();
+}
+
+// A sustained focus interval must remain quiet, including when a toy is visible.
+// This makes no claim about subjective engagement or rendered liquid stability.
+#[test]
+fn thirty_minutes_of_focus_does_not_solicit_or_vocalize() {
+    let mut state = EcologyState::new(30_030);
+    let mut director = EpisodeDirector::default();
+    let position = state.den.anchor;
+    for tick in 0..36_000 {
+        let mut input = frame(ActionId::BringProceduralOrb, position, (tick + 1) as f64 * 0.05);
+        input.focus_mode = true;
+        input.play_drive = 0.9;
+        input.curiosity_drive = 0.9;
+        let output = director.tick(&mut state, input, intent(position), 0.05);
+        assert!(output.vocal_trigger.is_none());
+        assert!(output.body_intent.target_position.is_finite());
+        assert!(!matches!(output.debug.active_goal,
+            Some(EpisodeGoal::OfferOrb | EpisodeGoal::SoloOrbPlay | EpisodeGoal::SharedAttention)));
+        state.metabolism.advance(0.05);
+    }
+    assert_eq!(state.episode_stats.started[EpisodeGoal::OfferOrb.index()], 0);
+    state.validate().unwrap();
 }
 
 #[test]
@@ -164,5 +195,46 @@ fn dragging_pet_during_orb_episode_does_not_teleport_or_corrupt_object() {
     assert!(output.body_intent.target_position.cmpge(Vec2::ZERO).all());
     assert!(output.body_intent.target_position.cmple(Vec2::ONE).all());
     assert!(state.objects[0].position.is_finite());
+    state.validate().unwrap();
+}
+
+// Thirty save/restart cycles test persistent evidence, not thirty days of
+// continuous creature simulation. Offline time must not invent new outcomes.
+#[test]
+fn thirty_daily_restarts_preserve_evidence_and_later_refusal_changes_behavior() {
+    let mut state = EcologyState::new(30_031);
+    let identity = state.identity_seed;
+    let mut director = EpisodeDirector::default();
+    for day in 0..30_u64 {
+        let event = (1_u64 << 63) | (day + 1);
+        director.observe_game_response(event, EpisodeGoal::OfferOrb, day < 15);
+        state.episode_memory = director.memory();
+        let before_offline = state.episode_memory.clone();
+        state.metabolism.apply_offline_seconds(86_400.0);
+        assert_eq!(state.episode_memory, before_offline);
+        let encoded = serde_json::to_vec(&state).unwrap();
+        state = EcologyState::restore(serde_json::from_slice(&encoded).unwrap()).unwrap();
+        director = EpisodeDirector::from_memory(&state.episode_memory);
+        assert_eq!(director.memory(), before_offline);
+        let before_duplicate = director.memory();
+        director.observe_game_response(event, EpisodeGoal::OfferOrb, day < 15);
+        assert_eq!(director.memory(), before_duplicate);
+        assert_eq!(state.identity_seed, identity);
+        assert!(state.episode_memory.is_valid());
+        if day == 14 {
+            // Measured repeated acceptance must affect the next play decision.
+            let mut input = frame(ActionId::SelfPlay, state.den.anchor, 15.0 * 86_400.0);
+            input.play_drive = 0.8;
+            let output = director.tick(&mut state, input, intent(input.pet_position), 0.05);
+            assert_eq!(output.debug.active_goal, Some(EpisodeGoal::OfferOrb));
+            director.interrupt_for_shutdown();
+        }
+    }
+    // After contradictory outcomes and another launch, a playful pet respects
+    // the refusal boundary. Rest and independent play remain valid alternatives.
+    let mut input = frame(ActionId::SelfPlay, state.den.anchor, 30.0 * 86_400.0);
+    input.play_drive = 0.8;
+    let output = director.tick(&mut state, input, intent(input.pet_position), 0.05);
+    assert_ne!(output.debug.active_goal, Some(EpisodeGoal::OfferOrb));
     state.validate().unwrap();
 }

@@ -315,7 +315,7 @@ enum EpisodeStep {
 
 /// The sole ecology behavior writer. With no active episode this boundary is a
 /// strict pass-through and therefore preserves every existing brain mode.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct EpisodeAdaptation {
     placement: [f32; 2],
     placement_failures: [u8; 2],
@@ -323,6 +323,8 @@ struct EpisodeAdaptation {
     game_refusals: [u8; 2],
     recent: [u64; 16],
     cursor: usize,
+    #[serde(default)]
+    placement_event_sequence: u64,
 }
 
 impl EpisodeAdaptation {
@@ -330,6 +332,7 @@ impl EpisodeAdaptation {
         if id == 0 || self.recent.contains(&id) {
             return false;
         }
+        if id & (1u64 << 63) == 0 { self.placement_event_sequence = self.placement_event_sequence.max(id); }
         self.recent[self.cursor] = id;
         self.cursor = (self.cursor + 1) % self.recent.len();
         true
@@ -342,6 +345,25 @@ impl EpisodeAdaptation {
         } else {
             0.0
         }
+    }
+}
+
+/// Learned interaction evidence and refusal boundaries survive sessions; motor phases do not.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EpisodeMemory {
+    adaptation: EpisodeAdaptation,
+    orb_bid_cooldown: f32,
+    endogenous_play_cooldown: f32,
+    petting_cooldown: f32,
+}
+impl EpisodeMemory {
+    pub fn is_valid(&self) -> bool {
+        self.adaptation.placement.iter().all(|v| v.is_finite() && (-4.0..=8.0).contains(v))
+            && self.adaptation.game.iter().all(|v| v.is_finite() && (-6.0..=8.0).contains(v))
+            && self.adaptation.cursor < 16
+            && self.adaptation.placement_event_sequence < (1u64 << 63)
+            && [self.orb_bid_cooldown, self.endogenous_play_cooldown, self.petting_cooldown]
+                .iter().all(|v| v.is_finite() && (0.0..=120.0).contains(v))
     }
 }
 
@@ -379,6 +401,17 @@ impl Default for EpisodeDirector {
 }
 
 impl EpisodeDirector {
+    pub fn from_memory(memory: &EpisodeMemory) -> Self {
+        if !memory.is_valid() { return Self::default(); }
+        Self { adaptation: memory.adaptation.clone(), orb_bid_cooldown: memory.orb_bid_cooldown,
+            endogenous_play_cooldown: memory.endogenous_play_cooldown,
+            petting_cooldown: memory.petting_cooldown, ..Self::default() }
+    }
+    pub fn memory(&self) -> EpisodeMemory {
+        EpisodeMemory { adaptation: self.adaptation.clone(), orb_bid_cooldown: self.orb_bid_cooldown,
+            endogenous_play_cooldown: self.endogenous_play_cooldown, petting_cooldown: self.petting_cooldown }
+    }
+    pub fn placement_event_sequence(&self) -> u64 { self.adaptation.placement_event_sequence }
     /// A measured bite can select the crumb actually at the lips, even when
     /// attention was aimed at a different crumb. Never restart chewing/refusal.
     pub fn observe_mouth_contact(&mut self, state: &mut EcologyState, object_id: ObjectId) {
@@ -780,7 +813,27 @@ impl EpisodeDirector {
             output.debug.selected_reason = reason;
         }
 
+        let held_orb = state.objects.iter().find(|o| o.kind == ObjectKind::Orb
+            && o.lifecycle == ObjectLifecycle::GrabbedByUser).map(|o| o.position);
+        if held_orb.is_some() && held_orb_play_margin(state, frame) < -0.06
+            && self.active.is_some_and(|e| e.goal == EpisodeGoal::ChaseOrb)
+            && let Some(mut ended) = self.active.take() {
+            ended.phase = EpisodePhase::Complete;
+            state.episode_stats.completed[ended.goal.index()] += 1;
+            push_outcome(&mut output, EcologyOutcome::EpisodeCompleted(ended.goal));
+        }
         let Some(mut active) = self.active.take() else {
+            if let Some(orb_position) = held_orb
+                && held_orb_play_margin(state, frame) <= 0.0
+                && !frame.sleeping && !frame.focus_mode && frame.window_pressure < 0.22 {
+                output.body_intent.target_position = frame.pet_position;
+                output.body_intent.target_surface = None;
+                output.body_intent.locomotion = LocomotionMode::Arrive;
+                output.body_intent.desired_speed = 0.0;
+                output.body_intent.pose = PoseIntent::Compact;
+                output.body_intent.gaze_target = Some(orb_position);
+                output.body_intent.interaction_target = Some(InteractionTarget::ProceduralOrb);
+            }
             output.visual_context = visual_context(state, None, frame);
             return output;
         };
@@ -862,6 +915,9 @@ impl EpisodeDirector {
                 }
             }
             EpisodeStep::Abort(reason) => {
+                if active.goal == EpisodeGoal::OfferOrb && reason == EpisodeReason::TimedOut {
+                    self.orb_bid_cooldown = self.orb_bid_cooldown.max(20.0);
+                }
                 active.phase = EpisodePhase::Aborted;
                 state.episode_stats.aborted[active.goal.index()] =
                     state.episode_stats.aborted[active.goal.index()].saturating_add(1);
@@ -966,6 +1022,7 @@ fn select_episode(
         ));
     }
     if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
+        if held_orb_play_margin(state, frame) <= 0.0 { return None; }
         return Some((
             EpisodeGoal::ChaseOrb,
             EpisodeReason::UserEngaged,
@@ -1049,6 +1106,22 @@ fn select_episode(
         )),
         _ => None,
     }
+}
+
+// Offering a toy is an invitation. Current recovery costs can outweigh its
+// appeal without changing attachment or the learned value of the toy.
+fn held_orb_play_margin(state: &EcologyState, frame: EcologyBehaviorFrame) -> f32 {
+    let affinity = state.objects.iter().find(|o| o.kind == ObjectKind::Orb)
+        .map_or(0.0, |o| o.preference.max(0.0) * o.familiarity);
+    let fatigue = frame.social_contact.fatigue.clamp(0.0, 1.0);
+    let stress = frame.play_state.affect.stress.clamp(0.0, 1.0);
+    let interest = frame.play_drive * 0.65 + frame.curiosity_drive * 0.3
+        + frame.play_state.playfulness * 0.18 + affinity * 0.2
+        + frame.play_state.felt.play_readiness * 0.25;
+    let engagement = interest * state.metabolism.reserve * (1.0 - fatigue) * (1.0 - stress);
+    let recovery = fatigue * 0.45 + stress * 0.55
+        + state.metabolism.satiation.powi(2) * 0.18 + frame.autonomy_drive * 0.1;
+    engagement - recovery
 }
 
 fn fill_candidate_trace(
@@ -1326,6 +1399,13 @@ fn drive_episode(
                 active.commitment_remaining = commitment_for(EpisodeGoal::InterceptOrb);
                 output.body_intent.expression = lifecore::FacePose::Playful.expression();
                 return EpisodeStep::Continue;
+            }
+            // Contact is the only acquisition signal. An unreachable offer must
+            // yield control when its bounded approach commitment is exhausted.
+            // This is a recovery watchdog, not evidence of user refusal.
+            if active.phase == EpisodePhase::Approach
+                && !frame.orb_physical.contact && active.commitment_remaining <= 0.0 {
+                return EpisodeStep::Abort(EpisodeReason::TimedOut);
             }
             match active.phase {
                 EpisodePhase::Orient if active.phase_elapsed_seconds >= 0.28 => {
@@ -1742,7 +1822,7 @@ fn drive_episode(
                     {
                         active.attempts = active.attempts.saturating_add(1);
                         active.prediction_confidence =
-                            (active.prediction_confidence + 0.14).clamp(0.0, 0.92);
+                            (active.prediction_confidence * 0.72).clamp(0.0, 0.92);
                         output.vocal_trigger = Some(EcologyVocalTrigger::MissAndRetry);
                         set_phase(active, EpisodePhase::Retry);
                     }
@@ -2853,6 +2933,75 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn interception_miss_reduces_confidence_in_the_failed_prediction() {
+        let mut state = EcologyState::default();
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::PlayCursorChase);
+        frame.orb_physical.contact = false;
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        let active = director.active.as_mut().unwrap();
+        active.goal = EpisodeGoal::InterceptOrb;
+        active.phase = EpisodePhase::Execute;
+        active.phase_elapsed_seconds = 1.2;
+        active.prediction_confidence = 0.8;
+        active.target_position = Some(Vec2::splat(0.8));
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        let after = director.active.unwrap();
+        assert_eq!(after.phase, EpisodePhase::Retry);
+        assert!(after.prediction_confidence < 0.8);
+    }
+
+    #[test]
+    fn learned_memory_is_bounded_reversible_and_rejects_corruption() {
+        let mut director = EpisodeDirector::default();
+        for id in 1..80 { director.observe_game_response(id | (1u64 << 63), EpisodeGoal::OfferOrb, true); }
+        assert_eq!(director.adaptation.game[0], 8.0);
+        for id in 80..100 { director.observe_game_response(id | (1u64 << 63), EpisodeGoal::OfferOrb, false); }
+        assert_eq!(director.adaptation.game[0], -6.0);
+        let memory = director.memory();
+        assert!(memory.is_valid());
+        let mut invalid = memory.clone();
+        invalid.adaptation.cursor = 16;
+        assert!(!invalid.is_valid());
+        let mut restored = EpisodeDirector::from_memory(&memory);
+        let before = restored.memory();
+        restored.observe_game_response(99 | (1u64 << 63), EpisodeGoal::OfferOrb, true);
+        assert_eq!(restored.memory(), before, "duplicate evidence after restart");
+    }
+
+    #[test]
+    fn held_toy_invitation_respects_current_recovery_without_punishing_preference() {
+        let mut state = EcologyState::default();
+        state.objects[0].lifecycle = ObjectLifecycle::GrabbedByUser;
+        let preference = state.objects[0].preference;
+        let mut frame = behavior_frame(ActionId::PlayCursorChase);
+        frame.play_drive = 0.8;
+        let mut director = EpisodeDirector::default();
+        director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(director.active.unwrap().goal, EpisodeGoal::ChaseOrb);
+        frame.social_contact.fatigue = 0.95;
+        frame.play_state.affect.stress = 0.7;
+        let rest = director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert!(director.active.is_none());
+        assert_eq!(rest.body_intent.target_position, frame.pet_position);
+        assert_eq!(rest.body_intent.desired_speed, 0.0);
+        assert_eq!(rest.body_intent.gaze_target, Some(state.objects[0].position));
+        assert_eq!(state.objects[0].preference, preference);
+        assert_eq!(director.adaptation.game, [0.0; 2]);
+        frame.social_contact.fatigue = 0.0;
+        frame.play_state.affect.stress = 0.0;
+        director.tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(director.active.unwrap().goal, EpisodeGoal::ChaseOrb);
+        // Fullness can tip a mildly interested pet toward observation, without
+        // preventing an energetic pet from choosing play after a meal.
+        let mut frame = behavior_frame(ActionId::PlayCursorChase);
+        state.metabolism.satiation = 1.0;
+        assert!(held_orb_play_margin(&state, frame) < 0.0);
+        frame.play_drive = 1.0;
+        assert!(held_orb_play_margin(&state, frame) > 0.0);
+    }
 
     fn representative_intent() -> BodyIntent {
         BodyIntent {

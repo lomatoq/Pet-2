@@ -330,15 +330,9 @@ impl CompanionExpressionDirector {
 }
 
 fn gaze_mode_for(intent: PrimaryIntent, uncertainty: f32) -> CompanionGazeMode {
-    if uncertainty > 0.45
-        && !matches!(
-            intent,
-            PrimaryIntent::Sleep
-                | PrimaryIntent::Avoid
-                | PrimaryIntent::GuardPain
-                | PrimaryIntent::RejectContact
-        )
-    {
+    // Urgent interception, contact and defense own attention even when the
+    // outcome is uncertain. Social referencing is only for recipient-directed bids.
+    if uncertainty > 0.45 && matches!(intent, PrimaryIntent::OfferObject | PrimaryIntent::InvitePlay) {
         return CompanionGazeMode::SocialReference;
     }
     match intent {
@@ -539,6 +533,16 @@ mod tests {
             curiosity: 0.8,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn uncertainty_does_not_steal_interception_or_protective_attention() {
+        for intent in [PrimaryIntent::Chase,PrimaryIntent::Intercept,PrimaryIntent::Catch] {
+            assert_eq!(gaze_mode_for(intent,1.0),CompanionGazeMode::PredictiveIntercept);
+        }
+        assert_eq!(gaze_mode_for(PrimaryIntent::Sleep,1.0),CompanionGazeMode::Sleep);
+        assert_eq!(gaze_mode_for(PrimaryIntent::RejectContact,1.0),CompanionGazeMode::AvoidantCheck);
+        assert_eq!(gaze_mode_for(PrimaryIntent::Explore,1.0),CompanionGazeMode::Inspect);
     }
 
     #[test]
