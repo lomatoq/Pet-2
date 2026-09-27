@@ -488,7 +488,6 @@ fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     q.x/=max(0.72,1.0+taper*clamp(q.y,-1.0,1.0));
     let capsule=length(max(abs(q)*vec2<f32>(radius.x,effective_height)-straight,vec2<f32>(0.0)))/cap_radius;
     let distance=mix(capsule,length(q),surprise);
-    let oval=1.0-smoothstep(0.93,1.05,distance);
     let inner_to_outer=clamp(side*q.x*0.5+0.5,0.0,1.0);
     let semantic_upper=mix(lids.x,lids.y,inner_to_outer);
     let top=1.06-globals.lids_brows.z*0.35+(semantic_upper*0.95)*(0.65+0.35*angry)
@@ -497,15 +496,15 @@ fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     let inner_arc=1.0-min(q.x*q.x,1.0);
     let bottom=-1.16+max(gaze.y,0.0)*0.44+lids.z*0.48-0.12*inner_arc
         +joy*(0.68+0.54*inner_arc);
-    let opened=oval*(1.0-smoothstep(top-0.06,top+0.06,q.y))*smoothstep(bottom-0.05,bottom+0.05,q.y);
+    let open_distance=max((distance-1.0)*cap_radius,
+        max((q.y-top)*effective_height,(bottom-q.y)*effective_height));
     let arc_x=clamp(local.x,-0.038,0.038);
     let arc_y=(-0.013+0.015*pow(arc_x/0.038,2.0))*(1.0-2.0*joy);
-    let closed=1.0-smoothstep(0.003,0.006,length(local-vec2<f32>(arc_x,arc_y)));
-    // The open eye disappears before the closed-lid arc becomes prominent;
-    // crossfading both silhouettes made translucent ellipses show behind sleep.
-    let open_visibility=1.0-smoothstep(0.20,0.66,blink);
-    let closed_visibility=smoothstep(0.66,0.92,blink);
-    return opened*open_visibility+closed*closed_visibility;
+    let closed_distance=length(local-vec2<f32>(arc_x,arc_y))-0.0045;
+    // Close geometry, not ink opacity: fading the fill exposed the bright pearl
+    // underneath and made blinks look like pale flashes across the whole eye.
+    let lid_distance=mix(open_distance,closed_distance,smoothstep(0.0,0.92,blink));
+    return 1.0-smoothstep(-0.0015,0.0015,lid_distance);
 }
 fn pearl_brow(point:vec2<f32>,side:f32)->f32 {
     let e=pearl_emotion();let shape=globals.face_brows[select(1u,0u,side<0.0)];

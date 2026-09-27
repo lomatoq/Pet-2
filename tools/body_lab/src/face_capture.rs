@@ -194,7 +194,8 @@ impl Capture {
                 if sleep_only {
                     fixtures.clear();
                     for (name,left,right) in [("SleepStaleFace",0.70,0.70),("SleepCheck",0.28,1.0),
-                        ("AwakeControl",0.0,0.0),("BlinkClosing",0.8,0.8)] {
+                        ("AwakeControl",0.0,0.0),("BlinkEarly",0.35,0.35),
+                        ("BlinkMiddle",0.55,0.55),("BlinkClosing",0.8,0.8)] {
                         let mut face=FacePose::Awake.expression();
                         face.blink_left=left;face.blink_right=right;
                         fixtures.push((name.into(),face,true));
