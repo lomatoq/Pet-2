@@ -17,6 +17,7 @@ mod liquid_render;
 mod locomotion;
 mod mesh;
 mod morph;
+mod mood_color;
 mod physiology;
 mod renderer;
 mod tuning;
@@ -210,6 +211,7 @@ pub struct ProceduralBody {
     self_care_motor: lifecore::SelfCareMotorFrame,
     base_somatic_actuation: SomaticActuationPacket,
     self_care: self_care_presentation::SelfCarePresentation,
+    mood_color: mood_color::MoodColor,
     mouth_context_age: f32,
     mouth_context_open: f32,
     contained_face: liquid::SmoothFaceOrigin,
@@ -250,6 +252,7 @@ impl ProceduralBody {
             self_care_motor: Default::default(),
             base_somatic_actuation: Default::default(),
             self_care: Default::default(),
+            mood_color: Default::default(),
             mouth_context_age: 0.0,
             mouth_context_open: 0.0,
             contained_face: liquid::SmoothFaceOrigin::default(),
@@ -635,6 +638,7 @@ impl ProceduralBody {
         }
         let suppressed = !self.self_care_available(intent) || voice.active;
         self.self_care.update(self.self_care_motor, suppressed, dt);
+        self.mood_color.update(affect, intent.expression, dt);
         let mut presented_intent = intent.clone();
         if !suppressed { self.self_care.apply_face(&mut presented_intent); }
         self.embodiment.self_care_lean = self.self_care.lean;
@@ -1031,7 +1035,8 @@ impl ProceduralBody {
                 .shadow_vertical_offset
                 .clamp(-96.0, 96.0),
         );
-        let feather = self.tuning.compositor.shadow_feather.clamp(2.0, 128.0);
+        let feather = self.tuning.compositor.shadow_feather.clamp(2.0, 128.0)
+            * (1.0+self.mood_color.joy*0.75);
         minimum = minimum.min(organism_minimum + shadow_offset - Vec2::splat(feather));
         maximum = maximum.max(organism_maximum + shadow_offset + Vec2::splat(feather));
         // Screen contact belongs to material, not its halo. Keep all-particle
@@ -1305,6 +1310,9 @@ impl ProceduralBody {
             presentation_offset: self.presentation_offset,
             debug_view: DebugView::Material,
             time: self.animation.time,
+            mood_tint: self.mood_color.tint,
+            mood_trail: self.mood_color.trail,
+            joy_aura: self.mood_color.joy,
             arousal,
             glow: (self.expression.current.body_glow * genome.body.bioluminescence
                 + effect.glow_boost * 0.34)

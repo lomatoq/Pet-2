@@ -106,6 +106,8 @@ struct Globals {
     face_eye: [f32; 4],
     face_eye_scales: [f32; 4],
     self_care: [f32; 4],
+    mood_tint: [f32; 4],
+    mood_trail: [f32; 4],
 }
 
 #[repr(C)]
@@ -115,6 +117,7 @@ struct ComposeGlobals {
     shadow: [f32; 4],
     shadow_style: [f32; 4],
     post: [f32; 4],
+    mood_aura: [f32; 4],
 }
 
 #[repr(C)]
@@ -216,6 +219,9 @@ pub struct RenderParameters {
     pub time: f32,
     pub arousal: f32,
     pub glow: f32,
+    pub mood_tint: Vec3,
+    pub mood_trail: Vec3,
+    pub joy_aura: f32,
     pub body_length: f32,
     pub body_width: f32,
     pub body_roundness: f32,
@@ -3260,6 +3266,7 @@ fn compose_globals_for(
     render_scale: u32,
 ) -> ComposeGlobals {
     ComposeGlobals {
+        mood_aura: [parameters.mood_tint.x,parameters.mood_tint.y,parameters.mood_tint.z,parameters.joy_aura.clamp(0.0,1.0)],
         output_mode: [
             if premultiplied_output { 1.0 } else { 0.0 },
             review_background.shader_value(),
@@ -3310,6 +3317,9 @@ impl Default for RenderParameters {
             time: 0.0,
             arousal: 0.3,
             glow: 0.2,
+            mood_tint: Vec3::ONE,
+            mood_trail: Vec3::ONE,
+            joy_aura: 0.0,
             body_length: 1.0,
             body_width: 0.72,
             body_roundness: 0.8,
@@ -3520,6 +3530,8 @@ fn globals_for_resolved(
     });
     Globals {
         self_care: [bounded(parameters.tongue_extension,0.0,1.0,0.0), bounded(parameters.tongue_side,-1.0,1.0,0.0),0.0,0.0],
+        mood_tint: [parameters.mood_tint.x,parameters.mood_tint.y,parameters.mood_tint.z,parameters.joy_aura],
+        mood_trail: [parameters.mood_trail.x,parameters.mood_trail.y,parameters.mood_trail.z,0.0],
         face_eye_scales: [
             bounded(parameters.eye_scales[0].x, 0.85, 1.28, 1.0),
             bounded(parameters.eye_scales[0].y, 0.75, 1.45, 1.0),

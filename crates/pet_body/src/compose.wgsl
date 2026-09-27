@@ -7,6 +7,7 @@ struct ComposeGlobals {
     shadow_style: vec4<f32>,
     // x: cinematic bloom strength; y: intermediate render scale; zw reserved.
     post: vec4<f32>,
+    mood_aura: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: ComposeGlobals;
@@ -156,14 +157,15 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let shadow_premultiplied = globals.shadow_style.yzw * shadow_alpha;
     // Further broaden the already Gaussian-filtered silhouette. The faint
     // pearl halo sits behind the dark shadow, preserving contrast on white.
-    let spread=globals.output_mode.zw*globals.shadow_style.x*0.9;
+    let spread=globals.output_mode.zw*globals.shadow_style.x*(0.9+globals.mood_aura.w*0.75);
     let glow_field=(footprint_shadow(input.uv)*0.40
         +footprint_shadow(input.uv+vec2<f32>(spread.x,0.0))*0.15
         +footprint_shadow(input.uv-vec2<f32>(spread.x,0.0))*0.15
         +footprint_shadow(input.uv+vec2<f32>(0.0,spread.y))*0.15
         +footprint_shadow(input.uv-vec2<f32>(0.0,spread.y))*0.15)*globals.post.w;
-    let glow_alpha=glow_field*globals.post.z*(1.0-organism.a)*(1.0-shadow_alpha);
-    let combined_rgb = organism.rgb + shadow_premultiplied+vec3<f32>(0.64,0.59,0.90)*glow_alpha;
+    let glow_alpha=glow_field*(globals.post.z+globals.mood_aura.w*0.16)*(1.0-organism.a)*(1.0-shadow_alpha);
+    let aura_color=mix(vec3<f32>(0.64,0.59,0.90),globals.mood_aura.xyz,globals.mood_aura.w);
+    let combined_rgb = organism.rgb + shadow_premultiplied+aura_color*glow_alpha;
     let combined_alpha = clamp(organism.a + shadow_alpha+glow_alpha, 0.0, 1.0);
     let background = review_background(input.uv);
     if (background.a > 0.5) {

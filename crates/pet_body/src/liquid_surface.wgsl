@@ -58,6 +58,8 @@ struct Globals {
     face_eye: vec4<f32>,
     face_eye_scales: vec4<f32>,
     self_care: vec4<f32>,
+    mood_tint: vec4<f32>,
+    mood_trail: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -1377,6 +1379,15 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     color += vec3<f32>(0.04,0.12,0.14)*blue;
     color = mix(color,vec3<f32>(0.83,0.89,1.0),pow(1.0-pearl_normal.z,3.2)*0.7);
     color = mix(color,vec3<f32>(1.0),pow(max(0.0,dot(pearl_normal,normalize(vec3<f32>(-0.35,0.48,1.0)))),19.0)*0.18);
+    // A broad material-space wash lets newly recruited color reach the core
+    // before the flanks. The delayed color catches up and the effect settles;
+    // there is no autonomous hue oscillator and no face-centred color patch.
+    let wash=0.20+0.70*exp(-dot(reference_point-vec2<f32>(-0.2,0.15),reference_point-vec2<f32>(-0.2,0.15))*1.6);
+    let mood=mix(globals.mood_trail.xyz,globals.mood_tint.xyz,wash);
+    let mood_amount=clamp(length(vec3<f32>(1.0)-mood)*2.0,0.0,0.38);
+    let pearl_gray=dot(color,vec3<f32>(0.2126,0.7152,0.0722));
+    color=mix(vec3<f32>(pearl_gray),color,1.0+mood_amount*0.35)*mood;
+    color+=vec3<f32>(0.025,0.016,0.008)*globals.mood_tint.w;
     // Reference colors are display-referred. Invert the compositor tone curve
     // so the original pearl palette survives the native linear HDR pipeline.
     let pearl_linear=pow(color,vec3<f32>(2.2));

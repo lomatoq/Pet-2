@@ -58,8 +58,9 @@ impl Capture {
         let mut records = Vec::new();
         let eyes_only = std::env::args().any(|arg| arg == "--eye-emotions-only");
         let care_only = std::env::args().any(|arg| arg == "--self-care-only");
+        let mood_only = std::env::args().any(|arg| arg == "--mood-colors-only");
         for scale in [1.0_f32, 1.5, 2.0] {
-            if care_only && scale != 1.0 {continue;}
+            if (care_only || mood_only) && scale != 1.0 {continue;}
             let pixels = (512.0 * scale) as u32;
             let _ = window.request_inner_size(PhysicalSize::new(pixels, pixels));
             renderer.resize(PhysicalSize::new(pixels, pixels));
@@ -175,6 +176,19 @@ impl Capture {
                         fixtures.push((name.into(),expression,true));
                     }
                 }
+                if mood_only {
+                    fixtures.clear();
+                    for (name,curve,tension,raise) in [
+                        ("Calm",0.0,0.0,0.0), ("Delight",0.95,0.0,0.0),
+                        ("DelightOnset",0.95,0.0,0.0), ("Content",0.45,0.0,0.0),
+                        ("Concern",-0.7,0.0,0.0), ("Tense",-0.4,0.8,0.0),
+                        ("Curious",0.05,0.0,0.8),
+                    ] {
+                        let mut face=FacePose::Awake.expression();
+                        face.mouth_curve=curve;face.brow_tension=tension;face.brow_raise=raise;
+                        fixtures.push((name.into(),face,true));
+                    }
+                }
                 for (fixture, expression, managed) in fixtures {
                     let mut body = Box::new(ProceduralBody::generate(&genome)?);
                     body.apply_tuning_profile(profile.clone())?;
@@ -220,7 +234,7 @@ impl Capture {
                         expression,
                         interaction_target: None,
                     };
-                    for _ in 0..180 {
+                    for _ in 0..if mood_only {if fixture=="DelightOnset" {60} else {720}} else {180} {
                         body.embodied_update(
                             &intent,
                             &SensorFrame::default(),
@@ -265,7 +279,7 @@ impl Capture {
                 }
             }
         }
-        if eyes_only || care_only {
+        if eyes_only || care_only || mood_only {
             fs::write(self.output.join("channels.json"),serde_json::to_vec_pretty(&records)?)?;
             return Ok(());
         }
