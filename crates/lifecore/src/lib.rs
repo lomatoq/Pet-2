@@ -11,6 +11,7 @@ mod bandit;
 mod companion;
 mod development;
 mod drives;
+mod excitation;
 mod exploration;
 mod face_geometry;
 mod genome;
@@ -40,6 +41,7 @@ pub use bandit::*;
 pub use companion::*;
 pub use development::*;
 pub use drives::*;
+pub use excitation::*;
 pub use exploration::*;
 pub use face_geometry::*;
 pub use genome::*;
@@ -147,6 +149,14 @@ impl LifeCore {
             .drives
             .integrate_felt_state(snapshot.felt, snapshot.derived, episode, dt);
         self.state.affect.integrate_felt_state(snapshot.felt, dt);
+    }
+
+    /// Resolve excitement after the host reports actual play and motor ownership.
+    pub fn update_excitation(&mut self, mut input: ExcitationInput, dt: f32) -> ExcitationMotorFrame {
+        input.blocked |= self.state.focus_mode
+            || matches!(self.state.current_action, ActionId::Sleep | ActionId::Metamorphosis);
+        self.state.excitation.tick(input, &self.state.genome.temperament,
+            &mut self.state.drives, self.state.affect, self.state.genome.identity_seed, dt)
     }
 
     /// Tick once at the behavior rate after the host has resolved ecology and

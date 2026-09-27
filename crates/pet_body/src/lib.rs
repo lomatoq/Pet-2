@@ -212,6 +212,8 @@ pub struct ProceduralBody {
     base_somatic_actuation: SomaticActuationPacket,
     self_care: self_care_presentation::SelfCarePresentation,
     mood_color: mood_color::MoodColor,
+    excitement_presentation: lifecore::ExcitationMotorFrame,
+    excitement_roll: f32,
     mouth_context_age: f32,
     mouth_context_open: f32,
     contained_face: liquid::SmoothFaceOrigin,
@@ -253,6 +255,8 @@ impl ProceduralBody {
             base_somatic_actuation: Default::default(),
             self_care: Default::default(),
             mood_color: Default::default(),
+            excitement_presentation: Default::default(),
+            excitement_roll: 0.0,
             mouth_context_age: 0.0,
             mouth_context_open: 0.0,
             contained_face: liquid::SmoothFaceOrigin::default(),
@@ -342,6 +346,9 @@ impl ProceduralBody {
     }
 
     pub fn set_self_care_motor(&mut self, motor: lifecore::SelfCareMotorFrame) { self.self_care_motor=motor; }
+    pub fn set_excitation_presentation(&mut self, frame: lifecore::ExcitationMotorFrame) {
+        self.excitement_presentation = frame;
+    }
 
     pub fn set_feeding_expression_active(&mut self, active: bool) { self.feeding_expression_active=active; }
 
@@ -638,7 +645,12 @@ impl ProceduralBody {
         }
         let suppressed = !self.self_care_available(intent) || voice.active;
         self.self_care.update(self.self_care_motor, suppressed, dt);
+        let excitement = if suppressed { lifecore::ExcitationMotorFrame::default() } else { self.excitement_presentation };
+        self.mood_color.set_excitation(excitement.intensity, excitement.chroma_pulse);
         self.mood_color.update(affect, intent.expression, dt);
+        let roll_target = if excitement.roll_radians.is_finite() { excitement.roll_radians } else { 0.0 };
+        self.excitement_roll += (roll_target-self.excitement_roll)
+            * (1.0-(-dt.clamp(0.0,0.1)/0.30).exp());
         let mut presented_intent = intent.clone();
         if !suppressed { self.self_care.apply_face(&mut presented_intent); }
         self.embodiment.self_care_lean = self.self_care.lean;
@@ -1456,6 +1468,11 @@ impl ProceduralBody {
             droplets: self.embodiment.droplets.render_states(),
             liquid: {
                 let mut liquid = self.embodiment.liquid.render_state();
+                // One transform for eyes, brows and mouth; ordinary attention keeps
+                // its existing limits while a playful roll can turn the whole face.
+                let turn = glam::Mat2::from_angle(self.excitement_roll);
+                liquid.face_frame.axis_x = turn * liquid.face_frame.axis_x;
+                liquid.face_frame.axis_y = turn * liquid.face_frame.axis_y;
                 let desired = liquid.face_frame.origin;
                 liquid.face_frame.origin = self.contained_face.origin.unwrap_or_else(|| {
                     liquid::contain_face_origin(

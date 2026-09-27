@@ -501,7 +501,11 @@ fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     let arc_x=clamp(local.x,-0.038,0.038);
     let arc_y=(-0.013+0.015*pow(arc_x/0.038,2.0))*(1.0-2.0*joy);
     let closed=1.0-smoothstep(0.003,0.006,length(local-vec2<f32>(arc_x,arc_y)));
-    return mix(opened,closed,smoothstep(0.45,0.92,blink));
+    // The open eye disappears before the closed-lid arc becomes prominent;
+    // crossfading both silhouettes made translucent ellipses show behind sleep.
+    let open_visibility=1.0-smoothstep(0.20,0.66,blink);
+    let closed_visibility=smoothstep(0.66,0.92,blink);
+    return opened*open_visibility+closed*closed_visibility;
 }
 fn pearl_brow(point:vec2<f32>,side:f32)->f32 {
     let e=pearl_emotion();let shape=globals.face_brows[select(1u,0u,side<0.0)];

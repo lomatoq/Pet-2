@@ -57,10 +57,12 @@ impl Capture {
         let mut renderer = pollster::block_on(Renderer::new(window.clone(), &initial.mesh))?;
         let mut records = Vec::new();
         let eyes_only = std::env::args().any(|arg| arg == "--eye-emotions-only");
+        let sleep_only = std::env::args().any(|arg| arg == "--sleep-eyes-only");
         let care_only = std::env::args().any(|arg| arg == "--self-care-only");
         let mood_only = std::env::args().any(|arg| arg == "--mood-colors-only");
+        let excitement_only = std::env::args().any(|arg| arg == "--excitement-only");
         for scale in [1.0_f32, 1.5, 2.0] {
-            if (care_only || mood_only) && scale != 1.0 {continue;}
+            if (care_only || mood_only || sleep_only || excitement_only) && scale != 1.0 {continue;}
             let pixels = (512.0 * scale) as u32;
             let _ = window.request_inner_size(PhysicalSize::new(pixels, pixels));
             renderer.resize(PhysicalSize::new(pixels, pixels));
@@ -189,6 +191,21 @@ impl Capture {
                         fixtures.push((name.into(),face,true));
                     }
                 }
+                if sleep_only {
+                    fixtures.clear();
+                    for (name,left,right) in [("SleepStaleFace",0.70,0.70),("SleepCheck",0.28,1.0),
+                        ("AwakeControl",0.0,0.0),("BlinkClosing",0.8,0.8)] {
+                        let mut face=FacePose::Awake.expression();
+                        face.blink_left=left;face.blink_right=right;
+                        fixtures.push((name.into(),face,true));
+                    }
+                }
+                if excitement_only {
+                    fixtures.clear();
+                    for name in ["ExcitedWarm", "ExcitedCool", "ExcitedInverted"] {
+                        fixtures.push((name.into(),FacePose::Playful.expression(),true));
+                    }
+                }
                 for (fixture, expression, managed) in fixtures {
                     let mut body = Box::new(ProceduralBody::generate(&genome)?);
                     body.apply_tuning_profile(profile.clone())?;
@@ -222,19 +239,27 @@ impl Capture {
                         _ => lifecore::SelfCareMotorFrame::default(),
                     };
                     body.set_self_care_motor(care);
+                    if excitement_only {
+                        body.set_excitation_presentation(lifecore::ExcitationMotorFrame {
+                            intensity:0.85,
+                            chroma_pulse:if fixture=="ExcitedWarm" {0.0} else {0.09},
+                            roll_radians:if fixture=="ExcitedInverted" {std::f32::consts::PI} else {0.0},
+                            ..Default::default()
+                        });
+                    }
                     body.set_feeding_expression_active(fixture=="CareFeedingPriority");
                     let intent = BodyIntent {
-                        locomotion: LocomotionMode::Hover,
+                        locomotion: if fixture.starts_with("Sleep") {LocomotionMode::Sleep} else {LocomotionMode::Hover},
                         target_position: Vec2::splat(0.5),
                         target_surface: None,
                         desired_speed: 0.0,
                         facing_direction: 1.0,
                         gaze_target: Some(Vec2::new(0.55, 0.5)),
-                        pose: PoseIntent::Neutral,
+                        pose: if fixture.starts_with("Sleep") {PoseIntent::Compact} else {PoseIntent::Neutral},
                         expression,
                         interaction_target: None,
                     };
-                    for _ in 0..if mood_only {if fixture=="DelightOnset" {60} else {720}} else {180} {
+                    for _ in 0..if mood_only || excitement_only {if fixture=="DelightOnset" {60} else {720}} else {180} {
                         body.embodied_update(
                             &intent,
                             &SensorFrame::default(),
@@ -279,7 +304,7 @@ impl Capture {
                 }
             }
         }
-        if eyes_only || care_only || mood_only {
+        if eyes_only || care_only || mood_only || sleep_only {
             fs::write(self.output.join("channels.json"),serde_json::to_vec_pretty(&records)?)?;
             return Ok(());
         }

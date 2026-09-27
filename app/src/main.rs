@@ -5,6 +5,7 @@
 #![recursion_limit = "512"]
 
 mod activity_glance;
+mod excitation_runtime;
 mod birth_runtime;
 mod startup_reveal;
 mod companion_runtime;
@@ -2082,6 +2083,7 @@ struct PetRuntime {
     ecology: EcologyRuntime,
     motor: BehaviorPerformanceRuntime,
     last_motor_packet: SomaticActuationPacket,
+    excitation: excitation_runtime::ExcitationRuntime,
     sleep_snuffle: local_voice_context::SleepSnuffleContext,
     repertoire: pet_motor::RepertoireRuntime,
     last_repertoire: pet_motor::RepertoireOutput,
@@ -3962,8 +3964,64 @@ impl PetApplication {
             }
             keep_eyes_available_during_active_locomotion(&mut output.body_intent);
             repertoire_bridge::merge_face(&mut output.body_intent, &repertoire);
+            let contact = runtime.sensors.embodied_interaction.contact;
+            let pleasant = motor_goal.felt.contact_pleasantness;
+            let episode = runtime.ecology.active_episode().map(|e| e.goal);
+            let orb_play = matches!(episode, Some(EpisodeGoal::ChaseOrb | EpisodeGoal::InterceptOrb
+                | EpisodeGoal::SoloOrbPlay | EpisodeGoal::RetrieveOrb));
+            let gentle = contact.active && contact.pointer_speed < 1.2 && pleasant > 0.1;
+            let quick_play = runtime.sensors.cursor_distance_to_pet < 0.18
+                && runtime.sensors.cursor_velocity.length() > 0.12
+                && motor_goal.felt.play_readiness > 0.1;
+            let cue = if gentle { Some(lifecore::ExcitationCue::GentleStroke) }
+                else if orb_play { Some(lifecore::ExcitationCue::OrbGame) }
+                else if quick_play { Some(lifecore::ExcitationCue::QuickPlay) } else { None };
+            let observed_play = if orb_play {
+                (runtime.body.simulation.feedback.velocity.length()*5.0).clamp(0.0,1.0)
+            } else if quick_play {
+                (runtime.sensors.cursor_velocity.length()*3.0).clamp(0.0,1.0)
+            } else { 0.0 };
+            let cue_strength = if gentle { pleasant } else if cue.is_some() {
+                observed_play
+            } else { 0.0 };
+            let excitation_blocked = runtime.birth.started.is_some()
+                || runtime.sensors.pet_dragged || runtime.life.state.focus_mode
+                || runtime.lab_face_pose.is_some() || runtime.lab_motor_program.is_some()
+                || runtime.emotion_burst.active || runtime.voice_motion.is_some()
+                || runtime.digestion_site.is_some() || runtime.last_surface_care.target.is_some()
+                || motor_goal.felt.startle > 0.2 || motor_goal.felt.pain_like > 0.15
+                || !runtime.body.self_care_available(&output.body_intent)
+                || matches!(episode, Some(EpisodeGoal::EatMorsel | EpisodeGoal::InspectMorsel
+                    | EpisodeGoal::SleepInDen | EpisodeGoal::EscapePressure | EpisodeGoal::RecoverAfterPressure));
+            let feedback = runtime.excitation.observe(cue, cue_strength, output.affect.arousal,
+                if contact.active { pleasant } else { output.affect.valence * motor_goal.felt.agency_match },
+                runtime.body.simulation.feedback.world_position, LIFE_DT);
+            let excitation = runtime.life.update_excitation(lifecore::ExcitationInput {
+                play_engagement: observed_play,
+                energy: runtime.ecology.state().metabolism.reserve,
+                physical_load: motor_goal.felt.physical_load,
+                blocked: excitation_blocked,
+                executing: runtime.excitation.executing,
+                allow_roll: true,
+                wall_available: runtime.topology.monitors.len() == 1,
+                cue, cue_strength, feedback,
+                ..Default::default()
+            }, LIFE_DT);
+            // Object handling owns its route. Excitement can accumulate during play,
+            // then finds an outlet when the mouth/hands and navigation are free.
+            let route_free = !excitation_blocked && !runtime.cradle_seat.inside
+                && episode.is_none_or(|e| matches!(e, EpisodeGoal::SharedAttention | EpisodeGoal::PeekFromDen));
+            let presentation = if route_free { excitation } else { Default::default() };
+            let exciting = runtime.excitation.apply(presentation,
+                runtime.body.simulation.feedback.world_position, LIFE_DT, &mut output.body_intent);
+            runtime.body.set_excitation_presentation(presentation);
+            if exciting {
+                motor_packet.support = None;
+                motor_packet.fields.fill(None);
+                runtime.body.set_somatic_actuation(motor_packet.clone());
+            }
             let gut = &runtime.ecology.state().metabolism.tract;
-            let self_care_busy = runtime.birth.started.is_some()
+            let self_care_busy = exciting || runtime.birth.started.is_some()
                 || !runtime.body.self_care_available(&output.body_intent)
                 || voice_visual_state(&runtime.audio).active
                 || runtime.lab_face_pose.is_some()
@@ -4432,6 +4490,8 @@ impl PetApplication {
                         "voice_command": runtime.voice_motion.as_ref().filter(|m| !m.autonomous_rest).map(|m| m.cue),
                         "autonomous_rest": runtime.voice_motion.as_ref().is_some_and(|m| m.autonomous_rest),
                         "frustration_burst": runtime.emotion_burst.active,
+                        "excitation": &runtime.life.state.excitation,
+                        "excitation_executing": runtime.excitation.executing,
                         "active_performance": runtime.motor.active(),
                         "packet": &runtime.last_motor_packet,
                         "somatic_feedback": runtime.body.somatic_feedback(),
@@ -4721,6 +4781,7 @@ impl ApplicationHandler for PetApplication {
         // again against today's monitor topology rather than resumed mid-flight.
         prepared.life.state.exploration.resume_after_absence();
         prepared.life.state.self_care.resume_after_absence();
+        prepared.life.state.excitation.resume_after_absence();
         let topology = topology_from_event_loop(event_loop, 1);
         let desktop_bounds = topology.virtual_physical_bounds;
         if !desktop_bounds.is_valid() {
@@ -4913,6 +4974,7 @@ impl ApplicationHandler for PetApplication {
             ecology: prepared.ecology,
             motor: BehaviorPerformanceRuntime::new(identity_seed),
             last_motor_packet: SomaticActuationPacket::default(),
+            excitation: excitation_runtime::ExcitationRuntime::default(),
             sleep_snuffle: local_voice_context::SleepSnuffleContext::default(),
             repertoire: pet_motor::RepertoireRuntime::new(identity_seed),
             last_repertoire: pet_motor::RepertoireOutput::default(),

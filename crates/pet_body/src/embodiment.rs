@@ -386,9 +386,23 @@ impl EmbodiedRuntime {
         } else {
             self.update_blink(mode, intent, affect, expression, dt);
         }
+        // Sleep is an authoritative motor state, including supported Compact
+        // sleep. Do not let an unrelated awake expression leave ghost ellipses.
+        // A deliberate managed unilateral sleep-check remains the exception.
+        let sleeping = intent.locomotion == lifecore::LocomotionMode::Sleep
+            || mode == GazeMode::Sleep;
+        let checking = sleeping && self.managed_blink
+            && expression.blink_left.max(expression.blink_right) >= 0.98
+            && expression.blink_left.min(expression.blink_right) < 0.90;
+        let aperture_target = if sleeping && !checking {0.0}
+            else if checking {1.0} else {expression.eye_aperture.clamp(0.0,1.0)};
+        if sleeping && !checking {
+            self.pose.blink_left = 1.0;
+            self.pose.blink_right = 1.0;
+        }
         self.pose.eye_aperture = smooth(
             self.pose.eye_aperture,
-            expression.eye_aperture.clamp(0.0, 1.0),
+            aperture_target,
             16.0,
             dt,
         );
@@ -400,7 +414,7 @@ impl EmbodiedRuntime {
         );
         // Emotion changes lid contours, never magnifies the eyeball/iris.
         self.pose.eye_scales = [Vec2::ONE; 2];
-        let aperture_closure = 1.0 - self.pose.eye_aperture;
+        let aperture_closure = if checking {0.0} else {1.0 - self.pose.eye_aperture};
         self.pose.blink_left = self.pose.blink_left.max(aperture_closure);
         self.pose.blink_right = self.pose.blink_right.max(aperture_closure);
         self.update_pupil(mode, intent, sensors, mind, expression, face_tuning, dt);
@@ -1322,6 +1336,37 @@ fn deterministic_unit(seed: u64, sequence: u64, salt: u64) -> f32 {
 mod tests {
     use super::*;
     use lifecore::{BodyIntent, Genome, LocomotionMode, PoseIntent};
+
+    #[test]
+    fn actual_sleep_closes_both_eyes_but_keeps_managed_checks_and_waking_blinks() {
+        let genome=Genome::from_seed(42);
+        let traits=DerivedVisualTraits::from_genome(&genome);
+        let mut runtime=EmbodiedRuntime::new(42,&traits);
+        runtime.managed_blink=true;
+        let mut display=intent();
+        display.locomotion=lifecore::LocomotionMode::Sleep;
+        display.pose=PoseIntent::Compact;
+        let update=|runtime:&mut EmbodiedRuntime,display:&BodyIntent,expression| {
+            runtime.update(&genome.body,&traits,VisualMindInput::default(),display,
+                &SensorFrame::default(),&BodyFeedback::default(),AffectState::default(),
+                expression,FaceTuning::default(),VoiceVisualState::default(),1.0/120.0);
+        };
+        let mut face=lifecore::ExpressionState::default();
+        face.blink_left=0.70;face.blink_right=0.70;
+        for _ in 0..120 {update(&mut runtime,&display,face);}
+        assert_eq!((runtime.pose.blink_left,runtime.pose.blink_right),(1.0,1.0));
+        face.blink_left=0.28;face.blink_right=1.0;
+        update(&mut runtime,&display,face);
+        assert_eq!((runtime.pose.blink_left,runtime.pose.blink_right),(0.28,1.0));
+        display.locomotion=lifecore::LocomotionMode::Hover;
+        display.pose=PoseIntent::Neutral;
+        face.blink_left=0.0;face.blink_right=0.0;
+        for _ in 0..120 {update(&mut runtime,&display,face);}
+        assert!(runtime.pose.blink_left<0.001 && runtime.pose.blink_right<0.001);
+        face.blink_left=0.42;face.blink_right=0.11;
+        update(&mut runtime,&display,face);
+        assert_eq!((runtime.pose.blink_left,runtime.pose.blink_right),(0.42,0.11));
+    }
 
     #[test]
     fn worry_brows_require_disappointment_not_small_frowns_or_alarm() {

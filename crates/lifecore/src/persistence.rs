@@ -104,6 +104,8 @@ impl AttentionBudget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifeState {
     #[serde(default)]
+    pub excitation: crate::ExcitationState,
+    #[serde(default)]
     pub self_care: crate::SelfCareState,
     #[serde(default)]
     pub exploration: crate::ExplorationMemory,
@@ -144,6 +146,7 @@ impl LifeState {
         let drives = Drives::initial(&genome.temperament);
         let vocal_motifs = generate_initial_motifs(&genome.voice);
         Self {
+            excitation: crate::ExcitationState::default(),
             self_care: crate::SelfCareState::default(),
             exploration: crate::ExplorationMemory::default(),
             genome,
@@ -176,6 +179,7 @@ impl LifeState {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.genome.is_valid()
+            && self.excitation.is_valid()
             && self.self_care.is_valid()
             && self.exploration.is_valid()
             && self.development.is_valid_for_genome(&self.genome)

@@ -9,15 +9,21 @@ pub struct MoodColor {
     pub trail: Vec3,
     joy_drive: f32,
     pub joy: f32,
+    excitement: f32,
+    excitement_wave: f32,
 }
 impl Default for MoodColor {
     fn default() -> Self {
-        Self { drive: Vec3::ONE, tint: Vec3::ONE, trail: Vec3::ONE, joy_drive: 0.0, joy: 0.0 }
+        Self { drive: Vec3::ONE, tint: Vec3::ONE, trail: Vec3::ONE, joy_drive: 0.0, joy: 0.0, excitement: 0.0, excitement_wave: 0.0 }
     }
 }
 fn unit(v:f32)->f32 { if v.is_finite() {v.clamp(0.0,1.0)} else {0.0} }
 fn ease(v:f32)->f32 { let v=unit(v);v*v*(3.0-2.0*v) }
 impl MoodColor {
+    pub fn set_excitation(&mut self, intensity: f32, wave: f32) {
+        self.excitement = unit(intensity);
+        self.excitement_wave = unit(wave / 0.095);
+    }
     pub fn update(&mut self, affect:AffectState, face:ExpressionState, dt:f32) {
         if !dt.is_finite() || dt<=0.0 {return;}
         let smile=unit(face.mouth_curve);
@@ -31,7 +37,8 @@ impl MoodColor {
             +Vec3::new(-0.12,-0.06,0.0)*subdued
             +Vec3::new(-0.10,0.0,-0.025)*curious
             +Vec3::new(-0.065,-0.025,0.0)*calm
-            +Vec3::new(0.0,-0.12,-0.055)*tension).clamp(Vec3::splat(0.80),Vec3::ONE);
+            +Vec3::new(0.0,-0.12,-0.055)*tension
+            +Vec3::new(-0.10*self.excitement_wave, -0.08*(1.0-self.excitement_wave), -0.09*(1.0-self.excitement_wave))*self.excitement).clamp(Vec3::splat(0.80),Vec3::ONE);
         let happy=ease((smile-0.30)/0.55)*(1.0-tension)
             *(0.65+0.35*unit(affect.valence));
         // Cascaded low-pass stages give a soft start as well as a soft arrival.
@@ -52,6 +59,24 @@ impl MoodColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn excitement_palette_changes_softly_and_returns_without_flashing() {
+        let mut m=MoodColor::default();
+        for i in 0..1200 {
+            let before=m.tint;
+            m.set_excitation(0.9, ((i as f32/120.0).sin()*0.5+0.5)*0.09);
+            m.update(AffectState::default(),ExpressionState::default(),1.0/60.0);
+            assert!(m.tint.distance(before)<0.003);
+            assert!(m.tint.min_element()>=0.8 && m.tint.max_element()<=1.0);
+        }
+        m.set_excitation(0.0,0.0);
+        let mut quiet=MoodColor::default();
+        for _ in 0..2400 {
+            m.update(AffectState::default(),ExpressionState::default(),1.0/60.0);
+            quiet.update(AffectState::default(),ExpressionState::default(),1.0/60.0);
+        }
+        assert!(m.tint.distance(quiet.tint)<0.001);
+    }
     #[test]
     fn color_and_glow_are_continuous_bounded_and_recover() {
         let mut m=MoodColor::default();
