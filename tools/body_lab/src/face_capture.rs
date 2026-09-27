@@ -133,7 +133,7 @@ impl Capture {
                 }
                 if care_only {
                     fixtures.clear();
-                    for name in ["CareNeutral","CareGroom","CareScratch","CareNuzzle","CareDecline","CareFeedingPriority"] {
+                    for name in ["CareNeutral","CareGroom","CareGroomShort","CareGroomLeft","CareScratch","CareNuzzle","CareDecline","CareFeedingPriority"] {
                         fixtures.push((name.into(),FacePose::Awake.expression(),true));
                     }
                     for (name,primary) in [
@@ -171,6 +171,11 @@ impl Capture {
                     // Fixed pixel reference: approximately 190 px diameter at 100%.
                     body.set_presentation_scale(0.8);
                     let care = match fixture.as_str() {
+                        "CareGroomShort" | "CareGroomLeft" => lifecore::SelfCareMotorFrame {
+                            kind:lifecore::SelfCareKind::Groom,strength:0.95,side:-1.0,
+                            tongue_extension:if fixture=="CareGroomShort" {0.3} else {0.95},
+                            mouth_open:0.28,squint:0.25,face_lowering:0.7,face_turn:-0.25,
+                            body_lean:-0.3,..Default::default()},
                         "CareGroom" | "CareFeedingPriority" => lifecore::SelfCareMotorFrame {
                             kind:lifecore::SelfCareKind::Groom,strength:0.95,side:1.0,
                             tongue_extension:0.95,mouth_open:0.28,squint:0.25,

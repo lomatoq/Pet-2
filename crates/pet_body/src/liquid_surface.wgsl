@@ -1417,14 +1417,27 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // An attached soft tongue follows the very same local mouth/yaw frame.
     // Its motor extension comes from causal grooming, never a shader timer.
     let extension=globals.self_care.x;
-    let tongue_root=vec2<f32>(0.0,centerline-half_height*0.25);
-    let tongue_tip=tongue_root+vec2<f32>(globals.self_care.y*0.030,-0.054)*extension;
-    let tongue_radius=0.013*sqrt(extension);
-    let tongue_distance=segment_distance(mouth_local,tongue_root,tongue_tip)-tongue_radius;
+    let tongue_root=vec2<f32>(0.0,centerline-half_height*0.12);
+    let tongue_length=0.037*extension;
+    let tongue_width=0.025*sqrt(smoothstep(0.0,0.40,extension));
+    let tongue_height=tongue_length*0.58+0.009*extension;
+    let tongue_progress=clamp((tongue_root.y-mouth_local.y)/max(tongue_length,0.001),0.0,1.0);
+    // A broad spatulate feline-like tip, with a shallow lateral curl. Width
+    // opens early in the stroke: retracting makes a short blep, never a needle.
+    let tongue_curl=globals.self_care.y*0.009*extension*tongue_progress*tongue_progress;
+    let tongue_local=vec2<f32>(mouth_local.x-tongue_curl,
+        mouth_local.y-tongue_root.y+tongue_length*0.40);
+    let tongue_distance=(length(tongue_local/vec2<f32>(max(tongue_width,0.001),max(tongue_height,0.001)))-1.0)
+        *min(max(tongue_width,0.001),max(tongue_height,0.001));
     let tongue=(1.0-smoothstep(-0.002,0.002,tongue_distance))
-        *smoothstep(0.02,0.14,extension)*globals.face_tuning.x;
-    let tongue_highlight=clamp(1.0-abs(mouth_local.x-tongue_tip.x*0.5)/max(tongue_radius,0.001),0.0,1.0);
-    let tongue_color=mix(vec3<f32>(0.43,0.15,0.38),vec3<f32>(0.86,0.49,0.67),tongue_highlight*0.65);
+        *smoothstep(0.02,0.14,extension)*globals.face_tuning.x
+        *(1.0-smoothstep(tongue_root.y-0.001,tongue_root.y+0.004,mouth_local.y));
+    let tongue_rounding=sqrt(max(0.0,1.0-pow(tongue_local.x/max(tongue_width,0.001),2.0)));
+    let tongue_light=tongue_rounding*(0.5+0.35*tongue_progress);
+    let tongue_groove=exp(-pow(tongue_local.x/0.0025,2.0))
+        *smoothstep(0.05,0.25,tongue_progress)*(1.0-smoothstep(0.60,0.95,tongue_progress));
+    let tongue_color=mix(vec3<f32>(0.72,0.25,0.37),vec3<f32>(0.98,0.57,0.65),tongue_light)
+        -vec3<f32>(0.055,0.045,0.035)*tongue_groove;
     color=mix(color,tongue_color,tongue);
     let face_coverage = max(max(eyes,mouth),tongue)*coverage;
 
