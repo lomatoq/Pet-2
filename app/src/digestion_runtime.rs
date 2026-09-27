@@ -120,9 +120,13 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
         }
         runtime.body.set_somatic_actuation(packet);
     }
+    let contour = runtime.body.main_liquid_contact_bounds_pixels(extent.y);
+    let outlet = lateral_outlet(feedback.world_position, contour.minimum, contour.maximum,
+        extent, left, right, floor, runtime.ecology.state().identity_seed);
     let frame = pet_ecology::DigestionFrame {
-        outlet: feedback.world_position
-            + Vec2::new(bottom.x / extent.x, (bottom.y - 3.0) / extent.y),
+        body_bounds: Some([feedback.world_position+contour.minimum/extent,
+            feedback.world_position+contour.maximum/extent]),
+        outlet,
         mouth: feedback.world_position + mouth / extent,
         gas_outlet: feedback.world_position + runtime.body.liquid_physical_support_pixels(Vec2::new(1.0,0.45).normalize(),extent.y) / extent,
         body_velocity: feedback.velocity,
@@ -149,5 +153,44 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
         runtime.intent.expression.mouth_open = 0.15 + gut.burp * 0.45;
         runtime.intent.expression.mouth_compression = 0.0;
         runtime.intent.expression.eye_aperture = 1.0 + gut.burp * 0.2;
+    }
+}
+
+// The chain is drawn in the world overlay. Place its first joint outside the
+// measured silhouette, so it emerges beside the lower flank rather than being
+// painted across the belly. Clearance includes the largest emitted radius.
+#[allow(clippy::too_many_arguments)]
+fn lateral_outlet(center: Vec2, minimum: Vec2, maximum: Vec2, extent: Vec2,
+    left: f32, right: f32, floor: f32, seed: u64) -> Vec2 {
+    let clearance = 7.0 * extent.y / 1152.0;
+    let low = center.x + (minimum.x - clearance) / extent.x;
+    let high = center.x + (maximum.x + clearance) / extent.x;
+    let room_left = (low - left) * extent.x;
+    let room_right = (right - high) * extent.x;
+    let prefer_right = seed.is_multiple_of(2);
+    let right_side = if room_left < clearance { true }
+        else if room_right < clearance { false } else { prefer_right };
+    Vec2::new(if right_side { high } else { low },
+        (center.y + (maximum.y - clearance * 2.0) / extent.y).min(floor - clearance / extent.y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn waste_exits_lower_flank_outside_body_at_all_desktop_aspects() {
+        for aspect in [0.75, 1.0, 2.4, 3.5] {
+            let extent=Vec2::new(1152.0*aspect,1152.0);
+            let lo=Vec2::new(-90.0,-65.0);let hi=Vec2::new(80.0,48.0);
+            for seed in [1,2] {
+                let p=Vec2::new(0.5,0.9);
+                let outlet=lateral_outlet(p,lo,hi,extent,0.0,1.0,0.95,seed);
+                let local=(outlet-p)*extent;
+                assert!(local.x<lo.x-6.0 || local.x>hi.x+6.0);
+                assert!(local.y>0.0 && outlet.y<0.95);
+            }
+            let p=Vec2::new(1.0-hi.x/extent.x,0.9);
+            assert!(lateral_outlet(p,lo,hi,extent,0.0,1.0,0.95,2).x<p.x);
+        }
     }
 }

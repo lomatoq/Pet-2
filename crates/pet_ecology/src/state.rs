@@ -101,11 +101,16 @@ impl SavedEcologyRng {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EcologyState {
     #[serde(default)]
+    pub orb_experience: crate::OrbExperience,
+    #[serde(default)]
     pub episode_memory: crate::EpisodeMemory,
     #[serde(default)]
     pub waste: crate::WasteWorld,
     #[serde(default)]
     pub successful_touch_sides: [u32; 2],
+    /// Bounded recent positive touch evidence; lifetime counts remain diagnostics.
+    #[serde(default)]
+    pub touch_preference: [f32; 2],
     pub schema_version: u32,
     pub identity_seed: u64,
     pub next_object_id: u64,
@@ -139,8 +144,10 @@ impl EcologyState {
         }
         Self {
             episode_memory: crate::EpisodeMemory::default(),
+            orb_experience: crate::OrbExperience::default(),
             waste: crate::WasteWorld::default(),
             successful_touch_sides: [0; 2],
+            touch_preference: [0.0; 2],
             schema_version: ECOLOGY_STATE_SCHEMA_VERSION,
             identity_seed,
             next_object_id,
@@ -162,6 +169,20 @@ impl EcologyState {
     #[must_use]
     pub fn snapshot(&self) -> Self {
         self.clone()
+    }
+
+    /// A completed pleasant contact is evidence, not elapsed time or absence.
+    /// Each new observation discounts older evidence so preference can reverse.
+    pub fn observe_touch_preference(&mut self, side: f32) {
+        if !side.is_finite() || side.abs() <= 0.01 { return; }
+        for evidence in &mut self.touch_preference { *evidence *= 0.9; }
+        let index = usize::from(side > 0.0);
+        self.touch_preference[index] = (self.touch_preference[index] + 0.1).min(1.0);
+    }
+
+    pub fn preferred_touch_side(&self) -> f32 {
+        (self.touch_preference[1] - self.touch_preference[0])
+            / (self.touch_preference[0] + self.touch_preference[1] + 0.2)
     }
 
     pub fn restore(mut snapshot: Self) -> Result<Self, EcologyError> {
@@ -190,6 +211,10 @@ impl EcologyState {
     }
 
     pub fn validate(&self) -> Result<(), EcologyError> {
+        if !self.orb_experience.valid() { return Err(EcologyError::InvalidEpisodeMemory); }
+        if !self.touch_preference.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+            return Err(EcologyError::InvalidTouchPreference);
+        }
         if !self.episode_memory.is_valid() { return Err(EcologyError::InvalidEpisodeMemory); }
         if !matches!(self.schema_version, 1 | ECOLOGY_STATE_SCHEMA_VERSION) {
             return Err(EcologyError::UnsupportedSchema {

@@ -105,12 +105,7 @@ pub fn from_frames(
         context.orb_position = orb.map(|o| o.position);
         context.orb_id = orb.map(|o| o.id);
         context.orb_stored = orb.is_some_and(|o| o.lifecycle == ObjectLifecycle::StoredInDen);
-        context.preferred_touch_side =
-            match state.successful_touch_sides[1].cmp(&state.successful_touch_sides[0]) {
-                std::cmp::Ordering::Greater => 1.0,
-                std::cmp::Ordering::Less => -1.0,
-                std::cmp::Ordering::Equal => 0.0,
-            };
+        context.preferred_touch_side = state.preferred_touch_side();
     }
     context
 }

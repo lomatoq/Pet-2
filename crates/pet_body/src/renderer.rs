@@ -105,6 +105,7 @@ struct Globals {
     face_mouth: [f32; 4],
     face_eye: [f32; 4],
     face_eye_scales: [f32; 4],
+    self_care: [f32; 4],
 }
 
 #[repr(C)]
@@ -243,6 +244,8 @@ pub struct RenderParameters {
     pub brow_asymmetry: f32,
     pub geometry: lifecore::FaceGeometry,
     pub eye_aperture: f32,
+    pub tongue_extension: f32,
+    pub tongue_side: f32,
     pub mouth_open: f32,
     pub feeding_mouth_offset: Vec2,
     pub mouth_shout: f32,
@@ -3340,6 +3343,8 @@ impl Default for RenderParameters {
             mouth_shout: 0.0,
             eye_scales: [Vec2::ONE; 2],
             mouth_curve: 0.1,
+            tongue_extension: 0.0,
+            tongue_side: 0.0,
             mouth_tension: 0.0,
             cheek_glow: 0.0,
             audio_envelope: 0.0,
@@ -3514,6 +3519,7 @@ fn globals_for_resolved(
         }
     });
     Globals {
+        self_care: [bounded(parameters.tongue_extension,0.0,1.0,0.0), bounded(parameters.tongue_side,-1.0,1.0,0.0),0.0,0.0],
         face_eye_scales: [
             bounded(parameters.eye_scales[0].x, 0.85, 1.28, 1.0),
             bounded(parameters.eye_scales[0].y, 0.75, 1.45, 1.0),

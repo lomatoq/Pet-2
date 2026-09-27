@@ -140,6 +140,8 @@ pub enum ExpectedOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ActivityEpisode {
+    pub play_variant: u8,
+    pub play_evidence_recorded: bool,
     pub feeding_bite: crate::FeedingBite,
     /// Affect sampled once for this bout's delivery; safety inputs remain live.
     pub bout_play_drive: f32,
@@ -370,6 +372,7 @@ impl EpisodeMemory {
 #[derive(Clone, Debug)]
 pub struct EpisodeDirector {
     adaptation: EpisodeAdaptation,
+    prediction_observer: crate::orb_experience::OrbPredictionObserver,
     active: Option<ActivityEpisode>,
     tick: u64,
     visual_episode_cooldown: f32,
@@ -386,6 +389,7 @@ impl Default for EpisodeDirector {
     fn default() -> Self {
         Self {
             adaptation: EpisodeAdaptation::default(),
+            prediction_observer: Default::default(),
             active: None,
             tick: 0,
             visual_episode_cooldown: 0.0,
@@ -439,6 +443,7 @@ impl EpisodeDirector {
         state.episode_stats.next_episode_id = id.saturating_add(1).max(1);
         state.episode_stats.started[goal.index()] += 1;
         self.active = Some(ActivityEpisode {
+            play_variant: 0, play_evidence_recorded: false,
             feeding_bite: crate::FeedingBite::default(), id, goal,
             phase: EpisodePhase::Evaluate, object_id: Some(object_id),
             target_position: Some(target), reason_code: EpisodeReason::FoodOpportunity,
@@ -623,6 +628,7 @@ impl EpisodeDirector {
         } else {
             0.0
         };
+        self.prediction_observer.observe(state,frame.desktop_aspect,dt,frame.timestamp);
         self.visual_episode_cooldown = (self.visual_episode_cooldown - dt).max(0.0);
         self.orb_bid_cooldown = (self.orb_bid_cooldown - dt).max(0.0);
         self.endogenous_play_cooldown = (self.endogenous_play_cooldown - dt).max(0.0);
@@ -732,6 +738,7 @@ impl EpisodeDirector {
                 let side_index = usize::from(self.touch_side > 0.0);
                 state.successful_touch_sides[side_index] =
                     state.successful_touch_sides[side_index].saturating_add(1);
+                state.observe_touch_preference(self.touch_side);
             }
             self.pleasant_touch_seconds = 0.0;
         }
@@ -744,6 +751,7 @@ impl EpisodeDirector {
             let in_diameters = offset / diameter;
             let follow = in_diameters.clamp_length_max(0.35) * diameter;
             self.active = Some(ActivityEpisode {
+                play_variant: 0, play_evidence_recorded: false,
                 feeding_bite: crate::FeedingBite::default(),
                 id,
                 goal: EpisodeGoal::SharedAttention,
@@ -788,6 +796,7 @@ impl EpisodeDirector {
             state.episode_stats.started[goal.index()] =
                 state.episode_stats.started[goal.index()].saturating_add(1);
             self.active = Some(ActivityEpisode {
+                play_variant: 0, play_evidence_recorded: false,
                 feeding_bite: crate::FeedingBite::default(),
                 id,
                 goal,
@@ -805,6 +814,11 @@ impl EpisodeDirector {
                 contact_side: 0.0,
                 expected_outcome: expected_outcome_for(goal),
             });
+            if matches!(goal,EpisodeGoal::SoloOrbPlay|EpisodeGoal::ChaseOrb)
+                && let Some(orb)=state.objects.iter().find(|o|Some(o.id)==object_id) {
+                    let variant=state.orb_experience.choose(frame,orb.position,orb.velocity,state.identity_seed);
+                    self.active.as_mut().unwrap().play_variant=variant;
+            }
             if goal == EpisodeGoal::SoloOrbPlay && reason == EpisodeReason::AutonomousPlay {
                 self.endogenous_idle_seconds = 0.0;
                 self.endogenous_play_cooldown = 10.0;
@@ -844,6 +858,27 @@ impl EpisodeDirector {
         active.commitment_remaining = (active.commitment_remaining - dt).max(0.0);
         let previous_goal = active.goal;
         let step = drive_episode(state, frame, &mut active, &mut output, dt);
+        if !matches!(previous_goal,EpisodeGoal::ChaseOrb|EpisodeGoal::SoloOrbPlay)
+            && matches!(active.goal,EpisodeGoal::ChaseOrb|EpisodeGoal::SoloOrbPlay)
+            && let Some(orb)=state.objects.iter().find(|o|Some(o.id)==active.object_id) {
+                active.play_variant=state.orb_experience.choose(frame,orb.position,orb.velocity,state.identity_seed);
+                active.play_evidence_recorded=false;
+        }
+        if matches!(previous_goal,EpisodeGoal::ChaseOrb|EpisodeGoal::SoloOrbPlay)
+            && !active.play_evidence_recorded {
+            let free_object=state.objects.iter().any(|o|Some(o.id)==active.object_id
+                && o.lifecycle!=ObjectLifecycle::GrabbedByUser);
+            let contact=frame.orb_physical.contact && free_object
+                && output.object_commands[..output.object_command_count].iter().any(|command|
+                    matches!(command,ObjectCommand::ApplyImpulse{object_id,..} if Some(*object_id)==active.object_id));
+            let failed=free_object && active.elapsed_seconds>0.5
+                && matches!(step,EpisodeStep::Abort(EpisodeReason::TimedOut));
+            if contact || failed {
+                state.orb_experience.observe_contact(active.play_variant,contact);
+                active.play_evidence_recorded=true;
+            }
+        }
+
         if active.goal == EpisodeGoal::CarryOrbHome {
             let side = self.adaptation.placement_side();
             let delta = frame.pet_position - state.den.anchor;
@@ -966,6 +1001,10 @@ fn select_episode(
             None,
         ));
     }
+    // Opportunistic food must not repeatedly wake a sleeping animal.
+    if frame.sleeping || frame.selected_action == ActionId::Sleep {
+        return Some((EpisodeGoal::SleepInDen, EpisodeReason::ReturnToDen, None));
+    }
     if let Some(morsel) = state.objects.iter().find(|object| {
         object.kind == ObjectKind::Morsel
             && (state.metabolism.satiation < 0.88 || object.radius_px_at_reference > 3.0)
@@ -982,9 +1021,6 @@ fn select_episode(
             EpisodeReason::FoodOpportunity,
             Some(morsel.id),
         ));
-    }
-    if frame.sleeping || frame.selected_action == ActionId::Sleep {
-        return Some((EpisodeGoal::SleepInDen, EpisodeReason::ReturnToDen, None));
     }
     if frame.orb_trapped {
         return Some((
@@ -1051,7 +1087,11 @@ fn select_episode(
             .filter(|skill| {
                 frame.timestamp - skill.last_used_seconds >= crate::MIN_PRACTICE_COOLDOWN_SECONDS
             })
-            .max_by(|left, right| left.competence.total_cmp(&right.competence))
+            .max_by(|left, right| {
+                // Competence supports a confident display, while recent use
+                // makes room for another learned movement. No fabricated win.
+                practice_score(left, frame).total_cmp(&practice_score(right, frame))
+            })
             .map(|skill| {
                 (
                     EpisodeGoal::PerformSkill,
@@ -1124,6 +1164,14 @@ fn held_orb_play_margin(state: &EcologyState, frame: EcologyBehaviorFrame) -> f3
     engagement - recovery
 }
 
+fn practice_score(skill: &crate::LearnedSkill, frame: EcologyBehaviorFrame) -> f32 {
+    let age = (frame.timestamp - skill.last_used_seconds).max(0.0) as f32;
+    let freshness = 1.0 - (-age / 180.0).exp();
+    let learning = skill.uncertainty * (0.25 + frame.curiosity_drive * 0.4);
+    skill.competence * 0.35 + freshness * 0.75 + learning
+        + skill.social_value.max(0.0) * 0.15
+}
+
 fn fill_candidate_trace(
     trace: &mut EcologyDecisionTrace,
     state: &EcologyState,
@@ -1148,7 +1196,7 @@ fn fill_candidate_trace(
         .filter(|skill| {
             frame.timestamp - skill.last_used_seconds >= crate::MIN_PRACTICE_COOLDOWN_SECONDS
         })
-        .max_by(|left, right| left.competence.total_cmp(&right.competence));
+        .max_by(|left, right| practice_score(left, frame).total_cmp(&practice_score(right, frame)));
     let candidates = [
         (
             EpisodeGoal::EscapePressure,
@@ -1283,7 +1331,7 @@ fn fill_candidate_trace(
         ),
         (
             EpisodeGoal::PerformSkill,
-            practice_skill.map_or(0.0, |skill| 0.52 + skill.competence * 0.30),
+            practice_skill.map_or(0.0, |skill| practice_score(skill, frame)),
             practice_skill.is_some()
                 && frame.selected_action == ActionId::HappyDisplay
                 && !frame.focus_mode,
@@ -1513,7 +1561,7 @@ fn drive_episode(
             let motivation=frame.play_state.motivation(&state.metabolism,active.bout_play_drive,active.bout_fatigue,affinity,relative_speed);
             output.debug.orb_motivation=Some(motivation);
             let play_plan = crate::orb_play_plan(
-                active.id,
+                u64::from(active.play_variant),
                 active.attempts,
                 active.phase_elapsed_seconds,
                 frame.pet_position,
@@ -1789,10 +1837,11 @@ fn drive_episode(
                 EpisodePhase::Prepare => {
                     let lead_seconds =
                         (0.10 + active.prediction_confidence * 0.20).clamp(0.10, 0.30);
-                    active.target_position = Some(
-                        (orb_position + orb_velocity * lead_seconds)
-                            .clamp(Vec2::splat(0.025), Vec2::splat(0.975)),
-                    );
+                    let uncertainty=state.object_memories.iter().find(|m|m.object_id==orb_id)
+                        .map_or(0.5,|m|m.prediction_error_ema);
+                    let lead_seconds=lead_seconds*(1.0-uncertainty*0.45);
+                    active.target_position = Some(state.orb_experience.predict(
+                        orb_position,orb_velocity,frame.desktop_aspect,lead_seconds));
                     set_phase(active, EpisodePhase::Execute);
                 }
                 EpisodePhase::Execute => {
@@ -2623,6 +2672,8 @@ fn drive_episode(
                 return EpisodeStep::Complete;
             }
             if active.elapsed_seconds >= skill.prototype.duration_seconds + 2.0 {
+                let _ = state.skills.record_attempt(skill_id, 1.0, frame.timestamp.max(0.0), None);
+                push_outcome(output, EcologyOutcome::SkillMotorError { skill_id, error: 1.0 });
                 return EpisodeStep::Abort(EpisodeReason::TimedOut);
             }
         }
@@ -3203,7 +3254,9 @@ mod tests {
         let orb = state.objects[0].clone();
         let mut director = EpisodeDirector {
             adaptation: EpisodeAdaptation::default(),
+            prediction_observer: Default::default(),
             active: Some(ActivityEpisode {
+                play_variant: 0, play_evidence_recorded: false,
                 feeding_bite: crate::FeedingBite::default(),
                 id: 9,
                 goal: EpisodeGoal::OfferOrb,
@@ -3675,7 +3728,9 @@ mod tests {
         let orb_id = state.objects[0].id;
         let mut director = EpisodeDirector {
             adaptation: EpisodeAdaptation::default(),
+            prediction_observer: Default::default(),
             active: Some(ActivityEpisode {
+                play_variant: 0, play_evidence_recorded: false,
                 feeding_bite: crate::FeedingBite::default(),
                 id: 1,
                 goal: EpisodeGoal::CarryOrbHome,

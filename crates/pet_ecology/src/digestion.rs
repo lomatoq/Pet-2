@@ -207,6 +207,9 @@ pub struct WasteWorld {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct DigestionFrame {
+    /// Measured main-body bounds in normalized screen coordinates; only an
+    /// attached, emerging chain is excluded from this conservative envelope.
+    pub body_bounds: Option<[Vec2; 2]>,
     pub outlet: Vec2,
     pub mouth: Vec2,
     pub gas_outlet: Vec2,
@@ -220,6 +223,7 @@ impl Default for DigestionFrame {
     fn default() -> Self {
         Self {
             outlet: Vec2::splat(0.5),
+            body_bounds: None,
             mouth: Vec2::splat(0.5),
             gas_outlet: Vec2::splat(0.5),
             body_velocity: Vec2::ZERO,
@@ -511,6 +515,13 @@ impl WasteWorld {
                     chain.nodes.last_mut().unwrap().position = f.outlet;
                 }
                 for n in &mut chain.nodes {
+                    if chain.remaining > 0.0 && f.settled
+                        && let Some([minimum,maximum])=f.body_bounds
+                        && n.position.y+n.radius>minimum.y && n.position.y-n.radius<maximum.y {
+                            let side=if f.outlet.x<(minimum.x+maximum.x)*0.5 {-1.0} else {1.0};
+                            if side<0.0 {n.position.x=n.position.x.min(minimum.x-n.radius/aspect);}
+                            else {n.position.x=n.position.x.max(maximum.x+n.radius/aspect);}
+                    }
                     n.position.x = n
                         .position
                         .x
@@ -623,6 +634,28 @@ mod tests {
             profiles.push(c.rest_turns.clone());
         }
         assert!(profiles.windows(2).all(|p|p[0]!=p[1]));
+    }
+
+    #[test]
+    fn emerging_soft_chain_cannot_fold_back_through_the_belly() {
+        for side in [-1.0,1.0] {
+            let mut gut=DigestiveTract {bowel:0.4,hydration:0.3,fiber:0.5,phase:1.7,effort:10.0,..Default::default()};
+            let mut world=WasteWorld::default();
+            let x=0.5+side*0.055;
+            let frame=DigestionFrame {outlet:Vec2::new(x,0.88),floor:0.9,settled:true,
+                body_bounds:Some([Vec2::new(0.45,0.78),Vec2::new(0.55,0.9)]),..Default::default()};
+            for _ in 0..240 {
+                world.step(&mut gut,frame,1.0/120.0);
+                for chain in &world.chains {
+                    if chain.remaining>0.0 {
+                        for node in &chain.nodes {
+                            assert!((node.position.x-0.5)*side>=0.05+node.radius-1e-6);
+                        }
+                    }
+                }
+            }
+            assert!(!world.chains.is_empty() && world.valid());
+        }
     }
 
     #[test]

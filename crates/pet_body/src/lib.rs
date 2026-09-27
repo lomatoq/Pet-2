@@ -9,6 +9,7 @@ mod droplets;
 mod ecology_render;
 mod embodiment;
 mod expression;
+mod self_care_presentation;
 mod gaze_controller;
 mod graph;
 mod liquid;
@@ -206,6 +207,9 @@ pub struct ProceduralBody {
     feeding_mouth_offset: Vec2,
     feeding_mouth_activity: f32,
     feeding_expression_active: bool,
+    self_care_motor: lifecore::SelfCareMotorFrame,
+    base_somatic_actuation: SomaticActuationPacket,
+    self_care: self_care_presentation::SelfCarePresentation,
     mouth_context_age: f32,
     mouth_context_open: f32,
     contained_face: liquid::SmoothFaceOrigin,
@@ -243,6 +247,9 @@ impl ProceduralBody {
             feeding_mouth_offset: Vec2::ZERO,
             feeding_mouth_activity: 0.0,
             feeding_expression_active: false,
+            self_care_motor: Default::default(),
+            base_somatic_actuation: Default::default(),
+            self_care: Default::default(),
             mouth_context_age: 0.0,
             mouth_context_open: 0.0,
             contained_face: liquid::SmoothFaceOrigin::default(),
@@ -273,6 +280,7 @@ impl ProceduralBody {
     /// Installs the immutable phase packet consumed by the authoritative body
     /// on subsequent fixed steps. The packet cannot alter solver structure.
     pub fn set_somatic_actuation(&mut self, actuation: SomaticActuationPacket) {
+        self.base_somatic_actuation = actuation.clone();
         self.embodiment.liquid.set_somatic_actuation(actuation);
     }
 
@@ -319,6 +327,18 @@ impl ProceduralBody {
             self.tuning.schema_version,
         )
     }
+
+    /// Check before ticking physiology so an unseen action cannot receive relief.
+    pub fn self_care_available(&self, intent: &BodyIntent) -> bool {
+        !self.feeding_expression_active && self.feeding_mouth_activity <= 0.05
+            && self.embodiment.pose.audio_envelope <= 0.02
+            && intent.locomotion != lifecore::LocomotionMode::Sleep
+            && intent.expression.effort <= 0.2
+            && !matches!(intent.pose, PoseIntent::Sleeping | PoseIntent::Cocoon)
+            && !matches!(intent.expression.face_pose, lifecore::FacePose::Startled | lifecore::FacePose::Boundary)
+    }
+
+    pub fn set_self_care_motor(&mut self, motor: lifecore::SelfCareMotorFrame) { self.self_care_motor=motor; }
 
     pub fn set_feeding_expression_active(&mut self, active: bool) { self.feeding_expression_active=active; }
 
@@ -613,7 +633,18 @@ impl ProceduralBody {
         } else {
             self.mouth_context_age = (self.mouth_context_age + dt.max(0.0)).min(60.0);
         }
+        let suppressed = !self.self_care_available(intent) || voice.active;
+        self.self_care.update(self.self_care_motor, suppressed, dt);
         let mut presented_intent = intent.clone();
+        if !suppressed { self.self_care.apply_face(&mut presented_intent); }
+        self.embodiment.self_care_lean = self.self_care.lean;
+        self.embodiment.self_care_pulse = self.self_care.pulse;
+        let mut care_packet = self.base_somatic_actuation.clone();
+        if !suppressed && self.self_care_motor.kind != lifecore::SelfCareKind::None {
+            self.self_care.compose_body(&mut care_packet);
+        }
+        self.embodiment.liquid.set_somatic_actuation(care_packet);
+
         // The caller already composed R14, motor and semantic scene expression.
         // Keep that final intent, including lab/manual geometry and held closure.
         if let Some(gaze) = self.fast_phenotype.face.gaze_target {
@@ -661,7 +692,8 @@ impl ProceduralBody {
         );
         self.embodiment.liquid.set_face_attention_pose(
             (self.embodiment.pose.face_attention_offset
-                + self.fast_phenotype.face.translation_offset)
+                + self.fast_phenotype.face.translation_offset
+                + Vec2::new(self.self_care.turn * 0.028, -self.self_care.lowering * 0.028))
                 .clamp_length_max(0.082),
             (self.embodiment.pose.face_attention_roll + self.fast_phenotype.face.semantic_roll)
                 .clamp(
@@ -1209,7 +1241,13 @@ impl ProceduralBody {
         let tissue = phase.sin() * 0.65 + (phase * 1.73 + 0.8).sin() * 0.35;
         let settle = (-(self.mouth_context_age - 3.0).max(0.0) * 1.4).exp();
         let voice_authority = pose.audio_envelope.clamp(0.0, 1.0);
-        pose.mouth_open *= settle.max(voice_authority).max(self.feeding_mouth_activity).max(f32::from(self.feeding_expression_active));
+        // Sustained emotion is an active cause too. The old idle-age fade
+        // silently closed an alarm/joy mouth after three seconds.
+        let semantic_aperture = ((pose.brow_raise-0.35)/0.35).clamp(0.0,1.0)
+            .max(((pose.mouth_curve.abs()-0.22)/0.40).clamp(0.0,1.0));
+        pose.mouth_open *= settle.max(voice_authority).max(self.feeding_mouth_activity)
+            .max(f32::from(self.feeding_expression_active)).max(self.self_care.strength)
+            .max(semantic_aperture);
         // One brief tissue adjustment per long quiet interval, not a perpetual
         // mouth oscillator. Voice and food have independent opening authority.
         let cycle = (t + identity_phase).rem_euclid(8.5);
@@ -1326,6 +1364,9 @@ impl ProceduralBody {
             brow_asymmetry: pose.brow_asymmetry,
             geometry: pose.geometry,
             eye_aperture: pose.eye_aperture,
+            tongue_extension: if self.feeding_expression_active || self.feeding_mouth_activity>0.05
+                || pose.audio_envelope>0.02 {0.0} else {self.self_care.tongue},
+            tongue_side: self.self_care.side,
             mouth_open: pose.mouth_open,
             feeding_mouth_offset: self.feeding_mouth_render_offset(),
             mouth_curve: pose.mouth_curve,
@@ -1515,6 +1556,46 @@ mod tests {
     use lifecore::{BodyIntent, ExpressionState, Genome, LocomotionMode, PoseIntent, SensorFrame};
 
     use super::*;
+
+    #[test]
+    fn sustained_emotion_retains_mouth_aperture_after_idle_fade() {
+        let genome=Genome::from_seed(42);
+        let mut body=ProceduralBody::generate(&genome).unwrap();
+        body.mouth_context_age=20.0;
+        body.embodiment.pose.mouth_open=0.5;
+        body.embodiment.pose.mouth_curve=0.70;
+        assert!(body.render_parameters(&genome,0.0).mouth_open>0.49);
+        body.embodiment.pose.mouth_curve=0.0;
+        body.embodiment.pose.brow_raise=0.8;
+        assert!(body.render_parameters(&genome,0.0).mouth_open>0.49);
+        body.embodiment.pose.brow_raise=0.0;
+        assert!(body.render_parameters(&genome,0.0).mouth_open<0.01);
+    }
+
+    #[test]
+    fn self_care_mouth_and_tongue_yield_to_feeding_sleep_and_voice() {
+        let genome=Genome::from_seed(42);
+        for priority in 0..4 {
+            let mut body=ProceduralBody::generate(&genome).unwrap();
+            let mut goal=intent(LocomotionMode::Hover,Vec2::splat(0.5));
+            let motor=lifecore::SelfCareMotorFrame {kind:lifecore::SelfCareKind::Groom,
+                strength:1.0,tongue_extension:1.0,mouth_open:0.35,..Default::default()};
+            body.set_self_care_motor(motor);
+            for _ in 0..80 {body.embodied_update(&goal,&SensorFrame::default(),AffectState::default(),
+                VisualMindInput::default(),VoiceVisualState::default(),1.0/120.0);}
+            assert!(body.render_parameters(&genome,0.0).tongue_extension>0.95);
+            let mut voice=VoiceVisualState::default();
+            match priority {
+                0 => body.set_feeding_expression_active(true),
+                1 => {goal.locomotion=LocomotionMode::Sleep;goal.pose=PoseIntent::Compact;},
+                2 => {voice.active=true;voice.mouth_open=0.6;voice.envelope=0.7;},
+                _ => body.set_self_care_motor(Default::default()),
+            }
+            body.embodied_update(&goal,&SensorFrame::default(),AffectState::default(),
+                VisualMindInput::default(),voice,1.0/120.0);
+            assert_eq!(body.render_parameters(&genome,0.0).tongue_extension,0.0);
+        }
+    }
 
     #[test]
     fn chewing_keeps_jaw_visible_after_idle_mouth_has_settled() {

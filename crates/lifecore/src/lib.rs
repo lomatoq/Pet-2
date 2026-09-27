@@ -23,6 +23,7 @@ mod organic_regulation;
 mod persistence;
 mod phenotype;
 mod phenotype_director;
+mod self_care;
 mod vita;
 
 use std::{array, collections::VecDeque};
@@ -51,6 +52,7 @@ pub use organic_regulation::*;
 pub use persistence::*;
 pub use phenotype::*;
 pub use phenotype_director::*;
+pub use self_care::*;
 pub use vita::*;
 
 pub const LIFECORE_HZ: f32 = 20.0;
@@ -145,6 +147,28 @@ impl LifeCore {
             .drives
             .integrate_felt_state(snapshot.felt, snapshot.derived, episode, dt);
         self.state.affect.integrate_felt_state(snapshot.felt, dt);
+    }
+
+    /// Tick once at the behavior rate after the host has resolved ecology and
+    /// protective motor ownership. A hidden microact never earns bodily relief.
+    pub fn update_self_care(
+        &mut self,
+        sensors: &SensorFrame,
+        body: &BodyFeedback,
+        busy: bool,
+        dt: f32,
+    ) -> SelfCareMotorFrame {
+        let busy = busy || self.state.focus_mode
+            || matches!(self.state.current_action, ActionId::Sleep | ActionId::Metamorphosis);
+        self.state.self_care.tick(
+            sensors,
+            body,
+            &self.state.genome.temperament,
+            &mut self.state.drives,
+            self.state.affect,
+            busy,
+            dt,
+        )
     }
 
     /// Advances only calendar/homeostatic opportunity during an explicitly

@@ -100,6 +100,8 @@ pub struct EmbodiedRuntime {
     /// Set by the final semantic gaze owner during interception, protection,
     /// sleep, or other moments where a local fixation check would be incoherent.
     pub suppress_microsaccades: bool,
+    pub self_care_lean: f32,
+    pub self_care_pulse: f32,
     pub pose: EmbodiedPose,
     pub physiology: VisualPhysiologyRuntime,
     pub droplets: DropletRuntime,
@@ -171,6 +173,8 @@ impl EmbodiedRuntime {
     pub fn new(seed: u64, traits: &DerivedVisualTraits) -> Self {
         let seed_phase = (seed as u32 as f32 / u32::MAX as f32) * std::f32::consts::TAU;
         Self {
+            self_care_lean: 0.0,
+            self_care_pulse: 0.0,
             pose: EmbodiedPose {
                 eye_scales: [Vec2::ONE; 2],
                 pupil_size: 0.52,
@@ -1005,7 +1009,7 @@ impl EmbodiedRuntime {
             .map_or(0.0, |collision| collision.intensity)
             .clamp(0.0, 1.0);
         let compression_target =
-            (pose_compression + impact * 0.35 + affect.stress * 0.08).clamp(-0.08, 0.48);
+            (pose_compression + impact * 0.35 + affect.stress * 0.08 + self.self_care_pulse * 0.075).clamp(-0.08, 0.48);
         self.pose.compression = smooth(self.pose.compression, compression_target, 15.0, dt);
 
         let stretch =
@@ -1029,7 +1033,7 @@ impl EmbodiedRuntime {
             .max(((acceleration.length() - 0.18) / 0.85).clamp(0.0, 1.0));
         let tilt_target =
             ((-velocity.x * 0.20 - acceleration.x * 0.065).clamp(-0.18, 0.18)) * tilt_activity;
-        self.pose.tilt = smooth(self.pose.tilt, tilt_target, 8.0, dt);
+        self.pose.tilt = smooth(self.pose.tilt, tilt_target + self.self_care_lean * 0.16, 8.0, dt);
         let head_target = Vec2::new(-acceleration.x, -acceleration.y) * (0.028 + softness * 0.035);
         spring_vec2(
             &mut self.pose.head_lag,

@@ -163,6 +163,37 @@ mod tests {
         assert!(ids.contains(&90));
         assert!(step(&mut s, &g, &c, &p, 1000).is_empty());
     }
+
+    #[test]
+    fn busy_new_source_is_inspected_when_available_not_forgotten_without_sampling() {
+        let (g, mut c, p) = fixture();
+        let mut s = VirtualInteroception::default();
+        let _ = step(&mut s, &g, &c, &p, 1);
+        c.orb_id = Some(44);
+        c.orb_position = Some(Vec2::new(0.53, 0.5));
+        c.world_goal = crate::MotorWorldGoal::CarryOrbHome;
+        let blocked = step(&mut s, &g, &c, &p, 1200);
+        assert!(!blocked.iter().any(|id| (62..=70).contains(id)));
+        assert!(s.novelty > 0.99);
+        c.world_goal = crate::MotorWorldGoal::None;
+        assert!(step(&mut s, &g, &c, &p, 1).contains(&68));
+        assert!(!step(&mut s, &g, &c, &p, 400).contains(&68));
+    }
+
+    #[test]
+    fn distant_source_does_not_become_familiar_just_from_elapsed_time() {
+        let (g, mut c, p) = fixture();
+        let mut s = VirtualInteroception::default();
+        let _ = step(&mut s, &g, &c, &p, 1);
+        c.orb_id = Some(45);
+        c.orb_position = Some(Vec2::new(0.98, 0.5));
+        let _ = step(&mut s, &g, &c, &p, 1200);
+        assert!(s.novelty > 0.99);
+        c.body.motion.world_position = Vec2::new(0.9, 0.5);
+        assert!(step(&mut s, &g, &c, &p, 1).contains(&68));
+        let _ = step(&mut s, &g, &c, &p, 1200);
+        assert!(s.novelty < 0.01);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +206,9 @@ pub struct VirtualInteroception {
     last_sample: Vec2,
     novelty: f32,
     sampled: bool,
+    /// A visible scene change is remembered until an available local sample.
+    /// Motor ownership must not silently count as having inspected a source.
+    pending_source_sample: bool,
     weak_sampled: bool,
     contact: bool,
     sneeze_stage: u8,
@@ -243,6 +277,10 @@ impl VirtualInteroception {
             self.novelty = 1.0;
             self.sampled = false;
             self.weak_sampled = false;
+            self.pending_source_sample = true;
+        }
+        if changed && orb.is_none() {
+            self.pending_source_sample = false;
         }
         if changed && orb.is_none() && self.sampled {
             emit(70, self.orb);
@@ -266,14 +304,19 @@ impl VirtualInteroception {
         self.signals.gradient = offset.normalize_or_zero() * intensity;
         self.signals.adaptation +=
             (intensity - self.signals.adaptation) * (1.0 - (-dt / 2.0).exp());
-        self.novelty *= (-dt / 6.0).exp();
+        // Familiarity requires exposure while the animal can attend. Waiting
+        // across the desktop or carrying/eating is not an information sample.
+        if allowed && intensity > 0.12 {
+            self.novelty *= (-dt * intensity / 6.0).exp();
+        }
         if self.initialized
             && allowed
             && intensity > 0.12
-            && (old_intensity <= 0.12 || (changed && orb.is_some()))
+            && (old_intensity <= 0.12 || self.pending_source_sample)
         {
             emit(if self.novelty > 0.3 { 68 } else { 67 }, source);
             self.sampled = true;
+            self.pending_source_sample = false;
             self.weak_sampled = false;
             self.last_sample = position;
         }

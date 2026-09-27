@@ -57,6 +57,7 @@ struct Globals {
     face_mouth: vec4<f32>,
     face_eye: vec4<f32>,
     face_eye_scales: vec4<f32>,
+    self_care: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -429,7 +430,9 @@ fn face_space(point: vec2<f32>) -> vec2<f32> {
 fn pearl_emotion()->vec3<f32> {
     let lids=(globals.face_lids[0]+globals.face_lids[1])*0.5;
     let brows=(globals.face_brows[0]+globals.face_brows[1])*0.5;
-    let surprise=smoothstep(0.16,0.76,globals.lids_brows.w)*smoothstep(0.04,0.34,(lids.x+lids.y)*0.5);
+    let authored_alert=smoothstep(0.04,0.34,(lids.x+lids.y)*0.5);
+    let semantic_alert=smoothstep(0.40,0.80,globals.lids_brows.w)*smoothstep(0.22,0.62,globals.brow_mouth.z);
+    let surprise=max(smoothstep(0.16,0.76,globals.lids_brows.w)*authored_alert,semantic_alert);
     let inner_lowering=smoothstep(0.06,0.36,brows.y-brows.x);
     let anger=inner_lowering*smoothstep(0.28,0.72,globals.brow_mouth.x)*(1.0-surprise);
     let sadness=saturate(-globals.brow_mouth.w*1.7)*(1.0-anger);
@@ -482,7 +485,7 @@ fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     let oval=1.0-smoothstep(0.93,1.05,distance);
     let inner_to_outer=clamp(side*q.x*0.5+0.5,0.0,1.0);
     let semantic_upper=mix(lids.x,lids.y,inner_to_outer);
-    let top=1.06-globals.lids_brows.z*0.35+(semantic_upper*0.95)*(0.30+0.70*angry)
+    let top=1.06-globals.lids_brows.z*0.35+(semantic_upper*0.95)*(0.65+0.35*angry)
         -angry*(0.50-0.44*side*q.x)-sad*(0.26+0.38*side*q.x)
         +0.14*lids.w*(1.0-min(q.x*q.x,1.0));
     let inner_arc=1.0-min(q.x*q.x,1.0);
@@ -1411,7 +1414,19 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let mouth_distance=length(vec2<f32>(mouth_local.x-x,max(abs(mouth_local.y-centerline)-half_height,0.0)));
     let mouth=(1.0-smoothstep(0.003,0.006,mouth_distance))*globals.face_tuning.x;
     color=mix(color,vec3<f32>(0.025,0.016,0.048),mouth*0.96);
-    let face_coverage = max(eyes,mouth)*coverage;
+    // An attached soft tongue follows the very same local mouth/yaw frame.
+    // Its motor extension comes from causal grooming, never a shader timer.
+    let extension=globals.self_care.x;
+    let tongue_root=vec2<f32>(0.0,centerline-half_height*0.25);
+    let tongue_tip=tongue_root+vec2<f32>(globals.self_care.y*0.030,-0.054)*extension;
+    let tongue_radius=0.013*sqrt(extension);
+    let tongue_distance=segment_distance(mouth_local,tongue_root,tongue_tip)-tongue_radius;
+    let tongue=(1.0-smoothstep(-0.002,0.002,tongue_distance))
+        *smoothstep(0.02,0.14,extension)*globals.face_tuning.x;
+    let tongue_highlight=clamp(1.0-abs(mouth_local.x-tongue_tip.x*0.5)/max(tongue_radius,0.001),0.0,1.0);
+    let tongue_color=mix(vec3<f32>(0.43,0.15,0.38),vec3<f32>(0.86,0.49,0.67),tongue_highlight*0.65);
+    color=mix(color,tongue_color,tongue);
+    let face_coverage = max(max(eyes,mouth),tongue)*coverage;
 
     let volume_alpha = 1.0 - exp(
         -(globals.material_a.x * 0.68 + globals.material_a.y * 0.32)

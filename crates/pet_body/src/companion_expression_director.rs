@@ -218,7 +218,16 @@ impl CompanionExpressionDirector {
             face.mouth_tension = face.mouth_tension.max(0.20 + pain * 0.42);
             face.mouth_compression = face.mouth_compression.max(0.12 + pain * 0.28);
             face.brow_tension = face.brow_tension.max(0.28 + pain * 0.40);
-            face.brow_raise = face.brow_raise.min(0.08);
+            if matches!(intent.primary, PrimaryIntent::StartleFreeze | PrimaryIntent::EscapePressure) {
+                // Alertness raises the brows; it must not become an angry knit
+                // merely because protective ownership won arbitration.
+                face.brow_raise = face.brow_raise.max(0.60 + intent.surprise * 0.24);
+                face.brow_tension = face.brow_tension.min(0.20);
+                face.eye_aperture = 1.0;
+                face.mouth_open = face.mouth_open.max(0.28 + intent.surprise * 0.24);
+            } else {
+                face.brow_raise = face.brow_raise.min(0.08);
+            }
             body.compactness = body.compactness.max(0.68 + pain * 0.20);
             body.contact_yield = body.contact_yield.min(0.18);
             body.viscosity_multiplier = body.viscosity_multiplier.max(1.12);
@@ -398,20 +407,22 @@ fn face_prototype(intent: PrimaryIntent) -> FaceTarget {
             face.eye_aperture = 0.96;
             face.pupil_size = 0.62;
             face.brow_raise = 0.18;
-            face.mouth_curve = 0.20;
+            face.mouth_curve = 0.70;
+            face.squint = 0.12;
+            face.mouth_open = 0.22;
         }
         PrimaryIntent::StartleFreeze => {
             face.eye_aperture = 1.0;
             face.pupil_size = 0.75;
-            face.brow_raise = 0.34;
+            face.brow_raise = 0.74;
             face.brow_tension = 0.12;
-            face.mouth_open = 0.10;
+            face.mouth_open = 0.48;
         }
         PrimaryIntent::GuardPain | PrimaryIntent::RejectContact | PrimaryIntent::EscapePressure => {
             face.eye_aperture = 0.80;
-            face.squint = 0.15;
-            face.brow_tension = 0.42;
-            face.mouth_curve = -0.08;
+            face.squint = 0.22;
+            face.brow_tension = if intent==PrimaryIntent::RejectContact {0.64} else {0.32};
+            face.mouth_curve = -0.30;
             face.mouth_tension = 0.34;
             face.mouth_compression = 0.25;
         }
@@ -533,6 +544,20 @@ mod tests {
             curiosity: 0.8,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn protective_alert_and_boundary_remain_distinct_and_joy_recruits_a_readable_smile() {
+        let mut director=CompanionExpressionDirector::new(42);
+        let mut alert=intent(PrimaryIntent::StartleFreeze);
+        alert.surprise=0.9;
+        let alarm=director.tick(alert,ExpressionEvidence {protective_reflex:true,..Default::default()},0.05);
+        let boundary=director.tick(intent(PrimaryIntent::RejectContact),ExpressionEvidence {protective_reflex:true,..Default::default()},0.05);
+        let joy=director.tick(intent(PrimaryIntent::Celebrate),Default::default(),0.05);
+        assert!(alarm.face.brow_raise>0.65 && alarm.face.mouth_open>0.4);
+        assert!(alarm.face.brow_tension<0.25);
+        assert!(boundary.face.brow_tension>0.6 && boundary.face.mouth_curve<0.0);
+        assert!(joy.face.mouth_curve>0.6 && joy.face.squint>0.1);
     }
 
     #[test]

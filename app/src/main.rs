@@ -3960,6 +3960,25 @@ impl PetApplication {
             }
             keep_eyes_available_during_active_locomotion(&mut output.body_intent);
             repertoire_bridge::merge_face(&mut output.body_intent, &repertoire);
+            let gut = &runtime.ecology.state().metabolism.tract;
+            let self_care_busy = runtime.birth.started.is_some()
+                || !runtime.body.self_care_available(&output.body_intent)
+                || voice_visual_state(&runtime.audio).active
+                || runtime.lab_face_pose.is_some()
+                || runtime.life.state.focus_mode
+                || runtime.emotion_burst.active
+                || runtime.voice_motion.is_some()
+                || runtime.last_surface_care.target.is_some()
+                || gut.strain > 0.03 || gut.burp > 0.05
+                || runtime.digestion_site.is_some()
+                || motor_goal.felt.startle > 0.2 || motor_goal.felt.pain_like > 0.15
+                || output.body_intent.locomotion == LocomotionMode::Sleep
+                || runtime.ecology.active_episode().is_some_and(|episode|
+                    !matches!(episode.goal, EpisodeGoal::SharedAttention | EpisodeGoal::PeekFromDen))
+                || repertoire.active_id.is_some();
+            let self_care = runtime.life.update_self_care(&runtime.sensors,
+                &runtime.body.simulation.feedback, self_care_busy, LIFE_DT);
+            runtime.body.set_self_care_motor(self_care);
             // Food owns the jaw while an actual bite is being processed. Generic
             // mood/scene faces must not replace its close-chew-open trajectory.
             if matches!(runtime.ecology.active_episode().map(|e|e.goal),Some(EpisodeGoal::EatMorsel))
@@ -4699,6 +4718,7 @@ impl ApplicationHandler for PetApplication {
         // Saved places remain familiar; an interrupted route must be planned
         // again against today's monitor topology rather than resumed mid-flight.
         prepared.life.state.exploration.resume_after_absence();
+        prepared.life.state.self_care.resume_after_absence();
         let topology = topology_from_event_loop(event_loop, 1);
         let desktop_bounds = topology.virtual_physical_bounds;
         if !desktop_bounds.is_valid() {
@@ -6438,7 +6458,7 @@ fn activity_telemetry_json(
         // second behavior supervisor.
         "activity": activity,
         "orb_play_variant": episode.filter(|e| matches!(e.goal, EpisodeGoal::SoloOrbPlay | EpisodeGoal::ChaseOrb))
-            .map(|e| pet_ecology::orb_play_name(e.id)),
+            .map(|e| pet_ecology::orb_play_name(u64::from(e.play_variant))),
         "orb_play_variant_count": pet_ecology::ORB_PLAY_NAMES.len(),
         "concrete_action": action_wire_name(state.current_action),
         "source": if episode.is_some() { "ecology_episode" } else { "lifecore_action" },

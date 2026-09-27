@@ -4,6 +4,8 @@ use thiserror::Error;
 /// be rejected and the host can fall back to its previous atomic snapshot.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EcologyError {
+    #[error("ecology touch preference contains invalid evidence")]
+    InvalidTouchPreference,
     #[error("unsupported ecology schema {found}; expected {expected}")]
     UnsupportedSchema { found: u32, expected: u32 },
     #[error("ecology identity seed must be non-zero")]

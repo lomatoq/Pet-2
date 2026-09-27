@@ -57,7 +57,9 @@ impl Capture {
         let mut renderer = pollster::block_on(Renderer::new(window.clone(), &initial.mesh))?;
         let mut records = Vec::new();
         let eyes_only = std::env::args().any(|arg| arg == "--eye-emotions-only");
+        let care_only = std::env::args().any(|arg| arg == "--self-care-only");
         for scale in [1.0_f32, 1.5, 2.0] {
+            if care_only && scale != 1.0 {continue;}
             let pixels = (512.0 * scale) as u32;
             let _ = window.request_inner_size(PhysicalSize::new(pixels, pixels));
             renderer.resize(PhysicalSize::new(pixels, pixels));
@@ -129,6 +131,35 @@ impl Capture {
                     fixtures.push(("AngerControl".into(),FacePose::Boundary.expression(),true));
                     fixtures.push(("SurpriseControl".into(),FacePose::Startled.expression(),true));
                 }
+                if care_only {
+                    fixtures.clear();
+                    for name in ["CareNeutral","CareGroom","CareScratch","CareNuzzle","CareDecline","CareFeedingPriority"] {
+                        fixtures.push((name.into(),FacePose::Awake.expression(),true));
+                    }
+                    for (name,primary) in [
+                        ("GeneralJoy",lifecore::PrimaryIntent::Celebrate),
+                        ("GeneralConcern",lifecore::PrimaryIntent::RecoverFromMiss),
+                        ("GeneralBoundary",lifecore::PrimaryIntent::RejectContact),
+                        ("GeneralStartle",lifecore::PrimaryIntent::StartleFreeze),
+                        ("GeneralCurious",lifecore::PrimaryIntent::Inspect),
+                        ("GeneralRest",lifecore::PrimaryIntent::Rest),
+                    ] {
+                        let mut director=pet_body::CompanionExpressionDirector::new(42);
+                        let motor=lifecore::CompanionIntentFrame {primary,confidence:0.8,
+                            curiosity:0.8,play_readiness:0.8,frustration:0.8,surprise:0.8,
+                            ..Default::default()};
+                        let mut target=pet_body::CompanionExpressionTarget::default();
+                        for _ in 0..30 {target=director.tick(motor,Default::default(),0.05);}
+                        let f=target.face;
+                        let expression=lifecore::ExpressionState {eye_aperture:f.eye_aperture,
+                            squint:f.squint,pupil_size:f.pupil_size,pupil_focus:f.pupil_focus,
+                            brow_raise:f.brow_raise,brow_tension:f.brow_tension,brow_asymmetry:f.brow_asymmetry,
+                            mouth_curve:f.mouth_curve,mouth_open:f.mouth_open,mouth_tension:f.mouth_tension,
+                            mouth_compression:f.mouth_compression,mouth_asymmetry:f.mouth_asymmetry,
+                            ..Default::default()};
+                        fixtures.push((name.into(),expression,true));
+                    }
+                }
                 for (fixture, expression, managed) in fixtures {
                     let mut body = Box::new(ProceduralBody::generate(&genome)?);
                     body.apply_tuning_profile(profile.clone())?;
@@ -139,6 +170,25 @@ impl Capture {
                     body.set_desktop_motion_space(Vec2::splat(pixels as f32), pixels as f32);
                     // Fixed pixel reference: approximately 190 px diameter at 100%.
                     body.set_presentation_scale(0.8);
+                    let care = match fixture.as_str() {
+                        "CareGroom" | "CareFeedingPriority" => lifecore::SelfCareMotorFrame {
+                            kind:lifecore::SelfCareKind::Groom,strength:0.95,side:1.0,
+                            tongue_extension:0.95,mouth_open:0.28,squint:0.25,
+                            face_lowering:0.7,face_turn:0.25,body_lean:0.3,..Default::default()},
+                        "CareScratch" => lifecore::SelfCareMotorFrame {
+                            kind:lifecore::SelfCareKind::Scratch,strength:0.9,side:-1.0,
+                            squint:0.75,mouth_asymmetry:-0.7,body_lean:-0.8,body_pulse:0.8,
+                            face_turn:-0.6,..Default::default()},
+                        "CareNuzzle" => lifecore::SelfCareMotorFrame {
+                            kind:lifecore::SelfCareKind::Nuzzle,strength:0.9,side:1.0,
+                            squint:0.65,face_turn:0.6,body_lean:0.7,..Default::default()},
+                        "CareDecline" => lifecore::SelfCareMotorFrame {
+                            kind:lifecore::SelfCareKind::Decline,strength:0.9,side:-1.0,
+                            squint:0.4,face_turn:-0.65,body_lean:-0.5,reluctance:0.85,..Default::default()},
+                        _ => lifecore::SelfCareMotorFrame::default(),
+                    };
+                    body.set_self_care_motor(care);
+                    body.set_feeding_expression_active(fixture=="CareFeedingPriority");
                     let intent = BodyIntent {
                         locomotion: LocomotionMode::Hover,
                         target_position: Vec2::splat(0.5),
@@ -189,11 +239,13 @@ impl Capture {
                         "desired": intent.expression, "smoothed": body.expression.current,
                         "renderer_geometry": parameters.geometry, "renderer_mouth_open": parameters.mouth_open,
                         "renderer_eye_scales": parameters.eye_scales,
+                        "self_care": care, "tongue_extension":parameters.tongue_extension,
+                        "body_tilt":parameters.tilt,"body_compression":parameters.compression,
                         "renderer_blink": [parameters.blink_left, parameters.blink_right]}));
                 }
             }
         }
-        if eyes_only {
+        if eyes_only || care_only {
             fs::write(self.output.join("channels.json"),serde_json::to_vec_pretty(&records)?)?;
             return Ok(());
         }
