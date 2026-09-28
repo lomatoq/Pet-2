@@ -118,6 +118,7 @@ struct ComposeGlobals {
     shadow_style: [f32; 4],
     post: [f32; 4],
     mood_aura: [f32; 4],
+    chromatic_motion: [f32; 4],
 }
 
 #[repr(C)]
@@ -222,6 +223,7 @@ pub struct RenderParameters {
     pub mood_tint: Vec3,
     pub mood_trail: Vec3,
     pub joy_aura: f32,
+    pub chromatic_motion: Vec2,
     pub body_length: f32,
     pub body_width: f32,
     pub body_roundness: f32,
@@ -3267,6 +3269,8 @@ fn compose_globals_for(
 ) -> ComposeGlobals {
     ComposeGlobals {
         mood_aura: [parameters.mood_tint.x,parameters.mood_tint.y,parameters.mood_tint.z,parameters.joy_aura.clamp(0.0,1.0)],
+        chromatic_motion: [parameters.chromatic_motion.x,parameters.chromatic_motion.y,
+            parameters.tail_lag.x,parameters.tail_lag.y],
         output_mode: [
             if premultiplied_output { 1.0 } else { 0.0 },
             review_background.shader_value(),
@@ -3319,6 +3323,7 @@ impl Default for RenderParameters {
             glow: 0.2,
             mood_tint: Vec3::ONE,
             mood_trail: Vec3::ONE,
+            chromatic_motion: Vec2::ZERO,
             joy_aura: 0.0,
             body_length: 1.0,
             body_width: 0.72,

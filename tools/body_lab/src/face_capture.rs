@@ -61,8 +61,9 @@ impl Capture {
         let care_only = std::env::args().any(|arg| arg == "--self-care-only");
         let mood_only = std::env::args().any(|arg| arg == "--mood-colors-only");
         let excitement_only = std::env::args().any(|arg| arg == "--excitement-only");
+        let spectrum_only = std::env::args().any(|arg| arg == "--spectrum-only");
         for scale in [1.0_f32, 1.5, 2.0] {
-            if (care_only || mood_only || sleep_only || excitement_only) && scale != 1.0 {continue;}
+            if (care_only || mood_only || sleep_only || excitement_only || spectrum_only) && scale != 1.0 {continue;}
             let pixels = (512.0 * scale) as u32;
             let _ = window.request_inner_size(PhysicalSize::new(pixels, pixels));
             renderer.resize(PhysicalSize::new(pixels, pixels));
@@ -207,6 +208,12 @@ impl Capture {
                         fixtures.push((name.into(),FacePose::Playful.expression(),true));
                     }
                 }
+                if spectrum_only {
+                    fixtures.clear();
+                    for name in ["SpectrumIdle", "SpectrumRight", "SpectrumLeft", "SpectrumDown"] {
+                        fixtures.push((name.into(),FacePose::Awake.expression(),true));
+                    }
+                }
                 for (fixture, expression, managed) in fixtures {
                     let mut body = Box::new(ProceduralBody::generate(&genome)?);
                     body.apply_tuning_profile(profile.clone())?;
@@ -283,7 +290,15 @@ impl Capture {
                     body.presentation_update(1.0 / 60.0);
                     renderer.set_review_background(background);
                     renderer.reset_perceptual_capture_state();
-                    let parameters = body.render_parameters(&genome, 0.0);
+                    let mut parameters = body.render_parameters(&genome, 0.0);
+                    if spectrum_only {
+                        parameters.chromatic_motion = match fixture.as_str() {
+                            "SpectrumRight"=>Vec2::new(0.65,0.0),
+                            "SpectrumLeft"=>Vec2::new(-0.65,0.0),
+                            "SpectrumDown"=>Vec2::new(0.0,0.65),
+                            _=>Vec2::ZERO,
+                        };
+                    }
                     let frame = renderer.render_capture(parameters)?;
                     let name =
                         format!("{fixture}-{background_name}-{}.ppm", (scale * 100.0) as u32);
@@ -305,7 +320,7 @@ impl Capture {
                 }
             }
         }
-        if eyes_only || care_only || mood_only || sleep_only {
+        if eyes_only || care_only || mood_only || sleep_only || excitement_only || spectrum_only {
             fs::write(self.output.join("channels.json"),serde_json::to_vec_pretty(&records)?)?;
             return Ok(());
         }

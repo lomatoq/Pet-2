@@ -8,6 +8,8 @@ struct ComposeGlobals {
     // x: cinematic bloom strength; y: intermediate render scale; zw reserved.
     post: vec4<f32>,
     mood_aura: vec4<f32>,
+    // xy screen-space motion; zw body-local lag (y up).
+    chromatic_motion: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: ComposeGlobals;
@@ -147,6 +149,51 @@ fn footprint_shadow(uv: vec2<f32>) -> f32 {
     return textureSample(shadow_texture, shadow_sampler, source_uv).r;
 }
 
+fn spectral_alpha(uv:vec2<f32>,p:vec2<f32>)->f32 {
+    var result=0.0;
+    var weight_sum=0.0;
+    // Subpixel-spaced Gaussian quadrature prevents discrete copies of the
+    // silhouette becoming visible when the wake grows wider at speed.
+    for(var i:i32=-8;i<=8;i+=1) {
+        let x=f32(i)*0.375;
+        let weight=exp(-0.5*x*x);
+        result+=textureSampleLevel(organism_texture,organism_sampler,uv+p*x,0.0).a*weight;
+        weight_sum+=weight;
+    }
+    return result/weight_sum;
+}
+
+fn spectral_rim(uv:vec2<f32>)->vec3<f32> {
+    let p=globals.output_mode.zw;
+    // The existing Gaussian silhouette supplies a stable normal even outside
+    // the sharp contour; four cheap reads avoid another full blur pass.
+    let centered=uv+globals.shadow.xy*p;
+    let gradient=vec2<f32>(footprint_shadow(centered+vec2<f32>(p.x*2.0,0.0))
+        -footprint_shadow(centered-vec2<f32>(p.x*2.0,0.0)),
+        footprint_shadow(centered+vec2<f32>(0.0,p.y*2.0))
+        -footprint_shadow(centered-vec2<f32>(0.0,p.y*2.0)));
+    if(length(gradient)<0.0001) { return vec3<f32>(0.0); }
+    let outward=-gradient/max(length(gradient),0.0001);
+    let velocity=globals.chromatic_motion.xy;
+    let speed=smoothstep(0.01,0.65,length(velocity));
+    let lag=globals.chromatic_motion.zw*vec2<f32>(1.0,-1.0);
+    let wake=-velocity+lag*0.8;
+    let wake_direction=wake/max(length(wake),0.001);
+    let trailing=pow(max(dot(outward,wake_direction),0.0),1.4);
+    let width=1.0+speed*(1.2+7.0*trailing);
+    let normal_offset=outward*p;
+    let blur_axis=normal_offset*max(width*0.50,0.70);
+    let red_field=spectral_alpha(uv-normal_offset*width*0.90,blur_axis);
+    let middle=spectral_alpha(uv,blur_axis);
+    let green_field=spectral_alpha(uv-normal_offset*width*0.40,blur_axis);
+    // Spectral fringes use silhouette coverage only. Face RGB never enters
+    // this pass, so even closed dark eyes cannot split or become luminous.
+    let red=max(red_field-green_field,0.0);
+    let green=max(green_field-middle,0.0);
+    return (vec3<f32>(1.0,0.055,0.025)*red
+        +vec3<f32>(0.045,1.10,0.16)*green)*(0.22+0.26*speed)*globals.post.w;
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let organism = tone_map_premultiplied(
@@ -165,7 +212,9 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         +footprint_shadow(input.uv-vec2<f32>(0.0,spread.y))*0.15)*globals.post.w;
     let glow_alpha=glow_field*(globals.post.z+globals.mood_aura.w*0.16)*(1.0-organism.a)*(1.0-shadow_alpha);
     let aura_color=mix(vec3<f32>(0.64,0.59,0.90),globals.mood_aura.xyz,globals.mood_aura.w);
-    let combined_rgb = organism.rgb + shadow_premultiplied+aura_color*glow_alpha;
+    let spectrum=spectral_rim(input.uv);
+    // Add emitted light without darkening the desktop with another alpha veil.
+    let combined_rgb = organism.rgb + shadow_premultiplied+aura_color*glow_alpha+spectrum;
     let combined_alpha = clamp(organism.a + shadow_alpha+glow_alpha, 0.0, 1.0);
     let background = review_background(input.uv);
     if (background.a > 0.5) {

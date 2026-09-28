@@ -214,6 +214,7 @@ pub struct ProceduralBody {
     mood_color: mood_color::MoodColor,
     excitement_presentation: lifecore::ExcitationMotorFrame,
     excitement_roll: f32,
+    chromatic_motion: Vec2,
     mouth_context_age: f32,
     mouth_context_open: f32,
     contained_face: liquid::SmoothFaceOrigin,
@@ -257,6 +258,7 @@ impl ProceduralBody {
             mood_color: Default::default(),
             excitement_presentation: Default::default(),
             excitement_roll: 0.0,
+            chromatic_motion: Vec2::ZERO,
             mouth_context_age: 0.0,
             mouth_context_open: 0.0,
             contained_face: liquid::SmoothFaceOrigin::default(),
@@ -648,6 +650,10 @@ impl ProceduralBody {
         let excitement = if suppressed { lifecore::ExcitationMotorFrame::default() } else { self.excitement_presentation };
         self.mood_color.set_excitation(excitement.intensity, excitement.chroma_pulse);
         self.mood_color.update(affect, intent.expression, dt);
+        let velocity = self.simulation.feedback.velocity;
+        let optical_velocity = if velocity.is_finite() { velocity.clamp_length_max(1.0) } else { Vec2::ZERO };
+        self.chromatic_motion += (optical_velocity-self.chromatic_motion)
+            * (1.0-(-dt.clamp(0.0,0.1)/0.18).exp());
         let roll_target = if excitement.roll_radians.is_finite() { excitement.roll_radians } else { 0.0 };
         self.excitement_roll += (roll_target-self.excitement_roll)
             * (1.0-(-dt.clamp(0.0,0.1)/0.30).exp());
@@ -1325,6 +1331,7 @@ impl ProceduralBody {
             mood_tint: self.mood_color.tint,
             mood_trail: self.mood_color.trail,
             joy_aura: self.mood_color.joy,
+            chromatic_motion: self.chromatic_motion,
             arousal,
             glow: (self.expression.current.body_glow * genome.body.bioluminescence
                 + effect.glow_boost * 0.34)
