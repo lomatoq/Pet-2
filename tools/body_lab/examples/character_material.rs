@@ -131,6 +131,9 @@ impl Capture {
         let mut body = ProceduralBody::generate(&genome)?;
         body.apply_tuning_profile(profile.clone())?;
         let mut renderer = pollster::block_on(Renderer::new(window, &body.mesh))?;
+        if std::env::args().any(|arg| arg == "--rim-continuity-only") {
+            return self.capture_rim_continuity(&mut renderer, &genome, &profile, &snapshot);
+        }
         let mut timings = Vec::new();
         for (shape, restored) in [("awake", false), ("resting", true)] {
             body = ProceduralBody::generate(&genome)?;
@@ -417,6 +420,81 @@ impl Capture {
         )?;
         Ok(())
     }
+
+    fn capture_rim_continuity(
+        &self,
+        renderer: &mut Renderer,
+        genome: &lifecore::Genome,
+        profile: &pet_body::LiquidTuningProfile,
+        snapshot: &BodyMaterialSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        renderer.set_review_background(ReviewBackground::Black);
+        for (shape, restored) in [("awake", false), ("resting", true)] {
+            let mut body = ProceduralBody::generate(genome)?;
+            body.apply_tuning_profile(profile.clone())?;
+            if restored {
+                body.restore_body_material_snapshot(snapshot)?;
+            }
+            let mut base = body.render_parameters(genome, 0.3);
+            base.render_mode = BodyRenderMode::ParticlePbf;
+            base.presentation_visibility = 1.0;
+            base.energy = energy_sample(0.0, "calm");
+            base.face_visible = false;
+            base.material_bloom_strength = 0.0;
+            base.shadow_opacity = 0.0;
+            base.joy_aura = 0.0;
+            for (name, label_delta, velocity_delta) in [
+                ("baseline", 0.0, 0.0),
+                ("label-plus", 0.006, 0.0),
+                ("label-minus", -0.006, 0.0),
+                ("velocity-plus", 0.0, 0.15),
+                ("velocity-minus", 0.0, -0.15),
+            ] {
+                let mut params = base;
+                for (i, particle) in params.liquid.particles[..params.liquid.particle_count]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let direction = glam::Vec2::new((i as f32 * 1.7).sin(), (i as f32 * 0.9).cos());
+                    particle.material_coordinate += direction * label_delta;
+                    particle.velocity += direction * velocity_delta;
+                }
+                renderer.reset_perceptual_capture_state();
+                let frame = renderer.render_capture(params)?;
+                save_frame(self.output.join(format!("{shape}-{name}.rgba")), frame)?;
+            }
+            let sequence = self.output.join(format!("{shape}-deformation"));
+            std::fs::create_dir_all(&sequence)?;
+            for index in 0..121 {
+                let mut params = base;
+                let t = index as f32 / 60.0;
+                // An optical oracle, not a substitute physical landing: identical
+                // smooth geometry in both renderers isolates shading response.
+                let compression = 1.0 - 0.24 * (t * std::f32::consts::FRAC_PI_2).sin().powi(2);
+                for particle in &mut params.liquid.particles[..params.liquid.particle_count] {
+                    particle.position.x /= compression.sqrt();
+                    particle.position.y = (particle.position.y + 0.35) * compression - 0.35;
+                }
+                params.time = t;
+                params.energy = energy_sample(t, "calm");
+                renderer.reset_perceptual_capture_state();
+                let frame = renderer.render_capture(params)?;
+                save_frame(sequence.join(format!("{index:03}.rgba")), frame)?;
+            }
+        }
+        Ok(())
+    }
+}
+fn save_frame(
+    path: PathBuf,
+    frame: pet_body::CapturedFrame,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = Vec::with_capacity(frame.rgba8.len() + 8);
+    bytes.extend(frame.width.to_le_bytes());
+    bytes.extend(frame.height.to_le_bytes());
+    bytes.extend(frame.rgba8);
+    std::fs::write(path, bytes)?;
+    Ok(())
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Capture {

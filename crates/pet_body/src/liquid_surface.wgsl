@@ -1148,6 +1148,14 @@ fn ink_current_coordinate(coordinate: vec2<f32>, phase: f32, warp_phase: f32) ->
         -s * coordinate.x + c * coordinate.y);
 }
 
+// A compressed particle neighbourhood can mix opposing rest labels. Using
+// their direction directly makes a smooth contact move a light pool abruptly.
+// Keep circulation in body-local space, with bounded material advection.
+fn ink_membrane_coordinate(point: vec2<f32>, material: vec2<f32>) -> vec2<f32> {
+    let displacement = material - point;
+    return point + displacement * (0.22 / sqrt(1.0 + dot(displacement, displacement) / 0.0144));
+}
+
 fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     let field = density_at(input.uv);
     let density = field.r;
@@ -1172,19 +1180,22 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     let birth_xy=point/0.38;
     let birth_normal=normalize(vec3<f32>(birth_xy,sqrt(max(0.025,1.0-dot(birth_xy,birth_xy)))));
     let normal=normalize(mix(fluid_normal,birth_normal,globals.cinematic_h.w));
-    let coord=mix(material.xy,birth_xy*0.38,globals.cinematic_h.w);
+    let coord=mix(ink_membrane_coordinate(point,material.xy),birth_xy*0.38,globals.cinematic_h.w);
     let time=globals.viewport_time.y;
     // Two broad currents share a circulation direction. Their different rates
     // stretch the luminous pools, without a seam, phase reset or random flicker.
     let energy=globals.energy_dynamics;
     let current=ink_current_coordinate(coord,energy.x,energy.y);
     let undertow=ink_current_coordinate(coord,energy.y,energy.x);
-    let orbit=current/max(length(current),0.0001);
-    let under_orbit=undertow/max(length(undertow),0.0001);
+    // A finite core prevents a near-zero coordinate from becoming a full
+    // angular flip. It is negligible at the body's outer membrane.
+    let orbit=current/sqrt(dot(current,current)+0.0049);
+    let under_orbit=undertow/sqrt(dot(undertow,undertow)+0.0049);
     let crest=pow(saturate(0.5+0.5*dot(orbit,vec2<f32>(0.96,0.28))),4.0);
     let return_flow=pow(saturate(0.5+0.5*dot(under_orbit,vec2<f32>(-0.62,-0.78))),5.0);
     let pool=saturate(0.08+crest*0.88+return_flow*0.64);
-    let local_strain=saturate(length(material.zw-globals.liquid_motion.xy)*0.35);
+    let strain_speed=length(material.zw-globals.liquid_motion.xy)*0.35;
+    let local_strain=strain_speed/(1.0+strain_speed);
     let phase=dot(orbit,vec2<f32>(0.61,-0.79));
     let blue=vec3<f32>(0.085,0.43,1.20);
     let orchid=vec3<f32>(0.79,0.12,0.72);
@@ -1194,8 +1205,8 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     let spectral=mix(spectrum,globals.energy_palette.rgb,globals.energy_palette.a);
     let arc=0.28+pool*0.72;
     let inner=max(distance,0.0);
-    let agitation=energy.w*0.11*sin(energy.x*7.0+dot(orbit,vec2<f32>(7.0,11.0)));
-    let shell_width=mix(1.65,7.8,pool)*(1.0+local_strain*0.20+agitation);
+    let agitation=energy.w*0.08*sin(energy.x*3.0+dot(orbit,vec2<f32>(3.0,5.0)));
+    let shell_width=mix(1.65,7.8,pool)*(1.0+local_strain*0.08+agitation);
     let shoulder=exp(-inner/mix(4.5,14.5,pool));
     let luminous_core=exp(-pow((distance-shell_width*0.50)/shell_width,2.0));
     let body_light=saturate(dot(normal,normalize(vec3<f32>(-0.50,0.60,0.62))));

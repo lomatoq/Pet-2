@@ -141,6 +141,10 @@ fn run_program(program: BehaviorProgramId, cadence: &[f32]) {
     body.simulation.feedback.world_position = Vec2::new(0.50, 0.86);
     body.simulation.set_motion_space_pixels(DESKTOP);
     body.set_desktop_motion_space(DESKTOP, 360.0);
+    // Match the desktop host's explicit geometry ownership even when this
+    // motor-only fixture has no current environmental plane. Exercise the
+    // production reconstruction path across the entire movement catalog.
+    body.embodiment.liquid.set_environment_support(None);
     motor.begin_lab_fixture(program, &goal, &context);
 
     let sensors = SensorFrame {

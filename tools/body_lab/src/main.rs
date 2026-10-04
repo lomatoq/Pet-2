@@ -1334,7 +1334,12 @@ fn sync_preview_space(body: &mut ProceduralBody, size: PhysicalSize<u32>) {
 
 fn generate_lab_body(genome: &Genome) -> Result<Box<ProceduralBody>, String> {
     ProceduralBody::generate(genome)
-        .map(Box::new)
+        .map(|mut body| {
+            // The preview owns a stable canvas, including when it supplies no
+            // current solid plane. Match the desktop's material reconstruction.
+            body.embodiment.liquid.set_environment_support(None);
+            Box::new(body)
+        })
         .map_err(|error| error.to_string())
 }
 

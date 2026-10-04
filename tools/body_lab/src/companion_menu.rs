@@ -14,6 +14,9 @@ pub(super) struct MenuState {
     desired_page: Option<usize>,
     panel_presence: f32,
     dismissal: f32,
+    dismissal_from: f32,
+    dismissal_target: f32,
+    dismissal_elapsed: f32,
     selected: usize,
     pub waiting_for_feed: bool,
     waiting_for_cleanup: bool,
@@ -51,13 +54,9 @@ impl MenuState {
         !self.hidden && self.opened.is_some_and(|t| t.elapsed().as_secs_f32() > 0.7)
     }
     pub fn hide_ready(&mut self) -> bool {
-        self.close
-            && self
-                .closing
-                .get_or_insert_with(Instant::now)
-                .elapsed()
-                .as_secs_f32()
-                >= 0.29
+        // Hide only after the rendered tail has finished. A separate wall
+        // clock can expire while a delayed frame is still visibly fading.
+        self.close && self.dismissal >= 1.0 && self.panel_presence <= 0.012
     }
 
     pub fn reopen(&mut self) -> bool {
@@ -79,6 +78,9 @@ impl MenuState {
         self.desired_page = None;
         self.panel_presence = 0.0;
         self.dismissal = 0.0;
+        self.dismissal_from = 0.0;
+        self.dismissal_target = 0.0;
+        self.dismissal_elapsed = 0.0;
         self.press = [0.0; 6];
         self.press_velocity = [0.0; 6];
         self.hover = [0.0; 6];
@@ -114,6 +116,22 @@ fn accent(index: usize) -> Color32 {
 }
 
 impl MenuState {
+    fn update_dismissal(&mut self, dt: f32) {
+        let target = if self.close { 1.0 } else { 0.0 };
+        if self.dismissal_target != target {
+            self.dismissal_from = self.dismissal;
+            self.dismissal_target = target;
+            self.dismissal_elapsed = 0.0;
+        }
+        self.dismissal_elapsed += dt.max(0.0);
+        let progress = (self.dismissal_elapsed / MENU_FADE_SECONDS).clamp(0.0, 1.0);
+        self.dismissal = self.dismissal_from
+            + (target - self.dismissal_from) * menu_opacity_ease(progress);
+        if progress >= 1.0 {
+            self.dismissal = target;
+        }
+    }
+
     fn select_panel(&mut self, panel: Option<usize>) {
         self.desired_page = panel;
         if self.page.is_none() {
@@ -298,6 +316,45 @@ fn bubble_motion(
         reduced,
     )
 }
+const MENU_FADE_SECONDS: f32 = 0.25;
+const REVEAL_SECONDS: f32 = 0.20;
+
+// Emil Kowalski's strong UI ease-out: cubic-bezier(0.23, 1, 0.32, 1).
+// Solve its time coordinate rather than treating the Bezier parameter as time.
+// This keeps most of the visible travel in a long, gently decelerating tail.
+fn menu_ease_out(time: f32) -> f32 {
+    menu_bezier(time, [0.23, 1.0, 0.32, 1.0])
+}
+
+// Opacity needs a gentler onset than travel: CSS `ease` starts softly, then
+// spends the remainder settling. Strong ease-out here would flash on frame one.
+fn menu_opacity_ease(time: f32) -> f32 {
+    menu_bezier(time, [0.25, 0.1, 0.25, 1.0])
+}
+
+fn menu_bezier(time: f32, control: [f32; 4]) -> f32 {
+    if time <= 0.0 {
+        return 0.0;
+    }
+    if time >= 1.0 {
+        return 1.0;
+    }
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..16 {
+        let t = (low + high) * 0.5;
+        let u = 1.0 - t;
+        let x = 3.0 * u * u * t * control[0] + 3.0 * u * t * t * control[2] + t * t * t;
+        if x < time {
+            low = t;
+        } else {
+            high = t;
+        }
+    }
+    let t = (low + high) * 0.5;
+    let u = 1.0 - t;
+    3.0 * u * u * t * control[1] + 3.0 * u * t * t * control[3] + t * t * t
+}
+
 fn bubble_motion_at(
     screen: Rect,
     nest_x: f32,
@@ -311,18 +368,20 @@ fn bubble_motion_at(
         vec2(420.0_f32.min(screen.width()), screen.height()),
     );
     let end = bubble_target(layout, index);
+    let age = (elapsed - index as f32 * 0.028).max(0.0);
+    let reveal = menu_opacity_ease(age / REVEAL_SECONDS);
     if reduced {
         return BubbleMotion {
             center: end,
-            alpha: 1.0 - dismissal,
+            alpha: reveal * (1.0 - dismissal),
             settled: 0.0,
         };
     }
-    let duration = (0.52 + (screen.width() - 420.0).max(0.0) * 0.00015).min(1.0);
-    let progress = ((elapsed - index as f32 * 0.028) / duration).clamp(0.0, 1.0);
-    // Minimum-jerk timing: zero velocity and acceleration at both ends.
-    let smooth = |t: f32| t * t * t * (10.0 + t * (-15.0 + 6.0 * t));
-    let t = smooth(progress);
+    // The existing full edge-to-nest arc is drawer-length travel. Retain its
+    // distance allowance; a short popover duration would throw it across wide monitors.
+    let duration = (0.50 + (screen.width() - 420.0).max(0.0) * 0.00015).min(1.0);
+    let progress = (age / duration).clamp(0.0, 1.0);
+    let t = menu_ease_out(progress);
     // One continuous curved arrival from the right edge, no scale pop or bounce.
     let start = pos2(screen.max.x + 34.0, screen.max.y - 230.0);
     let a = pos2(screen.max.x - 70.0, screen.max.y - 300.0);
@@ -332,14 +391,11 @@ fn bubble_motion_at(
         u * u * u * start.x + 3.0 * u * u * t * a.x + 3.0 * u * t * t * b.x + t * t * t * end.x,
         u * u * u * start.y + 3.0 * u * u * t * a.y + 3.0 * u * t * t * b.y + t * t * t * end.y,
     );
-    let exit = smooth(dismissal);
-    center.y += 18.0 * exit;
-    let fade = (progress / 0.15).clamp(0.0, 1.0);
-    let fade = fade * fade * (3.0 - 2.0 * fade);
+    center.y += 12.0 * dismissal;
     BubbleMotion {
         center,
-        alpha: fade * (1.0 - exit),
-        settled: progress.powi(8),
+        alpha: reveal * (1.0 - dismissal),
+        settled: t,
     }
 }
 
@@ -513,17 +569,8 @@ fn show_frame(
     let reduced =
         !ctx.style().animation_time.is_sign_positive() || ctx.style().animation_time == 0.0;
     state.update_panel(dt);
-    let target_dismissal = if state.close { 1.0 } else { 0.0 };
-    let dismissal_duration = if state.close { 0.21 } else { 0.24 };
-    let delta = target_dismissal - state.dismissal;
     if state.capture_elapsed.is_none() {
-        state.dismissal += delta.signum() * delta.abs().min(dt / dismissal_duration);
-    }
-    if state.dismissal > 0.99 {
-        state.dismissal = 1.0;
-    }
-    if state.dismissal < 0.001 {
-        state.dismissal = 0.0;
+        state.update_dismissal(dt);
     }
     let nest_x = state.nest_x.unwrap_or(screen.center().x);
     let layout = Rect::from_center_size(
@@ -936,8 +983,20 @@ pub(super) fn capture_frame(ctx: &egui::Context, fixture: &str) {
         .and_then(|s| s.parse::<f32>().ok())
     {
         state.close = true;
-        state.dismissal = (t / 0.21).clamp(0.0, 1.0);
+        state.update_dismissal(t);
         state.closing = Some(Instant::now() - std::time::Duration::from_secs_f32(t));
+    }
+    if let Some(t) = fixture.strip_prefix("retoggle-").and_then(|s| s.parse::<f32>().ok()) {
+        // Close during arrival, then reopen before the exit finishes. Replay
+        // the live transition; don't substitute a separately authored curve.
+        let mut elapsed = 0.0_f32;
+        while elapsed < t {
+            let dt = (t - elapsed).min(1.0 / 120.0);
+            state.close = (0.15..0.225).contains(&elapsed);
+            state.update_dismissal(dt);
+            elapsed += dt;
+        }
+        state.capture_elapsed = Some(t);
     }
     let _ = show_frame(ctx, &mut state, &frame, ready);
 }
@@ -1145,6 +1204,24 @@ mod tests {
             "reopening must preserve current exit opacity"
         );
         assert!(!menu.close && menu.closing.is_none());
+    }
+    #[test]
+    fn dismissal_waits_for_rendered_tail_and_retargets_current_value() {
+        let mut menu = MenuState::new(false);
+        menu.close = true;
+        menu.closing = Some(Instant::now() - std::time::Duration::from_secs(2));
+        assert!(!menu.hide_ready(), "wall time must not cut off an unrendered fade");
+        menu.update_dismissal(0.08);
+        let leaving = menu.dismissal;
+        assert!(leaving > 0.0 && leaving < 1.0);
+        assert!(!menu.reopen());
+        menu.update_dismissal(0.0);
+        assert_eq!(menu.dismissal, leaving, "retarget must not jump opacity");
+        menu.update_dismissal(0.05);
+        assert!(menu.dismissal < leaving);
+        menu.close = true;
+        menu.update_dismissal(MENU_FADE_SECONDS);
+        assert!(menu.hide_ready());
     }
     #[test]
     fn curved_arrival_has_stable_endpoints_and_separated_controls() {

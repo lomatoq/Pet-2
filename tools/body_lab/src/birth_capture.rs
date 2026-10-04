@@ -56,6 +56,9 @@ impl Capture {
         body.apply_tuning_profile(profile.clone())?;
         let mut renderer = pollster::block_on(Renderer::new(window.clone(), &body.mesh))?;
         renderer.set_review_background(ReviewBackground::Transparent);
+        if std::env::args().any(|arg| arg == "--orb-regression-only") {
+            return self.render_orb_regression(&mut renderer, &body, &genome);
+        }
         eprintln!(
             "birth capture format={:?} premultiplied_output={} linear source-over review",
             renderer.surface_format(),
@@ -471,6 +474,117 @@ impl Capture {
             bytes.extend(frame.rgba8);
             std::fs::write(self.output.join(format!("{name}.rgba")), bytes)?;
         }
+        Ok(())
+    }
+
+    /// Replay the production position/lifecycle-to-rotation path, then hold
+    /// geometry and throw history fixed while advancing the optical clock.
+    /// A full common optical period must not accumulate additional UV winding.
+    fn render_orb_regression(
+        &self,
+        renderer: &mut Renderer,
+        body: &ProceduralBody,
+        genome: &Genome,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const SIZE: u32 = 256;
+        const PERIOD: f32 = std::f32::consts::TAU * 200.0;
+        let verify = std::env::args().any(|arg| arg == "--orb-regression-verify");
+        renderer.resize(PhysicalSize::new(SIZE, SIZE));
+        let mut params = body.render_parameters(genome, 0.0);
+        params.presentation_visibility = 0.0;
+        params.shadow_opacity = 0.0;
+        params.joy_aura = 0.0;
+        params.material_bloom_strength = 0.0;
+        let mut measurements = Vec::new();
+        for (scale_name, radius_pixels) in [("native", 14.0), ("detail", 56.0)] {
+            for throws in [0_u32, 1, 5, 20] {
+                let mut baseline: Option<Vec<u8>> = None;
+                for (clock_name, optical_time, periodic) in [
+                    ("start", 15.0, true),
+                    ("ten-minutes", 600.0, false),
+                    ("one-hour", 3600.0, false),
+                    ("cycle-one", 15.0 + PERIOD, true),
+                    ("cycle-48", 15.0 + PERIOD * 48.0, true),
+                ] {
+                    let mut ecology = pet_ecology::EcologyState::new(42);
+                    ecology.objects.retain(|o| o.kind == pet_ecology::ObjectKind::Orb);
+                    let orb = ecology.objects.first_mut().ok_or("missing fixture orb")?;
+                    orb.position = Vec2::splat(0.5);
+                    orb.lifecycle = pet_ecology::ObjectLifecycle::Free;
+                    // Same native pixel footprint in a small isolated target.
+                    // Radius in normalized local shader coordinates is unchanged.
+                    orb.radius_px_at_reference = radius_pixels * 1080.0 / SIZE as f32;
+                    let id_phase = (orb.id % 997) as f32 * 0.013;
+                    let mut objects = pet_body::EcologyRenderer::new(
+                        renderer.device(), renderer.surface_format(), renderer.premultiplied_output(),
+                    );
+                    objects.prepare(renderer.queue(), &ecology, 1.0, 0.0);
+                    let mut tick = 0_u32;
+                    for throw in 0..throws {
+                        for step in 1..=30 {
+                            tick += 1;
+                            let t = step as f32 / 30.0;
+                            let sign = if throw % 2 == 0 { 1.0 } else { -1.0 };
+                            ecology.objects[0].position = Vec2::new(
+                                0.5 + sign * 0.23 * (t * std::f32::consts::TAU).sin(),
+                                0.5 - 0.16 * (t * std::f32::consts::PI).sin(),
+                            );
+                            ecology.objects[0].lifecycle = if step < 8 {
+                                pet_ecology::ObjectLifecycle::GrabbedByUser
+                            } else { pet_ecology::ObjectLifecycle::Free };
+                            objects.prepare(renderer.queue(), &ecology, 1.0, tick as f32 / 60.0);
+                        }
+                    }
+                    ecology.objects[0].position = Vec2::splat(0.5);
+                    ecology.objects[0].lifecycle = pet_ecology::ObjectLifecycle::Sleeping;
+                    for _ in 0..180 {
+                        tick += 1;
+                        objects.prepare(renderer.queue(), &ecology, 1.0, tick as f32 / 60.0);
+                    }
+                    objects.prepare(renderer.queue(), &ecology, 1.0, optical_time - id_phase);
+                    renderer.reset_perceptual_capture_state();
+                    let frame = renderer.render_capture_with_layers(
+                        params, |_, _, _, _| {},
+                        |_, _, encoder, view| objects.render_prepared_objects(encoder, view),
+                    )?;
+                    let name = format!("{scale_name}-throws-{throws:02}-{clock_name}");
+                    let mut bytes = Vec::with_capacity(frame.rgba8.len() + 8);
+                    bytes.extend(frame.width.to_le_bytes());
+                    bytes.extend(frame.height.to_le_bytes());
+                    bytes.extend(&frame.rgba8);
+                    std::fs::write(self.output.join(format!("{name}.rgba")), bytes)?;
+                    if let Some(reference) = &baseline {
+                        let mut sum = 0_u64;
+                        let mut samples = 0_u64;
+                        let mut maximum = 0_u8;
+                        for (a, b) in reference.chunks_exact(4).zip(frame.rgba8.chunks_exact(4)) {
+                            if a[3].max(b[3]) > 32 {
+                                for channel in 0..3 {
+                                    let delta = a[channel].abs_diff(b[channel]);
+                                    sum += u64::from(delta);
+                                    samples += 1;
+                                    maximum = maximum.max(delta);
+                                }
+                            }
+                        }
+                        let mean = sum as f64 / samples.max(1) as f64;
+                        measurements.push(serde_json::json!({"case":name,"periodic":periodic,
+                            "optical_time":optical_time,"mean_rgb_delta":mean,"max_rgb_delta":maximum}));
+                        if verify && periodic {
+                            assert!(mean < 0.35 && maximum <= 8,
+                                "orb accumulated UV winding: {name}, mean={mean}, max={maximum}");
+                        }
+                    } else {
+                        assert!(frame.rgba8.chunks_exact(4).any(|p| p[3] > 128), "empty orb");
+                        baseline = Some(frame.rgba8);
+                    }
+                }
+            }
+        }
+        std::fs::write(self.output.join("orb-regression.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"verified":verify,
+                "common_optical_period_seconds":PERIOD,"cases":measurements,
+                "scope":"Production instance packing/shader with deterministic throw-position replay; not a physical throw simulation"}))?)?;
         Ok(())
     }
 }

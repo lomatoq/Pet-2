@@ -10108,6 +10108,9 @@ mod tests {
     fn supported_rest_forms_a_flat_patch_without_moving_its_reference_frame() {
         let genome = Genome::from_seed(5784121873664838231);
         let mut body = ProceduralBody::generate(&genome).unwrap();
+        // Exercise the desktop's stable geometry ownership and immediate
+        // reconstruction while retaining the existing rest/jitter assertions.
+        body.embodiment.liquid.set_environment_support(None);
         body.apply_tuning_profile(production_liquid_tuning(approved_production_liquid_tuning(
             genome.identity_seed,
         )))

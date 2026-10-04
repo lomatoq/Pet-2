@@ -639,7 +639,11 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let alpha=(1.0-smoothstep(1.0-aa,1.0+aa,radial_distance))*input.color.a;
     let time=input.material.w;
     let depth=sqrt(max(1.0-radial_distance*radial_distance,0.0));
-    let angle=input.material.z+time*0.095*(1.0-radial_distance*radial_distance)
+    // Age may rotate the whole field, but must not accumulate radial shear:
+    // time * (1-r*r) winds the broad lights into subpixel rings over minutes.
+    // This differential drift has a time-independent bounded radial slope.
+    let angle=input.material.z+time*0.095
+        +0.26*sin(time*0.19+radial_distance*2.0)*(1.0-radial_distance*radial_distance)
         +0.10*sin(time*0.31+radial_distance*3.2);
     let c=cos(angle);let s=sin(angle);
     let q=vec2<f32>(c*input.local.x-s*input.local.y,s*input.local.x+c*input.local.y);

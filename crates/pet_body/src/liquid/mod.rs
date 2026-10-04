@@ -211,6 +211,8 @@ pub struct LiquidDiagnostics {
     /// Mass-weighted normal wall correction divided by dt, accumulated through
     /// the positional solve. A solver impulse estimate, not a measured SI force.
     pub support_normal_impulse: f32,
+    /// Main-material velocity retained when its carrier brakes into a real wall.
+    pub carrier_contact_delta_v: f32,
     pub bulk_surface_tension: f32,
     /// Area-preserving aspect of the physical character well, not render squash.
     pub permanent_field_aspect: f32,
@@ -343,7 +345,14 @@ pub struct LiquidMorphRuntime {
     /// Host geometry at the physics rate. Unlike a motor attachment this wall
     /// exists before a behavior decides to sit and while its intention changes.
     environment_support: Option<pet_motor::SurfaceAttachmentCommand>,
+    /// The environment API opts this host into a stable physical reference frame.
+    /// Clearing one surface does not switch its reconstruction contract.
+    geometry_owned_reference: bool,
     support_normal_impulse: f32,
+    previous_carrier_velocity: Option<Vec2>,
+    carrier_contact_delta_v: f32,
+    carrier_contact_echo_normal: Option<Vec2>,
+    pending_wall_impact: Option<(Vec2, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -485,6 +494,11 @@ impl LiquidMorphRuntime {
             contact_plane: None,
             support_well_offset: Vec2::ZERO,
             environment_support: None,
+            geometry_owned_reference: false,
+            previous_carrier_velocity: None,
+            carrier_contact_delta_v: 0.0,
+            carrier_contact_echo_normal: None,
+            pending_wall_impact: None,
             support_normal_impulse: 0.0,
         };
         runtime.snap_render_proxies();
@@ -562,6 +576,8 @@ impl LiquidMorphRuntime {
             replacement.support_stable_seconds = self.support_stable_seconds;
             replacement.supported_seconds = self.supported_seconds;
             replacement.environment_support = self.environment_support.clone();
+            replacement.geometry_owned_reference = self.geometry_owned_reference;
+            replacement.previous_carrier_velocity = self.previous_carrier_velocity;
             *self = replacement;
         } else {
             self.tuning = tuning;
@@ -611,6 +627,15 @@ impl LiquidMorphRuntime {
     /// Set the closest solid floor/cushion, in desktop-normalized coordinates.
     /// The solver measures separation itself; an airborne wall has no load.
     /// This is transient geometry, deliberately absent from the saved organism.
+    ///
+    /// Calling this API (including `None`) declares that this host owns geometry
+    /// throughout motion and retains its reference once contact owns the floor
+    /// (`environment_support_is_loaded`). Such hosts receive material-advected
+    /// reconstruction. Older somatic-only hosts reproject their root from the
+    /// filtered contour and retain that transform-feedback contract. This host
+    /// capability stays enabled after `None`: leaving a floor, entering an
+    /// adhesive wall mode, or temporarily removing geometry must not switch the
+    /// reconstruction response. It is reset only with a new runtime.
     pub fn set_environment_support(
         &mut self,
         support: Option<pet_motor::SurfaceAttachmentCommand>,
@@ -622,6 +647,7 @@ impl LiquidMorphRuntime {
                 && s.tangent.is_finite()
                 && s.load_fraction.is_finite()
         });
+        self.geometry_owned_reference = true;
     }
 
     fn support_surface(&self) -> Option<&pet_motor::SurfaceAttachmentCommand> {
@@ -658,6 +684,28 @@ impl LiquidMorphRuntime {
             return;
         }
         let normal = (screen_normal * Vec2::new(1.0, -1.0)).normalize_or_zero();
+        // A known physical floor has a unilateral solver and receives the real
+        // carrier delta-v during update. The old zero-mean affine kick would
+        // additionally lift its bottom half, erasing contact after a fast stop.
+        // Keep this fallback for host walls without a material contact plane.
+        if self
+            .previous_carrier_velocity
+            .is_some_and(|v| v.dot(normal) < 0.0)
+            && self.environment_support.as_ref().is_some_and(|support| {
+                support
+                    .normal
+                    .normalize_or_zero()
+                    .dot(screen_normal.normalize_or_zero())
+                    > 0.99
+            })
+        {
+            self.pending_wall_impact = Some((normal, intensity));
+            return;
+        }
+        self.apply_internal_wall_impact(normal, intensity);
+    }
+
+    fn apply_internal_wall_impact(&mut self, normal: Vec2, intensity: f32) {
         let tangent = normal.perp();
         let strength = intensity.clamp(0.0, 1.0) * 4.5;
         let mut impulses = [Vec2::ZERO; MAX_LIQUID_PARTICLES];
@@ -684,6 +732,56 @@ impl LiquidMorphRuntime {
         {
             if p.component_id == self.components.main_component && p.inverse_mass > 0.0 {
                 p.velocity += impulse - mean;
+            }
+        }
+    }
+
+    fn resolve_pending_wall_impact(&mut self) {
+        if let Some((normal, intensity)) = self.pending_wall_impact.take()
+            && self.carrier_contact_delta_v <= 0.0
+        {
+            // A real host collision may fall outside the weight-bearing reach
+            // of this genome. Never discard its fallback before measuring load.
+            self.apply_internal_wall_impact(normal, intensity);
+        }
+    }
+
+    /// Main material shares the host reference frame. If that frame is stopped
+    /// by a wall, preserve incoming normal momentum in the material before the
+    /// unilateral solver absorbs it. Filtered steering acceleration cannot carry
+    /// this impulse: its integral depends on the steering filter and frame rate.
+    fn retain_carrier_contact_momentum(&mut self, velocity: Vec2, inertia: f32, dragged: bool) {
+        self.carrier_contact_delta_v = 0.0;
+        let velocity = velocity
+            .is_finite()
+            .then(|| velocity.clamp_length_max(16.0));
+        let previous = self.previous_carrier_velocity;
+        self.previous_carrier_velocity = velocity;
+        let (Some(previous), Some(velocity), Some(plane)) =
+            (previous, velocity, self.contact_plane)
+        else {
+            self.carrier_contact_echo_normal = None;
+            return;
+        };
+        if dragged || self.material_grab.is_active() || self.measured_support_load <= 0.0 {
+            self.carrier_contact_echo_normal = None;
+            return;
+        }
+        if velocity.dot(plane.normal) > 0.0 {
+            self.carrier_contact_echo_normal = None;
+        }
+        let incoming = (-previous.dot(plane.normal)).max(0.0);
+        let lost = (velocity - previous).dot(plane.normal).clamp(0.0, incoming);
+        let delta_v = lost * inertia.clamp(0.0, 1.0);
+        self.carrier_contact_delta_v = delta_v;
+        if delta_v > 0.0 && velocity.dot(plane.normal) <= 0.0 {
+            self.carrier_contact_echo_normal = Some(plane.normal);
+        }
+        for particle in &mut self.particles[..self.particle_count] {
+            if particle.component_id == self.components.main_component
+                && particle.inverse_mass > 0.0
+            {
+                particle.velocity -= plane.normal * delta_v;
             }
         }
     }
@@ -928,6 +1026,20 @@ impl LiquidMorphRuntime {
             dt,
         );
         self.contact_plane = support_plane.filter(|_| !self.material_grab.is_active());
+        self.retain_carrier_contact_momentum(
+            feedback.velocity * motion.world_to_body_scale,
+            effective_flight_inertia,
+            sensors.pet_dragged,
+        );
+        self.resolve_pending_wall_impact();
+        // The normal stop above owns the contact impulse. Do not add the delayed
+        // steering-filter echo of that same stop for subsequent supported ticks.
+        let field_acceleration = self
+            .carrier_contact_echo_normal
+            .filter(|_| self.measured_support_load > 0.0)
+            .map_or(motion.acceleration, |normal| {
+                motion.acceleration - normal * motion.acceleration.dot(normal).max(0.0)
+            });
         let field_scale = self.tuning.character_field_radius_scale;
         // The root is a stable desktop reference, not the center of a seated
         // puddle. Keeping the well at that old height suspends a rounded upper
@@ -970,7 +1082,7 @@ impl LiquidMorphRuntime {
             &mut self.particles,
             self.particle_count,
             self.body_origin + self.support_well_offset,
-            motion.acceleration,
+            field_acceleration,
             CharacterFieldParameters {
                 radii: Vec2::new(0.35, 0.43) * field_scale,
                 // Preserve the authored v15 return-strength feel while changing
@@ -1008,7 +1120,7 @@ impl LiquidMorphRuntime {
         );
         // Detached parcels use an inertial screen frame: root acceleration
         // must not be applied again after the coordinate transport above.
-        let inertial_load = (-motion.acceleration * effective_flight_inertia).clamp_length_max(6.0);
+        let inertial_load = (-field_acceleration * effective_flight_inertia).clamp_length_max(6.0);
         for (i, particle) in self.particles[..self.particle_count].iter_mut().enumerate() {
             if self.was_detached[i] {
                 particle.force -= inertial_load;
@@ -1333,6 +1445,16 @@ impl LiquidMorphRuntime {
                 hit_circuit_breaker = true;
             }
             particle.velocity = velocity;
+            if self.geometry_owned_reference {
+                // A geometry-owning host keeps a stable physical reference:
+                // advect real material motion and filter only reconstruction
+                // residuals. Legacy transform-driven hosts instead reposition
+                // their root from the filtered contour every frame; preserve
+                // that feedback contract until they supply environment geometry.
+                // This capability exists throughout flight/contact/release; it
+                // does not switch at a landing or behavioral phase.
+                particle.render_position += particle.predicted_position - particle.position;
+            }
             particle.position = particle.predicted_position;
         }
         if hit_circuit_breaker {
@@ -1707,7 +1829,9 @@ impl LiquidMorphRuntime {
             let tuning = self.tuning;
             let face_frame = self.face_frame.clone();
             let cinematic_features = self.cinematic_features;
+            let geometry_owned_reference = self.geometry_owned_reference;
             *self = Self::new_with_tuning(self.seed, tuning);
+            self.geometry_owned_reference = geometry_owned_reference;
             self.face_frame = face_frame;
             self.cinematic_features = cinematic_features;
         }
@@ -1732,6 +1856,8 @@ impl LiquidMorphRuntime {
         face_frame.begin_recovery();
 
         let mut replacement = Self::new_with_tuning(self.seed, tuning);
+        replacement.geometry_owned_reference = self.geometry_owned_reference;
+        replacement.environment_support = self.environment_support.clone();
         replacement.body_origin = body_origin;
         replacement.elapsed = elapsed;
         replacement.material_breath_phase = self.material_breath_phase;
@@ -3489,6 +3615,7 @@ impl LiquidMorphRuntime {
             object_contact_impulse: self.object_contact_impulse,
             support_field_load: self.measured_support_load,
             support_normal_impulse: self.support_normal_impulse,
+            carrier_contact_delta_v: self.carrier_contact_delta_v,
             bulk_surface_tension: parameters.surface_tension,
             permanent_field_aspect: self.flight_field_aspect,
             particle_count: self.particle_count,
@@ -3971,6 +4098,175 @@ fn deterministic_unit(seed: u64, sequence: u64, salt: u64) -> f32 {
 #[cfg(test)]
 mod flight_field_tests {
     use super::*;
+
+    #[test]
+    fn geometry_owner_contract_survives_empty_surface_tuning_and_recovery() {
+        let mut runtime = LiquidMorphRuntime::new(42);
+        assert!(
+            !runtime.geometry_owned_reference,
+            "old somatic-only hosts retain their contract"
+        );
+        runtime.set_environment_support(None);
+        assert!(
+            runtime.geometry_owned_reference,
+            "birth/airborne host owns an empty environment too"
+        );
+        let mut tuning = runtime.tuning;
+        tuning.spacing_scale *= 1.01;
+        runtime.set_tuning(
+            tuning,
+            runtime.interaction_tuning,
+            FaceTuning::default(),
+            MaterialVariant::CurrentSafe,
+        );
+        assert!(runtime.geometry_owned_reference);
+        runtime.set_environment_support(None);
+        assert!(
+            runtime.geometry_owned_reference,
+            "removing a surface is not a renderer mode change"
+        );
+        let from = array::from_fn(|i| {
+            let p = runtime.particles[i];
+            (
+                p.render_position,
+                p.render_axis_major,
+                p.render_aspect,
+                p.render_surface_score,
+            )
+        });
+        runtime.recover_from_nonfinite(from);
+        assert!(runtime.geometry_owned_reference);
+        assert_eq!(
+            runtime.previous_carrier_velocity, None,
+            "recovery cannot replay an old impact"
+        );
+    }
+
+    #[test]
+    fn carrier_contact_retains_normal_momentum_without_shape_or_mass_edits() {
+        for hz in [30, 60, 120] {
+            for incoming in [0.08_f32, 0.6, 2.4] {
+                let mut runtime = LiquidMorphRuntime::new(42);
+                runtime.contact_plane = Some(SupportPlane {
+                    point: Vec2::NEG_Y * 0.4,
+                    normal: Vec2::Y,
+                    clearance: 0.1,
+                });
+                runtime.measured_support_load = 0.27;
+                runtime.previous_carrier_velocity = Some(Vec2::new(0.4, -incoming));
+                runtime.particles[0].component_id = 7;
+                let before = runtime.particles;
+                // Same physical stop at every timestep, independent of a/dt.
+                runtime.retain_carrier_contact_momentum(Vec2::new(0.4, 0.0), 0.72, false);
+                assert!(
+                    (runtime.carrier_contact_delta_v - incoming * 0.72).abs() < 1e-6,
+                    "{hz}Hz"
+                );
+                for (p, old) in runtime.particles[..runtime.particle_count]
+                    .iter()
+                    .zip(before)
+                {
+                    assert_eq!(p.position, old.position);
+                    assert_eq!(p.inverse_mass, old.inverse_mass);
+                    let expected = if p.component_id == runtime.components.main_component {
+                        Vec2::NEG_Y * incoming * 0.72
+                    } else {
+                        Vec2::ZERO
+                    };
+                    assert!((p.velocity - old.velocity - expected).length() < 1e-6);
+                }
+                for _ in 0..hz {
+                    runtime.retain_carrier_contact_momentum(Vec2::new(0.4, 0.0), 0.72, false);
+                    assert_eq!(
+                        runtime.carrier_contact_delta_v, 0.0,
+                        "rest must not accumulate impact"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn near_floor_braking_without_load_keeps_steering_ownership() {
+        let mut runtime = LiquidMorphRuntime::new(42);
+        // Broad-phase plane can exist ~21px above the floor; it is not contact.
+        runtime.contact_plane = Some(SupportPlane {
+            point: Vec2::NEG_Y,
+            normal: Vec2::Y,
+            clearance: 0.1,
+        });
+        runtime.previous_carrier_velocity = Some(Vec2::NEG_Y * 0.6);
+        runtime.measured_support_load = 0.0;
+        let before = runtime.particles;
+        runtime.retain_carrier_contact_momentum(Vec2::ZERO, 0.72, false);
+        assert_eq!(runtime.particles, before);
+        assert_eq!(runtime.carrier_contact_delta_v, 0.0);
+        assert_eq!(runtime.carrier_contact_echo_normal, None);
+        runtime.measured_support_load = 0.27;
+        runtime.retain_carrier_contact_momentum(Vec2::ZERO, 0.72, false);
+        assert_eq!(
+            runtime.carrier_contact_delta_v, 0.0,
+            "no deferred airborne impulse"
+        );
+    }
+
+    #[test]
+    fn actual_wall_event_keeps_fallback_when_carrier_reach_has_no_load() {
+        let mut reference = LiquidMorphRuntime::new(42);
+        reference.apply_wall_impact(Vec2::NEG_Y, 0.4);
+        let mut runtime = LiquidMorphRuntime::new(42);
+        runtime.previous_carrier_velocity = Some(Vec2::NEG_Y);
+        runtime.environment_support = Some(pet_motor::SurfaceAttachmentCommand {
+            surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
+            normal: Vec2::NEG_Y,
+            tangent: Vec2::X,
+            anchor_point: Vec2::new(0.5, 1.0),
+            target_contact_fraction: 0.32,
+            normal_compliance: 0.35,
+            tangent_friction: 0.7,
+            adhesion: 0.0,
+            load_fraction: 0.27,
+            break_force: 0.7,
+            release_half_life: 0.25,
+        });
+        runtime.apply_wall_impact(Vec2::NEG_Y, 0.4);
+        assert!(runtime.pending_wall_impact.is_some());
+        runtime.retain_carrier_contact_momentum(Vec2::ZERO, 0.72, false);
+        runtime.resolve_pending_wall_impact();
+        assert_eq!(runtime.particles, reference.particles);
+        runtime.resolve_pending_wall_impact();
+        assert_eq!(
+            runtime.particles, reference.particles,
+            "exactly one fallback per impact"
+        );
+    }
+
+    #[test]
+    fn contact_momentum_never_replays_startup_drag_or_takeoff() {
+        let mut runtime = LiquidMorphRuntime::new(42);
+        runtime.contact_plane = Some(SupportPlane {
+            point: Vec2::NEG_Y,
+            normal: Vec2::Y,
+            clearance: 0.1,
+        });
+        runtime.measured_support_load = 0.27;
+        runtime.retain_carrier_contact_momentum(Vec2::ZERO, 0.72, false);
+        assert_eq!(runtime.carrier_contact_delta_v, 0.0);
+        runtime.previous_carrier_velocity = Some(Vec2::NEG_Y);
+        runtime.retain_carrier_contact_momentum(Vec2::ZERO, 0.72, true);
+        assert_eq!(runtime.carrier_contact_delta_v, 0.0);
+        runtime.retain_carrier_contact_momentum(Vec2::ZERO, 0.72, false);
+        assert_eq!(runtime.carrier_contact_delta_v, 0.0);
+        runtime.carrier_contact_echo_normal = Some(Vec2::Y);
+        runtime.retain_carrier_contact_momentum(Vec2::Y, 0.72, false);
+        assert_eq!(runtime.carrier_contact_echo_normal, None);
+        assert_eq!(runtime.carrier_contact_delta_v, 0.0);
+        runtime.retain_carrier_contact_momentum(Vec2::ZERO, 0.72, false);
+        assert_eq!(
+            runtime.carrier_contact_delta_v, 0.0,
+            "braking away from wall is not landing"
+        );
+    }
 
     #[test]
     fn wall_impact_compresses_without_adding_net_momentum_or_moving_particles() {

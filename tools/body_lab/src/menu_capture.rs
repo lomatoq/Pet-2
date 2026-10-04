@@ -142,6 +142,11 @@ impl Capture {
             ];
             fixtures.extend((0..32).map(|i| format!("press-{:.6}", i as f32 / 60.0)));
         }
+        if std::env::var_os("PET2_MENU_MOTION_ONLY").is_some() {
+            fixtures = (0..76).map(|i| format!("open-{:.6}", i as f32 / 60.0)).collect();
+            fixtures.extend((0..22).map(|i| format!("close-{:.6}", i as f32 / 60.0)));
+            fixtures.extend((0..55).map(|i| format!("retoggle-{:.6}", i as f32 / 60.0)));
+        }
         let started = std::time::Instant::now();
         let count = fixtures.len();
         for name in fixtures {
