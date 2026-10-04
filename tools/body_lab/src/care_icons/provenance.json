@@ -1,0 +1,64 @@
+{
+  "family": "Phosphor Fill",
+  "size": [
+    28,
+    56
+  ],
+  "method": "CairoSVG 4x supersampling then Lanczos coverage prefilter at28/56 pixels; native1x/2x selectablelevels avoid minification aliasing. Cached linear-sampled texture per icon; no font atlas.",
+  "assets": [
+    {
+      "name": "bowl-food",
+      "url": "https://raw.githubusercontent.com/phosphor-icons/core/main/assets/fill/bowl-food-fill.svg",
+      "svg_sha256": "3bc0394da565b269639d286ab80e4a2c73bcf68e236e7c9073df09bb3ee5deb2",
+      "coverage_sha256": {
+        "1": "45aae77f6c83696e42b301666f0e2987b25bfe44b85f169aa699bbbb4cdc4a08",
+        "2": "a9a06eac220a6e4b6bb525cf78b80756f4f0256e916196d9369dee14da03aef6"
+      }
+    },
+    {
+      "name": "graduation-cap",
+      "url": "https://raw.githubusercontent.com/phosphor-icons/core/main/assets/fill/graduation-cap-fill.svg",
+      "svg_sha256": "0324f19528344327607dd2ee731d1313f4bb7d40086c81e5c5305c8214a39975",
+      "coverage_sha256": {
+        "1": "f5308de81e0ff094be2e01ad49fcc9de62cbdd829af22d0e2ffd0c5c0c041894",
+        "2": "b943d7f4533bc9e02dfd6a1e7fcad7fe1be21057d755e6698cebfcab61ef2ccd"
+      }
+    },
+    {
+      "name": "identification-badge",
+      "url": "https://raw.githubusercontent.com/phosphor-icons/core/main/assets/fill/identification-badge-fill.svg",
+      "svg_sha256": "772e0caaa75808fa6b1ed4a7389d45dd3b0bd3f96c9fbffee480faae32791846",
+      "coverage_sha256": {
+        "1": "7f5fcbe39e1152595d0405c1c027157ead08610245562b388beb4448d9f204d5",
+        "2": "bfd77d314962f60b155f6b5dd7f717cf4dc5f7e18bdf909d3df0cb66c75721ac"
+      }
+    },
+    {
+      "name": "microphone",
+      "url": "https://raw.githubusercontent.com/phosphor-icons/core/main/assets/fill/microphone-fill.svg",
+      "svg_sha256": "cd8446012357f05a70679ecc792402aa6e49f1fdc820b04035a97b213a2f17a6",
+      "coverage_sha256": {
+        "1": "4504794e02aa6839b0a6bcb926a095b3b0b317790be39f17fe96d63d34fc8651",
+        "2": "3d5e1a959ca5fe34abbcb62668f12eae1639cc6d54d41341b2ab1408e17ad2df"
+      }
+    },
+    {
+      "name": "sliders-horizontal",
+      "url": "https://raw.githubusercontent.com/phosphor-icons/core/main/assets/fill/sliders-horizontal-fill.svg",
+      "svg_sha256": "59fdf39771e7939dd315912702f3c8241a9dfeb1f5b6512a074525884765a76c",
+      "coverage_sha256": {
+        "1": "0e70ba920d0e53b1c8165b2b1bc8c6b703d25e86f1c77a7bbf635c7172c34adb",
+        "2": "90a42c10b96f6b80281ad9a6f19b972ba0cbc22d409d3962325137741f46c28b"
+      }
+    },
+    {
+      "name": "sparkle",
+      "url": "https://raw.githubusercontent.com/phosphor-icons/core/main/assets/fill/sparkle-fill.svg",
+      "svg_sha256": "9872a9255717f4ecc0f01b028b9436042e0f49391e4ce7a57f61aa466684fad1",
+      "coverage_sha256": {
+        "1": "6d83ddae864dd0125f4b06c2a6d3284080f1129c73fdf5af528ea198dffd02b9",
+        "2": "d07eaabc79c21bc52349bebc7e8f87e87f6f660dbb133d205b3c216d990c7e59"
+      }
+    }
+  ]
+}

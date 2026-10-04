@@ -88,9 +88,10 @@ impl MenuState {
         true
     }
 }
-const INK: Color32 = Color32::from_rgb(47, 42, 58);
-const MUTED: Color32 = Color32::from_rgb(110, 103, 122);
-const ACCENT: Color32 = Color32::from_rgb(105, 79, 141);
+const INK: Color32 = Color32::from_rgb(236, 241, 246);
+const SYMBOL: Color32 = Color32::from_rgb(39, 48, 61);
+const MUTED: Color32 = Color32::from_rgb(164, 178, 191);
+const ACCENT: Color32 = Color32::from_rgb(176, 226, 214);
 const LABELS: [&str; 6] = ["Feed", "Teach", "Name", "Voice", "More", "Clean"];
 
 fn action_label(index: usize, latest: &Value) -> &'static str {
@@ -225,7 +226,7 @@ pub(super) fn configure(ctx: &egui::Context) {
     };
     ctx.set_fonts(fonts);
     ctx.tessellation_options_mut(|o| o.round_text_to_pixels = false);
-    ctx.set_visuals(egui::Visuals::light());
+    ctx.set_visuals(egui::Visuals::dark());
     ctx.style_mut(|s| {
         s.animation_time = if companion_glass::reduced_motion() {
             0.0
@@ -237,32 +238,32 @@ pub(super) fn configure(ctx: &egui::Context) {
             egui::FontId::new(17.0, heading_family),
         );
         s.spacing.item_spacing = vec2(8.0, 10.0);
-        s.spacing.button_padding = vec2(12.0, 8.0);
+        s.spacing.button_padding = vec2(14.0, 9.0);
         s.spacing.slider_width = 175.0;
         s.visuals.override_text_color = Some(INK);
         s.visuals.selection.bg_fill = ACCENT;
-        s.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-        s.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(239, 234, 245);
-        s.visuals.widgets.inactive.bg_fill = Color32::from_rgb(243, 238, 248);
+        s.visuals.selection.stroke = Stroke::new(1.0, SYMBOL);
+        s.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(38, 46, 56);
+        s.visuals.widgets.inactive.bg_fill = Color32::from_rgb(36, 44, 54);
         s.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, MUTED);
-        s.visuals.widgets.hovered.bg_fill = Color32::from_rgb(234, 225, 246);
+        s.visuals.widgets.hovered.bg_fill = Color32::from_rgb(53, 67, 77);
         s.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, ACCENT);
-        s.visuals.widgets.active.bg_fill = Color32::from_rgb(234, 225, 246);
+        s.visuals.widgets.active.bg_fill = Color32::from_rgb(53, 67, 77);
         s.visuals.widgets.active.fg_stroke = Stroke::new(1.0, INK);
-        s.visuals.widgets.inactive.bg_stroke = Stroke::new(0.7, Color32::from_rgb(223, 215, 232));
-        s.visuals.widgets.inactive.corner_radius = 10.into();
-        s.visuals.widgets.hovered.corner_radius = 10.into();
-        s.visuals.widgets.active.corner_radius = 10.into();
-        s.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(236, 230, 250);
+        s.visuals.widgets.inactive.bg_stroke = Stroke::new(0.7, Color32::from_rgb(66, 77, 88));
+        s.visuals.widgets.inactive.corner_radius = 12.into();
+        s.visuals.widgets.hovered.corner_radius = 12.into();
+        s.visuals.widgets.active.corner_radius = 12.into();
+        s.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(44, 55, 65);
         s.visuals.panel_fill = Color32::TRANSPARENT;
-        s.visuals.window_fill = Color32::from_rgb(251, 249, 253);
+        s.visuals.window_fill = Color32::from_rgb(28, 35, 44);
         s.visuals.window_corner_radius = 16.into();
         s.text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
         s.text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
         s.text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
     });
 }
 struct BubbleMotion {
@@ -342,112 +343,112 @@ fn bubble_motion_at(
     }
 }
 
-// Rounded vector symbols avoid a small font-atlas glyph and its dark shadow.
-// The pale fringe is only 0.35 points per side; shape AA remains egui's own.
-fn icon(p: &egui::Painter, c: egui::Pos2, index: usize, color: Color32) {
-    let path = |points: Vec<egui::Pos2>, closed: bool| {
-        for (width, ink) in [(2.4, color.gamma_multiply(0.10)), (1.7, color)] {
-            p.add(egui::epaint::PathShape {
-                points: points.clone(),
-                closed,
-                fill: Color32::TRANSPARENT,
-                stroke: Stroke::new(width, ink).into(),
-            });
-            if !closed {
-                for point in [points.first(), points.last()].into_iter().flatten() {
-                    p.circle_filled(*point, width * 0.5, ink);
-                }
-            }
-        }
+// Phosphor Fill, MIT. Original SVGs and prefiltered native 1x/2x coverage masks live
+// beside this source. A single cached texture per symbol uses linear sampling:
+// no small font atlas, bespoke strokes, duplicated shadow, or per-frame upload.
+fn icon(p: &egui::Painter, c: egui::Pos2, index: usize, color: Color32, scale: f32) {
+    let density = if p.ctx().pixels_per_point() > 1.25 {
+        2
+    } else {
+        1
     };
-    let pts = |points: &[[f32; 2]]| points.iter().map(|v| c + vec2(v[0], v[1])).collect();
-    let arc = |center: [f32; 2], radius: f32, start: f32, end: f32| {
-        (0..=32)
-            .map(|i| {
-                let a = start + (end - start) * i as f32 / 32.0;
-                c + vec2(center[0] + radius * a.cos(), center[1] + radius * a.sin())
-            })
-            .collect::<Vec<_>>()
+    let key = egui::Id::new(("care-phosphor-fill-v67", density));
+    let icons = if let Some(icons) = p
+        .ctx()
+        .data_mut(|data| data.get_temp::<[egui::TextureHandle; 6]>(key))
+    {
+        icons
+    } else {
+        let coverage: [&[u8]; 6] = if density == 1 {
+            [
+                include_bytes!("care_icons/bowl-food-1x.alpha"),
+                include_bytes!("care_icons/graduation-cap-1x.alpha"),
+                include_bytes!("care_icons/identification-badge-1x.alpha"),
+                include_bytes!("care_icons/microphone-1x.alpha"),
+                include_bytes!("care_icons/sliders-horizontal-1x.alpha"),
+                include_bytes!("care_icons/sparkle-1x.alpha"),
+            ]
+        } else {
+            [
+                include_bytes!("care_icons/bowl-food-2x.alpha"),
+                include_bytes!("care_icons/graduation-cap-2x.alpha"),
+                include_bytes!("care_icons/identification-badge-2x.alpha"),
+                include_bytes!("care_icons/microphone-2x.alpha"),
+                include_bytes!("care_icons/sliders-horizontal-2x.alpha"),
+                include_bytes!("care_icons/sparkle-2x.alpha"),
+            ]
+        };
+        let icons = std::array::from_fn(|i| {
+            let pixels = coverage[i]
+                .iter()
+                .map(|&a| Color32::from_white_alpha(a))
+                .collect();
+            p.ctx().load_texture(
+                format!("care-phosphor-{i}"),
+                egui::ColorImage::new([28 * density, 28 * density], pixels),
+                egui::TextureOptions::LINEAR,
+            )
+        });
+        p.ctx()
+            .data_mut(|data| data.insert_temp(key, icons.clone()));
+        icons
     };
-    match index {
-        0 => {
-            let mut outline = arc([0.0, 0.0], 9.6, -0.07, std::f32::consts::TAU - 1.18);
-            outline.extend(pts(&[[1.2, -5.6], [2.7, -2.5], [6.0, -2.1], [6.7, 0.0]]));
-            path(outline, true);
-            for d in [[-3.8, -3.2], [-4.0, 3.6], [2.5, 4.3]] {
-                p.circle_filled(c + vec2(d[0], d[1]), 1.2, color);
-            }
-        }
-        1 => {
-            path(
-                pts(&[[-11.0, -3.4], [0.0, -8.3], [11.0, -3.4], [0.0, 1.5]]),
-                true,
-            );
-            path(
-                pts(&[
-                    [-7.0, -1.4],
-                    [-7.0, 4.2],
-                    [-3.5, 6.5],
-                    [0.0, 7.3],
-                    [3.5, 6.5],
-                    [7.0, 4.2],
-                    [7.0, -1.4],
-                ]),
-                false,
-            );
-            path(pts(&[[10.5, -3.0], [10.5, 5.2]]), false);
-        }
-        2 => {
-            path(
-                pts(&[
-                    [-9.0, -9.0],
-                    [-1.5, -9.0],
-                    [9.7, 2.2],
-                    [2.2, 9.7],
-                    [-9.0, -1.5],
-                ]),
-                true,
-            );
-            p.circle_stroke(c + vec2(-4.8, -4.8), 1.4, Stroke::new(1.5, color));
-        }
-        3 => {
-            let mut capsule = arc(
-                [0.0, -5.5],
-                3.4,
-                std::f32::consts::PI,
-                std::f32::consts::TAU,
-            );
-            capsule.extend(arc([0.0, 0.3], 3.4, 0.0, std::f32::consts::PI));
-            path(capsule, true);
-            path(arc([0.0, 0.0], 6.7, 0.0, std::f32::consts::PI), false);
-            path(pts(&[[0.0, 6.7], [0.0, 10.0]]), false);
-            path(pts(&[[-3.5, 10.0], [3.5, 10.0]]), false);
-        }
-        4 => {
-            for (y, x) in [(-6.8, -3.8), (0.0, 4.0), (6.8, -1.2)] {
-                path(pts(&[[-10.0, y], [x - 2.2, y]]), false);
-                path(pts(&[[x + 2.2, y], [10.0, y]]), false);
-                path(arc([x, y], 2.2, 0.0, std::f32::consts::TAU), true);
-            }
-        }
-        _ => {
-            path(
-                pts(&[
-                    [0.0, -10.0],
-                    [2.7, -2.7],
-                    [10.0, 0.0],
-                    [2.7, 2.7],
-                    [0.0, 10.0],
-                    [-2.7, 2.7],
-                    [-10.0, 0.0],
-                    [-2.7, -2.7],
-                ]),
-                true,
-            );
-            path(pts(&[[8.0, -10.0], [8.0, -5.6]]), false);
-            path(pts(&[[5.8, -7.8], [10.2, -7.8]]), false);
-        }
+    // The badge's clip and graduation tassel need different optical centers.
+    let offset = match index {
+        1 => vec2(0.0, 0.1),
+        2 => vec2(0.0, -0.2),
+        _ => vec2(0.0, 0.0),
+    };
+    p.image(
+        icons[index].id(),
+        Rect::from_center_size(c + offset * scale, vec2(28.0, 28.0) * scale),
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        color,
+    );
+}
+
+// Shared physical response for the live controls and deterministic capture.
+// Both edges retarget the existing value; rapid release/repress never restarts.
+fn advance_press(value: &mut f32, velocity: &mut f32, held: bool, dt: f32, reduced: bool) {
+    let target = if held { 0.04 } else { 0.0 };
+    if reduced {
+        *value = 0.0;
+        *velocity = 0.0;
+        return;
     }
+    let rate = if held { 32.0 } else { 26.0 };
+    let previous = *value;
+    *value += (target - *value) * (1.0 - (-rate * dt).exp());
+    *velocity = (*value - previous) / dt.max(0.001);
+}
+
+fn panel_surface(p: &egui::Painter, rect: Rect) {
+    p.add(
+        egui::epaint::RectShape::filled(
+            rect.translate(vec2(0.0, 8.0)),
+            24,
+            Color32::from_black_alpha(42),
+        )
+        .with_blur_width(26.0),
+    );
+    p.rect_filled(rect, 24, Color32::from_rgb(27, 34, 43));
+    p.rect_stroke(
+        rect,
+        24,
+        Stroke::new(0.7, Color32::from_white_alpha(28)),
+        egui::StrokeKind::Inside,
+    );
+    // One large quiet header field, clipped inside the panel, carries the same
+    // mint energy as the buttons without a second white shell or chrome edge.
+    let clip = p.with_clip_rect(rect.shrink(1.0));
+    clip.add(
+        egui::epaint::RectShape::filled(
+            Rect::from_min_size(rect.min + vec2(22.0, 14.0), vec2(130.0, 48.0)),
+            24,
+            Color32::from_rgba_unmultiplied(120, 210, 192, 12),
+        )
+        .with_blur_width(34.0),
+    );
 }
 pub(super) fn show(
     ctx: &egui::Context,
@@ -484,7 +485,6 @@ fn show_frame(
         state.close = true;
     }
     let screen = ctx.content_rect();
-    let texture = state.glass.as_ref().and_then(Glass::texture);
     let hearing = &latest["details"]["hearing"];
     if state.waiting_for_feed && latest["details"]["feeding"]["enabled"].as_bool() == Some(true) {
         state.close = true;
@@ -538,17 +538,19 @@ fn show_frame(
             bubble_motion(screen, index, elapsed, state.dismissal, reduced)
         };
         let alpha = motion.alpha;
-        let scale = 1.0 + 0.012 * state.hover[index] - state.press[index];
+        let scale = if reduced {
+            1.0
+        } else {
+            1.0 - state.press[index]
+        };
         let rect = Rect::from_center_size(motion.center, vec2(56.0, 56.0));
         let layer = egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new(("care-bubble", index)),
         );
-        let pivot = rect.center_bottom();
-        let transform = egui::emath::TSTransform::from_translation(pivot.to_vec2())
-            * egui::emath::TSTransform::from_scaling(scale)
-            * egui::emath::TSTransform::from_translation(-pivot.to_vec2());
-        ctx.set_transform_layer(layer, transform);
+        // Keep the complete 56px hit area fixed while only the artwork depresses.
+        // The former bottom pivot made a press slide rather than sink inward.
+        ctx.set_transform_layer(layer, egui::emath::TSTransform::IDENTITY);
         let waiting = state.waiting_for_feed || state.waiting_for_cleanup;
         let active = state.desired_page == Some(index);
         let label = if (index == 0 && state.waiting_for_feed)
@@ -559,8 +561,6 @@ fn show_frame(
             action_label(index, latest)
         };
         let tint = accent(index);
-        // Preserve the material; floating never drives its optical phase.
-        let phase = index as f32 * 1.43;
         let float_weight = if reduced {
             0.0
         } else {
@@ -569,7 +569,7 @@ fn show_frame(
         let clock = elapsed * 0.72 + index as f32 * 1.43;
         let float =
             vec2((clock * 0.67).sin() * 1.15, clock.sin() * 2.6) * float_weight * motion.settled;
-        let visual_rect = rect.translate(float);
+        let visual_rect = Rect::from_center_size(rect.center() + float, rect.size() * scale);
         let response = egui::Area::new(layer.id)
             .order(egui::Order::Foreground)
             .constrain(false)
@@ -583,7 +583,16 @@ fn show_frame(
                 let finishing = label == "Finish";
                 let this_waiting = (index == 0 && state.waiting_for_feed)
                     || (index == 5 && state.waiting_for_cleanup);
-                companion_glass::bubble_shadow(ui.painter(), visual_rect, alpha);
+                ui.painter().add(
+                    egui::epaint::RectShape::filled(
+                        visual_rect
+                            .shrink(3.0)
+                            .translate(vec2(0.0, 3.0 * (1.0 - state.press[index] / 0.04))),
+                        28,
+                        Color32::from_black_alpha((15.0 * alpha) as u8),
+                    )
+                    .with_blur_width(9.0),
+                );
                 super::bubble_material::paint(
                     ui.painter(),
                     visual_rect,
@@ -594,12 +603,11 @@ fn show_frame(
                     } else {
                         state.hover[index] * 0.55
                     },
-                    phase,
+                    state.press[index] / 0.04,
                     index,
                 );
                 let c = visual_rect.center();
-                let ink = Color32::from_rgb(248, 249, 255)
-                    .gamma_multiply(alpha * if ready { 1.0 } else { 0.80 });
+                let ink = SYMBOL.gamma_multiply(alpha * if ready { 1.0 } else { 0.80 });
                 if finishing {
                     ui.painter()
                         .rect_filled(Rect::from_center_size(c, vec2(13.0, 13.0)), 3, ink);
@@ -612,10 +620,7 @@ fn show_frame(
                         );
                     }
                 } else {
-                    icon(ui.painter(), c, index, ink);
-                }
-                if active {
-                    ui.painter().circle_filled(c + vec2(0.0, 19.0), 1.75, ink);
+                    icon(ui.painter(), c, index, ink, scale);
                 }
                 if r.has_focus() {
                     ui.painter().rect_stroke(
@@ -652,23 +657,15 @@ fn show_frame(
                 ))
             })
             .inner;
-        let target = if response.is_pointer_button_down_on() {
-            0.035
-        } else {
-            0.0
-        };
-        if target > 0.0 {
-            state.press[index] = target;
-            state.press_velocity[index] = 0.0;
-        } else {
-            for _ in 0..4 {
-                let h = dt / 4.0;
-                state.press_velocity[index] += (400.0 * (target - state.press[index])
-                    - 40.0 * state.press_velocity[index])
-                    * h;
-                state.press[index] += state.press_velocity[index] * h;
-            }
-        }
+        let held = response.is_pointer_button_down_on();
+        let target = if held { 0.04 } else { 0.0 };
+        advance_press(
+            &mut state.press[index],
+            &mut state.press_velocity[index],
+            held,
+            dt,
+            reduced,
+        );
         let hover_target = if response.hovered() || response.has_focus() {
             1.0
         } else {
@@ -682,7 +679,7 @@ fn show_frame(
             ctx.request_repaint();
         }
         if alpha > 0.01 {
-            state.regions.push((transform * rect, 28.0 * scale));
+            state.regions.push((rect, 28.0));
         }
         if response.clicked() && closing.is_none() {
             command = state.activate(index, latest, ready);
@@ -690,10 +687,10 @@ fn show_frame(
     }
     if let Some(page) = state.page {
         let height = match page {
-            1 => 346.0,
-            2 => 268.0,
-            3 => 282.0,
-            _ => 210.0,
+            1 => 374.0,
+            2 => 294.0,
+            3 => 304.0,
+            _ => 256.0,
         };
         let rect = Rect::from_min_size(
             pos2(nest_x - 160.0, base.y - height - 18.0),
@@ -723,10 +720,12 @@ fn show_frame(
             state.regions.push((transform * rect, 24.0));
         }
         egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx,|ui|{
-            if closing.is_some() || state.desired_page != Some(page) { ui.disable(); }ui.set_opacity(panel_alpha);ui.set_min_size(rect.size());companion_glass::surface(ui.painter(),rect,24,texture,screen,1.0,false);
+            if closing.is_some() || state.desired_page != Some(page) { ui.disable(); }ui.set_opacity(panel_alpha);ui.set_min_size(rect.size());panel_surface(ui.painter(),rect);
             let mut inside=ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(20.0)).layout(egui::Layout::top_down(egui::Align::Min)));
             let ui=&mut inside;
-            ui.horizontal(|ui|{ui.label(RichText::new(LABELS[page]).heading().color(INK));ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if close_button(ui).on_hover_text("Close panel").clicked(){state.select_panel(None);}});});ui.add_space(4.0);
+            ui.horizontal(|ui|{ui.label(RichText::new(match page {1=>"Learning together",2=>"A name to remember",3=>"Voice & listening",_=>"A little more"}).heading().color(INK));ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if close_button(ui).on_hover_text("Close panel").clicked(){state.select_panel(None);}});});
+            ui.label(RichText::new(match page {1=>"A familiar sound. A shared little ritual.",2=>"Your voice makes it familiar.",3=>"Keep it comfortable for both of you.",_=>"Small moments, whenever you like."}).size(13.0).color(MUTED));
+            ui.add_space(8.0);
 
             ui.add_enabled_ui(ready,|ui|match page{
                 1|2=>{
@@ -736,8 +735,8 @@ fn show_frame(
                     let record=hearing["cues"].as_array().and_then(|a|a.get(index));let count=record.and_then(|r|r["examples"].as_u64()).unwrap_or(0);
                     let training=hearing["training"].is_object();let accepted=hearing["training"]["accepted"].as_u64().unwrap_or(0);
                     ui.small(format!("{count} / 40 examples · {}",if record.is_some_and(|r|r["ready"]==true){"ready to listen"}else{"learning together"}));
-                    ui.horizontal(|ui|{let segment_width=(ui.available_width()-32.0)/5.0;for i in 0..5{let (r,_)=ui.allocate_exact_size(vec2(segment_width,5.0),Sense::hover());ui.painter().rect_filled(r,3,if training&&(i as u64)<accepted {ACCENT}else{Color32::from_rgb(218,205,237)});}});
-                    ui.label(RichText::new(if training{ "Listening… leave a short pause between phrases." }else{"Say it five times, with a short pause. Existing examples stay saved."}).size(12.0).color(MUTED));
+                    ui.horizontal(|ui|{let segment_width=(ui.available_width()-32.0)/5.0;for i in 0..5{let (r,_)=ui.allocate_exact_size(vec2(segment_width,5.0),Sense::hover());ui.painter().rect_filled(r,3,if training&&(i as u64)<accepted {ACCENT}else{Color32::from_rgb(61,77,86)});}});
+                    ui.label(RichText::new(if training{ "Listening… leave a short pause between phrases." }else{"Say it five times, with a short pause. Existing examples stay saved."}).size(13.0).color(MUTED));
                     if primary(ui,if training{"Stop recording"}else{"Record 5 examples"}){command=Some(LabControlCommand::Hearing{action:if training{H::CancelTraining}else{H::TrainCommand{cue}}});}
                     if page==1 {ui.horizontal(|ui|{if ui.button("Show me").clicked(){command=Some(LabControlCommand::Hearing{action:H::Perform{cue}});}
 if ui.button("Try my voice").clicked(){command=Some(LabControlCommand::Hearing{action:H::Test});}});if ui.small_button("Record other words").on_hover_text("Helps distinguish a command from everyday speech").clicked(){command=Some(LabControlCommand::Hearing{action:H::TrainOther});}}
@@ -833,7 +832,7 @@ pub(super) fn capture_frame(ctx: &egui::Context, fixture: &str) {
             for slot in 0..5 {
                 let rect = Rect::from_center_size(
                     pos2(45.0 + slot as f32 * 79.0, top + 80.0),
-                    vec2(56.0, 56.0) * if slot == 3 { 0.965 } else { 1.0 },
+                    vec2(56.0, 56.0) * if slot == 3 { 0.96 } else { 1.0 },
                 );
                 let alpha = if slot == 4 { 0.5 } else { 1.0 };
                 let tint = accent(if slot == 2 { 1 } else { 0 });
@@ -842,21 +841,22 @@ pub(super) fn capture_frame(ctx: &egui::Context, fixture: &str) {
                     rect,
                     tint,
                     alpha,
-                    if slot == 1 {
-                        0.55
+                    if slot == 1 || slot == 3 {
+                        0.72
                     } else if slot == 2 {
                         1.0
                     } else {
                         0.0
                     },
-                    0.0,
+                    if slot == 3 { 1.0 } else { 0.0 },
                     slot,
                 );
                 icon(
                     &painter,
                     rect.center(),
                     if slot == 2 { 1 } else { 0 },
-                    Color32::from_rgb(248, 249, 255).gamma_multiply(alpha),
+                    SYMBOL.gamma_multiply(alpha),
+                    if slot == 3 { 0.96 } else { 1.0 },
                 );
             }
         }
@@ -889,12 +889,34 @@ pub(super) fn capture_frame(ctx: &egui::Context, fixture: &str) {
         }
         "failure" => state.action_error = true,
         "hover" => state.hover[0] = 1.0,
-        "pressed" => state.press[0] = 0.035,
+        "pressed" => {
+            state.press[0] = 0.04;
+            state.hover[0] = 1.0;
+        }
         "panel-exit" => {
             state.desired_page = None;
             state.panel_presence = 0.55;
         }
         _ => {}
+    }
+    if let Some(t) = fixture
+        .strip_prefix("press-")
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        // Hold for 180ms then release; use the exact live response helper.
+        let mut elapsed = 0.0_f32;
+        while elapsed < t {
+            let dt = (t - elapsed).min(1.0 / 120.0);
+            advance_press(
+                &mut state.press[0],
+                &mut state.press_velocity[0],
+                elapsed < 0.18,
+                dt,
+                false,
+            );
+            elapsed += dt;
+        }
+        state.hover[0] = 1.0;
     }
     if let Some(t) = fixture
         .strip_prefix("float-")
@@ -931,9 +953,9 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
         center,
         radius,
         if response.hovered() {
-            Color32::from_rgb(224, 213, 242)
+            Color32::from_rgb(65, 80, 91)
         } else {
-            Color32::from_rgb(236, 230, 250)
+            Color32::from_rgb(44, 55, 65)
         },
     );
     for sign in [-1.0, 1.0] {
@@ -952,7 +974,7 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
 fn primary(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add_sized(
         [ui.available_width(), 36.0],
-        egui::Button::new(RichText::new(label).color(Color32::WHITE))
+        egui::Button::new(RichText::new(label).color(SYMBOL).strong())
             .fill(ACCENT)
             .corner_radius(12),
     )
@@ -1027,6 +1049,47 @@ mod tests {
                 "pending action must not dispatch twice"
             );
         }
+    }
+
+    #[test]
+    fn held_control_keeps_full_hit_area_and_release_dispatches_once() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut state = MenuState::new(false);
+        state.capture_elapsed = Some(2.0);
+        for _ in 0..3 {
+            let _ = ui_tick(&ctx, &mut state, true, vec![]);
+        }
+        let initial = state.regions[0];
+        let position = initial.0.center() + vec2(25.5, 0.0);
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let _ = ui_tick(
+            &ctx,
+            &mut state,
+            true,
+            vec![egui::Event::PointerMoved(position), pointer(true)],
+        );
+        for _ in 0..12 {
+            let _ = ui_tick(&ctx, &mut state, true, vec![]);
+        }
+        assert!(
+            state.press[0] > 0.03,
+            "the live response must reach a visible depression while held"
+        );
+        assert_eq!(
+            state.regions[0], initial,
+            "visual depression must not shrink or translate the hit target"
+        );
+        assert!(matches!(
+            ui_tick(&ctx, &mut state, true, vec![pointer(false)]),
+            Some(LabControlCommand::Feeding { enabled: true })
+        ));
+        assert!(ui_tick(&ctx, &mut state, true, vec![]).is_none());
     }
 
     #[test]

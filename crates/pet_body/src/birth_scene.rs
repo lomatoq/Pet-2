@@ -26,13 +26,27 @@ pub struct BirthScene {
 }
 
 const IMAGES: [&[u8]; 6] = [
-    include_bytes!("../../../assets/nest/nest-pearl-v28.rgba"),
-    include_bytes!("../../../assets/birth/lower_back.rgba"),
-    include_bytes!("../../../assets/birth/upper_back.rgba"),
-    include_bytes!("../../../assets/birth/orb.rgba"),
-    include_bytes!("../../../assets/birth/lower_front.rgba"),
-    include_bytes!("../../../assets/birth/upper_front.rgba"),
+    include_bytes!("../../../assets/props-v67/nest.rgba"),
+    include_bytes!("../../../assets/props-v67/capsule-lower.rgba"),
+    include_bytes!("../../../assets/props-v67/capsule-upper.rgba"),
+    include_bytes!("../../../assets/props-v67/energy-orb.rgba"),
+    include_bytes!("../../../assets/props-v67/capsule-lower.rgba"),
+    include_bytes!("../../../assets/props-v67/capsule-upper.rgba"),
 ];
+
+/// The generated source keeps its original RGBA level, followed by an offline
+/// linear-light, premultiplied-alpha mip pyramid. All entries are embedded.
+pub(crate) fn authored_mip_levels(mut bytes: &[u8]) -> Vec<(u32, u32, &[u8])> {
+    let mut levels = Vec::new();
+    while !bytes.is_empty() {
+        let width = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let length = width as usize * height as usize * 4;
+        levels.push((width, height, &bytes[8..8 + length]));
+        bytes = &bytes[8 + length..];
+    }
+    levels
+}
 
 impl BirthScene {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -159,9 +173,11 @@ impl BirthScene {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         for bytes in IMAGES {
+            let levels = authored_mip_levels(bytes);
             let width = u32::from_le_bytes(bytes[..4].try_into().unwrap());
             let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
             let size = wgpu::Extent3d {
@@ -172,28 +188,34 @@ impl BirthScene {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("authored RGBA layer"),
                 size,
-                mip_level_count: 1,
+                mip_level_count: levels.len() as u32,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &bytes[8..],
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                size,
-            );
+            for (mip_level, (width, height, pixels)) in levels.into_iter().enumerate() {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: mip_level as u32,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width * 4),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
             let view = texture.create_view(&Default::default());
             self.textures
                 .push(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -234,12 +256,12 @@ impl BirthScene {
         sprites.push(self.revealed_den(den_sprite(viewport, den, den_scale, false)));
         if let Some((t, monitor)) = birth {
             let pose = vfx::Pose::new(t, monitor);
-            for (x, y, sw, sh, side) in [
-                (-546.98, 197.43, 1088.39, 787.0, 1.0),
-                (-548.0, -928.0, 1089.0, 666.0, -1.0),
-                (-626.9, -676.3, 1249.0, 1256.2, 0.0),
-                (-544.0, 365.0, 1086.0, 618.0, 1.0),
-                (-546.0, -929.0, 1087.0, 566.0, -1.0),
+            for (x, y, sw, sh, side, layer) in [
+                (-546.98, 197.43, 1088.39, 787.0, 1.0, 1.0),
+                (-548.0, -928.0, 1089.0, 666.0, -1.0, 2.0),
+                (-626.9, -676.3, 1249.0, 1256.2, 0.0, 0.0),
+                (-546.98, 197.43, 1088.39, 787.0, 1.0, 3.0),
+                (-548.0, -928.0, 1089.0, 666.0, -1.0, 4.0),
             ] {
                 let position = pose.world(glam::Vec2::new(x + sw * 0.5, y + sh * 0.5), side);
                 let open = ((t - 7.79) / 0.92).clamp(0.0, 1.0);
@@ -260,7 +282,7 @@ impl BirthScene {
                         sw * pose.scale * scale.x * 0.5,
                         sh * pose.scale * scale.y * 0.5,
                     ],
-                    effect: [t, if side == 0.0 { 1.0 } else { 0.0 }, 0.0, 0.0],
+                    effect: [t, if side == 0.0 { 1.0 } else { 0.0 }, layer, 0.0],
                     style: [pose.angle(side), opacity, 1.0 / w, 1.0 / h],
                     color: [1.0; 4],
                     ribbon_edges: [0.0; 4],
@@ -395,14 +417,15 @@ fn den_sprite(viewport: [u32; 2], den: [f32; 2], scale: f32, front: bool) -> Spr
     let w = viewport[0].max(1) as f32;
     let h = viewport[1].max(1) as f32;
     let width = den_width_pixels(viewport, scale);
+    // Source registration keeps the established physical rim and floor. These
+    // are measured source landmarks, not collision parameters for a new shape.
+    let source_y_scale = width * (0.292 - 0.171) / (757.0 - 566.0);
     Sprite {
-        // The visible base is at source y=846/1024. Its screen position remains
-        // anchor + .292*width, matching the taskbar placement of earlier builds.
         rect: [
             den[0] * w,
-            den[1] * h + width * 0.074_552_1,
+            den[1] * h + width * 0.292 - (757.0 - 866.0 * 0.5) * source_y_scale,
             width * 0.5,
-            width / 3.0,
+            866.0 * 0.5 * source_y_scale,
         ],
         effect: [0.0, if front { -1.0 } else { -2.0 }, 0.0, 0.0],
         style: [0.0, 1.0, 1.0 / w, 1.0 / h],
@@ -436,11 +459,26 @@ mod tests {
             let back = den_sprite(viewport, anchor, 1.0, false);
             let front = den_sprite(viewport, anchor, 1.0, true);
             assert_eq!(back.rect, front.rect);
-            let base = back.rect[1] + (846.0 / 1024.0 - 0.5) * back.rect[3] * 2.0;
+            let base = back.rect[1] + (757.0 / 866.0 - 0.5) * back.rect[3] * 2.0;
             assert!((base - viewport[1] as f32).abs() < 0.5);
-            let rim = back.rect[1] + (660.0 / 1024.0 - 0.5) * back.rect[3] * 2.0;
+            let rim = back.rect[1] + (566.0 / 866.0 - 0.5) * back.rect[3] * 2.0;
             let seat = anchor[1] * viewport[1] as f32 + den_seat_depth_pixels(viewport, 1.0);
             assert!(seat > rim && seat - rim < width * 0.04);
+        }
+    }
+
+    #[test]
+    fn generated_assets_have_complete_finite_mip_pyramids() {
+        for bytes in IMAGES {
+            let levels = authored_mip_levels(bytes);
+            assert!(levels.len() >= 9);
+            for pair in levels.windows(2) {
+                assert_eq!(pair[1].0, (pair[0].0 / 2).max(1));
+                assert_eq!(pair[1].1, (pair[0].1 / 2).max(1));
+            }
+            let last = levels.last().unwrap();
+            assert_eq!((last.0, last.1, last.2.len()), (1, 1, 4));
+            assert!(bytes.len() < 10_000_000);
         }
     }
 

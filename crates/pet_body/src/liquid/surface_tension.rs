@@ -12,12 +12,26 @@ use super::{
 /// lobe prevents coincident particles; its positive outer lobe minimizes exposed
 /// surface. Every pair receives equal-and-opposite acceleration, so cohesion
 /// cannot move the creature's centre of mass.
+#[cfg(test)]
 pub fn apply_surface_tension(
     particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
     count: usize,
     kernel_radius: f32,
     rest_density: f32,
     tension: f32,
+) {
+    apply_surface_tension_at_wall(particles, count, kernel_radius, rest_density, tension, None);
+}
+
+/// The solid-liquid interface has its own energy. Do not reduce cohesion in
+/// the upper mass just because another particle touched a support surface.
+pub(super) fn apply_surface_tension_at_wall(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    kernel_radius: f32,
+    rest_density: f32,
+    tension: f32,
+    wall: Option<super::xpbd::SupportPlane>,
 ) {
     let count = count.min(MAX_LIQUID_PARTICLES);
     let tension = tension.clamp(0.0, 2.5);
@@ -72,8 +86,18 @@ pub fn apply_surface_tension(
             // existing slider remains an acceleration-scale authoring control.
             let cohesion_term = delta / distance * cohesion * 0.85;
             let curvature_term = -(normals[first] - normals[second]) * 0.15;
+            let interface = wall.map_or(0.0, |wall| {
+                let distance =
+                    |p: Vec2| ((p - wall.point).dot(wall.normal) - wall.clearance).max(0.0);
+                let q = (distance(snapshot[first].position)
+                    .min(distance(snapshot[second].position))
+                    / (kernel_radius * 0.70))
+                    .clamp(0.0, 1.0);
+                1.0 - q * q * (3.0 - 2.0 * q)
+            });
+            let pair_tension = tension + (tension.min(0.48) - tension) * interface;
             let pair_acceleration =
-                (cohesion_term + curvature_term) * (tension * density_correction);
+                (cohesion_term + curvature_term) * (pair_tension * density_correction);
             accelerations[first] += pair_acceleration;
             accelerations[second] -= pair_acceleration;
         }
@@ -107,6 +131,41 @@ fn akinci_cohesion_2d(q: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wall_wetting_is_local_pair_symmetric_and_air_is_exactly_unchanged() {
+        let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+        for (i, p) in particles[..4].iter_mut().enumerate() {
+            p.position = Vec2::new((i % 2) as f32 * 0.12, (i / 2) as f32 * 0.8);
+            p.inverse_mass = 1.0;
+            p.density = 1.0;
+        }
+        let mut free = particles;
+        let mut near = particles;
+        let mut far = particles;
+        let wall = super::super::xpbd::SupportPlane {
+            point: Vec2::ZERO,
+            normal: Vec2::Y,
+            clearance: 0.0,
+        };
+        apply_surface_tension(&mut free, 4, 0.2, 1.0, 2.0);
+        apply_surface_tension_at_wall(&mut near, 4, 0.2, 1.0, 2.0, Some(wall));
+        apply_surface_tension_at_wall(
+            &mut far,
+            4,
+            0.2,
+            1.0,
+            2.0,
+            Some(super::super::xpbd::SupportPlane {
+                point: -Vec2::Y,
+                ..wall
+            }),
+        );
+        assert_eq!(free, far, "a far surface changed the bulk material");
+        assert_eq!(near[2].force, free[2].force);
+        assert_eq!(near[3].force, free[3].force);
+        assert_eq!(near[0].force, -near[1].force);
+        assert!(near[0].force.length() < free[0].force.length() * 0.3);
+    }
 
     #[test]
     fn cohesion_is_pair_symmetric_and_compact() {

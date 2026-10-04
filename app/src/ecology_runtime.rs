@@ -825,7 +825,9 @@ impl EcologyRuntime {
         let id = food.id;
         let awake = body.somatic_actuation().locomotion.pose != pet_motor::MotorPoseIntent::SupportedSleep;
         let floor_supported = !settled || (self.food_grounded
-            && ((center.y + support.y / height) - self.food_rest.unwrap().1.y).abs() * height < 8.0);
+            && ((center.y + support.y / height) - self.food_rest.unwrap().1.y).abs() * height < 8.0
+            && (self.food_bite_started == Some(id) || floor_bite_support_ready(body,
+                (self.food_rest.unwrap().1.y - center.y) * height, height)));
         let open = body.embodiment.pose.mouth_open > 0.08;
         // Closing a verified bite is allowed; a stale caught-object latch is
         // never itself current contact or permission to swallow while asleep.
@@ -2193,6 +2195,26 @@ impl EcologyRuntime {
     }
 }
 
+/// A floor bite starts after the lower body can support its mouth excursion.
+/// A stable rounded/irregular support can also feed once the real motion has
+/// settled; it does not need to wait forever for a perfectly flat footprint.
+fn floor_bite_support_ready(body: &ProceduralBody, floor_y: f32, height: f32) -> bool {
+    let hull = body.main_liquid_contact_bounds_pixels(height);
+    let half_patch = (hull.maximum.x - hull.minimum.x) * 0.20;
+    let patch_ready = [-1.0, -0.5, 0.0, 0.5, 1.0].iter().all(|x| {
+        let p = Vec2::new(x * half_patch, floor_y - 2.0);
+        body.liquid_physical_circle_contact_pixels(p, p, 1.0, height)
+            .is_some()
+    });
+    let d = body.embodiment.liquid.diagnostics();
+    let quiescent_loaded_support = d.support_field_load > 0.0
+        && d.support_normal_impulse > 0.01
+        && d.maximum_speed < 0.08
+        && d.detached_mass == 0.0
+        && (floor_y - hull.maximum.y).abs() < 3.0;
+    patch_ready || quiescent_loaded_support
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2276,16 +2298,18 @@ mod tests {
     #[test]
     fn floor_food_has_visible_ingress_before_consumption_without_changing_portion() {
         for (height, gap) in [(720.0, 30.0), (1080.0, 30.0), (1440.0, 45.0)] {
-            exercise_floor_food_landing(height, gap, 1, 42);
+            for physical_support in [false, true] {
+                exercise_floor_food_landing(height, gap, 1, 42, physical_support);
+            }
         }
     }
 
     #[test]
     fn consecutive_floor_crumbs_keep_contact_and_liquid_cohesion() {
-        exercise_floor_food_landing(1080.0, 30.0, 3, 5784121873664838231);
+        exercise_floor_food_landing(1080.0, 30.0, 3, 5784121873664838231, true);
     }
 
-    fn exercise_floor_food_landing(height: f32, gap: f32, crumbs: usize, seed: u64) {
+    fn exercise_floor_food_landing(height: f32, gap: f32, crumbs: usize, seed: u64, physical_support: bool) {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::at(directory.path());
         let mut runtime = EcologyRuntime::load_or_create(&store, 42, true).unwrap();
@@ -2395,6 +2419,9 @@ mod tests {
                 support: runtime.feeding_support(),
                 ..Default::default()
             });
+            if physical_support {
+                body.embodiment.liquid.set_environment_support(runtime.feeding_support());
+            }
             body.embodied_update(
                 &intent,
                 &sensors,
@@ -2535,7 +2562,7 @@ mod tests {
             "feeding face jumped {maximum_face_step}px"
         );
         eprintln!(
-            "feeding verified: height={height}, crumbs={crumbs}, max_detached={maximum_detached}, root_step={maximum_step}px, face_step={maximum_face_step}px"
+            "feeding verified: height={height}, geometry={physical_support}, crumbs={crumbs}, max_detached={maximum_detached}, root_step={maximum_step}px, face_step={maximum_face_step}px"
         );
         assert!(
             maximum_detached < 8.0,

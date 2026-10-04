@@ -1,5 +1,5 @@
 use glam::Vec2;
-use lifecore::{CompanionIntentFrame, PrimaryIntent};
+use lifecore::{CompanionIntentFrame, FaceGeometry, PrimaryIntent};
 
 use crate::gaze_controller::GazeMode as CompanionGazeMode;
 use crate::{
@@ -9,6 +9,9 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FaceTarget {
+    /// Contextual deviations from neutral geometry. They compose with the
+    /// phenotype rig; expression, blink and speech keep independent ownership.
+    pub geometry: FaceGeometry,
     pub eye_aperture: f32,
     pub squint: f32,
     pub pupil_size: f32,
@@ -21,6 +24,38 @@ pub struct FaceTarget {
     pub mouth_tension: f32,
     pub mouth_compression: f32,
     pub mouth_asymmetry: f32,
+}
+
+impl FaceTarget {
+    pub fn apply_geometry(self, geometry: &mut FaceGeometry) {
+        let neutral = FaceGeometry::default();
+        for ((out, value), base) in geometry
+            .lids
+            .iter_mut()
+            .flatten()
+            .chain(geometry.brows.iter_mut().flatten())
+            .chain(geometry.mouth.iter_mut())
+            .zip(
+                self.geometry
+                    .lids
+                    .iter()
+                    .flatten()
+                    .chain(self.geometry.brows.iter().flatten())
+                    .chain(self.geometry.mouth.iter()),
+            )
+            .zip(
+                neutral
+                    .lids
+                    .iter()
+                    .flatten()
+                    .chain(neutral.brows.iter().flatten())
+                    .chain(neutral.mouth.iter()),
+            )
+        {
+            *out += value - base;
+        }
+        *geometry = geometry.sanitized();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,6 +129,11 @@ pub struct CompanionExpressionDirector {
     expressive_side: f32,
     brow_asymmetry: f32,
     mouth_asymmetry: f32,
+    /// Short-lived performance memory, never a pose timer or a random variant.
+    appraisal_adaptation: f32,
+    expected_success: f32,
+    contact_warmth: f32,
+    direction: f32,
 }
 
 impl CompanionExpressionDirector {
@@ -123,6 +163,10 @@ impl CompanionExpressionDirector {
             },
             brow_asymmetry: 0.0,
             mouth_asymmetry: 0.0,
+            appraisal_adaptation: 0.0,
+            expected_success: 0.0,
+            contact_warmth: 0.0,
+            direction: 0.0,
         }
     }
 
@@ -134,6 +178,60 @@ impl CompanionExpressionDirector {
         dt: f32,
     ) -> CompanionExpressionTarget {
         let intent = intent.sanitized();
+        let safe_dt = finite(dt, 0.0).clamp(0.0, 0.25);
+        let danger = evidence.protective_reflex
+            || evidence.pain_like > 0.22
+            || evidence.contact_strain > 0.65
+            || intent.protective();
+        let sleeping = intent.primary == PrimaryIntent::Sleep;
+        let safe_contact = !danger
+            && !sleeping
+            && evidence.contact_pressure > 0.02
+            && matches!(
+                intent.primary,
+                PrimaryIntent::AcceptContact | PrimaryIntent::Nuzzle
+            );
+        let active_contact = evidence.contact_point.filter(|point| {
+            point.is_finite() && evidence.contact_pressure > 0.02 && (safe_contact || danger)
+        });
+        let direction = active_contact
+            .or(intent.target.position)
+            .filter(|_| evidence.body_position.is_finite())
+            .map(|point| {
+                let delta = point - evidence.body_position;
+                delta.x / (delta.length() + 0.035)
+            })
+            .unwrap_or(self.expressive_side * 0.30);
+        self.direction = follow(self.direction, direction, safe_dt, 0.28);
+        let appraisal = if sleeping || danger {
+            0.0
+        } else {
+            intent.curiosity * 0.55 + intent.surprise * 0.30 + intent.anticipation * 0.15
+        };
+        self.appraisal_adaptation = follow(self.appraisal_adaptation, appraisal, safe_dt, 2.8);
+        let orienting = (appraisal - self.appraisal_adaptation).max(0.0);
+        let expected_before = self.expected_success;
+        self.expected_success = follow(
+            self.expected_success,
+            intent.expected_outcome.success * intent.anticipation,
+            safe_dt,
+            1.6,
+        );
+        let warmth_target = if safe_contact {
+            intent.contact_pleasantness.max(0.0)
+        } else {
+            0.0
+        };
+        self.contact_warmth = follow(
+            self.contact_warmth,
+            warmth_target,
+            safe_dt,
+            if warmth_target > self.contact_warmth {
+                0.65
+            } else {
+                2.8
+            },
+        );
         let mut face = face_prototype(intent.primary);
         let mut body = body_prototype(intent.primary);
         let mut owner = ExpressionOwner::MotorIntent;
@@ -162,24 +260,69 @@ impl CompanionExpressionDirector {
         // These are sustained targets; ExpressionRuntime owns their transitions.
         match intent.primary {
             PrimaryIntent::Inspect | PrimaryIntent::Explore | PrimaryIntent::SearchObject => {
-                face.mouth_open = 0.04 + intent.curiosity * 0.10;
-                face.mouth_compression = (1.0 - intent.confidence) * 0.12;
-                face.brow_raise += intent.curiosity * 0.12;
+                let uncertainty =
+                    (1.0 - intent.confidence).max(intent.expected_outcome.uncertainty);
+                face.eye_aperture =
+                    0.96 + 0.04 * intent.confidence - 0.25 * intent.fatigue - 0.035 * uncertainty;
+                face.mouth_open = 0.025 + intent.curiosity * (0.04 + orienting * 0.15);
+                face.mouth_curve = 0.02 + intent.confidence * 0.10 - uncertainty * 0.07;
+                face.mouth_compression = uncertainty * 0.20;
+                face.brow_raise =
+                    0.14 + intent.curiosity * 0.25 + uncertainty * 0.12 + orienting * 0.18;
+                face.brow_tension += uncertainty * 0.06;
+                face.geometry.mouth[0] = 0.90 + intent.confidence * 0.15;
+                for (i, lid) in face.geometry.lids.iter_mut().enumerate() {
+                    let side = if i == 0 { -1.0 } else { 1.0 };
+                    lid[0] = -uncertainty * 0.10 * (1.0 + side * self.direction);
+                    lid[1] = -intent.fatigue * 0.14;
+                    lid[3] = intent.curiosity * 0.12;
+                }
             }
             PrimaryIntent::InvitePlay | PrimaryIntent::Chase | PrimaryIntent::Intercept => {
-                let delight = intent.confidence * 0.55 + intent.play_readiness * 0.45;
+                let delight = (intent.confidence * 0.55 + intent.play_readiness * 0.45)
+                    * (1.0 - intent.fatigue * 0.48);
                 face.mouth_curve = 0.28 + delight * 0.28;
                 face.mouth_open = 0.08 + delight * 0.16;
                 face.squint = 0.08 + delight * 0.10;
-                face.eye_aperture = 0.94 - delight * 0.06;
+                face.eye_aperture = 0.94 - delight * 0.06 - intent.fatigue * 0.19;
+                face.geometry.mouth[0] = 0.92 + delight * 0.25;
+                face.geometry.lids = [[0.0, 0.0, delight * 0.16, 0.08]; 2];
+            }
+            PrimaryIntent::Celebrate => {
+                let delight = (intent.valence.max(0.0) * 0.32
+                    + intent.arousal * 0.26
+                    + intent.confidence * 0.22
+                    + intent.play_readiness * 0.20)
+                    * (1.0 - intent.fatigue * 0.40);
+                face.mouth_curve = 0.30 + delight * 0.50;
+                face.mouth_open = 0.035 + delight * delight * 0.34;
+                face.squint = 0.045 + delight * 0.23;
+                face.brow_raise = 0.07 + delight * 0.24 + orienting * 0.10;
+                face.eye_aperture = 0.96 - delight * 0.15 - intent.fatigue * 0.18;
+                face.geometry.mouth[0] = 0.90 + delight * 0.32;
+                face.geometry.lids = [[0.0, 0.0, delight * 0.20, 0.12]; 2];
             }
             PrimaryIntent::RecoverFromMiss => {
-                face.mouth_curve = -0.12 - intent.frustration * 0.22;
-                face.mouth_compression = 0.12 + intent.frustration * 0.25;
+                // A lost expectation first reads as a question, then softens.
+                // Frustration can tense the lips; it is not defensive anger.
+                face.mouth_curve = -0.06 - intent.frustration * 0.25 - expected_before * 0.05;
+                face.mouth_compression = 0.08 + intent.frustration * 0.30 + expected_before * 0.12;
                 face.mouth_tension = 0.10 + intent.frustration * 0.20;
                 face.eye_aperture = 0.88 - intent.frustration * 0.12;
+                face.brow_raise = 0.12 + expected_before * 0.35 + intent.surprise * 0.15;
+                face.brow_tension = 0.02 + intent.frustration * 0.08;
+                face.geometry.brows = [[0.16 + expected_before * 0.20, 0.0, 0.30, 1.0]; 2];
+                face.geometry.mouth[0] = 0.94 - intent.frustration * 0.13;
             }
             _ => {}
+        }
+
+        if !danger && !sleeping {
+            // The received touch leaves a brief affiliative after-effect. The
+            // cached point alone is not contact and cannot manufacture warmth.
+            face.mouth_curve += self.contact_warmth * 0.18;
+            face.brow_tension *= 1.0 - self.contact_warmth * 0.60;
+            face.squint += self.contact_warmth * 0.10;
         }
 
         if matches!(
@@ -199,15 +342,20 @@ impl CompanionExpressionDirector {
                 let axis = (point - evidence.body_position).normalize_or_zero();
                 body.lean += axis * 0.05 * pleasant;
             }
+            if safe_contact {
+                face.geometry.mouth[0] = 0.95 + self.contact_warmth * 0.14;
+                for (i, lid) in face.geometry.lids.iter_mut().enumerate() {
+                    let side = if i == 0 { -1.0 } else { 1.0 };
+                    lid[2] = pleasant * (0.10 + 0.08 * (1.0 + side * self.direction));
+                    lid[0] = -pleasant * 0.04 * (1.0 + side * self.direction);
+                }
+            }
         }
 
         // Physical integrity owns the final semantic face. It may never be
         // overwritten by positive valence or attachment.
-        let danger = evidence.protective_reflex
-            || evidence.pain_like > 0.22
-            || evidence.contact_strain > 0.65
-            || intent.protective();
         if danger {
+            face.geometry = FaceGeometry::default();
             owner = ExpressionOwner::Integrity;
             let pain = evidence
                 .pain_like
@@ -257,12 +405,11 @@ impl CompanionExpressionDirector {
                 _ => (0.0, 0.0),
             }
         };
-        let safe_dt = finite(dt, 0.0).clamp(0.0, 0.25);
         let brow_tau = if danger { 0.08 } else { 0.32 };
         let mouth_tau = if danger { 0.08 } else { 0.46 };
-        self.brow_asymmetry += (brow_target * self.expressive_side - self.brow_asymmetry)
+        self.brow_asymmetry += (brow_target * self.direction - self.brow_asymmetry)
             * (1.0 - (-safe_dt / brow_tau).exp());
-        self.mouth_asymmetry += (mouth_target * self.expressive_side - self.mouth_asymmetry)
+        self.mouth_asymmetry += (mouth_target * self.direction - self.mouth_asymmetry)
             * (1.0 - (-safe_dt / mouth_tau).exp());
         face.brow_asymmetry = self.brow_asymmetry;
         face.mouth_asymmetry = self.mouth_asymmetry;
@@ -375,6 +522,7 @@ fn gaze_mode_for(intent: PrimaryIntent, uncertainty: f32) -> CompanionGazeMode {
 
 fn face_prototype(intent: PrimaryIntent) -> FaceTarget {
     let mut face = FaceTarget {
+        geometry: FaceGeometry::default(),
         eye_aperture: 0.98,
         squint: 0.0,
         pupil_size: 0.50,
@@ -505,6 +653,7 @@ fn body_prototype(intent: PrimaryIntent) -> BodyStyleTarget {
 }
 
 fn sanitize_face(face: &mut FaceTarget) {
+    face.geometry = face.geometry.sanitized();
     face.eye_aperture = unit(face.eye_aperture);
     face.squint = unit(face.squint);
     face.pupil_size = unit(face.pupil_size);
@@ -545,6 +694,10 @@ fn finite(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
 }
 
+fn follow(current: f32, target: f32, dt: f32, tau: f32) -> f32 {
+    current + (target - current) * (1.0 - (-dt / tau).exp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,7 +732,16 @@ mod tests {
             },
             0.05,
         );
-        let joy = director.tick(intent(PrimaryIntent::Celebrate), Default::default(), 0.05);
+        let joy = director.tick(
+            CompanionIntentFrame {
+                valence: 0.9,
+                arousal: 0.8,
+                play_readiness: 0.9,
+                ..intent(PrimaryIntent::Celebrate)
+            },
+            Default::default(),
+            0.05,
+        );
         assert!(alarm.face.brow_raise > 0.65 && alarm.face.mouth_open > 0.4);
         assert!(alarm.face.brow_tension < 0.25);
         assert!(boundary.face.brow_tension > 0.6 && boundary.face.mouth_curve < 0.0);
@@ -666,8 +828,10 @@ mod tests {
             assert!((face.face.brow_asymmetry + other.face.brow_asymmetry).abs() < 1.0e-6);
             assert_eq!(face.blink_left > 0.001, face.blink_right > 0.0009);
             if frame > 180 {
-                assert!(face.face.brow_asymmetry.abs() > 0.35);
-                assert!(face.face.mouth_asymmetry.abs() > 0.07);
+                // With no spatial evidence, identity is a quiet bias rather
+                // than a permanently raised eyebrow on the same side.
+                assert!((0.10..0.13).contains(&face.face.brow_asymmetry.abs()));
+                assert!((0.02..0.03).contains(&face.face.mouth_asymmetry.abs()));
             }
         }
     }
@@ -683,7 +847,7 @@ mod tests {
                 1.0 / 60.0,
             );
         }
-        assert!(previous.face.mouth_asymmetry.abs() > 0.23);
+        assert!(previous.face.mouth_asymmetry.abs() > 0.07);
         assert!(previous.face.mouth_curve > 0.0);
         for _ in 0..180 {
             let current = director.tick(
@@ -695,8 +859,8 @@ mod tests {
             assert!((current.face.brow_asymmetry - previous.face.brow_asymmetry).abs() < 0.02);
             previous = current;
         }
-        assert!(previous.face.brow_asymmetry.abs() > 0.41);
-        assert!(previous.face.mouth_asymmetry.abs() > 0.13);
+        assert!(previous.face.brow_asymmetry.abs() > 0.12);
+        assert!(previous.face.mouth_asymmetry.abs() > 0.04);
         assert!(previous.face.mouth_curve <= 0.0);
         for _ in 0..300 {
             previous = director.tick(intent(PrimaryIntent::Rest), Default::default(), 1.0 / 60.0);
@@ -767,5 +931,239 @@ mod tests {
             active = next;
         }
         assert_eq!(starts, 1);
+    }
+
+    fn held(input: CompanionIntentFrame, evidence: ExpressionEvidence, seconds: f32) -> FaceTarget {
+        let mut director = CompanionExpressionDirector::new(42);
+        let mut face = FaceTarget::default();
+        for _ in 0..(seconds * 60.0) as usize {
+            face = director.tick(input, evidence, 1.0 / 60.0).face;
+        }
+        face
+    }
+
+    #[test]
+    fn same_intent_has_contextual_repertoire_instead_of_seeded_pose_variants() {
+        let fresh = intent(PrimaryIntent::Inspect);
+        let alert = held(fresh, Default::default(), 2.0);
+        let tired = held(
+            CompanionIntentFrame {
+                fatigue: 0.85,
+                ..fresh
+            },
+            Default::default(),
+            2.0,
+        );
+        let cautious = held(
+            CompanionIntentFrame {
+                confidence: 0.1,
+                ..fresh
+            },
+            Default::default(),
+            2.0,
+        );
+        assert!(alert.eye_aperture - tired.eye_aperture > 0.20);
+        assert!(cautious.mouth_compression - alert.mouth_compression > 0.15);
+        assert!(cautious.brow_raise - alert.brow_raise > 0.09);
+        assert!(cautious.geometry.maximum_error(alert.geometry) > 0.10);
+        let small = held(
+            CompanionIntentFrame {
+                primary: PrimaryIntent::Celebrate,
+                confidence: 0.35,
+                valence: 0.3,
+                arousal: 0.15,
+                ..Default::default()
+            },
+            Default::default(),
+            2.0,
+        );
+        let big = held(
+            CompanionIntentFrame {
+                primary: PrimaryIntent::Celebrate,
+                confidence: 0.95,
+                valence: 0.95,
+                arousal: 0.9,
+                play_readiness: 0.9,
+                ..Default::default()
+            },
+            Default::default(),
+            2.0,
+        );
+        assert!(big.mouth_curve - small.mouth_curve > 0.30);
+        assert!(big.mouth_open - small.mouth_open > 0.20);
+        assert!(big.geometry.maximum_error(small.geometry) > 0.15);
+    }
+
+    #[test]
+    fn contact_side_changes_local_lids_and_safe_touch_leaves_a_short_aftereffect() {
+        let input = CompanionIntentFrame {
+            contact_pleasantness: 0.9,
+            ..intent(PrimaryIntent::AcceptContact)
+        };
+        let evidence = |side| ExpressionEvidence {
+            body_position: Vec2::splat(0.5),
+            contact_point: Some(Vec2::new(side, 0.5)),
+            contact_pressure: 0.12,
+            ..Default::default()
+        };
+        let left = held(input, evidence(0.2), 2.0);
+        let right = held(input, evidence(0.8), 2.0);
+        assert!(left.geometry.lids[0][2] - right.geometry.lids[0][2] > 0.12);
+        assert!((left.geometry.lids[0][2] - right.geometry.lids[1][2]).abs() < 1e-5);
+        let mut director = CompanionExpressionDirector::new(42);
+        for _ in 0..120 {
+            let _ = director.tick(input, evidence(0.2), 1.0 / 60.0);
+        }
+        let quiet = intent(PrimaryIntent::QuietCompanionship);
+        let after = director.tick(quiet, Default::default(), 1.0 / 60.0).face;
+        let untouched = held(quiet, Default::default(), 1.0);
+        assert!(after.mouth_curve - untouched.mouth_curve > 0.14);
+        for _ in 0..1200 {
+            let _ = director.tick(quiet, evidence(0.2), 1.0 / 60.0);
+        }
+        assert!(
+            director.contact_warmth < 0.001,
+            "stale/non-social contact cannot renew warmth"
+        );
+    }
+
+    #[test]
+    fn expectation_history_changes_miss_without_turning_it_into_anger() {
+        let mut expected = CompanionExpressionDirector::new(42);
+        let mut waiting = intent(PrimaryIntent::Intercept);
+        waiting.anticipation = 0.95;
+        waiting.expected_outcome.success = 0.95;
+        for _ in 0..180 {
+            let _ = expected.tick(waiting, Default::default(), 1.0 / 60.0);
+        }
+        let miss = CompanionIntentFrame {
+            frustration: 0.45,
+            ..intent(PrimaryIntent::RecoverFromMiss)
+        };
+        let surprised = expected.tick(miss, Default::default(), 1.0 / 60.0).face;
+        let unanticipated = held(miss, Default::default(), 1.0);
+        assert!(surprised.brow_raise - unanticipated.brow_raise > 0.20);
+        assert!(surprised.brow_tension < 0.10);
+        assert!(surprised.mouth_curve < 0.0);
+        let boundary = held(
+            intent(PrimaryIntent::RejectContact),
+            Default::default(),
+            1.0,
+        );
+        assert!(boundary.brow_tension - surprised.brow_tension > 0.50);
+    }
+
+    #[test]
+    fn held_curiosity_adapts_without_repeating_or_restarting_from_episode_metadata() {
+        let mut director = CompanionExpressionDirector::new(42);
+        let mut input = intent(PrimaryIntent::Inspect);
+        let onset = director.tick(input, Default::default(), 0.05).face;
+        let mut settled = onset;
+        for tick in 0..1200 {
+            input.episode_id = tick;
+            settled = director.tick(input, Default::default(), 1.0 / 60.0).face;
+        }
+        assert!(onset.brow_raise - settled.brow_raise > 0.065);
+        let a = settled;
+        for _ in 0..1200 {
+            settled = director.tick(input, Default::default(), 1.0 / 60.0).face;
+        }
+        assert!((a.brow_raise - settled.brow_raise).abs() < 0.001);
+        assert!((a.mouth_open - settled.mouth_open).abs() < 0.001);
+    }
+
+    #[test]
+    fn contextual_layers_preserve_sleep_integrity_and_audio_ownership() {
+        let mut director = CompanionExpressionDirector::new(42);
+        let input = CompanionIntentFrame {
+            contact_pleasantness: 0.95,
+            ..intent(PrimaryIntent::Nuzzle)
+        };
+        for _ in 0..120 {
+            let _ = director.tick(
+                input,
+                ExpressionEvidence {
+                    contact_pressure: 0.2,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+        }
+        let sleepy = director.tick(intent(PrimaryIntent::Sleep), Default::default(), 0.05);
+        assert_eq!(sleepy.face.eye_aperture, 0.0);
+        assert_eq!(sleepy.face.geometry, FaceGeometry::default());
+        let pain = director.tick(
+            input,
+            ExpressionEvidence {
+                pain_like: 0.8,
+                audio_active: true,
+                audio_mouth_open: 0.73,
+                ..Default::default()
+            },
+            0.05,
+        );
+        assert_eq!(pain.owner, ExpressionOwner::Integrity);
+        assert!(pain.face.mouth_curve < 0.0);
+        assert_eq!(pain.face.geometry, FaceGeometry::default());
+        assert_eq!(pain.face.mouth_open, 0.73);
+    }
+
+    #[test]
+    fn contextual_memory_and_geometry_are_cadence_stable_and_bounded() {
+        let run = |hz: u32| {
+            let mut director = CompanionExpressionDirector::new(42);
+            let mut result = FaceTarget::default();
+            for frame in 0..hz * 6 {
+                let mut input = if frame < hz * 2 {
+                    intent(PrimaryIntent::Inspect)
+                } else if frame < hz * 4 {
+                    intent(PrimaryIntent::Nuzzle)
+                } else {
+                    intent(PrimaryIntent::QuietCompanionship)
+                };
+                input.contact_pleasantness = 0.9;
+                input.target.position = Some(Vec2::new(0.8, 0.5));
+                let evidence = ExpressionEvidence {
+                    body_position: Vec2::splat(0.5),
+                    contact_pressure: 0.15,
+                    contact_point: Some(Vec2::new(0.2, 0.5)),
+                    ..Default::default()
+                };
+                result = director.tick(input, evidence, 1.0 / hz as f32).face;
+                assert_eq!(result.geometry, result.geometry.sanitized());
+            }
+            result
+        };
+        let reference = run(120);
+        for hz in [20, 30, 60] {
+            let face = run(hz);
+            assert!((face.mouth_curve - reference.mouth_curve).abs() < 0.001);
+            assert!(face.geometry.maximum_error(reference.geometry) < 0.001);
+        }
+        let mut geometry = FaceGeometry::default();
+        held(intent(PrimaryIntent::Inspect), Default::default(), 2.0).apply_geometry(&mut geometry);
+        assert_eq!(geometry, geometry.sanitized());
+    }
+
+    #[test]
+    fn shader_clock_cannot_drive_an_independent_face_motor() {
+        let genome = lifecore::Genome::from_seed(42);
+        let mut body = Box::new(crate::ProceduralBody::generate(&genome).unwrap());
+        body.embodiment.pose.eye_aperture = 0.83;
+        body.embodiment.pose.mouth_open = 0.38;
+        body.embodiment.pose.mouth_curve = 0.45;
+        body.embodiment.pose.pupil_size = 0.62;
+        body.embodiment.pose.gaze = Vec2::new(0.11, -0.08);
+        let baseline = body.render_parameters(&genome, 0.8);
+        for seconds in [0.13, 0.72, 1.2, 4.6, 8.8, 60.0] {
+            body.animation.time = seconds;
+            let later = body.render_parameters(&genome, 0.8);
+            assert_eq!(later.gaze, baseline.gaze);
+            assert_eq!(later.pupil_size, baseline.pupil_size);
+            assert_eq!(later.mouth_open, baseline.mouth_open);
+            assert_eq!(later.mouth_curve, baseline.mouth_curve);
+            assert_eq!(later.mouth_tension, baseline.mouth_tension);
+            assert_eq!(later.geometry, baseline.geometry);
+        }
     }
 }

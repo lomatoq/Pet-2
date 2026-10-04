@@ -6,7 +6,7 @@ use wgpu::util::DeviceExt;
 use crate::DenVisualTuning;
 
 const MAX_ECOLOGY_INSTANCES: usize = 25 + pet_ecology::MAX_WASTE_NODES + 48;
-const PEARL_BYTES: &[u8] = include_bytes!("../../../assets/nest/orb-pearl-v28.rgba");
+const PEARL_BYTES: &[u8] = include_bytes!("../../../assets/props-v67/energy-orb.rgba");
 
 fn ecology_source_over_blend(premultiplied_output: bool) -> wgpu::BlendState {
     wgpu::BlendState {
@@ -248,7 +248,7 @@ impl EcologyRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let pearl_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -258,7 +258,7 @@ impl EcologyRenderer {
                 height: u32::from_le_bytes(PEARL_BYTES[4..8].try_into().unwrap()),
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: crate::birth_scene::authored_mip_levels(PEARL_BYTES).len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -490,27 +490,31 @@ impl EcologyRenderer {
         time_seconds: f32,
     ) {
         if !self.pearl_uploaded {
-            let width = u32::from_le_bytes(PEARL_BYTES[..4].try_into().unwrap());
-            let height = u32::from_le_bytes(PEARL_BYTES[4..8].try_into().unwrap());
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.pearl_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &PEARL_BYTES[8..],
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            for (level, (width, height, pixels)) in
+                crate::birth_scene::authored_mip_levels(PEARL_BYTES)
+                    .into_iter()
+                    .enumerate()
+            {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.pearl_texture,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width * 4),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
             self.pearl_uploaded = true;
         }
         let aspect = if desktop_aspect.is_finite() {
@@ -877,12 +881,23 @@ fn object_in_front(kind: ObjectKind, state: ObjectLifecycle) -> bool {
 #[test]
 fn floor_food_is_occluded_but_held_food_remains_visible() {
     for kind in [ObjectKind::Morsel, ObjectKind::Orb] {
-        for state in [ObjectLifecycle::Free, ObjectLifecycle::Sleeping,
-                      ObjectLifecycle::StoredInDen, ObjectLifecycle::Consumed] {
+        for state in [
+            ObjectLifecycle::Free,
+            ObjectLifecycle::Sleeping,
+            ObjectLifecycle::StoredInDen,
+            ObjectLifecycle::Consumed,
+        ] {
             assert!(!object_in_front(kind, state), "{kind:?} {state:?}");
         }
-        for state in [ObjectLifecycle::GrabbedByUser, ObjectLifecycle::CarriedByPet] {
-            assert_eq!(object_in_front(kind, state), state == ObjectLifecycle::GrabbedByUser || kind == ObjectKind::Morsel, "{kind:?} {state:?}");
+        for state in [
+            ObjectLifecycle::GrabbedByUser,
+            ObjectLifecycle::CarriedByPet,
+        ] {
+            assert_eq!(
+                object_in_front(kind, state),
+                state == ObjectLifecycle::GrabbedByUser || kind == ObjectKind::Morsel,
+                "{kind:?} {state:?}"
+            );
         }
     }
 }

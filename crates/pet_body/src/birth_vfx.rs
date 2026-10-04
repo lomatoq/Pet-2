@@ -540,17 +540,19 @@ pub(super) fn append(out: &mut Vec<Sprite>, t: f32, m: [f32; 4], v: [u32; 2]) {
             p,
             Vec2::new(220.0, 400.0) * pose.scale,
             a,
-            strength * 1.55,
-            [1.0, 0.82, 0.48],
+            // The new authored clasp already contains its broad light. Keep
+            // only a quiet charge pulse, rather than bleaching it into a cross.
+            strength * 0.16,
+            [0.40, 1.0, 0.80],
             3.0,
             true,
             v,
             [height, 0.0],
         );
         for (w, h, alpha, col) in [
-            (900.0, 112.0, 0.52, [1.0, 0.94, 0.74]),
-            (520.0, 700.0, 0.20, [1.0, 0.84, 0.47]),
-            (150.0, 820.0, 0.10, [1.0, 0.98, 0.92]),
+            (420.0, 240.0, 0.12, [0.50, 1.0, 0.85]),
+            (320.0, 460.0, 0.06, [0.60, 0.72, 1.0]),
+            (220.0, 520.0, 0.025, [0.60, 1.0, 0.90]),
         ] {
             sprite(
                 out,

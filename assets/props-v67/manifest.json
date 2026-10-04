@@ -1,0 +1,294 @@
+{
+  "version": 67,
+  "revision": "moonlight-family",
+  "generator": "built-in image_gen.imagegen",
+  "sources": [
+    {
+      "name": "nest",
+      "generated_file": "exec-2c043307-1250-49c3-babf-eb741abb68e9.png",
+      "source_size": [
+        1816,
+        866
+      ],
+      "runtime_size": [
+        1980,
+        866
+      ],
+      "crop": [
+        -82,
+        0,
+        1898,
+        866
+      ],
+      "source_sha256": "b6c7e8de84af847734c98770f75796921b24f7e9208a0c677bfae59c8685c902",
+      "runtime_alpha128_bounds": [
+        147,
+        81,
+        1837,
+        757
+      ],
+      "mip_sizes": [
+        [
+          1980,
+          866
+        ],
+        [
+          990,
+          433
+        ],
+        [
+          495,
+          216
+        ],
+        [
+          247,
+          108
+        ],
+        [
+          123,
+          54
+        ],
+        [
+          61,
+          27
+        ],
+        [
+          30,
+          13
+        ],
+        [
+          15,
+          6
+        ],
+        [
+          7,
+          3
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "rgba_sha256": "d53a33027f801aa96542d0d715f60230d0d6557a70ee95bbec145f289537268f"
+    },
+    {
+      "name": "capsule-lower",
+      "generated_file": "exec-9ca1b055-3261-4176-8667-7498a51b31a2.png",
+      "source_size": [
+        1704,
+        923
+      ],
+      "runtime_size": [
+        1635,
+        814
+      ],
+      "crop": [
+        35,
+        63,
+        1670,
+        877
+      ],
+      "source_sha256": "483c57f377c63f12d684d26a6a8d6a3bb4d171f3adbc3b6fa0a731b77bce0a3a",
+      "runtime_alpha128_bounds": [
+        8,
+        8,
+        1627,
+        806
+      ],
+      "mip_sizes": [
+        [
+          1635,
+          814
+        ],
+        [
+          817,
+          407
+        ],
+        [
+          408,
+          203
+        ],
+        [
+          204,
+          101
+        ],
+        [
+          102,
+          50
+        ],
+        [
+          51,
+          25
+        ],
+        [
+          25,
+          12
+        ],
+        [
+          12,
+          6
+        ],
+        [
+          6,
+          3
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "rgba_sha256": "714b4649c2d1dc385708a3b6833bca1732c470bd32932bfda0ae74055f1c0d5e"
+    },
+    {
+      "name": "capsule-upper",
+      "generated_file": "exec-a7ac8af1-acea-45ab-a845-e8e227492d31.png",
+      "source_size": [
+        1704,
+        923
+      ],
+      "runtime_size": [
+        1654,
+        609
+      ],
+      "crop": [
+        25,
+        112,
+        1679,
+        721
+      ],
+      "source_sha256": "587e3a85173aa0461e845c399ab8b6295d9be72fefe379f5b926aca30f56ffcd",
+      "runtime_alpha128_bounds": [
+        8,
+        8,
+        1646,
+        601
+      ],
+      "mip_sizes": [
+        [
+          1654,
+          609
+        ],
+        [
+          827,
+          304
+        ],
+        [
+          413,
+          152
+        ],
+        [
+          206,
+          76
+        ],
+        [
+          103,
+          38
+        ],
+        [
+          51,
+          19
+        ],
+        [
+          25,
+          9
+        ],
+        [
+          12,
+          4
+        ],
+        [
+          6,
+          2
+        ],
+        [
+          3,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "rgba_sha256": "74946ca03372e3f815de43d242e0b2ebd0ca491dfaddee5739bb8afd5d288e26"
+    },
+    {
+      "name": "energy-orb",
+      "generated_file": "exec-6a73f834-3e29-4518-8728-8f68f17e98e5.png",
+      "source_size": [
+        1254,
+        1254
+      ],
+      "runtime_size": [
+        1021,
+        1008
+      ],
+      "crop": [
+        116,
+        120,
+        1137,
+        1128
+      ],
+      "source_sha256": "0f6085ee1e7bea6dcfd03b7cc52e2bbbdfd2b7acc9c31cd73dde132e97576636",
+      "runtime_alpha128_bounds": [
+        8,
+        9,
+        1013,
+        999
+      ],
+      "mip_sizes": [
+        [
+          1021,
+          1008
+        ],
+        [
+          510,
+          504
+        ],
+        [
+          255,
+          252
+        ],
+        [
+          127,
+          126
+        ],
+        [
+          63,
+          63
+        ],
+        [
+          31,
+          31
+        ],
+        [
+          15,
+          15
+        ],
+        [
+          7,
+          7
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "rgba_sha256": "ca97cabe748d70f96ccd0bf67d5b9371a4dacf41bf22cdba937f44419faf09af"
+    }
+  ],
+  "note": "New generations after user rejection of realistic sofa. Sources preserved exactly; only transparent canvas registration and mip filtering.",
+  "runtime_color": "authored sRGB; straight alpha; mip levels averaged in linear premultiplied light, decoded for source-over exactly once",
+  "mip_format": "Repeated LE u32 width,height + RGBA8 to1x1. Source PNGs remain exact generated bytes."
+}

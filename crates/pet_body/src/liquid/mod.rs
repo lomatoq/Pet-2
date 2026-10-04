@@ -12,14 +12,14 @@ pub use contact_surface::{
 };
 mod density;
 mod face_frame;
+#[cfg(test)]
+mod incident_replay_tests;
 mod interaction;
 mod kernels;
 mod motor_field;
 mod particles;
 #[cfg(test)]
 mod rescue_tests;
-#[cfg(test)]
-mod incident_replay_tests;
 #[cfg(test)]
 mod shape_homeostasis;
 #[cfg(test)]
@@ -63,7 +63,6 @@ use self::{
         KERNEL_RADIUS, LiquidParticle, MAX_LIQUID_PARTICLES, PARTICLE_SPACING,
         initialize_particles_with,
     },
-    surface_tension::apply_surface_tension,
     topology_guard::{TopologyDecision, TopologyGuard},
     viscoelastic_bonds::{
         BondMaterial, BondUpdateParameters, MAX_BONDS, ViscoelasticBond, initialize_bonds,
@@ -209,6 +208,10 @@ pub struct LiquidDiagnostics {
     pub object_contact_impulse: f32,
     /// Measured physical surface load driving the permanent well, zero in air.
     pub support_field_load: f32,
+    /// Mass-weighted normal wall correction divided by dt, accumulated through
+    /// the positional solve. A solver impulse estimate, not a measured SI force.
+    pub support_normal_impulse: f32,
+    pub bulk_surface_tension: f32,
     /// Area-preserving aspect of the physical character well, not render squash.
     pub permanent_field_aspect: f32,
     pub particle_count: usize,
@@ -337,6 +340,10 @@ pub struct LiquidMorphRuntime {
     support_plane_clearance: Option<(u64, f32)>,
     contact_plane: Option<SupportPlane>,
     support_well_offset: Vec2,
+    /// Host geometry at the physics rate. Unlike a motor attachment this wall
+    /// exists before a behavior decides to sit and while its intention changes.
+    environment_support: Option<pet_motor::SurfaceAttachmentCommand>,
+    support_normal_impulse: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -477,6 +484,8 @@ impl LiquidMorphRuntime {
             support_plane_clearance: None,
             contact_plane: None,
             support_well_offset: Vec2::ZERO,
+            environment_support: None,
+            support_normal_impulse: 0.0,
         };
         runtime.snap_render_proxies();
         runtime
@@ -552,6 +561,7 @@ impl LiquidMorphRuntime {
             replacement.support_key = self.support_key;
             replacement.support_stable_seconds = self.support_stable_seconds;
             replacement.supported_seconds = self.supported_seconds;
+            replacement.environment_support = self.environment_support.clone();
             *self = replacement;
         } else {
             self.tuning = tuning;
@@ -596,6 +606,37 @@ impl LiquidMorphRuntime {
     pub fn set_cradle_bounds(&mut self, bounds: Option<(Vec2, Vec2)>) {
         self.cradle_bounds =
             bounds.filter(|(a, b)| a.is_finite() && b.is_finite() && b.x - a.x > 0.25);
+    }
+
+    /// Set the closest solid floor/cushion, in desktop-normalized coordinates.
+    /// The solver measures separation itself; an airborne wall has no load.
+    /// This is transient geometry, deliberately absent from the saved organism.
+    pub fn set_environment_support(
+        &mut self,
+        support: Option<pet_motor::SurfaceAttachmentCommand>,
+    ) {
+        self.environment_support = support.filter(|s| {
+            s.anchor_point.is_finite()
+                && s.normal.is_finite()
+                && s.normal.length_squared() > 0.5
+                && s.tangent.is_finite()
+                && s.load_fraction.is_finite()
+        });
+    }
+
+    fn support_surface(&self) -> Option<&pet_motor::SurfaceAttachmentCommand> {
+        self.environment_support
+            .as_ref()
+            .or(self.somatic_actuation.support.as_ref())
+    }
+
+    /// Physical contact only; the 300ms behavioral support dwell is unrelated.
+    pub fn environment_support_is_loaded(&self, surface_id: &str) -> bool {
+        self.environment_support
+            .as_ref()
+            .is_some_and(|s| s.surface_id.0 == surface_id)
+            && self.measured_support_load > 0.01
+            && self.contact_plane.is_some()
     }
 
     pub fn set_runtime_actuation(&mut self, actuation: PbfRuntimeActuation) {
@@ -650,6 +691,16 @@ impl LiquidMorphRuntime {
     pub fn set_somatic_actuation(&mut self, mut actuation: SomaticActuationPacket) {
         actuation.sanitize();
         self.somatic_actuation = actuation;
+    }
+
+    fn loaded_style_support_normal(&self, world_to_body_scale: Vec2) -> Option<Vec2> {
+        // A known floor far below is geometry, not a restriction on airborne
+        // gesture. Explicit adhesive attachments retain their motor frame.
+        if self.environment_support.is_some() && self.measured_support_load <= 0.0 {
+            return None;
+        }
+        self.support_surface()
+            .map(|support| (support.normal * world_to_body_scale.signum()).normalize_or_zero())
     }
 
     pub fn set_companion_body_style(&mut self, style: crate::BodyStyleTarget) {
@@ -885,7 +936,19 @@ impl LiquidMorphRuntime {
         let support_offset = self.contact_plane.map_or(Vec2::ZERO, |plane| {
             let resting_depth = 0.43 * field_scale / self.flight_field_aspect.sqrt() * 0.55;
             let current_depth = (self.body_origin - plane.point).dot(plane.normal);
-            plane.normal * (plane.clearance + resting_depth - current_depth).min(0.0)
+            let loading = self.environment_support.as_ref().map_or(1.0, |surface| {
+                (self.compliant_support_load / surface.load_fraction.max(0.001)).clamp(0.0, 1.0)
+            });
+            // The nearby wall continues to exist during liftoff; existence is
+            // not weight bearing. Otherwise the well keeps pinning a lower
+            // parcel to the wall after the supported load has already gone.
+            let requested_drop = (current_depth - plane.clearance - resting_depth).max(0.0);
+            // A contact may redistribute the nearby body; it cannot drag the
+            // navigation well an unbounded distance away from its carrier.
+            // Without finite sag, lifting the carrier made the well follow
+            // the old floor indefinitely and manufacture its own support load.
+            let maximum_drop = 0.18 * field_scale;
+            -plane.normal * maximum_drop * (requested_drop / maximum_drop).tanh() * loading
         });
         self.support_well_offset +=
             (support_offset - self.support_well_offset) * (1.0 - (-6.0 * dt).exp());
@@ -943,12 +1006,6 @@ impl LiquidMorphRuntime {
                 tail_bend: self.flight_tail_bend,
             },
         );
-        let supported_softness =
-            smoothstep01(((self.flight_field_aspect - 1.34) / (2.4 - 1.34)).clamp(0.0, 1.0)).max(
-                self.compliant_support_load
-                    .mul_add(2.5, 0.0)
-                    .clamp(0.0, 1.0),
-            );
         // Detached parcels use an inertial screen frame: root acceleration
         // must not be applied again after the coordinate transport above.
         let inertial_load = (-motion.acceleration * effective_flight_inertia).clamp_length_max(6.0);
@@ -987,23 +1044,24 @@ impl LiquidMorphRuntime {
                 }
             }
         }
-        let supported_tension = parameters.surface_tension
-            + (parameters.surface_tension.min(0.48) - parameters.surface_tension)
-                * supported_softness;
+        // Bulk cohesion is one material in flight and at a solid. Wetting is
+        // an interface property confined to particles next to the solid, not
+        // a behavior-triggered softening of the complete organism.
         let cooperative_separation_scale = if sensors.interaction_actuation.allow_intentional_bud {
             0.35
         } else {
             1.0
         };
-        apply_surface_tension(
+        surface_tension::apply_surface_tension_at_wall(
             &mut self.particles,
             self.particle_count,
             kernel_radius,
             self.rest_density,
-            supported_tension
+            parameters.surface_tension
                 * (1.0 - 0.55 * self.flight_comet.length())
                 * (1.0 + sensors.interaction_actuation.cohesion_delta).clamp(0.75, 1.25)
                 * cooperative_separation_scale,
+            support_plane,
         );
         let grab_parameters = GrabParameters {
             support_radius: kernel_radius
@@ -1093,9 +1151,7 @@ impl LiquidMorphRuntime {
                 lifecore::PoseIntent::Sleeping | lifecore::PoseIntent::Cocoon
             )
         {
-            let support_normal = self.somatic_actuation.support.as_ref().map(|support| {
-                (support.normal * motion.world_to_body_scale.signum()).normalize_or_zero()
-            });
+            let support_normal = self.loaded_style_support_normal(motion.world_to_body_scale);
             posture_energy += motor_field::apply_companion_style_field(
                 &mut self.particles,
                 self.particle_count,
@@ -1107,6 +1163,11 @@ impl LiquidMorphRuntime {
                 self.tuning.posture_gain,
             );
         }
+        let physical_packet = self.environment_support.as_ref().map(|support| {
+            let mut packet = self.somatic_actuation.clone();
+            packet.support = Some(support.clone());
+            packet
+        });
         let mut somatic_step = apply_somatic_actuation(
             &mut self.particles,
             self.particle_count,
@@ -1115,8 +1176,11 @@ impl LiquidMorphRuntime {
             self.material_grab.readback().contact_center,
             feedback.world_position,
             motion.world_to_body_scale,
-            &self.somatic_actuation,
+            physical_packet.as_ref().unwrap_or(&self.somatic_actuation),
             support_plane,
+            self.environment_support.as_ref().map_or(1.0, |s| {
+                (self.measured_support_load / s.load_fraction.max(0.001)).clamp(0.0, 1.0)
+            }),
             dt,
         );
         somatic_step.local_energy += posture_energy;
@@ -1187,7 +1251,7 @@ impl LiquidMorphRuntime {
                 self.flight_comet.length() * (1.0 - self.compliant_support_load).clamp(0.0, 1.0),
             );
         }
-        solve_density_constraints(
+        self.support_normal_impulse = solve_density_constraints(
             &mut self.particles,
             self.particle_count,
             DensityConstraintParameters {
@@ -1252,7 +1316,9 @@ impl LiquidMorphRuntime {
             self.contact_plane,
             dt,
         );
-        xpbd::project_support_plane(&mut self.particles, self.particle_count, support_plane);
+        self.support_normal_impulse +=
+            xpbd::project_support_plane(&mut self.particles, self.particle_count, support_plane)
+                / dt;
         xpbd::project_cradle(&mut self.particles, self.particle_count, cradle);
 
         // This is a circuit breaker, not normal material behavior. Acceptance
@@ -1276,8 +1342,8 @@ impl LiquidMorphRuntime {
             &mut self.particles,
             self.particle_count,
             kernel_radius,
-            parameters.numerical_xsph * (1.0 - supported_softness * 0.30),
-            parameters.viscosity * (1.0 - supported_softness * 0.40),
+            parameters.numerical_xsph,
+            parameters.viscosity,
             dt,
         );
         update_density_and_surface(&mut self.particles, self.particle_count, kernel_radius);
@@ -1726,7 +1792,7 @@ impl LiquidMorphRuntime {
         motion: DropletMotion,
         body_world_position: Vec2,
     ) -> Option<(Vec2, f32)> {
-        let support = self.somatic_actuation.support.as_ref()?;
+        let support = self.support_surface()?;
         if support.load_fraction <= 0.0 {
             return None;
         }
@@ -1738,6 +1804,36 @@ impl LiquidMorphRuntime {
         }
         let anchor = (support.anchor_point - body_world_position) * scale;
         let render = self.render_state();
+        if self.environment_support.is_some() {
+            let main: Vec<_> = render.particles[..render.particle_count]
+                .iter()
+                .copied()
+                .filter(|p| p.main_component)
+                .collect();
+            let foot = contact_surface::contact_surface_support(
+                &main,
+                self.tuning.iso_threshold,
+                -normal,
+            )?;
+            let gap = (foot - anchor).dot(normal);
+            // A compact physical contact zone, not a phase timer. At first
+            // geometric contact the load is already present; lifting away
+            // removes it continuously even if the old motor still says sit.
+            let contact_fraction = 1.0 - smoothstep01((gap / 0.035).clamp(0.0, 1.0));
+            // Supported weight belongs to the carrier's reachable lower body.
+            // When the navigation carrier rises beyond that field envelope,
+            // its lift unloads the old floor even if a stretched parcel still
+            // touches it. Geometry remains available to the unilateral solver.
+            // Otherwise strong settling weight can anchor the whole creature
+            // indefinitely while its flight reference travels away overhead.
+            let carrier_radius = 0.43 * self.tuning.character_field_radius_scale;
+            let carrier_height = (-anchor).dot(normal).max(0.0);
+            let reach_band = KERNEL_RADIUS * self.tuning.kernel_radius_scale * 0.48;
+            let reach = 1.0
+                - smoothstep01(((carrier_height - carrier_radius) / reach_band).clamp(0.0, 1.0));
+            let fraction = contact_fraction * reach;
+            return (fraction > 0.0).then_some((tangent, support.load_fraction * fraction));
+        }
         // The host places the density iso-contour against its support plane.
         // A zero-density kernel skirt is not load-bearing material. Query a
         // small real contour patch rather than reconstructing full bounds here.
@@ -1759,14 +1855,15 @@ impl LiquidMorphRuntime {
         measured: bool,
         dt: f32,
     ) -> Option<SupportPlane> {
-        let Some(support) = self.somatic_actuation.support.as_ref().filter(|support| {
+        let physical = self.environment_support.is_some();
+        let Some(support) = self.support_surface().cloned().filter(|support| {
             let awake_cling = self.somatic_actuation.program
                 == Some(BehaviorProgramId::DefenseStrainBraceAndRelease)
                 && matches!(
                     support.surface_id.0.as_str(),
                     "screen:left_edge" | "screen:right_edge" | "screen:top_edge"
                 );
-            measured
+            (measured || physical)
                 && (matches!(
                     support.surface_id.0.as_str(),
                     "screen:bottom_edge" | "voice:taskbar" | "food:taskbar" | "den:cushion"
@@ -1791,6 +1888,10 @@ impl LiquidMorphRuntime {
             .collect();
         let contour =
             contact_surface::contact_surface_support(&main, self.tuning.iso_threshold, -normal)?;
+        if physical && (contour - (point - self.body_origin)).dot(normal) > 0.15 {
+            self.support_plane_clearance = None;
+            return None;
+        }
         let lowest_center = main
             .iter()
             .map(|particle| particle.position.dot(normal))
@@ -3233,9 +3334,7 @@ impl LiquidMorphRuntime {
         dt: f32,
     ) {
         let support_key = self
-            .somatic_actuation
-            .support
-            .as_ref()
+            .support_surface()
             .map_or(0, |support| stable_text_hash(&support.surface_id.0));
         if support_key == 0 || support_key != self.support_key {
             self.support_stable_seconds = 0.0;
@@ -3389,6 +3488,8 @@ impl LiquidMorphRuntime {
             object_load: self.object_load,
             object_contact_impulse: self.object_contact_impulse,
             support_field_load: self.measured_support_load,
+            support_normal_impulse: self.support_normal_impulse,
+            bulk_surface_tension: parameters.surface_tension,
             permanent_field_aspect: self.flight_field_aspect,
             particle_count: self.particle_count,
             component_count: self.components.component_count,
@@ -3434,6 +3535,7 @@ fn apply_somatic_actuation(
     world_to_body_scale: Vec2,
     packet: &SomaticActuationPacket,
     support_plane: Option<SupportPlane>,
+    support_force_scale: f32,
     dt: f32,
 ) -> SomaticStepMetrics {
     let mut metrics = SomaticStepMetrics::default();
@@ -3528,7 +3630,11 @@ fn apply_somatic_actuation(
         }
     }
 
-    if let Some(support) = &packet.support {
+    if let Some(support) = packet
+        .support
+        .as_ref()
+        .filter(|_| support_force_scale > 0.0)
+    {
         let anchor = body_origin + (support.anchor_point - body_world_position) * scale;
         let mut normal = (support.normal * scale.signum()).normalize_or_zero();
         if normal.length_squared() <= 1.0e-6 {
@@ -3551,7 +3657,8 @@ fn apply_somatic_actuation(
                 // adhesion alone pulls a small toe out of a floating ball.
                 // The unilateral wall reaction and density solve redistribute
                 // this load laterally instead of moving a render silhouette.
-                let weight = -normal * support.load_fraction.clamp(0.0, 1.0) * 0.25;
+                let weight =
+                    -normal * support.load_fraction.clamp(0.0, 1.0) * (5.0 * support_force_scale);
                 particle.force += weight;
                 metrics.total_field_energy += weight.length() * safe_dt;
             }
@@ -3571,6 +3678,14 @@ fn apply_somatic_actuation(
             }
             let proximity = (1.0 - normal_distance.abs() / (contact_depth * 3.0)).clamp(0.0, 1.0);
             let normal_error = normal_distance.clamp(-contact_depth * 2.0, contact_depth * 2.0);
+            // A non-adhesive solid can repel penetration, never pull fluid
+            // across a positive gap. Wetting adjusts pairwise interface tension;
+            // it is not a 40/s^2 spring attaching every nearby parcel to the floor.
+            let normal_error = if wetting {
+                normal_error.min(0.0) + normal_error.max(0.0) * support.adhesion.clamp(0.0, 1.0)
+            } else {
+                normal_error
+            };
             let normal_force = -normal
                 * normal_error
                 * if wetting {
@@ -3593,6 +3708,7 @@ fn apply_somatic_actuation(
             let adhesion = -normal * normal_distance.max(0.0) * support.adhesion * 2.2;
             let force = ((normal_force + friction + load + adhesion)
                 * tangent_weight
+                * support_force_scale
                 * if wetting {
                     proximity
                 } else {
@@ -4037,6 +4153,45 @@ mod flight_field_tests {
     }
 
     #[test]
+    fn environmental_floor_does_not_suppress_airborne_vertical_style() {
+        let mut runtime = LiquidMorphRuntime::new(42);
+        let support = pet_motor::SurfaceAttachmentCommand {
+            surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
+            normal: Vec2::NEG_Y,
+            tangent: Vec2::X,
+            anchor_point: Vec2::new(0.5, 1.0),
+            target_contact_fraction: 0.32,
+            normal_compliance: 0.35,
+            tangent_friction: 0.7,
+            adhesion: 0.0,
+            load_fraction: 0.27,
+            break_force: 0.7,
+            release_half_life: 0.25,
+        };
+        runtime.set_environment_support(Some(support.clone()));
+        assert_eq!(
+            runtime.loaded_style_support_normal(Vec2::new(1.0, -1.0)),
+            None
+        );
+        runtime.measured_support_load = 0.2;
+        assert_eq!(
+            runtime.loaded_style_support_normal(Vec2::new(1.0, -1.0)),
+            Some(Vec2::Y)
+        );
+        runtime.set_environment_support(None);
+        runtime.measured_support_load = 0.0;
+        runtime.somatic_actuation.support = Some(pet_motor::SurfaceAttachmentCommand {
+            surface_id: lifecore::SurfaceId("screen:left_edge".into()),
+            normal: Vec2::X,
+            ..support
+        });
+        assert_eq!(
+            runtime.loaded_style_support_normal(Vec2::ONE),
+            Some(Vec2::X)
+        );
+    }
+
+    #[test]
     fn support_request_without_a_physical_patch_does_not_flatten_the_well() {
         let mut runtime = LiquidMorphRuntime::new(42);
         let support = pet_motor::SurfaceAttachmentCommand {
@@ -4202,6 +4357,7 @@ mod flight_field_tests {
             Vec2::ONE,
             &packet,
             None,
+            1.0,
             1.0 / 120.0,
         );
         let affected = runtime.particles[..runtime.particle_count]

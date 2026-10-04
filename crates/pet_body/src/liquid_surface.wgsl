@@ -61,6 +61,8 @@ struct Globals {
     mood_tint: vec4<f32>,
     mood_trail: vec4<f32>,
     optical_volume_bounds: vec4<f32>,
+    energy_palette: vec4<f32>,
+    energy_dynamics: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -490,6 +492,12 @@ fn pearl_eye_ink(point:vec2<f32>,side:f32)->vec3<f32> {
     let fresnel=0.035+0.965*pow(1.0-cap_normal.z,5.0);
     return ink*(1.0-fresnel*open)+pearl_studio(reflection,0.08)*fresnel*open*0.70;
 }
+// Compact smooth intersection. Rounds only the meeting of two contours;
+// unlike a screen blur, it preserves feature contrast and the closed lid.
+fn rounded_face_intersection(a:f32,b:f32,radius:f32)->f32 {
+    let h=max(radius-abs(a-b),0.0)/radius;
+    return max(a,b)+h*h*radius*0.25;
+}
 fn pearl_eye_distance(point:vec2<f32>,side:f32)->f32 {
     let index=select(1u,0u,side<0.0);
     let blink=select(globals.lids_brows.x,globals.lids_brows.y,side>0.0);
@@ -529,14 +537,20 @@ fn pearl_eye_distance(point:vec2<f32>,side:f32)->f32 {
     let inner_arc=1.0-min(q.x*q.x,1.0);
     let bottom=-1.16+max(gaze.y,0.0)*0.44+lids.z*0.48-0.12*inner_arc
         +joy*(0.68+0.54*inner_arc);
-    let open_distance=max((distance-1.0)*cap_radius,
-        max((q.y-top)*effective_height,(bottom-q.y)*effective_height));
     let arc_x=clamp(local.x,-0.038,0.038);
     let arc_y=(-0.013+0.015*pow(arc_x/0.038,2.0))*(1.0-2.0*joy);
+    // The upper lid travels farther than the lower lid. Earlier distance-field
+    // crossfading shrank the whole eye into an unrelated line at half closure.
+    // Here both curves approach their shared seal before the final lid mark.
+    let closing=smoothstep(0.0,0.96,blink);
+    let upper=mix(top*effective_height,arc_y+0.0045,closing);
+    let lower=mix(bottom*effective_height,arc_y-0.0045,closing);
+    let lid_clip=rounded_face_intersection(local.y-upper,lower-local.y,0.0030);
+    let open_distance=rounded_face_intersection((distance-1.0)*cap_radius,lid_clip,0.0045);
     let closed_distance=length(local-vec2<f32>(arc_x,arc_y))-0.0045;
     // Close geometry, not ink opacity: fading the fill exposed the bright pearl
     // underneath and made blinks look like pale flashes across the whole eye.
-    let lid_distance=mix(open_distance,closed_distance,smoothstep(0.0,0.92,blink));
+    let lid_distance=mix(open_distance,closed_distance,smoothstep(0.84,0.99,blink));
     return lid_distance;
 }
 fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
@@ -1122,7 +1136,18 @@ fn rounded_surface_highlights(
 }
 
 // Soft spectral ink. This is an authored light field, not a dielectric coat.
-// Pigment coordinates follow material; only slow chroma circulation uses time.
+// Pigment coordinates follow material. Backward rotation advects the light
+// field around that material continuously, rather than crossfading unrelated
+// plane waves whose bright regions repeatedly disappear in place.
+fn ink_current_coordinate(coordinate: vec2<f32>, phase: f32, warp_phase: f32) -> vec2<f32> {
+    let radius = length(coordinate);
+    let angle = phase + 0.26 * sin(radius * 7.5 - warp_phase);
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec2<f32>(c * coordinate.x + s * coordinate.y,
+        -s * coordinate.x + c * coordinate.y);
+}
+
 fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     let field = density_at(input.uv);
     let density = field.r;
@@ -1149,41 +1174,68 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     let normal=normalize(mix(fluid_normal,birth_normal,globals.cinematic_h.w));
     let coord=mix(material.xy,birth_xy*0.38,globals.cinematic_h.w);
     let time=globals.viewport_time.y;
-    // Two broad noncommensurate waves: no hash noise, no opacity flicker and no
-    // screen-locked texture sliding over a deforming body.
-    let drift=sin(coord.x*8.7+coord.y*6.1+time*0.61
-        +sin(coord.y*7.4-time*0.31)*0.62)*0.72
-        +sin(coord.y*11.3-coord.x*4.9-time*0.39)*0.36;
-    let pool=smoothstep(-0.85,0.90,drift);
+    // Two broad currents share a circulation direction. Their different rates
+    // stretch the luminous pools, without a seam, phase reset or random flicker.
+    let energy=globals.energy_dynamics;
+    let current=ink_current_coordinate(coord,energy.x,energy.y);
+    let undertow=ink_current_coordinate(coord,energy.y,energy.x);
+    let orbit=current/max(length(current),0.0001);
+    let under_orbit=undertow/max(length(undertow),0.0001);
+    let crest=pow(saturate(0.5+0.5*dot(orbit,vec2<f32>(0.96,0.28))),4.0);
+    let return_flow=pow(saturate(0.5+0.5*dot(under_orbit,vec2<f32>(-0.62,-0.78))),5.0);
+    let pool=saturate(0.08+crest*0.88+return_flow*0.64);
     let local_strain=saturate(length(material.zw-globals.liquid_motion.xy)*0.35);
-    let phase=dot(inward,vec2<f32>(0.61,-0.79))*0.65+drift*0.56;
+    let phase=dot(orbit,vec2<f32>(0.61,-0.79));
     let blue=vec3<f32>(0.085,0.43,1.20);
     let orchid=vec3<f32>(0.79,0.12,0.72);
     let mint=vec3<f32>(0.16,0.90,0.86);
-    let spectral=mix(mix(blue,orchid,smoothstep(-0.75,0.55,phase)),mint,
-        smoothstep(0.10,0.92,drift-inward.y*0.34)*0.72);
-    let arc=0.42+0.58*smoothstep(-0.6,0.8,drift+inward.x*0.36);
+    let spectrum=mix(mix(blue,orchid,smoothstep(-0.75,0.55,phase)),mint,
+        return_flow*0.84);
+    let spectral=mix(spectrum,globals.energy_palette.rgb,globals.energy_palette.a);
+    let arc=0.28+pool*0.72;
     let inner=max(distance,0.0);
-    let shell_width=mix(1.8,6.8,pool)*(1.0+local_strain*0.20);
-    let shoulder=exp(-inner/mix(5.0,12.5,pool));
+    let agitation=energy.w*0.11*sin(energy.x*7.0+dot(orbit,vec2<f32>(7.0,11.0)));
+    let shell_width=mix(1.65,7.8,pool)*(1.0+local_strain*0.20+agitation);
+    let shoulder=exp(-inner/mix(4.5,14.5,pool));
     let luminous_core=exp(-pow((distance-shell_width*0.50)/shell_width,2.0));
     let body_light=saturate(dot(normal,normalize(vec3<f32>(-0.50,0.60,0.62))));
     // A quiet near-black volume stays readable without looking like chrome.
     var color=vec3<f32>(0.0035,0.0030,0.0070)
         +vec3<f32>(0.009,0.007,0.018)*pow(body_light,1.4);
-    color+=spectral*shoulder*arc*0.40;
-    color+=vec3<f32>(0.92,1.00,1.12)*luminous_core*arc*0.82;
+    let radiance=0.40+energy.z*1.35;
+    color+=spectral*shoulder*arc*0.40*radiance;
+    color+=spectral*luminous_core*arc*0.24*radiance;
+    // A rounded white-hot center dissolves into the wider colored membrane.
+    // Both its width and strength travel with the same broad energy pool.
+    let soft_center=exp(-pow((distance-shell_width*0.28)/max(1.5,shell_width*0.42),2.0));
+    color+=mix(vec3<f32>(1.12,1.18,1.25),globals.energy_palette.rgb,0.07)
+        *soft_center*arc*1.02*radiance;
     let face_point=face_space(point);
+    // Broad faint volumes drift with the body. No lines, sheets or bright
+    // filament crosses its interior. Optical coordinates stay coherent when
+    // material labels fold during compression; the face keeps a dark backing.
+    let volume_current=ink_current_coordinate(point,energy.x,energy.y);
+    let volume_undertow=ink_current_coordinate(point,energy.y,energy.x);
+    let cloud_a=(volume_current-vec2<f32>(-0.12,-0.11))/vec2<f32>(0.23,0.18);
+    let cloud_b=(volume_undertow-vec2<f32>(0.17,0.05))/vec2<f32>(0.20,0.25);
+    let volume_pool=exp(-dot(cloud_a,cloud_a))*0.022
+        +exp(-dot(cloud_b,cloud_b))*0.012;
+    let face_reserve=1.0-smoothstep(0.12,0.25,
+        length((face_point-vec2<f32>(0.0,0.025))*vec2<f32>(1.0,1.35)));
+    let interior=smoothstep(4.0,16.0,inner)*(1.0-face_reserve*0.88);
+    let current_light=volume_pool*interior*radiance*(0.75+body_light*0.25);
+    color+=mix(spectral,globals.energy_palette.rgb,0.7)*current_light;
     let left_distance=pearl_eye_distance(face_point,-1.0);
     let right_distance=pearl_eye_distance(face_point,1.0);
     let eye_distance=min(left_distance,right_distance);
     let eye_aa=max(fwidth(eye_distance)*0.75,0.0012);
     let eyes=(1.0-smoothstep(-eye_aa,eye_aa,eye_distance))*globals.face_tuning.x;
-    let face_current=face_point.y*43.0+face_point.x*9.0-time*1.28
-        +sin(time*0.37+face_point.x*5.0)*0.45;
+    let face_current=face_point.y*43.0+face_point.x*9.0-energy.x*3.0
+        +sin(energy.y+face_point.x*5.0)*0.45;
     let eye_pool=0.5+0.5*sin(face_current);
     let eye_glow=exp(-max(eye_distance,0.0)/0.014)*globals.face_tuning.x;
-    let eye_energy=mix(vec3<f32>(0.68,1.15,1.95),vec3<f32>(2.70,2.48,3.12),eye_pool);
+    let eye_energy=mix(vec3<f32>(0.68,1.15,1.95),vec3<f32>(2.70,2.48,3.12),eye_pool)
+        *mix(vec3<f32>(1.0),globals.energy_palette.rgb,0.10)*(0.65+energy.z*0.65);
     color+=vec3<f32>(0.22,0.30,0.48)*eye_glow*(0.12+eye_pool*0.10);
     color=mix(color,eye_energy,eyes);
     let brows=max(pearl_brow(face_point,-1.0),pearl_brow(face_point,1.0))*globals.face_tuning.x;
@@ -1197,19 +1249,37 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
         mouth_delta.y-mouth_delta.x*face_gaze.x*0.13);
     let expression=pearl_emotion();
     let smile_curve=clamp(globals.brow_mouth.w*1.15-expression.x*0.45,-1.0,1.0);
-    let opening=smoothstep(0.06,0.78,globals.brow_mouth.z);
+    let compression=clamp(globals.face_mouth.w,0.0,1.0);
+    let tension=clamp(globals.mouth_voice.x,0.0,1.0);
+    let opening=smoothstep(0.0,0.85,globals.brow_mouth.z)*(1.0-compression*0.72);
     let happiness=max(globals.brow_mouth.w,0.0)*(1.0-expression.z);
-    let width=mix(0.045,mix(0.039+0.015*happiness,0.025,expression.z),opening)
-        *clamp(globals.face_mouth.x,0.72,1.25);
+    let width=mix(0.045,mix(0.039+0.015*happiness,0.027,expression.z),opening)
+        *clamp(globals.face_mouth.x,0.55,1.50);
     let x=clamp(mouth_local.x,-width,width);
-    let profile=sqrt(max(0.0,1.0-pow(x/width,2.0)));
-    let corner_bias=mix(globals.face_mouth.y,globals.face_mouth.z,x/width*0.5+0.5)*0.010*pow(x/width,2.0);
-    let centerline=-0.030*smile_curve*(1.0-pow(x/width,2.0))*(1.0-opening*0.45)-opening*0.005+corner_bias;
-    let half_height=opening*(0.032+expression.z*0.014)*profile;
+    let normalized_x=x/max(width,0.001);
+    // Separate upper lip recruitment and jaw lowering. Contextual corner pulls,
+    // compression, tension and voiced opening now reach the luminous material;
+    // the previous symmetric ellipse discarded these existing rig controls.
+    let height=opening*(0.034+expression.z*0.012)*(1.0+globals.face_eye.y*0.45);
+    let cubic_lips=mouth_lip_contours(normalized_x,height,smile_curve*0.625,tension,opening);
+    let sealed_lips=mouth_lip_contours(normalized_x,0.0,smile_curve*0.625,tension,opening);
+    let lip_section=sqrt(max(0.0,1.0-normalized_x*normalized_x));
+    let corner_pull=clamp((globals.face_mouth.z-globals.face_mouth.y)*0.20,-0.25,0.25);
+    let round_upper=sealed_lips.x+height*(0.24+0.20*(1.0-tension))*lip_section
+        *(1.0+corner_pull*normalized_x);
+    let round_lower=sealed_lips.y-height*(0.94+0.32*opening)*lip_section
+        *(1.0-corner_pull*normalized_x);
+    // Rounded vertical tangents keep a wide jaw from turning into a triangle
+    // at desktop size. Upper and lower contours still have independent travel.
+    let lip_contours=mix(cubic_lips,vec2<f32>(round_upper,round_lower),0.65);
+    let centerline=(lip_contours.x+lip_contours.y)*0.5;
+    let half_height=max((lip_contours.x-lip_contours.y)*0.5,0.0);
+    // A rounded swept contour also represents the sealed line at height zero.
+    // Its corners remain attached during asymmetric coarticulation and speech.
     let mouth_distance=length(vec2<f32>(mouth_local.x-x,max(abs(mouth_local.y-centerline)-half_height,0.0)));
     let mouth=(1.0-smoothstep(0.003,0.006,mouth_distance))*globals.face_tuning.x;
     let mouth_glow=exp(-max(mouth_distance-0.004,0.0)/0.010)*globals.face_tuning.x;
-    let mouth_pool=0.5+0.5*sin(mouth_local.x*32.0+mouth_local.y*24.0-time*1.28+0.6);
+    let mouth_pool=0.5+0.5*sin(mouth_local.x*32.0+mouth_local.y*24.0-energy.x*3.0+0.6);
     color+=vec3<f32>(0.24,0.32,0.50)*mouth_glow*(0.10+mouth_pool*0.09);
     color=mix(color,mix(vec3<f32>(0.50,0.87,1.42),vec3<f32>(1.80,1.61,2.18),mouth_pool),mouth);
     let extension=globals.self_care.x;

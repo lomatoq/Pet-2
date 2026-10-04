@@ -26,6 +26,72 @@ struct SavedLife {
 struct SavedOrganism {
     genome: lifecore::Genome,
 }
+
+fn energy_sample(time: f32, state: &str) -> pet_body::EnergyAppearance {
+    let mut affect = lifecore::AffectState::default();
+    let mut mind = pet_body::VisualMindInput::default();
+    match state {
+        "joy" => {
+            affect.valence = 0.9;
+            affect.arousal = 0.8;
+            affect.stress = 0.0;
+            affect.frustration = 0.0;
+        }
+        "anger" => {
+            affect.valence = -0.8;
+            affect.arousal = 0.9;
+            affect.stress = 0.8;
+            affect.frustration = 0.95;
+        }
+        "fear" => {
+            affect.valence = -0.8;
+            affect.arousal = 0.85;
+            affect.stress = 0.95;
+            affect.confidence = 0.05;
+            affect.frustration = 0.02;
+        }
+        "sleep" => {
+            affect.arousal = 0.05;
+            affect.stress = 0.0;
+            mind.fatigue = 1.0;
+        }
+        "curiosity" => {
+            mind.curiosity = 0.95;
+            affect.arousal = 0.55;
+            affect.stress = 0.02;
+        }
+        _ => {}
+    }
+    let mut energy = pet_body::EnergyExpression::default();
+    // Production state filter, isolated from physical pose for optical testing.
+    for _ in 0..960 {
+        energy.update(
+            affect,
+            mind,
+            lifecore::ExpressionState::default(),
+            state == "sleep",
+            1.0 / 120.0,
+        );
+    }
+    let whole = (time.max(0.0) * 120.0).floor() as u32;
+    for _ in 0..whole {
+        energy.update(
+            affect,
+            mind,
+            lifecore::ExpressionState::default(),
+            state == "sleep",
+            1.0 / 120.0,
+        );
+    }
+    energy.update(
+        affect,
+        mind,
+        lifecore::ExpressionState::default(),
+        state == "sleep",
+        time.max(0.0) - whole as f32 / 120.0,
+    );
+    energy.appearance
+}
 impl ApplicationHandler for Capture {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Err(e) = self.capture(event_loop) {
@@ -80,6 +146,7 @@ impl Capture {
                 renderer.set_review_background(background);
                 renderer.reset_perceptual_capture_state();
                 let mut params = body.render_parameters(&genome, 0.3);
+                params.energy = energy_sample(0.0, if restored { "sleep" } else { "calm" });
                 params.render_mode = BodyRenderMode::ParticlePbf;
                 params.presentation_visibility = 1.0;
                 params.blink_left = if restored { 1.0 } else { 0.0 };
@@ -122,6 +189,7 @@ impl Capture {
         ] {
             let mut params = body.render_parameters(&genome, time);
             params.time = time;
+            params.energy = energy_sample(time, "calm");
             params.render_mode = BodyRenderMode::ParticlePbf;
             params.presentation_visibility = 1.0;
             renderer.reset_perceptual_capture_state();
@@ -138,6 +206,7 @@ impl Capture {
             for index in 0..120 {
                 let mut params = body.render_parameters(&genome, 0.0);
                 params.time = index as f32 / 30.0;
+                params.energy = energy_sample(params.time, "calm");
                 params.render_mode = BodyRenderMode::ParticlePbf;
                 params.presentation_visibility = 1.0;
                 renderer.reset_perceptual_capture_state();
@@ -222,6 +291,36 @@ impl Capture {
                 std::fs::write(probes.join(format!("{shape}-{probe}.rgba")), bytes)?;
             }
         }
+        let emotions = self.output.join("emotions");
+        std::fs::create_dir_all(&emotions)?;
+        body = ProceduralBody::generate(&genome)?;
+        body.apply_tuning_profile(profile.clone())?;
+        let mut energy_log = Vec::new();
+        for state in ["calm", "joy", "anger", "fear", "sleep", "curiosity"] {
+            for time in [0.0, 1.0, 2.0] {
+                let mut params = body.render_parameters(&genome, 0.3);
+                params.render_mode = BodyRenderMode::ParticlePbf;
+                params.presentation_visibility = 1.0;
+                params.energy = energy_sample(time, state);
+                params.time = time;
+                // Same body/face throughout: this matrix isolates the material's
+                // response, not a scripted claim of full organism behavior.
+                renderer.set_review_background(ReviewBackground::Black);
+                renderer.reset_perceptual_capture_state();
+                let frame = renderer.render_capture(params)?;
+                let mut bytes = Vec::with_capacity(frame.rgba8.len() + 8);
+                bytes.extend(frame.width.to_le_bytes());
+                bytes.extend(frame.height.to_le_bytes());
+                bytes.extend(frame.rgba8);
+                std::fs::write(emotions.join(format!("{state}-{time:.0}.rgba")), bytes)?;
+                energy_log.push(serde_json::json!({"state":state,"time":time,
+                    "palette":params.energy.palette.to_array(),"dynamics":params.energy.dynamics.to_array()}));
+            }
+        }
+        std::fs::write(
+            emotions.join("energy.json"),
+            serde_json::to_vec_pretty(&energy_log)?,
+        )?;
         // Exercise the production velocity filter and unit conversion. No
         // chromatic_motion assignment: desktop feedback drives render params.
         let moving = self.output.join("velocity-motion");

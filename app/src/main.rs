@@ -205,6 +205,24 @@ fn cursor_hits_den_menu(cursor: Vec2, nest: Vec2, width: f32) -> bool {
         (cursor - nest - Vec2::new(0.0, width * 0.10)) / Vec2::new(width * 0.49, width * 0.23);
     local.length_squared() <= 1.0
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum DesktopButtonAction {
+    CareMenu,
+    Primary(bool),
+    Ignore,
+}
+
+fn desktop_button_action(button: MouseButton, state: ElementState) -> DesktopButtonAction {
+    match (button, state) {
+        (MouseButton::Right, ElementState::Pressed) => DesktopButtonAction::CareMenu,
+        (MouseButton::Left, state) => {
+            DesktopButtonAction::Primary(state == ElementState::Pressed)
+        }
+        _ => DesktopButtonAction::Ignore,
+    }
+}
+
 fn request_companion_care_menu(runtime: &mut PetRuntime, _store: &StateStore) {
     runtime.feeding_seconds = 0.0;
     runtime.cleanup_mode = false;
@@ -3214,6 +3232,35 @@ impl PetApplication {
                 feeding_actuation.support = runtime.ecology.feeding_support();
                 runtime.body.set_somatic_actuation(feeding_actuation);
             }
+            // Geometry belongs to every physics step, not the slower motor
+            // phase that eventually says "first_contact". Otherwise the host
+            // stops the root as a rigid object and the liquid only learns about
+            // its wall later, switching a stationary body abruptly into a puddle.
+            let physical_support = if runtime.birth.started.is_some() {
+                None
+            } else if runtime.cradle_seat.surface_available(cradle_geometry,
+                runtime.screen_body_center, cradle_contact.minimum, cradle_contact.maximum) {
+                Some(physical_support_command(
+                    "den:cushion",
+                    physical_to_virtual_normalized(&runtime.topology,
+                        Vec2::new(cradle_geometry.anchor.x, cradle_geometry.floor)),
+                    0.35,
+                ))
+            } else if let Some(motion) = runtime.voice_motion.as_ref().filter(|m|
+                matches!(m.cue, desktop_host::CueKind::Sit | desktop_host::CueKind::Sleep)) {
+                Some(physical_support_command("voice:taskbar",
+                    Vec2::new(runtime.body.simulation.feedback.world_position.x, motion.support_y), 0.35))
+            } else if runtime.ecology.feeding_navigation().is_some() {
+                runtime.ecology.feeding_support()
+            } else if runtime.last_motor_packet.support.as_ref().is_some_and(|s|
+                matches!(s.surface_id.0.as_str(), "screen:left_edge" | "screen:right_edge" | "screen:top_edge")) {
+                // Adhesive wall-clinging remains an explicit motor attachment.
+                None
+            } else {
+                Some(physical_support_command("screen:bottom_edge",
+                    screen_floor_anchor(&runtime.topology, runtime.screen_body_center, liquid_bounds.minimum.x, liquid_bounds.maximum.x), 0.35))
+            };
+            runtime.body.embodiment.liquid.set_environment_support(physical_support);
             runtime.body.embodied_update(
                 &runtime.intent,
                 &runtime.sensors,
@@ -3247,7 +3294,7 @@ impl PetApplication {
                 runtime.normalizer.monotonic_seconds(), body_dt, runtime.sensors.pet_dragged,
             ) {
                 let mut evidence = serde_json::json!({
-                    "build": "V66", "sample": observation.sample,
+                    "build": "V67", "sample": observation.sample,
                     "action": format!("{:?}", runtime.life.state.current_action),
                     "pose": format!("{:?}", runtime.intent.pose),
                     "program": runtime.body.somatic_actuation().program,
@@ -5513,47 +5560,28 @@ impl ApplicationHandler for PetApplication {
                     position,
                 );
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Right,
-                ..
-            } => {
-                request_companion_care_menu(runtime, &self.store);
-            }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                let down = state == ElementState::Pressed;
-                let cursor = virtual_normalized_to_physical(
-                    &runtime.topology, runtime.sensors.cursor_position,
-                );
-                let nest = virtual_normalized_to_physical(
-                    &runtime.topology, runtime.ecology.state().den.anchor,
-                );
-                let desktop_size = Vec2::new(
-                    runtime.topology.virtual_physical_bounds.width() as f32,
-                    runtime.topology.virtual_physical_bounds.height() as f32,
-                );
-                let nest_width = den_menu_hit_width(runtime.ecology.state().den.size_scale, desktop_size);
-                if down && cursor_hits_den_menu(cursor, nest, nest_width)
-                {
-                    // A house click belongs to care controls, including when the
-                    // creature is resting on its bed. Do not also begin a pet drag.
-                    runtime.pointer_tracker.suppress_until_release = true;
-                    request_companion_care_menu(runtime, &self.store);
-                } else if runtime.feeding_seconds > 0.0 {
-                    if down && runtime.food_click_cooldown <= 0.0 {
-                        runtime.ecology.sprinkle_food(
-                            runtime.sensors.cursor_position,
-                            runtime.sensors.timestamp.max(0.0),
-                        );
-                        runtime.food_click_cooldown = 0.20;
-                        runtime.save_accumulator = 30.0;
+            WindowEvent::MouseInput { state, button, .. } => {
+                match desktop_button_action(button, state) {
+                    DesktopButtonAction::CareMenu => {
+                        request_companion_care_menu(runtime, &self.store);
                     }
-                } else {
-                    runtime.pointer_tracker.record_window_event(down);
+                    DesktopButtonAction::Primary(down) => {
+                        // Primary interaction remains available over the nest,
+                        // including when the creature rests there.
+                        if runtime.feeding_seconds > 0.0 {
+                            if down && runtime.food_click_cooldown <= 0.0 {
+                                runtime.ecology.sprinkle_food(
+                                    runtime.sensors.cursor_position,
+                                    runtime.sensors.timestamp.max(0.0),
+                                );
+                                runtime.food_click_cooldown = 0.20;
+                                runtime.save_accumulator = 30.0;
+                            }
+                        } else {
+                            runtime.pointer_tracker.record_window_event(down);
+                        }
+                    }
+                    DesktopButtonAction::Ignore => {}
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => runtime.modifiers = modifiers.state(),
@@ -8679,7 +8707,10 @@ fn apply_screen_domain(
         virtual_normalized_to_physical(topology, body.simulation.feedback.world_position);
     let visual = body.liquid_visual_bounds_pixels(overlay_size.height.max(1) as f32);
     let contact = body.liquid_contact_bounds_pixels(overlay_size.height.max(1) as f32);
-    if bottom_edge_sleep && supported_rest_active {
+    let material_floor_contact = body.embodiment.liquid.environment_support_is_loaded("screen:bottom_edge")
+        && body.simulation.feedback.velocity.y >= 0.0;
+    let floor_owns_boundary = material_floor_contact || (bottom_edge_sleep && supported_rest_active);
+    if floor_owns_boundary {
         // Keep the acquired support frame stationary. Moving the root down for
         // every contour ripple raises the local particle wall again, pumping
         // the liquid upward and preventing a stable flattened contact patch.
@@ -8723,10 +8754,11 @@ fn apply_screen_domain(
     // Collision geometry cannot change merely because a behavior changes.
     // Switching from the actual lower silhouette to the taller upper lobe's
     // symmetric radius on leaving rest projected the pet upward by >60 px.
-    bounds_maximum.y = if bottom_edge_sleep && supported_rest_active {
+    bounds_maximum.y = if floor_owns_boundary {
         // The particle wall owns the lower boundary after acquisition; do not
         // add a second contour projection on top of that physical constraint.
-        (topology.virtual_physical_bounds.maximum.y as f32 - previous_center.y).max(1.0)
+        (virtual_normalized_to_physical(topology, screen_floor_anchor(topology, *previous_center, contact.minimum.x, contact.maximum.x)).y
+            - previous_center.y).max(1.0)
     } else {
         contact.maximum.y.max(1.0)
     };
@@ -8748,7 +8780,7 @@ fn apply_screen_domain(
     // Feeding that positional correction back as velocity/acceleration created
     // a self-startle -> deformation -> edge projection -> startle loop.
     let mut physical_velocity = attempted_velocity;
-    if bottom_edge_sleep && supported_rest_active {
+    if floor_owns_boundary {
         physical_velocity.y = 0.0;
         body.simulation.feedback.grounded = true;
     }
@@ -8785,6 +8817,34 @@ fn apply_screen_domain(
     *previous_center = constrained;
     *previous_velocity_px = physical_velocity;
     *was_in_contact = collided;
+}
+
+fn screen_floor_anchor(topology: &DisplayTopology, center: Vec2, left: f32, right: f32) -> Vec2 {
+    let mut edges: Vec<_> = topology.monitors.iter()
+        .flat_map(|m| [m.physical_bounds.minimum.y, m.physical_bounds.maximum.y])
+        .filter(|y| *y as f32 >= center.y)
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    // Use the same complete horizontal footprint as the host AABB projection.
+    // A center-only ray can pass an offset display seam while part of the body
+    // hits its ledge, leaving a rigid host collision with no liquid wall.
+    let bottom = edges.into_iter().find(|y| {
+        !aabb_covered(topology,
+            Vec2::new(center.x + left, *y as f32 + 0.01),
+            Vec2::new(center.x + right, *y as f32 + 0.5))
+    }).unwrap_or(topology.virtual_physical_bounds.maximum.y);
+    physical_to_virtual_normalized(topology, Vec2::new(center.x, bottom as f32))
+}
+
+fn physical_support_command(surface: &str, anchor_point: Vec2, normal_compliance: f32) -> pet_motor::SurfaceAttachmentCommand {
+    pet_motor::SurfaceAttachmentCommand {
+        surface_id: lifecore::SurfaceId(surface.into()), anchor_point,
+        normal: Vec2::NEG_Y, tangent: Vec2::X,
+        target_contact_fraction: 0.32, normal_compliance,
+        tangent_friction: 0.7, adhesion: 0.0, load_fraction: 0.27,
+        break_force: 0.7, release_half_life: 0.25,
+    }
 }
 
 fn local_guard_keeps_floor(packet: &SomaticActuationPacket) -> bool {
@@ -10703,9 +10763,7 @@ mod tests {
         assert!(!cursor_hits_den_menu(Vec2::splat(f32::NAN), nest, width));
     }
     #[test]
-    fn house_click_cannot_also_drag_a_sleeping_creature_and_next_pet_click_still_works() {
-        // A global input sample may have captured the body just before the
-        // native MouseInput event is dispatched. The house click still owns it.
+    fn suppressed_pointer_capture_waits_for_release_before_next_pet_click() {
         let mut pointer = PointerState { down: true, pet_dragged: true, ..Default::default() };
         let mut tracker = DesktopPointerTracker {
             suppress_until_release: true, captured: true, sampled_down: true,
@@ -10722,6 +10780,118 @@ mod tests {
         tracker.record_window_event(true);
         assert!(update_pointer_state(&mut pointer, &mut tracker, true, true));
         assert!(pointer.pet_touched && pointer.pet_dragged && tracker.captured);
+    }
+
+    #[test]
+    fn physical_floor_uses_monitor_union_and_does_not_close_vertical_seams() {
+        let mut monitors = two_monitor_topology().monitors;
+        monitors[1].physical_bounds.minimum = PhysicalDesktopPoint { x: 0, y: 1080 };
+        monitors[1].physical_bounds.maximum = PhysicalDesktopPoint { x: 1920, y: 2160 };
+        let stacked = DisplayTopology::new(monitors.clone(), 1);
+        let bottom = virtual_normalized_to_physical(&stacked, screen_floor_anchor(&stacked, Vec2::new(960.0, 500.0), -60.0, 60.0)).y;
+        assert_eq!(bottom, 2160.0, "adjacent display seam became a solid wall");
+        monitors[1].physical_bounds.minimum.x = 1920;
+        monitors[1].physical_bounds.maximum.x = 3840;
+        let l_shape = DisplayTopology::new(monitors, 1);
+        let bottom = virtual_normalized_to_physical(&l_shape, screen_floor_anchor(&l_shape, Vec2::new(960.0, 500.0), -60.0, 60.0)).y;
+        assert_eq!(bottom, 1080.0, "an empty L-layout gap was treated as support below the actual monitor");
+    }
+
+    #[test]
+    fn physical_floor_agrees_with_host_at_partial_width_display_ledge() {
+        let mut monitors = two_monitor_topology().monitors;
+        monitors[1].physical_bounds.minimum = PhysicalDesktopPoint { x: 1000, y: 1080 };
+        monitors[1].physical_bounds.maximum = PhysicalDesktopPoint { x: 2920, y: 2160 };
+        let topology = DisplayTopology::new(monitors, 1);
+        let center = Vec2::new(1010.0, 500.0);
+        let floor = virtual_normalized_to_physical(&topology,
+            screen_floor_anchor(&topology, center, -60.0, 60.0)).y;
+        assert_eq!(floor, 1080.0);
+        let stopped = constrain_center_swept(&topology, center, Vec2::new(1010.0, 1200.0),
+            Vec2::splat(-60.0), Vec2::splat(60.0));
+        assert!((stopped.y + 60.0 - floor).abs() < 0.1);
+        let clear_center = Vec2::new(1100.0, 500.0);
+        let open_floor = virtual_normalized_to_physical(&topology,
+            screen_floor_anchor(&topology, clear_center, -60.0, 60.0)).y;
+        assert_eq!(open_floor, 2160.0, "full footprint fits; seam must stay open");
+    }
+
+    #[test]
+    fn geometric_floor_loads_without_rest_program_and_releases_on_upward_motion() {
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.apply_tuning_profile(production_liquid_tuning(approved_production_liquid_tuning(42))).unwrap();
+        let topology = two_monitor_topology();
+        let span = Vec2::new(3840.0, 1080.0);
+        body.simulation.set_motion_space_pixels(span);
+        body.set_desktop_motion_space(span, 1080.0);
+        let initial = body.main_liquid_contact_bounds_pixels(1080.0);
+        let mut center = Vec2::new(1000.0, 1080.0 - initial.maximum.y);
+        let start = center;
+        let mut velocity = Vec2::ZERO;
+        let mut extent = Vec2::ZERO;
+        let mut contact = false;
+        body.simulation.feedback.world_position = physical_to_virtual_normalized(&topology, center);
+        let intent = BodyIntent {
+            locomotion: LocomotionMode::Hover, target_position: body.simulation.feedback.world_position,
+            target_surface: None, desired_speed: 0.0, facing_direction: 1.0,
+            gaze_target: None, pose: PoseIntent::Neutral, expression: Default::default(), interaction_target: None,
+        };
+        let sensors = SensorFrame::default();
+        for _ in 0..360 {
+            body.simulation.feedback.world_position.y += 0.015 / 120.0;
+            body.simulation.feedback.velocity = Vec2::new(0.0, 0.015);
+            body.embodiment.liquid.set_environment_support(Some(physical_support_command(
+                "screen:bottom_edge", screen_floor_anchor(&topology, center, initial.minimum.x, initial.maximum.x), 0.35)));
+            // No motor attachment, no supported pose, no sleep action/dwell.
+            apply_screen_domain(&mut body, &topology, PhysicalSize::new(3840, 1080), false, false,
+                &mut center, &mut velocity, &mut extent, &mut contact, 1.0 / 120.0);
+            body.embodied_update(&intent, &sensors, Default::default(), Default::default(), Default::default(), 1.0 / 120.0);
+        }
+        eprintln!("host settled root={center:?} start={start:?} diagnostics={:?}", body.embodiment.liquid.diagnostics());
+        assert!(body.embodiment.liquid.environment_support_is_loaded("screen:bottom_edge"));
+        assert!((center.y - start.y).abs() < 50.0, "root chased a changing contact contour: {start:?} -> {center:?}");
+        let settled = body.main_liquid_contact_bounds_pixels(1080.0);
+        assert!(settled.maximum.y - settled.minimum.y < (initial.maximum.y - initial.minimum.y) * 0.85);
+        let takeoff_y = center.y;
+        for tick in 0..360 {
+            body.simulation.feedback.world_position.y -= 0.05 / 120.0;
+            body.simulation.feedback.velocity = Vec2::new(0.0, -0.05);
+            apply_screen_domain(&mut body, &topology, PhysicalSize::new(3840, 1080), false, false,
+                &mut center, &mut velocity, &mut extent, &mut contact, 1.0 / 120.0);
+            body.embodied_update(&intent, &sensors, Default::default(), Default::default(), Default::default(), 1.0 / 120.0);
+            if tick % 120 == 119 {
+                let hull = body.main_liquid_contact_bounds_pixels(1080.0);
+                eprintln!("host takeoff seconds={} root_travel={} contact_gap={} load={} mass={}", (tick+1)/120, takeoff_y-center.y, 1080.0-center.y-hull.maximum.y, body.embodiment.liquid.diagnostics().support_field_load, body.embodiment.liquid.diagnostics().main_mass);
+            }
+        }
+        assert!(center.y < takeoff_y - 150.0, "physical floor blocked takeoff");
+        assert!(1080.0 - center.y - body.main_liquid_contact_bounds_pixels(1080.0).maximum.y > 15.0,
+            "carrier rose but actual material stayed stuck to the old floor");
+        let d = body.embodiment.liquid.diagnostics();
+        assert_eq!(d.support_field_load, 0.0);
+        assert_eq!(d.main_mass, 96.0);
+        assert_eq!(d.component_count, 1);
+        assert_eq!(d.failsafe_hits, 0);
+        assert_eq!(d.recovery_count, 0);
+    }
+
+    #[test]
+    fn primary_drag_at_nest_remains_primary_and_only_secondary_press_opens_care() {
+        let mut pointer = PointerState::default();
+        let mut tracker = DesktopPointerTracker::default();
+        for state in [ElementState::Pressed, ElementState::Released] {
+            let DesktopButtonAction::Primary(down) = desktop_button_action(MouseButton::Left, state)
+            else { panic!("primary input must not become a care-menu action"); };
+            tracker.record_window_event(down);
+            update_pointer_state(&mut pointer, &mut tracker, down, true);
+            assert_eq!(pointer.pet_dragged, down);
+            assert!(!tracker.suppress_until_release);
+        }
+        assert!(pointer.released);
+        assert_eq!(desktop_button_action(MouseButton::Right, ElementState::Pressed), DesktopButtonAction::CareMenu);
+        assert_eq!(desktop_button_action(MouseButton::Right, ElementState::Released), DesktopButtonAction::Ignore);
+        assert_eq!(desktop_button_action(MouseButton::Middle, ElementState::Pressed), DesktopButtonAction::Ignore);
     }
 
 }

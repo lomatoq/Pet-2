@@ -1,5 +1,5 @@
 //! Quiet pearl surfaces with transparent space between floating controls.
-use egui::{Color32, Rect, pos2};
+use egui::Rect;
 use std::path::Path;
 use winit::{dpi::PhysicalPosition, window::Window};
 
@@ -37,9 +37,6 @@ impl Glass {
         Some(Self { region: vec![] })
     }
     pub fn update(&mut self, _: &egui::Context, _: &Window) {}
-    pub fn texture(&self) -> Option<egui::TextureId> {
-        None
-    }
     pub fn set_regions(&mut self, window: &Window, rects: &[(Rect, f32)]) {
         let scale = window.scale_factor() as f32;
         let regions: Vec<_> = rects
@@ -93,75 +90,6 @@ fn placement_to_monitor_edge(anchor: [f32; 2], bounds: [f32; 4], scale: f32) -> 
     let half = (logical_width * 0.5).min(210.0);
     let nest_x = ((anchor[0] - left) / scale).clamp(half, (logical_width - half).max(half));
     MenuPlacement { position: [left as i32, top as i32], width, nest_x }
-}
-/// Soft local contact shadow, drawn by the existing UI renderer.
-pub fn bubble_shadow(painter: &egui::Painter, rect: Rect, alpha: f32) {
-    painter.add(
-        egui::epaint::RectShape::filled(
-            rect.shrink(2.0).translate(egui::vec2(0.0, 4.0)),
-            28,
-            Color32::from_rgba_unmultiplied(33, 28, 49, (23.0 * alpha) as u8),
-        )
-        .with_blur_width(12.0),
-    );
-}
-
-pub fn surface(
-    painter: &egui::Painter,
-    rect: Rect,
-    radius: u8,
-    texture: Option<egui::TextureId>,
-    screen: Rect,
-    alpha: f32,
-    active: bool,
-) {
-    painter.add(
-        egui::epaint::RectShape::filled(
-            rect.translate(egui::vec2(0.0, 4.0)),
-            radius,
-            Color32::from_rgba_unmultiplied(42, 31, 57, (18.0 * alpha) as u8),
-        )
-        .with_blur_width(14.0),
-    );
-    if let Some(id) = texture {
-        let uv = Rect::from_min_max(
-            pos2(rect.min.x / screen.width(), rect.min.y / screen.height()),
-            pos2(rect.max.x / screen.width(), rect.max.y / screen.height()),
-        );
-        painter.add(
-            egui::epaint::RectShape::filled(
-                rect,
-                radius,
-                Color32::from_white_alpha((230.0 * alpha) as u8),
-            )
-            .with_texture(id, uv),
-        );
-    }
-    let tint = if active {
-        [239, 232, 247]
-    } else {
-        [251, 249, 253]
-    };
-    painter.rect_filled(
-        rect,
-        radius,
-        Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], (255.0 * alpha) as u8),
-    );
-    painter.rect_stroke(
-        rect,
-        radius,
-        egui::Stroke::new(
-            0.8,
-            Color32::from_rgba_unmultiplied(210, 200, 222, (135.0 * alpha) as u8),
-        ),
-        egui::StrokeKind::Inside,
-    );
-    painter.rect_stroke(
-        rect.shrink(1.1),
-        radius.saturating_sub(1),
-        egui::Stroke::new(0.7, Color32::from_white_alpha((210.0 * alpha) as u8)),
-        egui::StrokeKind::Inside,
-    );
 }
 #[cfg(windows)]
 fn apply_region(window: &Window, rects: &[[i32; 5]]) {

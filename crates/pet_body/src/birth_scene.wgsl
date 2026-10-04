@@ -11,81 +11,32 @@ struct Out { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32>, @
     }
     var out:Out; out.position=vec4<f32>(p.x*style.z*2-1,1-p.y*style.w*2,0,1);out.uv=corners[index]*0.5+0.5;out.opacity=style.y;out.effect=effect;out.color=color;out.sprite_area=4.0*rect.z*rect.w;return out;
 }
-// V29 authored near-rim trace. Central knots follow the visible cushion/shell
-// interface; the shoulders return to the real outer silhouette instead of
-// extending a parabola diagonally across an unbroken wall. Same knots and cubic
-// interpolation are used by assets/nest/export_layers.py for editable layers.
-fn nest_front_rim_y(u: f32) -> f32 {
-    let knots = array<vec3<f32>, 21>(
-        vec3<f32>(65.000000, 510.000000, -1.000000000),
-        vec3<f32>(100.000000, 475.000000, -0.680000000),
-        vec3<f32>(150.000000, 450.000000, -0.289473684),
-        vec3<f32>(210.000000, 438.000000, 0.000000000),
-        vec3<f32>(240.000000, 479.000000, 1.164847512),
-        vec3<f32>(300.000000, 538.000000, 0.627937916),
-        vec3<f32>(400.000000, 582.000000, 0.370526316),
-        vec3<f32>(500.000000, 614.000000, 0.298666667),
-        vec3<f32>(600.000000, 642.000000, 0.195348837),
-        vec3<f32>(700.000000, 657.000000, 0.065899582),
-        vec3<f32>(768.000000, 660.000000, 0.000000000),
-        vec3<f32>(836.000000, 657.000000, -0.070515212),
-        vec3<f32>(936.000000, 635.000000, -0.246400000),
-        vec3<f32>(1036.000000, 607.000000, -0.294237288),
-        vec3<f32>(1136.000000, 576.000000, -0.353055556),
-        vec3<f32>(1236.000000, 535.000000, -0.585207612),
-        vec3<f32>(1296.000000, 480.000000, -1.090333919),
-        vec3<f32>(1330.000000, 436.000000, 0.000000000),
-        vec3<f32>(1386.000000, 455.000000, 0.460057434),
-        vec3<f32>(1436.000000, 490.000000, 0.830188679),
-        vec3<f32>(1474.000000, 528.000000, 1.000000000)
-    );
-    let x = clamp(u * 1536.0, knots[0].x, knots[20].x);
-    for (var i = 0u; i < 20u; i += 1u) {
-        let a = knots[i];
-        let b = knots[i + 1u];
-        if x <= b.x {
-            let h = b.x - a.x;
-            let t = clamp((x - a.x) / h, 0.0, 1.0);
-            let t2 = t * t;
-            let t3 = t2 * t;
-            return ((2.0 * t3 - 3.0 * t2 + 1.0) * a.y
-                + (t3 - 2.0 * t2 + t) * h * a.z
-                + (-2.0 * t3 + 3.0 * t2) * b.y
-                + (t3 - t2) * h * b.z) / 1024.0;
-        }
+// Moonlight cradle: trace the generated dark hollow/front lip interface.
+// The runtime slices one source in complementary alpha, never two drifting images.
+fn nest_front_rim_y(u:f32)->f32 {
+    let points=array<vec2<f32>,19>(
+        vec2<f32>(147,500),vec2<f32>(232,390),vec2<f32>(332,385),
+        vec2<f32>(382,457),vec2<f32>(482,511),vec2<f32>(582,540),
+        vec2<f32>(732,560),vec2<f32>(882,565),vec2<f32>(990,566),
+        vec2<f32>(1132,564),vec2<f32>(1282,556),vec2<f32>(1432,531),
+        vec2<f32>(1532,499),vec2<f32>(1582,473),vec2<f32>(1632,418),
+        vec2<f32>(1682,390),vec2<f32>(1742,380),vec2<f32>(1802,460),
+        vec2<f32>(1837,530));
+    let x=clamp(u*1980.0,points[0].x,points[18].x);
+    for (var i=0u;i<18u;i+=1u) {
+        let a=points[i];let b=points[i+1u];
+        if x<=b.x {return mix(a.y,b.y,(x-a.x)/(b.x-a.x))/866.0;}
     }
-    return knots[20].y / 1024.0;
+    return points[18].y/866.0;
 }
-
-// V66 living ink: texture alpha owns all silhouettes and the exact layer
-// boundaries. Authored value only supplies bounded depth cues; broad analytic
-// paint replaces the baked gold, rainbow reflection and granular metal finish.
-// Same UV/function on the two nest layers avoids a new foreground paint seam.
-fn illustrated_prop(sample:vec3<f32>,uv:vec2<f32>,nest:bool)->vec3<f32> {
-    let value=dot(display_color(sample),vec3<f32>(0.2126,0.7152,0.0722));
-    if nest {
-        let mid_mask=smoothstep(0.22,0.40,value);
-        let light_mask=smoothstep(0.64,0.83,value);
-        var paint=mix(vec3<f32>(0.008,0.010,0.026),vec3<f32>(0.032,0.038,0.084),mid_mask);
-        paint=mix(paint,vec3<f32>(0.13,0.15,0.23),light_mask);
-        let cushion=smoothstep(0.72,0.87,value);
-        return mix(paint,vec3<f32>(0.095,0.18,0.17),cushion*0.70);
-    }
-    // Rounded, quiet ink planes belong to the capsule rather than the source
-    // image's metal reflections. Bounded value modulation preserves seams
-    // without amplifying tiny authored grain into mottled highlight patches.
+// Each new generated capsule half shares its complete canvas and transform
+// between rear and front. A depth split follows the authored rim, not a tint.
+fn capsule_front_coverage(uv:vec2<f32>,upper:bool)->f32 {
     let x=uv.x*2.0-1.0;
-    let rounded=sqrt(max(0.0,1.0-x*x));
-    let rise=1.0-smoothstep(0.12,0.83,uv.y);
-    let plane=rounded*(0.30+0.70*rise);
-    var paint=mix(vec3<f32>(0.012,0.016,0.036),vec3<f32>(0.068,0.096,0.14),plane);
-    paint*=0.76+0.24*value;
-    let shoulder=1.0-smoothstep(0.12,1.0,length((uv-vec2<f32>(0.27,0.24))*vec2<f32>(2.4,4.2)));
-    paint+=vec3<f32>(0.015,0.036,0.038)*shoulder;
-    // The existing bright central latch reads as one luminous insert. Do not
-    // recolor every bright texture edge into a glowing outer crust.
-    let latch=smoothstep(0.93,0.995,value)*(1.0-smoothstep(0.035,0.085,abs(uv.x-0.5)));
-    return mix(paint,vec3<f32>(0.45,0.64,0.58),latch*0.72);
+    var edge=0.20+0.35*sqrt(max(0.0,1.0-x*x));
+    if upper { edge=0.90-0.20*sin(abs(x)*3.14159265)+0.080*x*x; }
+    let front=smoothstep(edge-0.002,edge+0.002,uv.y);
+    return select(front,1.0-front,upper);
 }
 
 @fragment fn fragment_main(input:Out)->@location(0) vec4<f32> {
@@ -100,7 +51,7 @@ fn illustrated_prop(sample:vec3<f32>,uv:vec2<f32>,nest:bool)->vec3<f32> {
         let front_alpha = sample.a * coverage;
         let back_alpha = (sample.a - front_alpha) / max(1.0 - front_alpha, 0.000001);
         let alpha = select(front_alpha, back_alpha, input.effect.y < -1.5) * input.opacity;
-        return vec4<f32>(illustrated_prop(sample.rgb,input.uv,true) * alpha, alpha);
+        return vec4<f32>(sample.rgb * alpha, alpha);
     }
     if input.effect.y>5.5 {
         let p=(input.uv-0.5)*2.0;let radius=length(p);let a=(1.0-smoothstep(0.80,1.0,radius))*input.opacity;
@@ -148,8 +99,16 @@ fn illustrated_prop(sample:vec3<f32>,uv:vec2<f32>,nest:bool)->vec3<f32> {
     }
     if input.effect.y > 0.5 { return capsule_orb(input.uv,input.effect.x,input.opacity); }
     let sample=textureSample(picture,picture_sampler,input.uv);
-    let alpha=sample.a*input.opacity;
-    return vec4<f32>(illustrated_prop(sample.rgb,input.uv,false)*alpha,alpha);
+    var source_alpha=sample.a;
+    if input.effect.z>0.5 {
+        let upper=input.effect.z==2.0 || input.effect.z==4.0;
+        let coverage=capsule_front_coverage(input.uv,upper);
+        let front_alpha=sample.a*coverage;
+        let back_alpha=(sample.a-front_alpha)/max(1.0-front_alpha,0.000001);
+        source_alpha=select(back_alpha,front_alpha,input.effect.z>2.5);
+    }
+    let alpha=source_alpha*input.opacity;
+    return vec4<f32>(sample.rgb*alpha,alpha);
 }
 
 
@@ -176,31 +135,15 @@ fn capsule_orb(uv:vec2<f32>,time:f32,opacity:f32)->vec4<f32> {
     let radius=length(p);
     let alpha=1.0-smoothstep(0.994,1.006,radius);
     if alpha<0.0001 {return vec4<f32>(0.0);}
-    // Preserve V20 release deformation and aperture exactly; replace only the
-    // interior material. Calm ink, a broad cool plane and an orbiting inlay
-    // explain an energetic seed without raymarched candy clouds or neon crust.
-    let normal_xy=p/max(1.0,radius);
-    let z=sqrt(max(0.0,1.0-dot(normal_xy,normal_xy)));
-    let n=vec3<f32>(normal_xy.x,-normal_xy.y,z);
-    let light=dot(n,normalize(vec3<f32>(-0.56,0.64,0.54)));
-    let plane=smoothstep(-0.12,0.10,light);
-    let shoulder=smoothstep(0.59,0.80,light);
-    var color=mix(vec3<f32>(0.004,0.006,0.017),vec3<f32>(0.025,0.033,0.069),plane);
-    color=mix(color,vec3<f32>(0.080,0.17,0.18),shoulder*0.65);
-    let q=rotate2(p,time*0.15+0.20*sin(time*0.32));
-    let orbit_outer=length(q-vec2<f32>(-0.25,-0.09));
-    let orbit_inner=length(q-vec2<f32>(-0.06,-0.02));
-    let ink_inlay=(1.0-smoothstep(0.52,0.545,orbit_outer))*smoothstep(0.495,0.52,orbit_inner);
-    let pulse=0.65+0.35*sin(time*2.15-radius*3.6);
-    color=mix(color,vec3<f32>(0.23,0.40,0.39),ink_inlay*(0.20+0.32*charge)*pulse);
-    let arc=exp(-pow((radius-0.958)/0.021,2.0));
-    let angular=smoothstep(0.14,0.88,dot(normal_xy,normalize(vec2<f32>(-0.64,-0.77))));
-    color+=vec3<f32>(0.28,0.36,0.37)*arc*angular*0.58;
-    let violet_side=smoothstep(0.40,0.94,normal_xy.x)*smoothstep(0.30,0.90,radius);
-    color+=vec3<f32>(0.039,0.017,0.075)*violet_side;
+    // New authored luminous volume, slowly sheared in radius so inner energy
+    // flows while the physical silhouette and opening aperture stay unchanged.
+    let angle=time*0.095*(1.0-radius*radius)+0.10*sin(time*0.31+radius*3.2);
+    let q=rotate2(p,angle);
+    let ink=textureSample(picture,picture_sampler,q*0.489+0.5);
+    let color=ink.rgb*(1.0+0.055*charge);
     let theta=atan2(p.y,p.x);
     let hole=radius*0.5+release*0.034*(sin(theta*3.0-open*4.4)+0.45*sin(theta*5.0+open*3.2));
     let clear=mix(1.0,smoothstep(open*0.83-0.13,open*0.83+0.065,hole),smoothstep(0.02,0.27,open));
-    let coverage=alpha*opacity*clear;
+    let coverage=alpha*opacity*clear*ink.a;
     return vec4<f32>(color*coverage,coverage);
 }

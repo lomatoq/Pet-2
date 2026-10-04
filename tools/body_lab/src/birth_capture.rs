@@ -86,6 +86,17 @@ impl Capture {
             ("seated-orb-free", 640, 480, 15.0, FacePose::Awake),
             ("seated-orb-rolling", 640, 480, 15.0, FacePose::Awake),
             ("seated-orb-large", 1280, 800, 15.0, FacePose::Awake),
+            ("seated-orb-flow-0", 640, 480, 15.0, FacePose::Awake),
+            (
+                "seated-orb-flow-frame",
+                640,
+                480,
+                15.0 + 1.0 / 60.0,
+                FacePose::Awake,
+            ),
+            ("seated-orb-flow-1", 640, 480, 16.0, FacePose::Awake),
+            ("seated-orb-flow-2", 640, 480, 17.0, FacePose::Awake),
+            ("seated-orb-flow-4", 640, 480, 19.0, FacePose::Awake),
             ("shouting", 640, 480, 15.0, FacePose::Awake),
             ("flattened", 640, 480, 15.0, FacePose::Awake),
             ("speaking", 640, 480, 15.0, FacePose::Awake),
@@ -119,6 +130,7 @@ impl Capture {
                 continue;
             }
             if std::env::args().any(|arg| arg == "--props-only")
+                && !name.starts_with("seated-orb-flow")
                 && !matches!(
                     name,
                     "capsule-arrival"
@@ -346,6 +358,15 @@ impl Capture {
                     1.0 - 310.0 * 0.292 / height as f32,
                 ]
             };
+            if name.starts_with("seated-orb-flow") {
+                // Independent physical reset: temporal differences measure the
+                // material flow alone, not carry-over angular velocity.
+                ecology_renderer = pet_body::EcologyRenderer::new(
+                    renderer.device(),
+                    renderer.surface_format(),
+                    renderer.premultiplied_output(),
+                );
+            }
             let mut ecology = pet_ecology::EcologyState::new(42);
             ecology.den.anchor = Vec2::from_array(den);
             let orb = &mut ecology.objects[0];
@@ -378,7 +399,7 @@ impl Capture {
                 renderer.queue(),
                 &ecology,
                 width as f32 / height as f32,
-                15.0,
+                time,
             );
             let scene = std::cell::RefCell::new(&mut scene);
             let inside = name.starts_with("seated");

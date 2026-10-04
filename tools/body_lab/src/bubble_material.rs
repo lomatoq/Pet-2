@@ -1,6 +1,6 @@
-//! Authored luminous ink for the six companion controls, in egui's existing pass.
+//! Soft opal energy membranes for six controls in egui's existing pass.
 //!
-//! A deep quiet center and tapered colored light bow preserve glyph contrast.
+//! Broad subsurface light and centered depression preserve filled-symbol contrast.
 //! Icons are painted above this material by the caller. GPU objects are
 //! initialized once; each immutable slot receives one small uniform update.
 use egui::{Color32, PaintCallbackInfo, Painter, Rect};
@@ -179,6 +179,7 @@ struct BubbleCallback {
     alpha: f32,
     emphasis: f32,
     phase: f32,
+    depression: f32,
     size: [f32; 2],
     rect: Rect,
     slot: usize,
@@ -209,6 +210,7 @@ impl CallbackTrait for BubbleCallback {
                 self.rect.width() / width,
                 self.rect.height() / height,
             ];
+            uniform.output[1] = finite_or(self.depression, 0.0).clamp(0.0, 1.0);
             let bytes = uniform.bytes();
             queue.write_buffer(&resources.slots[self.slot].uniform, 0, &bytes);
         }
@@ -248,7 +250,7 @@ pub fn paint(
     tint: Color32,
     alpha: f32,
     emphasis: f32,
-    phase: f32,
+    depression: f32,
     slot: usize,
 ) {
     if slot >= SLOTS
@@ -265,7 +267,8 @@ pub fn paint(
             tint,
             alpha,
             emphasis,
-            phase,
+            phase: slot as f32 * 1.43,
+            depression,
             size: [rect.width(), rect.height()],
             rect: painter
                 .ctx()
@@ -385,6 +388,7 @@ mod tests {
                         alpha: 1.0,
                         emphasis: slot as f32 / 6.0,
                         phase: slot as f32,
+                        depression: slot as f32 / 5.0,
                         size: [56.0; 2],
                         rect: Rect::from_min_size(
                             egui::pos2(22.125, 450.375),

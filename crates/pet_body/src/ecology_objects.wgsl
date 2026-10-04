@@ -631,30 +631,44 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let rgb = mix(input.color.rgb, vec3<f32>(1.0, 0.96, 0.72), core * 0.65) * (0.72 + pulse * 0.28);
         return encode_surface_output(vec4<f32>(rgb * alpha, alpha));
     }
-    // V66 illustrated living ink. Physical sphere radius and coverage
-    // coincide. All paint stays inside the silhouette; no additive halo/crust.
-    // Surface rotation moves the inset crescent, not the stationary lighting.
+    // A small toy needs light volumes, not a minified spiral badge. Two broad
+    // fields travel at different depths below a quiet glass shoulder. The
+    // generated art contributes folds, while the light itself moves through it.
+    // This is a bounded analytic volume approximation: no ray march/pass.
     let aa=max(fwidth(radial_distance),0.008);
     let alpha=(1.0-smoothstep(1.0-aa,1.0+aa,radial_distance))*input.color.a;
-    let z=sqrt(max(0.0,1.0-dot(input.local,input.local)));
-    let n=vec3<f32>(input.local,z);
-    let lighting=dot(n,normalize(vec3<f32>(-0.56,0.64,0.54)));
-    let terminator=smoothstep(-0.12,0.07,lighting);
-    let shoulder=smoothstep(0.60,0.77,lighting);
-    var paint=mix(vec3<f32>(0.008,0.010,0.030),vec3<f32>(0.038,0.052,0.105),terminator);
-    paint=mix(paint,vec3<f32>(0.12,0.25,0.25),shoulder*0.83);
-    let c=cos(input.material.z);let s=sin(input.material.z);
+    let time=input.material.w;
+    let depth=sqrt(max(1.0-radial_distance*radial_distance,0.0));
+    let angle=input.material.z+time*0.095*(1.0-radial_distance*radial_distance)
+        +0.10*sin(time*0.31+radial_distance*3.2);
+    let c=cos(angle);let s=sin(angle);
     let q=vec2<f32>(c*input.local.x-s*input.local.y,s*input.local.x+c*input.local.y);
-    // Offset circular subtraction makes a quiet curved inlay which rotates
-    // with genuine orb roll and remains readable at the production small size.
-    let outer=length(q-vec2<f32>(-0.22,0.14));
-    let inner=length(q-vec2<f32>(-0.05,0.21));
-    let crescent=(1.0-smoothstep(0.50-aa,0.50+aa,outer))*smoothstep(0.47-aa,0.47+aa,inner);
-    let inlay_color=mix(vec3<f32>(0.15,0.20,0.34),vec3<f32>(0.48,0.68,0.61),terminator);
-    paint=mix(paint,inlay_color,crescent*0.48);
-    let glint=1.0-smoothstep(0.055,0.092,length((input.local-vec2<f32>(-0.31,0.48))*vec2<f32>(0.8,1.3)));
-    paint=mix(paint,vec3<f32>(0.87,0.92,0.87),glint*0.70);
+    let uv=vec2<f32>(q.x,-q.y)*0.489+0.5;
+    let authored=textureSample(pearl_sprite,desktop_background_sampler,uv);
+    let near_center=vec2<f32>(0.33*cos(time*0.43),0.28*sin(time*0.43));
+    let far_center=vec2<f32>(0.35*cos(time*0.29+2.3),0.31*sin(time*0.29+2.3));
+    let near_p=(q*(0.80+0.20*depth)-near_center)/vec2<f32>(0.49,0.65);
+    let far_p=(q*0.84+vec2<f32>(depth*0.15,-depth*0.11)-far_center)/vec2<f32>(0.61,0.44);
+    let near_light=exp(-dot(near_p,near_p)*2.0);
+    let far_light=exp(-dot(far_p,far_p)*1.7);
+    let interior=smoothstep(0.0,0.42,depth);
+    let normal=normalize(vec3<f32>(input.local,depth+0.001));
+    let facing=max(dot(normal,normalize(vec3<f32>(-0.42,0.55,0.88))),0.0);
+    let glass=mix(vec3<f32>(0.028,0.038,0.105),vec3<f32>(0.15,0.21,0.38),facing*0.58);
+    var paint=mix(glass,authored.rgb,0.18);
+    let energy=vec3<f32>(0.24,0.91,0.70)*near_light
+        +vec3<f32>(0.36,0.29,0.86)*far_light;
+    paint+=energy*interior*(0.58+0.20*depth);
+    // Overlapping fields produce one soft luminous core rather than white
+    // outlines. The fixed shoulder makes their independent interior drift read.
+    paint+=vec3<f32>(0.45,0.67,0.71)*near_light*far_light*interior*0.60;
+    let shoulder=pow(1.0-depth,2.4)*(0.28+0.72*facing);
+    paint+=mix(vec3<f32>(0.24,0.36,0.75),vec3<f32>(0.50,0.82,0.74),facing)*shoulder*0.46;
+    let reflection=exp(-dot((input.local-vec2<f32>(-0.34,0.45))/vec2<f32>(0.28,0.20),
+        (input.local-vec2<f32>(-0.34,0.45))/vec2<f32>(0.28,0.20))*2.0);
+    paint+=vec3<f32>(0.37,0.46,0.51)*reflection*0.40;
     let lower_arc=smoothstep(-0.15,0.95,-input.local.y+0.30*input.local.x*input.local.x);
-    paint*=1.0-0.16*input.den_surface.x*lower_arc;
-    return encode_surface_output(vec4<f32>(paint*alpha,alpha));
+    paint*=1.0-0.12*input.den_surface.x*lower_arc;
+    let coverage=alpha*authored.a;
+    return encode_surface_output(vec4<f32>(paint*coverage,coverage));
 }

@@ -46,6 +46,7 @@ impl Capture {
             event_loop.create_window(
                 Window::default_attributes()
                     .with_title("Pet Lab · production face capture")
+                    .with_visible(false)
                     .with_inner_size(PhysicalSize::new(512, 512)),
             )?,
         );
@@ -55,6 +56,9 @@ impl Capture {
         ))?;
         let initial = ProceduralBody::generate(&genome)?;
         let mut renderer = pollster::block_on(Renderer::new(window.clone(), &initial.mesh))?;
+        if std::env::args().any(|arg| arg == "--contextual-expressions") {
+            return capture_contextual(&self.output, &mut renderer, &genome, profile);
+        }
         let mut records = Vec::new();
         let eyes_only = std::env::args().any(|arg| arg == "--eye-emotions-only");
         let sleep_only = std::env::args().any(|arg| arg == "--sleep-eyes-only");
@@ -656,4 +660,282 @@ impl Capture {
         )?;
         Ok(())
     }
+}
+
+fn expression_from_director(
+    target: pet_body::CompanionExpressionTarget,
+) -> lifecore::ExpressionState {
+    let f = target.face;
+    let mut expression = lifecore::ExpressionState {
+        eye_aperture: f.eye_aperture,
+        squint: f.squint,
+        pupil_size: f.pupil_size,
+        pupil_focus: f.pupil_focus,
+        brow_raise: f.brow_raise,
+        brow_tension: f.brow_tension,
+        brow_asymmetry: f.brow_asymmetry,
+        mouth_curve: f.mouth_curve,
+        mouth_open: f.mouth_open,
+        mouth_tension: f.mouth_tension,
+        mouth_compression: f.mouth_compression,
+        mouth_asymmetry: f.mouth_asymmetry,
+        blink_left: target.blink_left,
+        blink_right: target.blink_right,
+        ..Default::default()
+    };
+    f.apply_geometry(&mut expression.geometry);
+    expression
+}
+
+fn context_case(name: &str) -> (lifecore::CompanionIntentFrame, pet_body::ExpressionEvidence) {
+    use lifecore::PrimaryIntent as I;
+    let mut input = lifecore::CompanionIntentFrame {
+        primary: I::Inspect,
+        curiosity: 0.85,
+        confidence: 0.9,
+        arousal: 0.3,
+        ..Default::default()
+    };
+    input.target.position = Some(Vec2::new(0.8, 0.5));
+    let mut evidence = pet_body::ExpressionEvidence {
+        body_position: Vec2::splat(0.5),
+        ..Default::default()
+    };
+    match name {
+        "CuriousCautious" => {
+            input.confidence = 0.12;
+            input.expected_outcome.uncertainty = 0.8;
+        }
+        "CuriousTired" => {
+            input.fatigue = 0.9;
+        }
+        "TouchLeft" | "TouchRight" => {
+            input.primary = I::AcceptContact;
+            input.contact_pleasantness = 0.9;
+            evidence.contact_pressure = 0.14;
+            evidence.contact_point =
+                Some(Vec2::new(if name == "TouchLeft" { 0.2 } else { 0.8 }, 0.5));
+        }
+        "SmallJoy" | "BigJoy" => {
+            let intensity = if name == "SmallJoy" { 0.25 } else { 0.95 };
+            input.primary = I::Celebrate;
+            input.curiosity = 0.0;
+            input.valence = intensity;
+            input.arousal = intensity;
+            input.confidence = intensity;
+            input.play_readiness = intensity;
+        }
+        "ExpectedSuccess" => {
+            input.primary = I::Intercept;
+            input.anticipation = 0.95;
+            input.expected_outcome.success = 0.95;
+            input.play_readiness = 0.8;
+        }
+        "UnexpectedMiss" | "ExpectedMiss" => {
+            input.primary = I::RecoverFromMiss;
+            input.frustration = 0.45;
+            input.curiosity = 0.0;
+        }
+        "Boundary" => {
+            input.primary = I::RejectContact;
+            input.discomfort = 0.7;
+            evidence.protective_reflex = true;
+        }
+        "AfterTouch" | "Quiet" => {
+            input.primary = I::QuietCompanionship;
+            input.curiosity = 0.0;
+        }
+        "Sleep" => {
+            input.primary = I::Sleep;
+            input.fatigue = 0.95;
+            input.curiosity = 0.0;
+        }
+        _ => {}
+    }
+    (input, evidence)
+}
+
+fn capture_contextual(
+    output: &std::path::Path,
+    renderer: &mut Renderer,
+    genome: &Genome,
+    profile: LiquidTuningProfile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut records = Vec::new();
+    for case in [
+        "CuriousConfident",
+        "CuriousCautious",
+        "CuriousTired",
+        "TouchLeft",
+        "TouchRight",
+        "SmallJoy",
+        "BigJoy",
+        "UnexpectedMiss",
+        "ExpectedMiss",
+        "Boundary",
+        "AfterTouch",
+        "Sleep",
+        "RigBlink025",
+        "RigBlink050",
+        "RigBlink075",
+        "RigPressedLips",
+        "RigOpenLips",
+        "RigCornerPull",
+        "MouthTimeline",
+        "Timeline",
+    ] {
+        let mut body = Box::new(ProceduralBody::generate(genome)?);
+        body.apply_tuning_profile(profile.clone())?;
+        body.embodiment.managed_blink = true;
+        body.set_render_aspect(1.0);
+        body.set_desktop_motion_space(Vec2::splat(512.0), 512.0);
+        // This renderer's presentation scale expands view bounds: larger
+        // values make the creature smaller, not larger.
+        body.set_presentation_scale(1.02);
+        let mut director = pet_body::CompanionExpressionDirector::new(42);
+        let mut target = pet_body::CompanionExpressionTarget::default();
+        let timeline = case.ends_with("Timeline");
+        let ticks = if case == "MouthTimeline" {
+            480
+        } else if timeline {
+            1200
+        } else {
+            282
+        };
+        for frame in 0..ticks {
+            let seconds = frame as f32 / 120.0;
+            let context = if case == "MouthTimeline" || case.starts_with("Rig") {
+                "Quiet"
+            } else if timeline {
+                if seconds < 2.0 {
+                    "CuriousCautious"
+                } else if seconds < 4.0 {
+                    "CuriousConfident"
+                } else if seconds < 6.0 {
+                    "TouchLeft"
+                } else if seconds < 8.0 {
+                    "Quiet"
+                } else {
+                    "Sleep"
+                }
+            } else if seconds < 2.0 && case == "ExpectedMiss" {
+                "ExpectedSuccess"
+            } else if seconds < 2.0 && case == "AfterTouch" {
+                "TouchRight"
+            } else {
+                case
+            };
+            let (input, evidence) = context_case(context);
+            if frame % 6 == 0 {
+                target = director.tick(input, evidence, 0.05);
+            }
+            let blink = director.present_blink(1.0 / 120.0);
+            target.blink_left = blink.left;
+            target.blink_right = blink.right;
+            let mut expression = expression_from_director(target);
+            // Capacity probes isolate the final rig from autonomous selection.
+            // These explicit inputs are diagnostic fixtures, never new actions.
+            match case {
+                "RigBlink025" | "RigBlink050" | "RigBlink075" => {
+                    let closure = match case {
+                        "RigBlink025" => 0.25,
+                        "RigBlink050" => 0.50,
+                        _ => 0.75,
+                    };
+                    expression.blink_left = closure;
+                    expression.blink_right = closure;
+                }
+                "RigPressedLips" => {
+                    expression.mouth_open = 0.50;
+                    expression.mouth_compression = 0.85;
+                    expression.mouth_tension = 0.80;
+                }
+                "RigOpenLips" => {
+                    expression.mouth_open = 0.50;
+                }
+                "RigCornerPull" => {
+                    expression.mouth_curve = 0.25;
+                    expression.mouth_asymmetry = 0.5;
+                }
+                "MouthTimeline" => {
+                    let ramp = |x: f32| {
+                        let x = x.clamp(0.0, 1.0);
+                        x * x * (3.0 - 2.0 * x)
+                    };
+                    expression.blink_left = 0.0;
+                    expression.blink_right = 0.0;
+                    expression.mouth_curve = 0.55 * ramp(seconds) * (1.0 - ramp(seconds - 2.0));
+                    expression.mouth_open =
+                        0.75 * ramp(seconds - 0.6) * (1.0 - ramp(seconds - 2.5));
+                    expression.mouth_compression =
+                        0.80 * ramp(seconds - 2.0) * (1.0 - ramp(seconds - 3.0));
+                    expression.mouth_tension = expression.mouth_compression * 0.8;
+                    expression.mouth_asymmetry = 0.32 * ramp(seconds) * (1.0 - ramp(seconds - 2.6));
+                }
+                _ => {}
+            }
+            let intent = BodyIntent {
+                locomotion: if context == "Sleep" {
+                    LocomotionMode::Sleep
+                } else {
+                    LocomotionMode::Hover
+                },
+                target_position: Vec2::splat(0.5),
+                target_surface: None,
+                desired_speed: 0.0,
+                facing_direction: 1.0,
+                gaze_target: target.gaze,
+                pose: PoseIntent::Neutral,
+                expression,
+                interaction_target: None,
+            };
+            body.embodied_update(
+                &intent,
+                &SensorFrame::default(),
+                AffectState::default(),
+                VisualMindInput::default(),
+                VoiceVisualState::default(),
+                1.0 / 120.0,
+            );
+            if (!timeline && frame + 1 != ticks) || (timeline && frame % 5 != 0) {
+                continue;
+            }
+            body.presentation_update(if timeline { 1.0 / 24.0 } else { 1.0 / 60.0 });
+            for (label, background) in [
+                ("dark", ReviewBackground::Black),
+                ("light", ReviewBackground::White),
+            ] {
+                if timeline && label == "light" {
+                    continue;
+                }
+                renderer.set_review_background(background);
+                renderer.reset_perceptual_capture_state();
+                let parameters = body.render_parameters(genome, input.arousal);
+                let capture = renderer.render_capture(parameters)?;
+                let name = if timeline {
+                    format!("{}-{:03}.ppm", case.to_lowercase(), frame / 5)
+                } else {
+                    format!("{case}-{label}.ppm")
+                };
+                let mut file = fs::File::create(output.join(&name))?;
+                write!(file, "P6\n{} {}\n255\n", capture.width, capture.height)?;
+                let rgb: Vec<_> = capture
+                    .rgba8
+                    .chunks_exact(4)
+                    .flat_map(|p| p[..3].iter().copied())
+                    .collect();
+                file.write_all(&rgb)?;
+                records.push(serde_json::json!({ "file": name, "context": context,
+                    "time": seconds, "intent": input, "expression": body.expression.current,
+                    "renderer_geometry": parameters.geometry, "renderer_aperture": parameters.eye_aperture,
+                    "renderer_blinks": [parameters.blink_left, parameters.blink_right],
+                    "note": "Production director20Hz, expression/body120Hz and renderer; fixed scripted evidence, no persistent pet data." }));
+            }
+        }
+    }
+    fs::write(
+        output.join("contextual-channels.json"),
+        serde_json::to_vec_pretty(&records)?,
+    )?;
+    Ok(())
 }

@@ -991,10 +991,23 @@ fn admitted_bed_sleep_keeps_quiet_gaze_during_loaded_settle_but_awake_rest_track
     };
     let mut packet = SomaticActuationPacket::default();
     packet.locomotion.pose = pet_motor::MotorPoseIntent::SupportedRest;
-    let motor = MotorActuationFrame { packet: &packet, context: &context, scene_pose: None };
-    assert_eq!(causal_gaze_mode(Some(&motor), lifecore::ActionId::Sleep, false), pet_body::FixationGazeMode::Sleep);
-    assert_eq!(causal_gaze_mode(Some(&motor), lifecore::ActionId::WakeUp, false), pet_body::FixationGazeMode::Track);
-    assert_eq!(causal_gaze_mode(Some(&motor), lifecore::ActionId::Sleep, true), pet_body::FixationGazeMode::AvoidantCheck);
+    let motor = MotorActuationFrame {
+        packet: &packet,
+        context: &context,
+        scene_pose: None,
+    };
+    assert_eq!(
+        causal_gaze_mode(Some(&motor), lifecore::ActionId::Sleep, false),
+        pet_body::FixationGazeMode::Sleep
+    );
+    assert_eq!(
+        causal_gaze_mode(Some(&motor), lifecore::ActionId::WakeUp, false),
+        pet_body::FixationGazeMode::Track
+    );
+    assert_eq!(
+        causal_gaze_mode(Some(&motor), lifecore::ActionId::Sleep, true),
+        pet_body::FixationGazeMode::AvoidantCheck
+    );
 }
 
 fn restore_managed_blinks(expression: &mut lifecore::ExpressionState, blinks: [f32; 2]) {
@@ -1068,6 +1081,7 @@ fn apply_companion_expression(
     target: pet_body::CompanionExpressionTarget,
 ) {
     let face = target.face;
+    face.apply_geometry(&mut actuation.expression.geometry);
     actuation.expression.eye_aperture = face.eye_aperture;
     actuation.expression.squint = face.squint;
     actuation.expression.pupil_size = face.pupil_size;
@@ -1231,9 +1245,15 @@ mod tests {
 
     #[test]
     fn recorded_pre_incident_supported_rest_does_not_self_interrupt_into_startle() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../crates/lifecore/tests/fixtures/v63_sleep_startle_incident.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../crates/lifecore/tests/fixtures/v63_sleep_startle_incident.json"
+        ))
+        .unwrap();
         let rows = fixture["rows"].as_array().unwrap();
-        let mut nervous = NervousSystemRuntime { executed_locomotion: lifecore::LocomotionMode::Sleep, ..Default::default() };
+        let mut nervous = NervousSystemRuntime {
+            executed_locomotion: lifecore::LocomotionMode::Sleep,
+            ..Default::default()
+        };
         let mut life = LifeCore::new(lifecore::Genome::from_seed(64), 64);
         life.state.current_action = lifecore::ActionId::Sleep;
         life.state.drives = serde_json::from_value(rows[0]["drives"].clone()).unwrap();
@@ -1251,9 +1271,19 @@ mod tests {
             nervous.body_feedback.frame_id = frame;
             assert!(nervous.body_feedback.motion.grounded);
             assert_eq!(nervous.body_feedback.contact.contact_count, 0);
-            nervous.prepare_cognition_tick(&mut life, &mut vita, &mut morph, 0.42,
-                NervousReadabilityTuning::default().for_live_runtime(), 0.05);
-            let output = life.tick(&SensorFrame::default(), &lifecore::BodyFeedback::default(), 0.05);
+            nervous.prepare_cognition_tick(
+                &mut life,
+                &mut vita,
+                &mut morph,
+                0.42,
+                NervousReadabilityTuning::default().for_live_runtime(),
+                0.05,
+            );
+            let output = life.tick(
+                &SensorFrame::default(),
+                &lifecore::BodyFeedback::default(),
+                0.05,
+            );
             let context = pet_motor::BehaviorContextFrame {
                 body: nervous.body_feedback,
                 somatic: serde_json::from_value(row["somatic"].clone()).unwrap(),
@@ -1262,20 +1292,31 @@ mod tests {
                 screen_edge_support_stable_seconds: 2.0,
                 surfaces: vec![pet_motor::SurfaceCandidate {
                     surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
-                    minimum: glam::Vec2::new(0.0, 0.999), maximum: glam::Vec2::ONE,
-                    velocity: glam::Vec2::ZERO, familiarity: 0.7, recent_failed_landings: 0,
+                    minimum: glam::Vec2::new(0.0, 0.999),
+                    maximum: glam::Vec2::ONE,
+                    velocity: glam::Vec2::ZERO,
+                    familiarity: 0.7,
+                    recent_failed_landings: 0,
                 }],
                 ..Default::default()
             };
             assert!(context.somatic.supported);
             let goal = lifecore::BehaviorGoalFrame {
-                action: output.selected_action, body_intent: output.body_intent,
-                affect: life.state.affect, drives: life.state.drives,
-                felt: nervous.snapshot.felt, derived: nervous.snapshot.derived,
-                attachment: life.state.affect.attachment, recent_outcome: None,
+                action: output.selected_action,
+                body_intent: output.body_intent,
+                affect: life.state.affect,
+                drives: life.state.drives,
+                felt: nervous.snapshot.felt,
+                derived: nervous.snapshot.derived,
+                attachment: life.state.affect.attachment,
+                recent_outcome: None,
             };
             let packet = motor.tick(&goal, &context, 0.05);
-            assert_eq!(packet.program, Some(pet_motor::BehaviorProgramId::RestNremSleep), "frame={frame}");
+            assert_eq!(
+                packet.program,
+                Some(pet_motor::BehaviorProgramId::RestNremSleep),
+                "frame={frame}"
+            );
             assert!(nervous.snapshot.felt.startle < 1e-6);
         }
         assert!(life.state.drives.sleep < initial_debt - 0.15);
@@ -1286,7 +1327,10 @@ mod tests {
         let mut nervous = NervousSystemRuntime {
             executed_locomotion: lifecore::LocomotionMode::Sleep,
             body_feedback: BodyFeedbackV2 {
-                motion: lifecore::BodyMotionFeedbackV2 { grounded: true, ..Default::default() },
+                motion: lifecore::BodyMotionFeedbackV2 {
+                    grounded: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -1299,14 +1343,22 @@ mod tests {
         let sensors = SensorFrame::default();
         for frame in 1..=1200 {
             nervous.body_feedback.frame_id = frame;
-            nervous.prepare_cognition_tick(&mut life, &mut vita, &mut morph,
-                0.42, NervousReadabilityTuning::default().for_live_runtime(), 0.05);
+            nervous.prepare_cognition_tick(
+                &mut life,
+                &mut vita,
+                &mut morph,
+                0.42,
+                NervousReadabilityTuning::default().for_live_runtime(),
+                0.05,
+            );
             life.tick(&sensors, &lifecore::BodyFeedback::default(), 0.05);
         }
         assert!(life.state.drives.sleep < 0.65);
         assert!(nervous.episode.rest_quality > 0.8);
-        assert!(nervous.snapshot.felt.contact_pleasantness < 0.001,
-            "a supported sleeper is not receiving user caresses");
+        assert!(
+            nervous.snapshot.felt.contact_pleasantness < 0.001,
+            "a supported sleeper is not receiving user caresses"
+        );
         // Completed body observations model a gentle human-contact UInput.
         nervous.body_feedback.contact.contact_count = 1;
         nervous.body_feedback.contact.pressure = 0.18;
@@ -1315,8 +1367,14 @@ mod tests {
         let debt = life.state.drives.sleep;
         for frame in 1201..=1220 {
             nervous.body_feedback.frame_id = frame;
-            nervous.prepare_cognition_tick(&mut life, &mut vita, &mut morph,
-                0.42, NervousReadabilityTuning::default().for_live_runtime(), 0.05);
+            nervous.prepare_cognition_tick(
+                &mut life,
+                &mut vita,
+                &mut morph,
+                0.42,
+                NervousReadabilityTuning::default().for_live_runtime(),
+                0.05,
+            );
         }
         assert_eq!(life.state.current_action, lifecore::ActionId::WakeUp);
         assert!(nervous.snapshot.felt.contact_pleasantness > 0.35);

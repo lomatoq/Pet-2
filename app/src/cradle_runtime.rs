@@ -31,6 +31,22 @@ pub struct CradleSeat {
     descending: bool,
 }
 impl CradleSeat {
+    /// Broad phase for the one-way physical cushion, independent of a sit
+    /// intention or the occlusion/admission latch. Passing underneath remains
+    /// free; the liquid solver decides the exact first surface contact.
+    pub fn surface_available(
+        &self,
+        g: CradleGeometry,
+        center: Vec2,
+        hull_min: Vec2,
+        hull_max: Vec2,
+    ) -> bool {
+        self.inside
+            || (self.fits_entrance(g, center, hull_min, hull_max)
+                && center.y < g.floor - 12.0
+                && center.y + hull_max.y <= g.floor + 3.0)
+    }
+
     pub fn scene_target(&self, g: CradleGeometry, target: Vec2, sleeping_in_den: bool) -> Vec2 {
         if self.inside && sleeping_in_den {
             g.anchor
@@ -142,6 +158,24 @@ mod tests {
         CradleGeometry::new(Vec2::new(300.0, 300.0), [1920, 1080], 1.0)
     }
     #[test]
+    fn cushion_collision_precedes_admission_and_rejects_underneath() {
+        let g = geometry();
+        let seat = CradleSeat::default();
+        let min = Vec2::splat(-60.0);
+        let max = Vec2::splat(60.0);
+        assert!(!seat.inside);
+        // 50px above the wall: too early for the 28px admission latch, but
+        // physics must already know the actual geometric plane on approach.
+        assert!(seat.surface_available(g, Vec2::new(g.anchor.x, g.floor - 110.0), min, max));
+        assert!(!seat.surface_available(g, Vec2::new(g.anchor.x, g.floor + 10.0), min, max));
+        assert!(!seat.surface_available(
+            g,
+            Vec2::new(g.anchor.x + g.half_width * 2.0, g.floor - 65.0),
+            min,
+            max
+        ));
+    }
+    #[test]
     fn changing_liquid_hull_does_not_reverse_committed_descent() {
         let g = geometry();
         let mut seat = CradleSeat::default();
@@ -161,14 +195,25 @@ mod tests {
     #[test]
     fn sleeping_scene_does_not_turn_a_local_guard_fallback_into_an_exit() {
         let g = geometry();
-        let mut seat = CradleSeat { inside: true, ..Default::default() };
+        let mut seat = CradleSeat {
+            inside: true,
+            ..Default::default()
+        };
         let center = Vec2::new(g.anchor.x, g.floor - 62.0);
         let fallback_floor_target = Vec2::new(g.anchor.x - 140.0, 1000.0);
         let target = seat.scene_target(g, fallback_floor_target, true);
-        assert!(seat.navigation(g, center, Vec2::splat(-60.0), Vec2::splat(60.0), target).is_none());
+        assert!(
+            seat.navigation(g, center, Vec2::splat(-60.0), Vec2::splat(60.0), target)
+                .is_none()
+        );
         // Actual wake/exit ownership still traverses the open lip.
         let target = seat.scene_target(g, fallback_floor_target, false);
-        assert!(seat.navigation(g, center, Vec2::splat(-60.0), Vec2::splat(60.0), target).unwrap().y < center.y);
+        assert!(
+            seat.navigation(g, center, Vec2::splat(-60.0), Vec2::splat(60.0), target)
+                .unwrap()
+                .y
+                < center.y
+        );
     }
     #[test]
     fn outside_and_underneath_never_become_occluded_or_clamped() {

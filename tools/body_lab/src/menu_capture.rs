@@ -105,6 +105,7 @@ impl Capture {
         fixtures.extend((0..48).map(|i| format!("open-{:.6}", i as f32 / 60.0)));
         fixtures.extend((0..12).map(|i| format!("drift-{:.6}", i as f32 / 60.0)));
         fixtures.extend((0..14).map(|i| format!("close-{:.6}", i as f32 / 60.0)));
+        fixtures.extend((0..40).map(|i| format!("press-{:.6}", i as f32 / 60.0)));
         if capture_scale > 1 || wide {
             fixtures.retain(|name| {
                 matches!(
@@ -125,6 +126,12 @@ impl Capture {
                 "material-grid-dark".into(),
                 "material-grid-checker".into(),
                 "controls".into(),
+                "learn".into(),
+                "name".into(),
+                "voice".into(),
+                "settings".into(),
+                "pending".into(),
+                "offline".into(),
                 "hover".into(),
                 "pressed".into(),
                 "feeding".into(),
@@ -133,6 +140,7 @@ impl Capture {
                 "drift-0.016667".into(),
                 "drift-0.033333".into(),
             ];
+            fixtures.extend((0..32).map(|i| format!("press-{:.6}", i as f32 / 60.0)));
         }
         let started = std::time::Instant::now();
         let count = fixtures.len();
@@ -189,7 +197,7 @@ impl Capture {
             bytes.extend(frame.rgba8);
             fs::write(self.output.join(format!("{name}.rgba")), bytes)?;
         }
-        fs::write(self.output.join("capture-timing.json"),serde_json::json!({"frames":count,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"method":"native full renderer+readback+egui 60 settle passes; not live FPS or isolated shader timing"}).to_string())?;
+        fs::write(self.output.join("capture-timing.json"),serde_json::json!({"frames":count,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"format":format!("{:?}",renderer.surface_format()),"pixels_per_point":capture_scale,"method":"native full renderer+readback+egui 60 settle passes; not live FPS or isolated shader timing"}).to_string())?;
         Ok(())
     }
 }

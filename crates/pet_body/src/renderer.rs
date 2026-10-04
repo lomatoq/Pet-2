@@ -110,6 +110,8 @@ struct Globals {
     mood_tint: [f32; 4],
     mood_trail: [f32; 4],
     optical_volume_bounds: [f32; 4],
+    energy_palette: [f32; 4],
+    energy_dynamics: [f32; 4],
 }
 
 #[repr(C)]
@@ -239,6 +241,7 @@ pub struct RenderParameters {
     pub glow: f32,
     pub mood_tint: Vec3,
     pub mood_trail: Vec3,
+    pub energy: crate::EnergyAppearance,
     pub joy_aura: f32,
     pub chromatic_motion: Vec2,
     pub body_length: f32,
@@ -3434,6 +3437,7 @@ impl Default for RenderParameters {
             glow: 0.2,
             mood_tint: Vec3::ONE,
             mood_trail: Vec3::ONE,
+            energy: crate::EnergyAppearance::default(),
             chromatic_motion: Vec2::ZERO,
             joy_aura: 0.0,
             body_length: 1.0,
@@ -3646,6 +3650,18 @@ fn globals_for_resolved(
     });
     Globals {
         optical_volume_bounds: [-1.0, -1.0, 0.5, 0.5],
+        energy_palette: [
+            bounded(parameters.energy.palette.x, 0.0, 1.5, 0.34),
+            bounded(parameters.energy.palette.y, 0.0, 1.5, 0.44),
+            bounded(parameters.energy.palette.z, 0.0, 1.5, 1.0),
+            bounded(parameters.energy.palette.w, 0.0, 1.0, 0.32),
+        ],
+        energy_dynamics: [
+            finite_or(parameters.energy.dynamics.x, 0.0).rem_euclid(std::f32::consts::TAU),
+            finite_or(parameters.energy.dynamics.y, 0.0).rem_euclid(std::f32::consts::TAU),
+            bounded(parameters.energy.dynamics.z, 0.0, 1.0, 0.42),
+            bounded(parameters.energy.dynamics.w, 0.0, 1.0, 0.0),
+        ],
         self_care: [
             bounded(parameters.tongue_extension, 0.0, 1.0, 0.0),
             bounded(parameters.tongue_side, -1.0, 1.0, 0.0),

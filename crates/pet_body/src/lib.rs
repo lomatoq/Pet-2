@@ -8,6 +8,7 @@ mod companion_expression_director;
 mod droplets;
 mod ecology_render;
 mod embodiment;
+mod energy_expression;
 mod expression;
 mod gaze_controller;
 mod graph;
@@ -32,6 +33,7 @@ pub use droplets::{
 };
 pub use ecology_render::{EcologyCaptureExclusion, EcologyRenderer};
 pub use embodiment::{EmbodiedPose, EmbodiedRuntime, GazeMode, VoiceVisualState};
+pub use energy_expression::{EnergyAppearance, EnergyExpression};
 pub use expression::ExpressionRuntime;
 pub use gaze_controller::GazeMode as FixationGazeMode;
 pub use gaze_controller::*;
@@ -213,6 +215,7 @@ pub struct ProceduralBody {
     base_somatic_actuation: SomaticActuationPacket,
     self_care: self_care_presentation::SelfCarePresentation,
     mood_color: mood_color::MoodColor,
+    energy_expression: EnergyExpression,
     excitement_presentation: lifecore::ExcitationMotorFrame,
     excitement_roll: f32,
     chromatic_motion: Vec2,
@@ -257,6 +260,7 @@ impl ProceduralBody {
             base_somatic_actuation: Default::default(),
             self_care: Default::default(),
             mood_color: Default::default(),
+            energy_expression: Default::default(),
             excitement_presentation: Default::default(),
             excitement_roll: 0.0,
             chromatic_motion: Vec2::ZERO,
@@ -679,6 +683,13 @@ impl ProceduralBody {
         self.mood_color
             .set_excitation(excitement.intensity, excitement.chroma_pulse);
         self.mood_color.update(affect, intent.expression, dt);
+        self.energy_expression.update(
+            affect,
+            visual_mind,
+            intent.expression,
+            intent.pose == PoseIntent::Sleeping,
+            dt,
+        );
         let velocity = self.optical_screen_velocity();
         let optical_velocity = if velocity.is_finite() {
             velocity.clamp_length_max(1.0)
@@ -1306,14 +1317,8 @@ impl ProceduralBody {
     #[must_use]
     pub fn render_parameters(&self, genome: &Genome, arousal: f32) -> RenderParameters {
         let mut pose = self.embodiment.pose;
-        // Small coupled tissue motions follow arousal, breathing and current
-        // aperture. Closed mouths/eyes stay closed; speech retains authority.
-        let awake = pose.eye_aperture.clamp(0.0, 1.0);
-        let t = self.animation.time;
-        let identity_phase = (genome.identity_seed % 997) as f32 * 0.013;
-        let interest = arousal.clamp(0.0, 1.0);
-        let phase = t * 2.1 + identity_phase;
-        let tissue = phase.sin() * 0.65 + (phase * 1.73 + 0.8).sin() * 0.35;
+        // The expression director and embodiment own facial motion. Rendering
+        // must not add a second clock-driven gaze, pupil, or mouth performance.
         let settle = (-(self.mouth_context_age - 3.0).max(0.0) * 1.4).exp();
         let voice_authority = pose.audio_envelope.clamp(0.0, 1.0);
         // Sustained emotion is an active cause too. The old idle-age fade
@@ -1327,27 +1332,8 @@ impl ProceduralBody {
             .max(f32::from(self.feeding_expression_active))
             .max(self.self_care.strength)
             .max(semantic_aperture);
-        // One brief tissue adjustment per long quiet interval, not a perpetual
-        // mouth oscillator. Voice and food have independent opening authority.
-        let cycle = (t + identity_phase).rem_euclid(8.5);
-        let micro_gate = if cycle < 1.1 {
-            (std::f32::consts::PI * cycle / 1.1).sin().powi(2)
-        } else {
-            0.0
-        };
-        let lips = pose.mouth_open * awake * (1.0 - voice_authority) * micro_gate;
-        pose.mouth_open = (pose.mouth_open + lips * tissue * 0.055).clamp(0.0, 1.0);
-        pose.mouth_curve =
-            (pose.mouth_curve + lips * (phase * 0.71).sin() * 0.025).clamp(-1.0, 1.0);
-        pose.mouth_tension = (pose.mouth_tension + lips * tissue.abs() * 0.025).clamp(0.0, 1.0);
-        pose.geometry.mouth[0] += lips * tissue * 0.025;
-        pose.geometry.mouth[1] += lips * (phase * 0.71).sin() * 0.015;
-        pose.geometry.mouth[2] += lips * (phase * 0.71).sin() * 0.015;
+        pose.mouth_open = pose.mouth_open.clamp(0.0, 1.0);
         pose.geometry = pose.geometry.sanitized();
-        pose.gaze += Vec2::new((phase * 1.31).sin(), (phase * 0.83).sin())
-            * (0.003 + interest * 0.003)
-            * awake;
-        pose.pupil_size = (pose.pupil_size + tissue * 0.008 * awake).clamp(0.0, 1.0);
         let physiology = self.embodiment.physiology.pose;
         let traits = self.visual_traits;
         let profile = &self.tuning;
@@ -1386,6 +1372,7 @@ impl ProceduralBody {
             time: self.animation.time,
             mood_tint: self.mood_color.tint,
             mood_trail: self.mood_color.trail,
+            energy: self.energy_expression.appearance,
             joy_aura: self.mood_color.joy,
             chromatic_motion: renderer::spectral_motion_for(
                 self.chromatic_motion,
@@ -1661,9 +1648,14 @@ mod tests {
         baseline.tuning.render_mode = BodyRenderMode::ParticlePbf;
         let overlay_height = 320.0;
         let physical_velocity = Vec2::new(16.0, 12.0); // pixels/s, screen Y down
-        let expected_local = physical_velocity * (2.0 * baseline.projection_scale() / overlay_height);
+        let expected_local =
+            physical_velocity * (2.0 * baseline.projection_scale() / overlay_height);
         let mut visible_motion: Option<Vec2> = None;
-        for desktop in [Vec2::new(1_920.0, 1_080.0), Vec2::new(3_840.0, 2_160.0), Vec2::new(5_120.0, 1_440.0)] {
+        for desktop in [
+            Vec2::new(1_920.0, 1_080.0),
+            Vec2::new(3_840.0, 2_160.0),
+            Vec2::new(5_120.0, 1_440.0),
+        ] {
             let mut body = baseline.clone();
             body.set_desktop_motion_space(desktop, overlay_height);
             assert!(body.embodiment.world_to_body_scale().y < 0.0);
@@ -1671,15 +1663,25 @@ mod tests {
             assert!((body.optical_screen_velocity() - expected_local).length() < 1e-6);
             let intent = intent(LocomotionMode::Hover, Vec2::splat(0.5));
             for _ in 0..24 {
-                body.embodied_update(&intent, &SensorFrame::default(), AffectState::default(),
-                    VisualMindInput::default(), VoiceVisualState::default(), 1.0 / 120.0);
+                body.embodied_update(
+                    &intent,
+                    &SensorFrame::default(),
+                    AffectState::default(),
+                    VisualMindInput::default(),
+                    VoiceVisualState::default(),
+                    1.0 / 120.0,
+                );
             }
             let rendered = body.render_parameters(&genome, 0.0).chromatic_motion;
-            assert!(rendered.x > 0.02 && rendered.y > 0.02,
-                "real right/down pixel motion vanished or flipped: desktop={desktop:?} rendered={rendered:?}");
+            assert!(
+                rendered.x > 0.02 && rendered.y > 0.02,
+                "real right/down pixel motion vanished or flipped: desktop={desktop:?} rendered={rendered:?}"
+            );
             if let Some(reference) = visible_motion {
-                assert!((rendered - reference).length() < 1e-6,
-                    "the same pixel speed changed optical strength on desktop={desktop:?}");
+                assert!(
+                    (rendered - reference).length() < 1e-6,
+                    "the same pixel speed changed optical strength on desktop={desktop:?}"
+                );
             } else {
                 visible_motion = Some(rendered);
             }
@@ -1688,11 +1690,16 @@ mod tests {
             let reversed = body.render_parameters(&genome, 0.0).chromatic_motion;
             assert!(reversed.x < 0.0 && reversed.y < 0.0);
             assert!(reversed.dot(rendered) < 0.0);
-            assert!((reversed + rendered).length() < 1e-6,
-                "a reversal must preserve bounded filtered strength while changing direction");
+            assert!(
+                (reversed + rendered).length() < 1e-6,
+                "a reversal must preserve bounded filtered strength while changing direction"
+            );
             // A stop is not a lingering optical wake, even before the filter decays.
             body.simulation.feedback.velocity = Vec2::ZERO;
-            assert_eq!(body.render_parameters(&genome, 0.0).chromatic_motion, Vec2::ZERO);
+            assert_eq!(
+                body.render_parameters(&genome, 0.0).chromatic_motion,
+                Vec2::ZERO
+            );
         }
     }
 

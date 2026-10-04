@@ -151,22 +151,27 @@ pub(super) fn project_support_plane(
     particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
     count: usize,
     plane: Option<SupportPlane>,
-) {
+) -> f32 {
     let Some(plane) = plane.and_then(SupportPlane::normalized) else {
-        return;
+        return 0.0;
     };
+    let mut mass_displacement = 0.0;
     for particle in &mut particles[..count.min(MAX_LIQUID_PARTICLES)] {
         if particle.inverse_mass.is_finite() && particle.inverse_mass > f32::EPSILON {
-            particle.predicted_position = plane.project(particle.predicted_position);
+            let projected = plane.project(particle.predicted_position);
+            mass_displacement +=
+                (projected - particle.predicted_position).dot(plane.normal) / particle.inverse_mass;
+            particle.predicted_position = projected;
         }
     }
+    mass_displacement
 }
 
 pub fn solve_density_constraints(
     particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
     count: usize,
     parameters: DensityConstraintParameters,
-) {
+) -> f32 {
     let DensityConstraintParameters {
         rest_density,
         kernel_radius,
@@ -188,9 +193,10 @@ pub fn solve_density_constraints(
         || kernel_radius <= f32::EPSILON
         || rest_density <= f32::EPSILON
     {
-        return;
+        return 0.0;
     }
     let support_plane = support_plane.and_then(SupportPlane::normalized);
+    let mut wall_mass_displacement = 0.0;
 
     // XPBD multipliers persist only across the iterations of this solve. Carrying
     // them into the next fixed tick stores stale pressure and produces a large
@@ -245,9 +251,8 @@ pub fn solve_density_constraints(
             // residual, retains the authored XPBD compliance, and changes only
             // pressure multipliers, preserving pair-symmetric momentum transfer.
             let nonlinear_regularization = 6.0 * constraint / (kernel_radius * kernel_radius);
-            let unconstrained_delta =
-                (-constraint - alpha * lambdas[index])
-                    / (gradient_norm_sum + alpha + nonlinear_regularization + 1.0e-6);
+            let unconstrained_delta = (-constraint - alpha * lambdas[index])
+                / (gradient_norm_sum + alpha + nonlinear_regularization + 1.0e-6);
             let next_lambda = (lambdas[index] + unconstrained_delta).min(0.0);
             delta_lambdas[index] = next_lambda - lambdas[index];
             lambdas[index] = next_lambda;
@@ -291,10 +296,11 @@ pub fn solve_density_constraints(
                 particle.predicted_position = particle.predicted_position.clamp(minimum, maximum);
             }
         }
-        project_support_plane(particles, count, support_plane);
+        wall_mass_displacement += project_support_plane(particles, count, support_plane);
         project_cradle(particles, count, cradle);
     }
     update_density_and_surface(particles, count, kernel_radius);
+    wall_mass_displacement / dt
 }
 
 #[cfg(test)]
