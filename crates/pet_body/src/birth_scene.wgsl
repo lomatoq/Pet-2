@@ -1,10 +1,14 @@
 @group(0) @binding(0) var picture: texture_2d<f32>;
 @group(0) @binding(1) var picture_sampler: sampler;
 struct Out { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32>, @location(1) opacity:f32, @location(2) effect:vec4<f32>, @location(3) color:vec4<f32> }
-@vertex fn vertex_main(@builtin(vertex_index) index:u32,@location(0) rect:vec4<f32>,@location(1) effect:vec4<f32>,@location(2) style:vec4<f32>,@location(3) color:vec4<f32>)->Out {
+@vertex fn vertex_main(@builtin(vertex_index) index:u32,@location(0) rect:vec4<f32>,@location(1) effect:vec4<f32>,@location(2) style:vec4<f32>,@location(3) color:vec4<f32>,@location(4) ribbon_edges:vec4<f32>)->Out {
     let corners=array<vec2<f32>,6>(vec2<f32>(-1,-1),vec2<f32>(1,-1),vec2<f32>(-1,1),vec2<f32>(-1,1),vec2<f32>(1,-1),vec2<f32>(1,1));
     let q=corners[index]*rect.zw;
-    let p=rect.xy+vec2<f32>(q.x*cos(style.x)-q.y*sin(style.x),q.x*sin(style.x)+q.y*cos(style.x));
+    var p=rect.xy+vec2<f32>(q.x*cos(style.x)-q.y*sin(style.x),q.x*sin(style.x)+q.y*cos(style.x));
+    if effect.y > 3.5 && effect.y < 4.5 {
+        let along=corners[index].y*0.5+0.5;
+        p=mix(rect.xy,rect.zw,along)+corners[index].x*mix(ribbon_edges.xy,ribbon_edges.zw,along);
+    }
     var out:Out; out.position=vec4<f32>(p.x*style.z*2-1,1-p.y*style.w*2,0,1);out.uv=corners[index]*0.5+0.5;out.opacity=style.y;out.effect=effect;out.color=color;return out;
 }
 // V29 authored near-rim trace. Central knots follow the visible cushion/shell

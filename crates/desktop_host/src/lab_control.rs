@@ -81,7 +81,9 @@ pub enum LabControlCommand {
         lease_seconds: u32,
     },
     CloseSession,
-    Cleanup { enabled: bool },
+    Cleanup {
+        enabled: bool,
+    },
     Feeding {
         enabled: bool,
     },

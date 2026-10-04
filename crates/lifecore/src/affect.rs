@@ -49,7 +49,10 @@ impl AffectState {
                 .as_ref()
                 .map_or(0.0, |collision| collision.intensity),
         );
-        let mean_need = drives.homeostatic_cost() / 7.9;
+        // Appetitive interests can be high while the creature is comfortable.
+        // Unexplored novelty and unused play opportunities are not suffering.
+        let mean_need = (1.15 * drives.sleep.powi(2)
+            + 0.92 * drives.comfort.powi(2) + 1.35 * drives.safety.powi(2)) / 3.42;
         let ignored = (ignored_attempts as f32 / 5.0).clamp(0.0, 1.0);
         let pose_stress = body.pose_error.clamp(0.0, 1.0);
 
@@ -91,6 +94,7 @@ impl AffectState {
             + 0.25 * (1.0 - felt.body_integrity))
             .clamp(0.0, 1.0);
         let valence_evidence = (0.30 * felt.comfort + 0.35 * felt.relief
+            + 0.60 * felt.contact_pleasantness * felt.social_safety
             - 0.55 * felt.pain_like
             - 0.35 * felt.restraint)
             .clamp(-1.0, 1.0);
@@ -103,7 +107,10 @@ impl AffectState {
         self.stress = smooth(self.stress, threat, 8.0, dt).clamp(0.0, 1.0);
         self.confidence = smooth(self.confidence, confidence_evidence, 2.0, dt).clamp(0.0, 1.0);
         self.frustration = smooth(self.frustration, frustration_evidence, 4.0, dt).clamp(0.0, 1.0);
-        self.attachment = smooth(self.attachment, attachment_evidence, 0.18, dt).clamp(0.0, 1.0);
+        // Positive contact accumulates bounded familiarity. A quiet interval
+        // supplies no negative evidence and must not undo that familiarity.
+        self.attachment = (self.attachment
+            + (1.0 - self.attachment) * attachment_evidence * 0.008 * dt).clamp(0.0, 1.0);
     }
 
     #[must_use]

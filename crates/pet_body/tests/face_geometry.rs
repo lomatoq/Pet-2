@@ -319,7 +319,9 @@ fn affection_raises_lower_lids_while_tiredness_drops_upper_lids() {
     assert!(affection.geometry.lids[0][2] > 0.5);
     assert_eq!(tired.geometry.lids[0][2], 0.0);
     assert!(tired.eye_aperture < affection.eye_aperture - 0.3);
-    assert!(tired.mouth_curve < 0.0 && affection.mouth_curve > 0.5);
+    // Fatigue owns heavy lids; it must not invent negative valence.
+    assert!(tired.mouth_curve.abs() < 1.0e-6);
+    assert!(affection.mouth_curve > 0.5);
 }
 
 #[test]

@@ -49,23 +49,24 @@ impl Drives {
         &mut self,
         temperament: &TemperamentGenome,
         sensors: &SensorFrame,
-        current_action: ActionId,
+        _current_action: ActionId,
         dt: f32,
     ) {
-        let relief = current_action.definition().drive_relief;
-        // `drive_relief` describes how well an action can satisfy a need over
-        // a complete bout. Applying it at full strength every simulation
-        // second made even IdleHover erase several needs before they had time
-        // to become behaviorally meaningful. Neutral presence therefore gives
-        // no artificial relief, while engaged actions deliver a bounded part
-        // of their advertised value on each second of the bout.
-        let relief_efficiency = match current_action {
-            ActionId::IdleHover | ActionId::WakeUp => 0.0,
-            ActionId::ObserveCursor | ActionId::ObserveUserActivity | ActionId::SilentStare => 0.16,
-            ActionId::Sleep => 0.26,
-            ActionId::RetreatFromCursor | ActionId::FrustratedRetreat => 0.22,
-            _ => 0.18,
-        };
+        self.update_with_rest_quality(temperament, sensors, _current_action, dt, 0.0);
+    }
+
+    /// Rest quality must come from completed physical evidence, not a Sleep
+    /// nomination. The host consumes that observation once per cognition tick.
+    pub fn update_with_rest_quality(
+        &mut self,
+        temperament: &TemperamentGenome,
+        sensors: &SensorFrame,
+        _current_action: ActionId,
+        dt: f32,
+        rest_quality: f32,
+    ) {
+        // A proposed action is not an experience. Relief enters through
+        // measured body evidence or a deduplicated confirmed outcome.
         let hour_angle = std::f32::consts::TAU
             * (sensors.time_of_day_01 - temperament.circadian_phase).rem_euclid(1.0);
         let circadian_sleep = (0.5 - 0.5 * hour_angle.cos()).clamp(0.0, 1.0);
@@ -120,33 +121,50 @@ impl Drives {
                     .sin()
                     .max(-0.65);
 
-        self.sleep += (0.0025 + circadian_sleep * 0.006) * dt
-            - relief.sleep * relief_efficiency * self.sleep * dt;
+        let rest = rest_quality.clamp(0.0, 1.0);
+        // Non-zero quality has already passed actual sleep/support/safety
+        // admission. Poorer admitted sleep recovers slower; it is not partly
+        // waking, and cannot accumulate an opposing circadian debt floor.
+        let awake = f32::from(rest == 0.0);
+        self.sleep += ((0.0025 + circadian_sleep * 0.006) * awake
+            - self.sleep * rest / 80.0) * dt;
         self.social += (0.0010 + temperament.sociability * 0.0028)
             * social_rhythm
             * (0.82 + user_present * 0.18)
-            * dt
-            - relief.social * relief_efficiency * self.social * dt;
-        self.play += (0.0009 + temperament.playfulness * 0.0031) * play_rhythm * dt
-            - relief.play * relief_efficiency * self.play * dt;
+            * dt;
+        self.play += (0.0009 + temperament.playfulness * 0.0031) * play_rhythm * dt;
         self.curiosity += (0.0008 + temperament.curiosity * (0.28 + novelty_input * 0.72) * 0.0032)
             * curiosity_rhythm
-            * dt
-            - relief.curiosity * relief_efficiency * self.curiosity * dt;
+            * dt;
         self.comfort += (0.0007
             + work_intensity * 0.0015
             + self.sleep * 0.0006
             + (1.0 - user_available) * user_present * 0.0004)
-            * dt
-            - relief.comfort * relief_efficiency * self.comfort * dt;
-        self.safety += (cursor_threat * 0.08 - 0.012) * dt
-            - relief.safety * relief_efficiency * self.safety * dt;
+            * dt;
+        self.safety += (cursor_threat * 0.08 - 0.012) * dt;
         self.autonomy +=
-            (0.0007 + temperament.autonomy * 0.0015 + work_intensity * user_present * 0.0009) * dt
-                - relief.autonomy * relief_efficiency * self.autonomy * dt;
-        self.novelty += (0.0011 + (1.0 - novelty_input) * 0.0022) * dt
-            - relief.novelty * relief_efficiency * self.novelty * dt;
+            (0.0007 + temperament.autonomy * 0.0015 + work_intensity * user_present * 0.0009) * dt;
+        self.novelty += (0.0011 + (1.0 - novelty_input) * 0.0022) * dt;
         *self = self.bounded();
+    }
+
+    /// One actual outcome, in deficit units; the host owns attribution and
+    /// LifeCore deduplicates event identity before calling this method.
+    pub fn relieve_measured(&mut self, drive: DriveKind, amount: f32) {
+        if !amount.is_finite() || amount <= 0.0 {
+            return;
+        }
+        let value = match drive {
+            DriveKind::Sleep => &mut self.sleep,
+            DriveKind::Social => &mut self.social,
+            DriveKind::Play => &mut self.play,
+            DriveKind::Curiosity => &mut self.curiosity,
+            DriveKind::Comfort => &mut self.comfort,
+            DriveKind::Safety => &mut self.safety,
+            DriveKind::Autonomy => &mut self.autonomy,
+            DriveKind::Novelty => &mut self.novelty,
+        };
+        *value = (*value - amount.min(0.24)).clamp(0.0, 1.0);
     }
 
     /// Slow homeostatic evidence from the embodied nervous-system loop.
@@ -159,11 +177,11 @@ impl Drives {
         dt: f32,
     ) {
         let dt = dt.clamp(0.0, 0.25);
-        self.sleep += (0.00035 + 0.00055 * felt.activation + 0.00040 * felt.physical_load
-            - 0.0018 * episode.sleeping_or_deep_rest)
+        self.sleep += (0.00035 + 0.00055 * felt.activation + 0.00040 * felt.physical_load)
+            * f32::from(episode.sleeping_or_deep_rest <= 0.0)
             * dt;
         self.social += (0.00025 * episode.user_absent + 0.00035 * episode.ignored_social_bid
-            - 0.0016 * episode.safe_social_exchange)
+            - 0.06 * self.social * episode.safe_social_exchange.clamp(0.0, 1.0))
             * dt;
         self.play += (0.00018 * (1.0 - felt.play_readiness) + 0.00022 * felt.boredom
             - 0.0014 * episode.successful_play)
@@ -174,7 +192,7 @@ impl Drives {
             * dt;
         self.comfort +=
             (0.0012 * felt.pain_like + 0.00055 * felt.restraint + 0.00040 * felt.physical_load
-                - 0.0013 * felt.comfort)
+                - 0.012 * self.comfort * felt.comfort)
                 * dt;
         self.safety += (0.0014 * derived.neural_threat
             + 0.0015 * felt.pain_like
@@ -374,11 +392,34 @@ mod tests {
         for _ in 0..50 {
             drives.update(&temperament, &sensors, ActionId::SelfPlay, 0.1);
         }
-
+        assert!(
+            drives.play >= before.play,
+            "a blocked proposal cannot satisfy play"
+        );
+        drives.relieve_measured(DriveKind::Play, 0.14);
+        drives.relieve_measured(DriveKind::Autonomy, 0.12);
         assert!(drives.play < before.play - 0.08);
         assert!(drives.autonomy < before.autonomy - 0.07);
         assert!(drives.social >= before.social);
         assert!(drives.sleep >= before.sleep);
         assert!(drives.play > 0.0);
+    }
+
+    #[test]
+    fn real_rest_recovers_at_circadian_peak_but_sleep_proposal_does_not() {
+        let temperament = temperament();
+        let sensors = SensorFrame { time_of_day_01: (temperament.circadian_phase + 0.5).fract(), ..Default::default() };
+        let mut sleeping = Drives::initial(&temperament);
+        sleeping.sleep = 0.99;
+        let mut proposal = sleeping;
+        let mut partial = sleeping;
+        for _ in 0..900 {
+            sleeping.update_with_rest_quality(&temperament, &sensors, ActionId::Sleep, 0.1, 1.0);
+            partial.update_with_rest_quality(&temperament, &sensors, ActionId::Sleep, 0.1, 0.5);
+            proposal.update(&temperament, &sensors, ActionId::Sleep, 0.1);
+        }
+        assert!(sleeping.sleep < 0.34);
+        assert!(partial.sleep > sleeping.sleep);
+        assert!(proposal.sleep > 0.99);
     }
 }

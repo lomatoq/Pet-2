@@ -43,12 +43,16 @@ pub struct OrganicRuntimeInput {
     pub direct_contact: f32,
     /// Zero derives a stable context from action, intent, and support.
     pub context_key: u64,
+    /// Credit owner, separate from a recurring learned context. An episode ID
+    /// must not be used as a habit key or every bout would forget its predecessor.
+    pub execution_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrganicRuntimeOutput {
     pub regulation: RegulationOutput,
     pub preferred_rest_target: Option<Vec2>,
+    pub preferred_rest_surface: Option<lifecore::SurfaceId>,
     pub cling_available: bool,
 }
 
@@ -56,6 +60,8 @@ pub struct OrganicRuntimeOutput {
 pub struct OrganicRuntime {
     regulator: OrganicRegulator,
     last_action: Option<ActionId>,
+    last_primary: Option<PrimaryIntent>,
+    last_execution_id: Option<u64>,
     was_contacting: bool,
     was_sound_salient: bool,
     was_novel: bool,
@@ -84,6 +90,8 @@ impl OrganicRuntime {
         Self {
             regulator: OrganicRegulator::from_state(state),
             last_action: None,
+            last_primary: None,
+            last_execution_id: None,
             was_contacting: false,
             was_sound_salient: false,
             was_novel: false,
@@ -106,6 +114,12 @@ impl OrganicRuntime {
         self.regulator.persistent_state()
     }
 
+    /// Reset the same persisted learner that `load` restores, including its
+    /// unexecuted episode/credit. Identity, body and other stores are untouched.
+    pub fn reset_learning(&mut self) {
+        *self = Self::default();
+    }
+
     /// Loads only the bounded feature/state DTO. Missing, oversized, or
     /// malformed state falls back safely without affecting the rest of Pet 2.
     #[must_use]
@@ -114,8 +128,11 @@ impl OrganicRuntime {
         for candidate in [&path, &sibling(&path, ".organic_regulation.bak")] {
             if fs::metadata(candidate).is_ok_and(|meta| meta.len() <= MAX_ORGANIC_STATE_BYTES)
                 && let Ok(bytes) = fs::read(candidate)
-                && let Ok(state) = serde_json::from_slice::<OrganicRegulationStateV1>(&bytes)
+                && let Ok(mut state) = serde_json::from_slice::<OrganicRegulationStateV1>(&bytes)
             {
+                // Motor/perception execution is process-owned. Restore learned
+                // habits and ID continuity, never unfinished outcome credit.
+                state.active_episode = None;
                 return Self::from_state(state);
             }
         }
@@ -172,7 +189,13 @@ impl OrganicRuntime {
         self.enrich_surface_familiarity(goal, context);
         let changed = self
             .last_action
-            .is_some_and(|previous| previous != goal.action);
+            .is_some_and(|previous| previous != goal.action)
+            || self
+                .last_primary
+                .is_some_and(|primary| primary != context.companion_intent)
+            || self
+                .last_execution_id
+                .is_some_and(|id| id != input.execution_id);
         self.pending_action_change |= changed;
         let pending_action_ready =
             self.pending_action_change && self.regulator.active_trace().is_none();
@@ -188,6 +211,20 @@ impl OrganicRuntime {
         let fresh_sound = sound_interest > 0.04 && !self.was_sound_salient;
         let fresh_novelty = novelty > 0.42 && !self.was_novel;
         let fresh_name = input.heard_name && !self.heard_name_latched;
+        let social_execution = is_social(goal.action)
+            && matches!(
+                context.companion_intent,
+                PrimaryIntent::InviteContact
+                    | PrimaryIntent::AcceptContact
+                    | PrimaryIntent::Nuzzle
+                    | PrimaryIntent::SocialCheckIn
+                    | PrimaryIntent::QuietCompanionship
+                    | PrimaryIntent::Approach
+            )
+            && !context.pet_dragged
+            && context.boundary_violation < 0.1
+            && goal.felt.pain_like < 0.15
+            && goal.felt.restraint < 0.2;
         if changed
             || self
                 .regulator
@@ -204,7 +241,7 @@ impl OrganicRuntime {
                 self.pending_contact_action = None;
             }
         }
-        if fresh_contact && is_social(goal.action) {
+        if fresh_contact && social_execution {
             self.pending_contact_credit = true;
             self.pending_contact_action = Some(goal.action);
             self.pending_contact_age = 0.0;
@@ -238,17 +275,18 @@ impl OrganicRuntime {
         } else {
             input.context_key
         };
-        let (drive, drive_error) = goal.drives.strongest();
+        let (drive, drive_error) = execution_drive(context.companion_intent, goal.drives);
         let phase_index = context.somatic.phase.map_or(0, |phase| phase.index);
         let trace_matches = self
             .regulator
             .active_trace()
-            .is_some_and(|trace| trace.selected_action == goal.action);
+            .is_some_and(|trace| trace.selected_action == goal.action)
+            && !changed;
         let social_contact_credit = trace_matches
             && self.pending_contact_credit
             && self.pending_contact_action == Some(goal.action)
             && self.pending_contact_age <= 1.0
-            && is_social(goal.action)
+            && social_execution
             && self.regulator.active_trace().is_some_and(|trace| {
                 matches!(trace.phase, CausalPhase::Act | CausalPhase::AwaitOutcome)
             });
@@ -265,6 +303,7 @@ impl OrganicRuntime {
             input.outcome.or_else(|| {
                 inferred_outcome(
                     goal.action,
+                    context.companion_intent,
                     context,
                     trace_matches && completion_edge,
                     social_contact_credit,
@@ -293,11 +332,12 @@ impl OrganicRuntime {
             acted: phase_index >= 3 || context.somatic.completion_reason != CompletionReason::None,
             outcome: input.outcome,
         });
-        if regulation
-            .trace
-            .as_ref()
-            .is_some_and(|trace| trace.selected_action == goal.action)
-        {
+        if regulation.trace.as_ref().is_some_and(|trace| {
+            trace.selected_action == goal.action
+                && trace.context_key == context_key
+                && trace.observed == OrganicOutcomeCode::Pending
+                && !changed
+        }) {
             self.pending_action_change = false;
         }
 
@@ -305,6 +345,8 @@ impl OrganicRuntime {
         self.last_axis = (goal.body_intent.target_position - context.body.motion.world_position)
             .normalize_or(self.last_axis);
         self.last_action = Some(goal.action);
+        self.last_primary = Some(context.companion_intent);
+        self.last_execution_id = Some(input.execution_id);
         self.was_contacting = contact > 0.20;
         if social_contact_credit {
             self.pending_contact_credit = false;
@@ -323,10 +365,11 @@ impl OrganicRuntime {
             novelty > 0.42
         };
         self.heard_name_latched = input.heard_name;
-        let preferred_rest_target = habitual_rest_target(&self.regulator, goal, context);
+        let preferred_rest = habitual_rest_target(&self.regulator, goal, context);
         let output = OrganicRuntimeOutput {
             regulation,
-            preferred_rest_target,
+            preferred_rest_target: preferred_rest.as_ref().map(|target| target.anchor_point),
+            preferred_rest_surface: preferred_rest.map(|target| target.surface_id),
             cling_available: !self.cling_exhausted && self.grip_remaining > 0.0,
         };
         self.latest = Some(output.clone());
@@ -347,6 +390,26 @@ impl OrganicRuntime {
         let Some(latest) = &self.latest else {
             return;
         };
+        // The learned place only adjusts an approach along the SAME currently
+        // selected support. It cannot replace a locked object/defense target or
+        // move the root of an already settled body.
+        if packet.locomotion.pose == MotorPoseIntent::Landing
+            && let (Some(point), Some(surface), Some(support)) = (
+                latest.preferred_rest_target,
+                latest.preferred_rest_surface.as_ref(),
+                packet.support.as_mut(),
+            )
+            && support.surface_id == *surface
+            && let Some(target) = &mut packet.locomotion.target_position
+        {
+            let tangent = support.tangent.normalize_or_zero();
+            let shift = tangent
+                * (point - support.anchor_point)
+                    .dot(tangent)
+                    .clamp(-0.08, 0.08);
+            support.anchor_point = (support.anchor_point + shift).clamp(Vec2::ZERO, Vec2::ONE);
+            *target = (*target + shift).clamp(Vec2::ZERO, Vec2::ONE);
+        }
         if let Some(trace) = &latest.regulation.trace {
             let expression_phase = if trace.phase == CausalPhase::IntegrateOutcome
                 && trace.observed != OrganicOutcomeCode::Success
@@ -463,10 +526,19 @@ fn selected_surface(
 
 fn inferred_outcome(
     action: ActionId,
+    primary: PrimaryIntent,
     context: &BehaviorContextFrame,
     completion_edge: bool,
     social_contact_credit: bool,
 ) -> Option<OrganicOutcome> {
+    if matches!(
+        primary,
+        PrimaryIntent::EatInspect | PrimaryIntent::EatAccept | PrimaryIntent::EatReject
+    ) {
+        // Looking at food and completing its motor clip is not ingestion.
+        return (context.world_event == pet_motor::MotorWorldEvent::FoodConsumed)
+            .then(|| OrganicOutcome::success(0.9));
+    }
     if social_contact_credit {
         return Some(OrganicOutcome::success(0.82));
     }
@@ -474,12 +546,36 @@ fn inferred_outcome(
         return None;
     }
     match context.somatic.completion_reason {
-        CompletionReason::GoalReached
-        | CompletionReason::ContactConfirmed
-        | CompletionReason::SupportConfirmed
-        | CompletionReason::UserResponded => Some(OrganicOutcome::success(
-            context.somatic.support_stability.max(0.68),
-        )),
+        CompletionReason::SupportConfirmed
+            if matches!(
+                primary,
+                PrimaryIntent::Rest
+                    | PrimaryIntent::Sleep
+                    | PrimaryIntent::IdleContent
+                    | PrimaryIntent::Nest
+                    | PrimaryIntent::ReturnHome
+            ) && (context.body.motion.grounded
+                || context.screen_edge_supported
+                || context.den_supported) =>
+        {
+            Some(OrganicOutcome::success(
+                context.somatic.support_stability.max(0.68),
+            ))
+        }
+        CompletionReason::ContactConfirmed
+            if matches!(
+                primary,
+                PrimaryIntent::Chase
+                    | PrimaryIntent::Intercept
+                    | PrimaryIntent::Catch
+                    | PrimaryIntent::InvitePlay
+            ) && context.world_event == pet_motor::MotorWorldEvent::OrbStored =>
+        {
+            Some(OrganicOutcome::success(0.82))
+        }
+        CompletionReason::UserResponded if is_social(action) && context.pet_touched => {
+            Some(OrganicOutcome::success(0.82))
+        }
         CompletionReason::TimedOut if is_social(action) => Some(OrganicOutcome::no_response()),
         CompletionReason::TimedOut | CompletionReason::Invalidated => Some(OrganicOutcome {
             code: OrganicOutcomeCode::Failed,
@@ -493,6 +589,50 @@ fn inferred_outcome(
         }),
         _ => None,
     }
+}
+
+fn execution_drive(primary: PrimaryIntent, drives: lifecore::Drives) -> (lifecore::DriveKind, f32) {
+    use lifecore::DriveKind;
+    let (kind, value) = match primary {
+        PrimaryIntent::Sleep | PrimaryIntent::Wake => (DriveKind::Sleep, drives.sleep),
+        PrimaryIntent::EatInspect
+        | PrimaryIntent::EatAccept
+        | PrimaryIntent::EatReject
+        | PrimaryIntent::Rest
+        | PrimaryIntent::IdleContent
+        | PrimaryIntent::ReturnHome
+        | PrimaryIntent::Nest
+        | PrimaryIntent::GroomSelf
+        | PrimaryIntent::SettleAfterStress => (DriveKind::Comfort, drives.comfort),
+        PrimaryIntent::InvitePlay
+        | PrimaryIntent::Chase
+        | PrimaryIntent::Intercept
+        | PrimaryIntent::Catch
+        | PrimaryIntent::RecoverFromMiss => (DriveKind::Play, drives.play),
+        PrimaryIntent::Carry
+        | PrimaryIntent::SearchObject
+        | PrimaryIntent::Explore
+        | PrimaryIntent::Inspect
+        | PrimaryIntent::Mimic
+        | PrimaryIntent::Orient
+        | PrimaryIntent::Peek
+        | PrimaryIntent::Approach
+        | PrimaryIntent::Follow => (DriveKind::Curiosity, drives.curiosity),
+        PrimaryIntent::EscapePressure
+        | PrimaryIntent::Avoid
+        | PrimaryIntent::GuardPain
+        | PrimaryIntent::StartleFreeze
+        | PrimaryIntent::RejectContact
+        | PrimaryIntent::Hide => (DriveKind::Safety, drives.safety),
+        PrimaryIntent::InviteContact
+        | PrimaryIntent::AcceptContact
+        | PrimaryIntent::Nuzzle
+        | PrimaryIntent::SocialCheckIn
+        | PrimaryIntent::QuietCompanionship
+        | PrimaryIntent::OfferObject => (DriveKind::Social, drives.social),
+        PrimaryIntent::Celebrate => (DriveKind::Autonomy, drives.autonomy),
+    };
+    (kind, value.clamp(0.0, 1.0))
 }
 
 fn expected_for(action: ActionId, intent: PrimaryIntent) -> ExpectedOutcome {
@@ -530,8 +670,19 @@ fn habitual_rest_target(
     regulator: &OrganicRegulator,
     goal: &BehaviorGoalFrame,
     context: &BehaviorContextFrame,
-) -> Option<Vec2> {
-    if goal.action == ActionId::Sleep {
+) -> Option<pet_motor::SurfaceTarget> {
+    if !matches!(
+        goal.action,
+        ActionId::IdleHover | ActionId::LandOnWindow | ActionId::Sleep
+    ) || !matches!(
+        context.companion_intent,
+        PrimaryIntent::Rest
+            | PrimaryIntent::IdleContent
+            | PrimaryIntent::QuietCompanionship
+            | PrimaryIntent::Sleep
+    ) || context.pet_dragged
+        || context.pet_touched
+    {
         return None;
     }
     context
@@ -542,10 +693,18 @@ fn habitual_rest_target(
                 support_context_key(&surface.surface_id.0, goal.action),
                 goal.action,
             );
-            (strength >= 0.08).then_some((surface, strength))
+            (strength >= 0.08 && surface.velocity.length() <= 0.02).then_some((surface, strength))
         })
         .max_by(|left, right| left.1.total_cmp(&right.1))
-        .map(|(surface, _)| (surface.minimum + surface.maximum) * 0.5)
+        .and_then(|(surface, _)| {
+            let mut available = context.clone();
+            available.surfaces = vec![surface.clone()];
+            let mut target = rank_surface(&available, goal.action == ActionId::Sleep, false)?;
+            let midpoint = (surface.minimum + surface.maximum) * 0.5;
+            target.anchor_point +=
+                target.tangent * (midpoint - target.anchor_point).dot(target.tangent);
+            Some(target)
+        })
 }
 
 fn push_causal_field(
@@ -623,6 +782,294 @@ mod tests {
     use super::*;
     use lifecore::{Drives, Genome, SurfaceId};
     use pet_motor::{BehaviorProgramId, PhaseId, SurfaceAttachmentCommand, SurfaceCandidate};
+
+    #[test]
+    fn process_restore_keeps_learned_habits_and_ids_but_drops_pending_credit() {
+        let mut runtime = OrganicRuntime::default();
+        let goal = goal(ActionId::InvitePetting);
+        let mut context = BehaviorContextFrame {
+            companion_intent: PrimaryIntent::InviteContact,
+            ..Default::default()
+        };
+        runtime.tick(
+            &goal,
+            &mut context,
+            OrganicRuntimeInput {
+                cause: Some(OrganicCauseCode::DirectContact),
+                ..Default::default()
+            },
+            0.05,
+        );
+        let mut state = runtime.persistent_state();
+        assert!(state.active_episode.is_some());
+        state.habits.push(lifecore::OrganicHabitV1 {
+            context_key: 42,
+            action: ActionId::InvitePetting,
+            strength: 0.4,
+            expected_quality: 0.8,
+            successes: 5,
+            last_success_seconds: 4.0,
+        });
+        let next_id = state.next_episode_id;
+        let habits = state.habits.clone();
+        let folder = tempfile::tempdir().unwrap();
+        OrganicRuntime::from_state(state)
+            .save(folder.path())
+            .unwrap();
+        let loaded = OrganicRuntime::load(folder.path()).persistent_state();
+        assert!(loaded.active_episode.is_none());
+        assert_eq!(loaded.habits, habits);
+        assert_eq!(loaded.next_episode_id, next_id);
+    }
+
+    #[test]
+    fn same_action_scene_change_interrupts_credit_and_restarts_for_the_new_owner() {
+        let mut runtime = OrganicRuntime::default();
+        let goal = goal(ActionId::IdleHover);
+        let mut context = BehaviorContextFrame {
+            companion_intent: PrimaryIntent::EatInspect,
+            ..Default::default()
+        };
+        let first = OrganicRuntimeInput {
+            execution_id: 10,
+            cause: Some(OrganicCauseCode::ExternalNovelty),
+            ..Default::default()
+        };
+        runtime.tick(&goal, &mut context, first, 0.05);
+        let mut state = runtime.persistent_state();
+        state.active_episode.as_mut().unwrap().phase = CausalPhase::Act;
+        runtime.regulator = OrganicRegulator::from_state(state);
+        context.companion_intent = PrimaryIntent::Rest;
+        let changed = runtime.tick(
+            &goal,
+            &mut context,
+            OrganicRuntimeInput {
+                execution_id: 11,
+                outcome: Some(OrganicOutcome::success(1.0)),
+                ..Default::default()
+            },
+            0.05,
+        );
+        assert_eq!(
+            changed.regulation.trace.unwrap().observed,
+            OrganicOutcomeCode::Interrupted
+        );
+        assert_eq!(changed.regulation.relief.amount, 0.0);
+        assert!(runtime.pending_action_change);
+        for _ in 0..60 {
+            runtime.tick(
+                &goal,
+                &mut context,
+                OrganicRuntimeInput {
+                    execution_id: 11,
+                    ..Default::default()
+                },
+                0.05,
+            );
+        }
+        let trace = runtime.regulator.active_trace().unwrap();
+        assert_eq!(
+            trace.context_key,
+            behavioral_context_key(goal.action, PrimaryIntent::Rest)
+        );
+        assert_eq!(trace.observed, OrganicOutcomeCode::Pending);
+        assert!(!runtime.pending_action_change);
+    }
+
+    #[test]
+    fn protective_execution_never_turns_a_touch_into_social_success() {
+        let mut runtime = OrganicRuntime::default();
+        let mut goal = goal(ActionId::InvitePetting);
+        goal.felt.pain_like = 0.5;
+        let mut context = BehaviorContextFrame {
+            companion_intent: PrimaryIntent::GuardPain,
+            ..Default::default()
+        };
+        context.pet_touched = true;
+        let first = runtime.tick(
+            &goal,
+            &mut context,
+            OrganicRuntimeInput {
+                direct_contact: 1.0,
+                ..Default::default()
+            },
+            0.05,
+        );
+        assert!(!runtime.pending_contact_credit);
+        let mut state = runtime.persistent_state();
+        state.active_episode.as_mut().unwrap().phase = CausalPhase::Act;
+        runtime.regulator = OrganicRegulator::from_state(state);
+        let second = runtime.tick(
+            &goal,
+            &mut context,
+            OrganicRuntimeInput {
+                direct_contact: 1.0,
+                ..Default::default()
+            },
+            0.05,
+        );
+        assert_eq!(first.regulation.relief.amount, 0.0);
+        assert_eq!(second.regulation.relief.amount, 0.0);
+        assert_eq!(
+            second.regulation.trace.unwrap().observed,
+            OrganicOutcomeCode::Pending
+        );
+    }
+
+    #[test]
+    fn food_and_landing_relief_follow_execution_not_the_strongest_need() {
+        let mut goal = goal(ActionId::LandOnWindow);
+        goal.drives.play = 1.0;
+        goal.drives.comfort = 0.4;
+        let mut context = BehaviorContextFrame {
+            companion_intent: PrimaryIntent::EatAccept,
+            ..Default::default()
+        };
+        context.somatic.completion_reason = CompletionReason::GoalReached;
+        assert!(
+            inferred_outcome(goal.action, context.companion_intent, &context, true, false)
+                .is_none()
+        );
+        context.somatic.completion_reason = CompletionReason::PhaseComplete;
+        assert!(
+            inferred_outcome(goal.action, context.companion_intent, &context, true, false)
+                .is_none()
+        );
+        context.world_event = pet_motor::MotorWorldEvent::FoodConsumed;
+        assert_eq!(
+            inferred_outcome(
+                goal.action,
+                context.companion_intent,
+                &context,
+                false,
+                false
+            )
+            .unwrap()
+            .code,
+            OrganicOutcomeCode::Success
+        );
+        assert_eq!(
+            execution_drive(context.companion_intent, goal.drives),
+            (lifecore::DriveKind::Comfort, 0.4)
+        );
+        context.world_event = pet_motor::MotorWorldEvent::None;
+        context.companion_intent = PrimaryIntent::Rest;
+        context.somatic.completion_reason = CompletionReason::SupportConfirmed;
+        assert!(
+            inferred_outcome(goal.action, context.companion_intent, &context, true, false)
+                .is_none()
+        );
+        context.body.motion.grounded = true;
+        assert_eq!(
+            inferred_outcome(goal.action, context.companion_intent, &context, true, false)
+                .unwrap()
+                .code,
+            OrganicOutcomeCode::Success
+        );
+        let mut runtime = OrganicRuntime::default();
+        runtime.tick(&goal, &mut context, OrganicRuntimeInput::default(), 0.05);
+        assert_eq!(
+            runtime
+                .latest()
+                .unwrap()
+                .regulation
+                .trace
+                .as_ref()
+                .unwrap()
+                .drive,
+            Some(lifecore::DriveKind::Comfort)
+        );
+        assert_eq!(
+            runtime
+                .latest()
+                .unwrap()
+                .regulation
+                .trace
+                .as_ref()
+                .unwrap()
+                .drive_error,
+            0.4
+        );
+        let mut executing = runtime.persistent_state();
+        executing.active_episode.as_mut().unwrap().phase = CausalPhase::Act;
+        runtime = OrganicRuntime::from_state(executing);
+        let completed = runtime.tick(
+            &goal,
+            &mut context,
+            OrganicRuntimeInput {
+                outcome: Some(OrganicOutcome::success(0.8)),
+                ..Default::default()
+            },
+            0.05,
+        );
+        assert_eq!(
+            completed.regulation.relief.drive,
+            Some(lifecore::DriveKind::Comfort)
+        );
+        assert!(completed.regulation.relief.amount > 0.0);
+        assert_eq!(goal.drives.play, 1.0);
+    }
+
+    #[test]
+    fn persisted_rest_preference_changes_landing_but_never_another_support() {
+        let surface = SurfaceId("window:known".into());
+        let mut state = OrganicRegulationStateV1::default();
+        state.habits.push(lifecore::OrganicHabitV1 {
+            context_key: support_context_key(&surface.0, ActionId::LandOnWindow),
+            action: ActionId::LandOnWindow,
+            strength: 0.7,
+            expected_quality: 0.8,
+            successes: 4,
+            last_success_seconds: 0.0,
+        });
+        let mut runtime = OrganicRuntime::from_state(state);
+        let goal = goal(ActionId::LandOnWindow);
+        let mut context = BehaviorContextFrame {
+            companion_intent: PrimaryIntent::Rest,
+            ..Default::default()
+        };
+        context.body.motion.world_position = Vec2::new(0.25, 0.4);
+        context.surfaces.push(SurfaceCandidate {
+            surface_id: surface.clone(),
+            minimum: Vec2::new(0.2, 0.5),
+            maximum: Vec2::new(0.8, 0.6),
+            velocity: Vec2::ZERO,
+            familiarity: 0.4,
+            recent_failed_landings: 0,
+        });
+        runtime.tick(&goal, &mut context, OrganicRuntimeInput::default(), 0.05);
+        assert_eq!(
+            runtime.latest().unwrap().preferred_rest_surface.as_ref(),
+            Some(&surface)
+        );
+        let mut packet = SomaticActuationPacket::default();
+        packet.locomotion.pose = MotorPoseIntent::Landing;
+        packet.locomotion.target_position = Some(Vec2::new(0.25, 0.46));
+        packet.support = Some(SurfaceAttachmentCommand {
+            surface_id: surface.clone(),
+            anchor_point: Vec2::new(0.25, 0.5),
+            normal: Vec2::NEG_Y,
+            tangent: Vec2::X,
+            target_contact_fraction: 0.28,
+            normal_compliance: 0.22,
+            tangent_friction: 0.68,
+            adhesion: 0.42,
+            load_fraction: 0.18,
+            break_force: 0.58,
+            release_half_life: 0.42,
+        });
+        let mut other = packet.clone();
+        other.support.as_mut().unwrap().surface_id = SurfaceId("window:other".into());
+        let other_target = other.locomotion.target_position;
+        runtime.decorate_packet(&goal, &mut other);
+        assert_eq!(other.locomotion.target_position, other_target);
+        runtime.decorate_packet(&goal, &mut packet);
+        assert!(packet.locomotion.target_position.unwrap().x > 0.25);
+        assert_eq!(packet.locomotion.target_position.unwrap().y, 0.46);
+        runtime.reset_learning();
+        assert!(runtime.persistent_state().habits.is_empty());
+        assert!(runtime.latest().is_none());
+    }
 
     fn goal(action: ActionId) -> BehaviorGoalFrame {
         let mut life = lifecore::LifeCore::new(Genome::from_seed(7), 7);
@@ -816,6 +1263,7 @@ mod tests {
 
         runtime.was_contacting = false;
         let social = goal(ActionId::InvitePetting);
+        context.companion_intent = PrimaryIntent::InviteContact;
         runtime.tick(
             &social,
             &mut context,

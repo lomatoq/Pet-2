@@ -21,6 +21,7 @@ pub fn from_frames(
     let gesture = vita.latest_embodied_gesture();
     let felt = nervous.snapshot().felt;
     let mut context = BehaviorContextFrame {
+        orientation: body.embodiment.orientation_evidence(),
         frame_id: feedback.frame_id,
         timestamp_seconds: sensors.timestamp,
         body: feedback,

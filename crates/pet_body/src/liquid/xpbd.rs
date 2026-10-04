@@ -55,6 +55,56 @@ pub struct CradleBoundary {
     pub component_id: u8,
 }
 
+/// A newly admitted or moved bowl may overlap the previous material state.
+/// Repair that pre-existing penetration as a common translation, not velocity.
+/// Projecting it only into predicted positions would launch the mass by depth/dt.
+pub(super) fn repair_cradle_penetration(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    cradle: Option<CradleBoundary>,
+) {
+    let Some(c) = cradle else {
+        return;
+    };
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for p in &particles[..count] {
+        if p.component_id == c.component_id && p.inverse_mass > 0.0 {
+            lo = lo.min(p.position.x);
+            hi = hi.max(p.position.x);
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() {
+        return;
+    }
+    // Compare the actual clamp endpoints: comparing widths first loses an
+    // ulp through cancellation and can produce a reversed translation interval.
+    let min_shift = c.minimum.x - lo;
+    let max_shift = c.maximum.x - hi;
+    let dx = if min_shift <= max_shift {
+        0.0_f32.clamp(min_shift, max_shift)
+    } else {
+        0.0
+    };
+    let half = (c.maximum.x - c.minimum.x) * 0.5;
+    let center = (c.minimum.x + c.maximum.x) * 0.5;
+    let mut dy = 0.0_f32;
+    for p in &particles[..count] {
+        if p.component_id == c.component_id && p.inverse_mass > 0.0 {
+            let x = (p.position.x + dx).clamp(c.minimum.x, c.maximum.x);
+            let floor = c.minimum.y + ((x - center) / half).powi(4) * half * 0.10;
+            dy = dy.max(floor - p.position.y);
+        }
+    }
+    let shift = Vec2::new(dx, dy);
+    for p in &mut particles[..count] {
+        if p.component_id == c.component_id && p.inverse_mass > 0.0 {
+            p.position += shift;
+            p.predicted_position += shift;
+        }
+    }
+}
+
 pub(super) fn project_cradle(
     particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
     count: usize,
@@ -186,8 +236,18 @@ pub fn solve_density_constraints(
                     snapshot[other].inverse_mass.max(0.0) * gradient.length_squared();
             }
             gradient_norm_sum += inverse_mass * gradient_i.length_squared();
+            // A crowded, nearly collinear pack can have a small Jacobian even
+            // with a large density residual. An undamped Newton/Jacobi step
+            // then jumps across several kernel neighborhoods; reconstructing
+            // velocity turns that numerical overshoot into a pressure explosion.
+            // Regularize the nonlinear step by its compressive residual and the
+            // Poly6 kernel's curvature scale (6 / h²). This vanishes with the
+            // residual, retains the authored XPBD compliance, and changes only
+            // pressure multipliers, preserving pair-symmetric momentum transfer.
+            let nonlinear_regularization = 6.0 * constraint / (kernel_radius * kernel_radius);
             let unconstrained_delta =
-                (-constraint - alpha * lambdas[index]) / (gradient_norm_sum + alpha + 1.0e-6);
+                (-constraint - alpha * lambdas[index])
+                    / (gradient_norm_sum + alpha + nonlinear_regularization + 1.0e-6);
             let next_lambda = (lambdas[index] + unconstrained_delta).min(0.0);
             delta_lambdas[index] = next_lambda - lambdas[index];
             lambdas[index] = next_lambda;

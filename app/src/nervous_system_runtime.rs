@@ -38,6 +38,7 @@ pub struct NervousSystemRuntime {
     voice_mouth_open: f32,
     startle_face: f32,
     companion_expression: Option<CompanionExpressionDirector>,
+    companion_body_style: pet_body::BodyStyleTarget,
     blink_owner: pet_body::BlinkOwner,
     blink_reason: pet_body::BlinkReason,
     ordinary_blink_active: bool,
@@ -72,6 +73,7 @@ impl Default for NervousSystemRuntime {
             voice_mouth_open: 0.0,
             startle_face: 0.0,
             companion_expression: None,
+            companion_body_style: pet_body::BodyStyleTarget::default(),
             blink_owner: pet_body::BlinkOwner::Physiological,
             blink_reason: pet_body::BlinkReason::None,
             ordinary_blink_active: false,
@@ -314,10 +316,19 @@ impl NervousSystemRuntime {
         let pose = ecology
             .as_ref()
             .and_then(|e| crate::motor_scene_pose(e.active_episode()));
+        let executed_action = crate::scene_execution::executed_action(
+            ecology.as_ref().and_then(|e| e.active_episode()),
+            life.state.current_action,
+        );
+        let scene_goal = ecology
+            .as_ref()
+            .and_then(|e| e.active_episode())
+            .map(|e| e.goal);
+        let scene_intent = intent.clone();
         let context =
             crate::motor_context::from_frames(self, vita, body, life, sensors, intent, ecology);
         let goal = lifecore::BehaviorGoalFrame {
-            action: life.state.current_action,
+            action: executed_action,
             body_intent: intent.clone(),
             affect: life.state.affect,
             drives: life.state.drives,
@@ -352,6 +363,14 @@ impl NervousSystemRuntime {
             }),
             dt,
         );
+        if !context.pet_dragged
+            && !context.focus_mode
+            && !packet.program.is_some_and(|p| {
+                pet_motor::orientation_acquisition_required(p, &packet.phase_name, &context)
+            })
+        {
+            crate::restore_orb_play_navigation(scene_goal, &packet, &scene_intent, intent, false);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -367,9 +386,12 @@ impl NervousSystemRuntime {
         dt: f32,
     ) {
         body.embodiment.managed_blink = true;
-        let observation=motor.as_ref().and_then(|m|m.context.orb_id.zip(m.context.orb_position));
-        self.gaze_object_velocity=measured_target_velocity(self.gaze_object_sample,observation,dt);
-        self.gaze_object_sample=observation;
+        let observation = motor
+            .as_ref()
+            .and_then(|m| m.context.orb_id.zip(m.context.orb_position));
+        self.gaze_object_velocity =
+            measured_target_velocity(self.gaze_object_sample, observation, dt);
+        self.gaze_object_sample = observation;
         let tuning = body.tuning_profile();
         let calibration = tuning.nervous.for_live_runtime();
         let mut phenotype = self.resolve_actuation(
@@ -454,28 +476,57 @@ impl NervousSystemRuntime {
         // Motor/VITA may overwrite the director's already-filtered gaze above.
         // Reconcile the selected attention AFTER every writer, so no raw cursor
         // or body-center target can bypass fixation continuity on presentation.
-        let selected_gaze = self
+        let preparing_target = motor
+            .as_ref()
+            .filter(|m| {
+                m.packet.program.is_some_and(|p| {
+                    pet_motor::orientation_acquisition_required(p, &m.packet.phase_name, m.context)
+                }) && m.packet.locomotion.target_locked
+                    && !protective
+                    && !m.context.pet_dragged
+                    && !m.context.pet_touched
+            })
+            .and_then(|m| m.packet.locomotion.target_position);
+        let selected_gaze = preparing_target.or(self
             .perception
             .attention_target_position
             .or(intent.gaze_target)
-            .or(Some(body.simulation.feedback.world_position));
-        let social_orb=motor.as_ref().filter(|m|
-            m.context.world_social_hold && !m.context.pet_dragged
-                && social_reference_allowed(final_gaze_mode,
-                    m.context.focus_mode || life.state.focus_mode, protective,
-                    self.body_feedback.environment.user_present, self.snapshot.derived.fatigue))
-            .and_then(|m|m.context.orb_position);
-        let predictive_orb=(final_gaze_mode==pet_body::FixationGazeMode::PredictiveIntercept)
-            .then(||motor.as_ref().and_then(|m|m.context.orb_position)).flatten();
+            .or(Some(body.simulation.feedback.world_position)));
+        let social_orb = motor
+            .as_ref()
+            .filter(|m| {
+                preparing_target.is_none()
+                    && m.context.world_social_hold
+                    && !m.context.pet_dragged
+                    && social_reference_allowed(
+                        final_gaze_mode,
+                        m.context.focus_mode || life.state.focus_mode,
+                        protective,
+                        self.body_feedback.environment.user_present,
+                        self.snapshot.derived.fatigue,
+                    )
+            })
+            .and_then(|m| m.context.orb_position);
+        let predictive_orb = (final_gaze_mode == pet_body::FixationGazeMode::PredictiveIntercept)
+            .then(|| motor.as_ref().and_then(|m| m.context.orb_position))
+            .flatten();
         let gaze = self.final_gaze.tick(
             pet_body::GazePlan {
                 primary_target: social_orb.or(predictive_orb).or(selected_gaze),
-                secondary_target: social_orb.map(|_|sensors.cursor_position),
-                mode: if social_orb.is_some() {pet_body::FixationGazeMode::SocialReference} else {final_gaze_mode},
-                target_velocity: if predictive_orb.is_some() {self.gaze_object_velocity} else {glam::Vec2::ZERO},
-                lead_seconds: if predictive_orb.is_some() {0.10} else {0.0},
-                dwell_min:0.45,
-                dwell_max:1.2,
+                secondary_target: social_orb.map(|_| sensors.cursor_position),
+                mode: if social_orb.is_some() {
+                    pet_body::FixationGazeMode::SocialReference
+                } else {
+                    final_gaze_mode
+                },
+                target_velocity: if predictive_orb.is_some() {
+                    self.gaze_object_velocity
+                } else {
+                    glam::Vec2::ZERO
+                },
+                lead_seconds: if predictive_orb.is_some() { 0.10 } else { 0.0 },
+                dwell_min: 0.45,
+                dwell_max: 1.2,
                 acquire_tau: 0.12,
                 confidence: vita.companion_intent().confidence,
                 ..pet_body::GazePlan::default()
@@ -487,6 +538,7 @@ impl NervousSystemRuntime {
         phenotype.face.gaze_target = intent.gaze_target;
         sensors.interaction_actuation = phenotype.interaction;
         self.actuation = phenotype.clone();
+        body.set_companion_body_style(self.companion_body_style);
         body.set_fast_phenotype_actuation(phenotype);
     }
 
@@ -615,6 +667,16 @@ impl NervousSystemRuntime {
         let mut episode = self.episode;
         episode.user_absent = f32::from(!self.body_feedback.environment.user_present);
         let f = self.snapshot.felt;
+        episode.sleeping_or_deep_rest =
+            measured_rest_quality(self.executed_locomotion, self.body_feedback, f);
+        // VITA fatigue and LifeCore debt consume the same physical observation.
+        episode.rest_quality = episode.sleeping_or_deep_rest;
+        episode.safe_social_exchange =
+            if episode.boundary_violation < 0.1 && f.pain_like < 0.15 && f.restraint < 0.2 {
+                f.contact_pleasantness
+            } else {
+                0.0
+            };
         let positive = (0.28 * f.contact_pleasantness
             + 0.30 * episode.successful_play
             + 0.24 * episode.goal_congruent_motor_success
@@ -715,6 +777,7 @@ impl NervousSystemRuntime {
             dt,
         );
         apply_companion_expression(&mut actuation, companion);
+        self.companion_body_style = companion.body;
         self.blink_owner = companion.blink_owner;
         self.blink_reason = companion.blink_reason;
         // Motor physiology and defensive ownership must survive R14's face layer.
@@ -785,42 +848,99 @@ impl NervousSystemRuntime {
     }
 }
 
-fn social_reference_allowed(mode:pet_body::FixationGazeMode, focused:bool, protective:bool, user_present:bool, fatigue:f32)->bool {
-    mode==pet_body::FixationGazeMode::Track && !focused && !protective && user_present && fatigue<0.7
+fn social_reference_allowed(
+    mode: pet_body::FixationGazeMode,
+    focused: bool,
+    protective: bool,
+    user_present: bool,
+    fatigue: f32,
+) -> bool {
+    mode == pet_body::FixationGazeMode::Track
+        && !focused
+        && !protective
+        && user_present
+        && fatigue < 0.7
 }
 
 #[test]
 fn social_reference_never_overrides_sleep_tracking_danger_or_focus() {
     use pet_body::FixationGazeMode as Mode;
-    assert!(social_reference_allowed(Mode::Track,false,false,true,0.2));
-    for mode in [Mode::Sleep,Mode::PredictiveIntercept,Mode::AvoidantCheck] {
-        assert!(!social_reference_allowed(mode,false,false,true,0.2));
+    assert!(social_reference_allowed(
+        Mode::Track,
+        false,
+        false,
+        true,
+        0.2
+    ));
+    for mode in [Mode::Sleep, Mode::PredictiveIntercept, Mode::AvoidantCheck] {
+        assert!(!social_reference_allowed(mode, false, false, true, 0.2));
     }
-    assert!(!social_reference_allowed(Mode::Track,true,false,true,0.2));
-    assert!(!social_reference_allowed(Mode::Track,false,true,true,0.2));
-    assert!(!social_reference_allowed(Mode::Track,false,false,false,0.2));
-    assert!(!social_reference_allowed(Mode::Track,false,false,true,0.9));
+    assert!(!social_reference_allowed(
+        Mode::Track,
+        true,
+        false,
+        true,
+        0.2
+    ));
+    assert!(!social_reference_allowed(
+        Mode::Track,
+        false,
+        true,
+        true,
+        0.2
+    ));
+    assert!(!social_reference_allowed(
+        Mode::Track,
+        false,
+        false,
+        false,
+        0.2
+    ));
+    assert!(!social_reference_allowed(
+        Mode::Track,
+        false,
+        false,
+        true,
+        0.9
+    ));
 }
 
 // Object positions are normalized desktop coordinates. Never borrow the pet's
 // velocity as a proxy: a stationary ball stays a stationary visual target.
-fn measured_target_velocity(previous:Option<(u64,glam::Vec2)>, current:Option<(u64,glam::Vec2)>, dt:f32)->glam::Vec2 {
-    let (Some((old_id,old)),Some((id,point)))=(previous,current) else {return glam::Vec2::ZERO;};
-    if old_id!=id || !dt.is_finite() || !(0.001..=0.2).contains(&dt)
-        || !point.is_finite() || !old.is_finite() || point.distance(old)>0.10 {
+fn measured_target_velocity(
+    previous: Option<(u64, glam::Vec2)>,
+    current: Option<(u64, glam::Vec2)>,
+    dt: f32,
+) -> glam::Vec2 {
+    let (Some((old_id, old)), Some((id, point))) = (previous, current) else {
+        return glam::Vec2::ZERO;
+    };
+    if old_id != id
+        || !dt.is_finite()
+        || !(0.001..=0.2).contains(&dt)
+        || !point.is_finite()
+        || !old.is_finite()
+        || point.distance(old) > 0.10
+    {
         return glam::Vec2::ZERO;
     }
-    ((point-old)/dt).clamp_length_max(1.0)
+    ((point - old) / dt).clamp_length_max(1.0)
 }
 
 #[test]
 fn gaze_velocity_is_measured_from_same_object_and_resets_on_switch_or_teleport() {
     use glam::Vec2;
-    let p=Some((1,Vec2::splat(0.5)));
-    assert_eq!(measured_target_velocity(p,p,0.05),Vec2::ZERO);
-    assert!(measured_target_velocity(p,Some((1,Vec2::new(0.51,0.5))),0.05).x>0.19);
-    assert_eq!(measured_target_velocity(p,Some((2,Vec2::new(0.51,0.5))),0.05),Vec2::ZERO);
-    assert_eq!(measured_target_velocity(p,Some((1,Vec2::ONE)),0.05),Vec2::ZERO);
+    let p = Some((1, Vec2::splat(0.5)));
+    assert_eq!(measured_target_velocity(p, p, 0.05), Vec2::ZERO);
+    assert!(measured_target_velocity(p, Some((1, Vec2::new(0.51, 0.5))), 0.05).x > 0.19);
+    assert_eq!(
+        measured_target_velocity(p, Some((2, Vec2::new(0.51, 0.5))), 0.05),
+        Vec2::ZERO
+    );
+    assert_eq!(
+        measured_target_velocity(p, Some((1, Vec2::ONE)), 0.05),
+        Vec2::ZERO
+    );
 }
 
 fn causal_gaze_mode(
@@ -831,10 +951,17 @@ fn causal_gaze_mode(
     let sleeping = motor.map_or(action == lifecore::ActionId::Sleep, |motor| {
         // Support validity is already owned by motor selection; do not reset
         // the eyes on individual noisy physical-contact samples here.
-        motor.packet.locomotion.pose == pet_motor::MotorPoseIntent::SupportedSleep
+        (motor.packet.locomotion.pose == pet_motor::MotorPoseIntent::SupportedSleep
             && (motor.packet.program == Some(pet_motor::BehaviorProgramId::RestNremSleep)
                 || motor.context.companion_intent == lifecore::PrimaryIntent::Sleep
-                || action == lifecore::ActionId::Sleep)
+                || action == lifecore::ActionId::Sleep))
+            // A physically admitted bed sleep can use a loaded settle packet
+            // before NREM selection. Its bed anchor is support, not something
+            // to repeatedly turn the head toward with eyes already closed.
+            || (motor.context.den_supported
+                && motor.context.companion_intent == lifecore::PrimaryIntent::Sleep
+                && action == lifecore::ActionId::Sleep
+                && motor.packet.locomotion.pose == pet_motor::MotorPoseIntent::SupportedRest)
     });
     if protective {
         pet_body::FixationGazeMode::AvoidantCheck
@@ -852,6 +979,22 @@ fn causal_gaze_mode(
     } else {
         pet_body::FixationGazeMode::Track
     }
+}
+
+#[cfg(test)]
+#[test]
+fn admitted_bed_sleep_keeps_quiet_gaze_during_loaded_settle_but_awake_rest_tracks() {
+    let context = pet_motor::BehaviorContextFrame {
+        den_supported: true,
+        companion_intent: lifecore::PrimaryIntent::Sleep,
+        ..Default::default()
+    };
+    let mut packet = SomaticActuationPacket::default();
+    packet.locomotion.pose = pet_motor::MotorPoseIntent::SupportedRest;
+    let motor = MotorActuationFrame { packet: &packet, context: &context, scene_pose: None };
+    assert_eq!(causal_gaze_mode(Some(&motor), lifecore::ActionId::Sleep, false), pet_body::FixationGazeMode::Sleep);
+    assert_eq!(causal_gaze_mode(Some(&motor), lifecore::ActionId::WakeUp, false), pet_body::FixationGazeMode::Track);
+    assert_eq!(causal_gaze_mode(Some(&motor), lifecore::ActionId::Sleep, true), pet_body::FixationGazeMode::AvoidantCheck);
 }
 
 fn restore_managed_blinks(expression: &mut lifecore::ExpressionState, blinks: [f32; 2]) {
@@ -1064,9 +1207,157 @@ fn merge_interaction(phenotype: &mut InteractionBodyActuation, vita: Interaction
     phenotype.sanitize();
 }
 
+fn measured_rest_quality(
+    executed: lifecore::LocomotionMode,
+    body: BodyFeedbackV2,
+    felt: lifecore::FeltStateV1,
+) -> f32 {
+    if executed != lifecore::LocomotionMode::Sleep
+        || !body.motion.grounded
+        || body.motion.clinging
+        || felt.restraint > 0.2
+        || felt.pain_like > 0.15
+        || felt.startle > 0.2
+    {
+        return 0.0;
+    }
+    (1.0 - body.motion.velocity.length() / 0.025).clamp(0.0, 1.0)
+        * (1.0 - body.fluid.settle_error.clamp(0.0, 1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_pre_incident_supported_rest_does_not_self_interrupt_into_startle() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../crates/lifecore/tests/fixtures/v63_sleep_startle_incident.json")).unwrap();
+        let rows = fixture["rows"].as_array().unwrap();
+        let mut nervous = NervousSystemRuntime { executed_locomotion: lifecore::LocomotionMode::Sleep, ..Default::default() };
+        let mut life = LifeCore::new(lifecore::Genome::from_seed(64), 64);
+        life.state.current_action = lifecore::ActionId::Sleep;
+        life.state.drives = serde_json::from_value(rows[0]["drives"].clone()).unwrap();
+        life.state.affect = serde_json::from_value(rows[0]["affect"].clone()).unwrap();
+        let mut vita = VitaRuntime::new(64, None);
+        let mut morph = MorphBrain::new(64, None).unwrap();
+        let mut motor = pet_motor::BehaviorPerformanceRuntime::new(64);
+        let initial_debt = life.state.drives.sleep;
+        for frame in 1..=600 {
+            // Counterfactual holds the independently confirmed PRE-event
+            // support/body observations; the third record has already lost
+            // support after the original reflex and is not declared restful.
+            let row = &rows[(frame as usize - 1) % 2];
+            nervous.body_feedback = serde_json::from_value(row["body"].clone()).unwrap();
+            nervous.body_feedback.frame_id = frame;
+            assert!(nervous.body_feedback.motion.grounded);
+            assert_eq!(nervous.body_feedback.contact.contact_count, 0);
+            nervous.prepare_cognition_tick(&mut life, &mut vita, &mut morph, 0.42,
+                NervousReadabilityTuning::default().for_live_runtime(), 0.05);
+            let output = life.tick(&SensorFrame::default(), &lifecore::BodyFeedback::default(), 0.05);
+            let context = pet_motor::BehaviorContextFrame {
+                body: nervous.body_feedback,
+                somatic: serde_json::from_value(row["somatic"].clone()).unwrap(),
+                // Preserve the measured floor patch for this causal replay.
+                screen_edge_supported: true,
+                screen_edge_support_stable_seconds: 2.0,
+                surfaces: vec![pet_motor::SurfaceCandidate {
+                    surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
+                    minimum: glam::Vec2::new(0.0, 0.999), maximum: glam::Vec2::ONE,
+                    velocity: glam::Vec2::ZERO, familiarity: 0.7, recent_failed_landings: 0,
+                }],
+                ..Default::default()
+            };
+            assert!(context.somatic.supported);
+            let goal = lifecore::BehaviorGoalFrame {
+                action: output.selected_action, body_intent: output.body_intent,
+                affect: life.state.affect, drives: life.state.drives,
+                felt: nervous.snapshot.felt, derived: nervous.snapshot.derived,
+                attachment: life.state.affect.attachment, recent_outcome: None,
+            };
+            let packet = motor.tick(&goal, &context, 0.05);
+            assert_eq!(packet.program, Some(pet_motor::BehaviorProgramId::RestNremSleep), "frame={frame}");
+            assert!(nervous.snapshot.felt.startle < 1e-6);
+        }
+        assert!(life.state.drives.sleep < initial_debt - 0.15);
+    }
+
+    #[test]
+    fn executed_rest_and_human_care_share_the_real_nervous_life_vita_path() {
+        let mut nervous = NervousSystemRuntime {
+            executed_locomotion: lifecore::LocomotionMode::Sleep,
+            body_feedback: BodyFeedbackV2 {
+                motion: lifecore::BodyMotionFeedbackV2 { grounded: true, ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut life = LifeCore::new(lifecore::Genome::from_seed(64), 64);
+        life.state.current_action = lifecore::ActionId::Sleep;
+        life.state.drives.sleep = 0.99;
+        let mut vita = VitaRuntime::new(64, None);
+        let mut morph = MorphBrain::new(64, None).unwrap();
+        let sensors = SensorFrame::default();
+        for frame in 1..=1200 {
+            nervous.body_feedback.frame_id = frame;
+            nervous.prepare_cognition_tick(&mut life, &mut vita, &mut morph,
+                0.42, NervousReadabilityTuning::default().for_live_runtime(), 0.05);
+            life.tick(&sensors, &lifecore::BodyFeedback::default(), 0.05);
+        }
+        assert!(life.state.drives.sleep < 0.65);
+        assert!(nervous.episode.rest_quality > 0.8);
+        assert!(nervous.snapshot.felt.contact_pleasantness < 0.001,
+            "a supported sleeper is not receiving user caresses");
+        // Completed body observations model a gentle human-contact UInput.
+        nervous.body_feedback.contact.contact_count = 1;
+        nervous.body_feedback.contact.pressure = 0.18;
+        nervous.body_feedback.contact.area = 0.25;
+        life.state.current_action = lifecore::ActionId::Sleep;
+        let debt = life.state.drives.sleep;
+        for frame in 1201..=1220 {
+            nervous.body_feedback.frame_id = frame;
+            nervous.prepare_cognition_tick(&mut life, &mut vita, &mut morph,
+                0.42, NervousReadabilityTuning::default().for_live_runtime(), 0.05);
+        }
+        assert_eq!(life.state.current_action, lifecore::ActionId::WakeUp);
+        assert!(nervous.snapshot.felt.contact_pleasantness > 0.35);
+        assert!(nervous.episode.safe_social_exchange > 0.35);
+        assert!(nervous.snapshot.felt.pain_like < 0.05);
+        // No direct erasure of sleep debt by the contact reward.
+        assert!((life.state.drives.sleep - debt).abs() < 0.01);
+    }
+
+    #[test]
+    fn rest_requires_supported_executed_sleep_and_still_body() {
+        let mut body = BodyFeedbackV2::default();
+        let felt = lifecore::FeltStateV1::default();
+        assert_eq!(
+            measured_rest_quality(lifecore::LocomotionMode::Sleep, body, felt),
+            0.0
+        );
+        body.motion.grounded = true;
+        assert_eq!(
+            measured_rest_quality(lifecore::LocomotionMode::Sleep, body, felt),
+            1.0
+        );
+        assert_eq!(
+            measured_rest_quality(lifecore::LocomotionMode::Seek, body, felt),
+            0.0
+        );
+        body.motion.velocity = glam::Vec2::new(0.03, 0.0);
+        assert_eq!(
+            measured_rest_quality(lifecore::LocomotionMode::Sleep, body, felt),
+            0.0
+        );
+        body.motion.velocity = glam::Vec2::ZERO;
+        let restraint = lifecore::FeltStateV1 {
+            restraint: 0.5,
+            ..felt
+        };
+        assert_eq!(
+            measured_rest_quality(lifecore::LocomotionMode::Sleep, body, restraint),
+            0.0
+        );
+    }
 
     #[test]
     fn managed_asymmetry_survives_scene_without_replacing_geometry() {

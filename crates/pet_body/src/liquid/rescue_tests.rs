@@ -1436,3 +1436,52 @@ fn occupied_cradle_contains_liquid_during_repeated_lateral_and_downward_loads() 
     assert_eq!(runtime.diagnostics.recovery_count, 0);
     assert!(runtime.diagnostics.finite);
 }
+
+#[test]
+fn sudden_cradle_contact_does_not_launch_stored_penetration_as_velocity() {
+    let (genome, mut runtime) = migrated_runtime(0x3201);
+    settle(&mut runtime, &genome, 0.6);
+    let mut peak = 0.0_f32;
+    let mut min_core = 1.0_f32;
+    for tick in 0..240 {
+        // A real admission/root correction can move the floor through material.
+        // This position repair is not a physical upward impact.
+        runtime.set_cradle_bounds(
+            (tick < 24).then_some((Vec2::new(-0.42, -0.10), Vec2::new(0.42, 2.0))),
+        );
+        step(
+            &mut runtime,
+            &genome,
+            &SensorFrame::default(),
+            &BodyFeedback::default(),
+            DropletMotion::default(),
+        );
+        peak = peak.max(runtime.diagnostics.maximum_speed);
+        min_core = min_core.min(runtime.diagnostics.main_mass / runtime.particle_count as f32);
+    }
+    eprintln!("cradle admission: peak={peak}, min_core={min_core}");
+    assert!(
+        peak < 5.0,
+        "position repair became an explosive impulse: {peak}"
+    );
+    assert!(min_core > 0.95, "admission fragmented the body: {min_core}");
+    assert_eq!(runtime.diagnostics.recovery_count, 0);
+}
+
+#[test]
+fn cradle_roundoff_cannot_invert_the_translation_interval() {
+    let minimum = Vec2::new(-0.5031195, -1.0);
+    let maximum = Vec2::new(0.14207843, 2.0);
+    let lo = -0.50290436_f32;
+    let hi = 0.14229363_f32;
+    assert!(hi - lo <= maximum.x - minimum.x);
+    assert!(minimum.x - lo > maximum.x - hi);
+    let mut particles = [super::particles::LiquidParticle::default(); super::particles::MAX_LIQUID_PARTICLES];
+    for (i, x) in [lo, hi].into_iter().enumerate() {
+        particles[i].position = Vec2::new(x, 0.0);
+        particles[i].predicted_position = particles[i].position;
+        particles[i].inverse_mass = 1.0;
+    }
+    super::xpbd::repair_cradle_penetration(&mut particles, 2, Some(super::xpbd::CradleBoundary { minimum, maximum, component_id: 0 }));
+    assert!(particles[..2].iter().all(|p| p.position.is_finite() && p.velocity == Vec2::ZERO));
+}

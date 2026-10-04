@@ -28,8 +28,16 @@ impl CradleGeometry {
 #[derive(Default)]
 pub struct CradleSeat {
     pub inside: bool,
+    descending: bool,
 }
 impl CradleSeat {
+    pub fn scene_target(&self, g: CradleGeometry, target: Vec2, sleeping_in_den: bool) -> Vec2 {
+        if self.inside && sleeping_in_den {
+            g.anchor
+        } else {
+            target
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
@@ -92,7 +100,7 @@ impl CradleSeat {
             && (material_center - g.anchor.x).abs() <= (g.half_width - half).max(8.0)
     }
     pub fn navigation(
-        &self,
+        &mut self,
         g: CradleGeometry,
         center: Vec2,
         hull_min: Vec2,
@@ -100,12 +108,25 @@ impl CradleSeat {
         target: Vec2,
     ) -> Option<Vec2> {
         let wants_home = g.contains_target(target);
+        if !wants_home || self.inside {
+            self.descending = false;
+        }
         if self.inside && !wants_home {
             return Some(Vec2::new(g.anchor.x, g.anchor.y - 32.0 - hull_max.y));
         }
         if !self.inside && wants_home {
             let fits = self.fits_entrance(g, center, hull_min, hull_max);
-            if !fits || center.y + hull_max.y > g.floor + 3.0 {
+            // Keep the descent committed across small changes of liquid hull.
+            // Otherwise the entrance check alternates between climb and descend.
+            if fits && center.y + hull_max.y <= g.floor + 3.0 {
+                self.descending = true;
+            }
+            if (center.x + (hull_min.x + hull_max.x) * 0.5 - g.anchor.x).abs() > g.half_width * 0.65
+                || center.y > g.floor
+            {
+                self.descending = false;
+            }
+            if !self.descending {
                 return Some(Vec2::new(g.anchor.x, g.anchor.y - 32.0 - hull_max.y));
             }
             return Some(Vec2::new(g.anchor.x, g.floor - hull_max.y));
@@ -119,6 +140,35 @@ mod tests {
     use super::*;
     fn geometry() -> CradleGeometry {
         CradleGeometry::new(Vec2::new(300.0, 300.0), [1920, 1080], 1.0)
+    }
+    #[test]
+    fn changing_liquid_hull_does_not_reverse_committed_descent() {
+        let g = geometry();
+        let mut seat = CradleSeat::default();
+        let c = Vec2::new(g.anchor.x, g.floor - 72.0);
+        seat.navigation(g, c, Vec2::splat(-65.0), Vec2::splat(65.0), g.anchor);
+        let next = seat
+            .navigation(
+                g,
+                c + Vec2::new(9.0, 0.0),
+                Vec2::splat(-84.0),
+                Vec2::splat(84.0),
+                g.anchor,
+            )
+            .unwrap();
+        assert!((next.y - (g.floor - 84.0)).abs() < 0.001);
+    }
+    #[test]
+    fn sleeping_scene_does_not_turn_a_local_guard_fallback_into_an_exit() {
+        let g = geometry();
+        let mut seat = CradleSeat { inside: true, ..Default::default() };
+        let center = Vec2::new(g.anchor.x, g.floor - 62.0);
+        let fallback_floor_target = Vec2::new(g.anchor.x - 140.0, 1000.0);
+        let target = seat.scene_target(g, fallback_floor_target, true);
+        assert!(seat.navigation(g, center, Vec2::splat(-60.0), Vec2::splat(60.0), target).is_none());
+        // Actual wake/exit ownership still traverses the open lip.
+        let target = seat.scene_target(g, fallback_floor_target, false);
+        assert!(seat.navigation(g, center, Vec2::splat(-60.0), Vec2::splat(60.0), target).unwrap().y < center.y);
     }
     #[test]
     fn outside_and_underneath_never_become_occluded_or_clamped() {
@@ -183,7 +233,10 @@ mod tests {
     #[test]
     fn dragging_keeps_occlusion_and_walls_until_entire_body_clears_lip() {
         let g = geometry();
-        let mut seat = CradleSeat { inside: true };
+        let mut seat = CradleSeat {
+            inside: true,
+            ..Default::default()
+        };
         for half in [60.0, 105.0] {
             for dx in [-180.0, 180.0] {
                 let mut center = Vec2::new(g.anchor.x + dx, g.floor);

@@ -152,6 +152,7 @@ struct Lab {
     visual_target: Option<Vec2>,
     visual_hue: f32,
     visual_strength: f32,
+    visual_surprise_scale: f32,
     shared_attention: bool,
     click_rhythm: Option<RhythmSignature>,
     windows: WindowAffordanceFrame,
@@ -167,6 +168,8 @@ struct Lab {
     execution_path: Vec<Vec2>,
     last_goal_phase: Option<(EpisodeGoal, EpisodePhase)>,
     last_gaze_target: Option<Vec2>,
+    mouth_aperture: f32,
+    verified_mouth_bite: Option<ObjectId>,
     last_scores: Vec<Value>,
     max_chromatic_blend: f32,
     max_camouflage_blend: f32,
@@ -205,6 +208,7 @@ impl Lab {
             visual_target: None,
             visual_hue: 0.0,
             visual_strength: 0.0,
+            visual_surprise_scale: 0.58,
             shared_attention: false,
             click_rhythm: None,
             windows: WindowAffordanceFrame::default(),
@@ -220,6 +224,8 @@ impl Lab {
             execution_path: Vec::new(),
             last_goal_phase: None,
             last_gaze_target: None,
+            mouth_aperture: 0.0,
+            verified_mouth_bite: None,
             last_scores: Vec::new(),
             max_chromatic_blend: 0.0,
             max_camouflage_blend: 0.0,
@@ -274,6 +280,25 @@ impl Lab {
             penetration_px: (body_radius + orb_radius - offset.length()).max(0.0),
             ..Default::default()
         };
+        // Explicit reduced-mouth fixture: this lab has no rendered gel body.
+        // The mouth is a 3px lip socket 22px below the preview's face center;
+        // body-center distance alone is never ingestion evidence.
+        let mouth_offset = Vec2::new(0.0, 22.0) / desktop;
+        let mouth = self.pet_position + mouth_offset;
+        let episode = self.director.active_episode();
+        let food = episode.and_then(|e| e.object_id).and_then(|id| self.state.objects.iter().find(|o|
+            o.id == id && o.kind == ObjectKind::Morsel && o.lifecycle != ObjectLifecycle::Consumed));
+        let food_physical = food.map(|food| {
+            let lip_contact = ((food.position - mouth) * desktop).length()
+                <= 3.0 + food.radius_px_at_reference * 720.0 / 1152.0;
+            let eating = episode.is_some_and(|e| e.goal == EpisodeGoal::EatMorsel);
+            let contact = lip_contact && !self.sleeping && food.lifecycle != ObjectLifecycle::GrabbedByUser
+                && (self.mouth_aperture > 0.08 || (eating && self.verified_mouth_bite == Some(food.id)));
+            if !lip_contact || self.sleeping { self.verified_mouth_bite = None; }
+            else if contact && eating { self.verified_mouth_bite = Some(food.id); }
+            pet_ecology::PhysicalGrabFrame { contact, socket_position: food.position - mouth_offset,
+                body_surface_position: mouth, ..Default::default() }
+        });
         let brain_intent = BodyIntent {
             locomotion: LocomotionMode::Hover,
             target_position: self.pet_position,
@@ -294,7 +319,7 @@ impl Lab {
             pet_velocity: self.pet_velocity,
             desktop_aspect: LAB_DESKTOP_ASPECT,
             orb_physical,
-            food_physical: None,
+            food_physical,
             cursor_position: self.cursor,
             pointer_down: false,
             user_activity: self.user_activity,
@@ -314,7 +339,7 @@ impl Lab {
             visual_strength: self.visual_strength,
             visual_colorfulness: self.visual_strength,
             visual_structure: self.visual_strength * 0.72,
-            visual_surprise: self.visual_strength * 0.58,
+            visual_surprise: self.visual_strength * self.visual_surprise_scale,
             shared_attention: self.shared_attention,
             autonomous_play_ready: false,
             click_rhythm: self.click_rhythm,
@@ -322,6 +347,7 @@ impl Lab {
         };
         let episode_started = Instant::now();
         let output = self.director.tick(&mut self.state, frame, brain_intent, dt);
+        self.mouth_aperture = output.body_intent.expression.mouth_open;
         self.episode_timings_us
             .push(episode_started.elapsed().as_secs_f64() * 1_000_000.0);
         self.record_output(tick, &output);
@@ -740,6 +766,9 @@ fn setup_scenario(lab: &mut Lab, scenario: &str) -> Result<(), Box<dyn Error>> {
             lab.visual_target = Some(Vec2::new(0.31, 0.66));
             lab.visual_hue = 0.84;
             lab.visual_strength = 0.96;
+            // A familiar color patch tests camouflage readability. High surprise
+            // instead legitimately gives ChromaticEcho the greater V60 utility.
+            lab.visual_surprise_scale = 0.0;
             lab.selected_action = ActionId::HideAndSeek;
         }
         "teach_figure_eight" | "skill_transfer_new_region" => {
@@ -998,6 +1027,7 @@ fn summary(lab: &Lab, arguments: &Arguments, encoded: &[u8]) -> Value {
     let physics_timing = timing_summary(&lab.object_physics_timings_us);
     json!({
         "scenario": arguments.scenario,
+        "feeding_evidence_model": "reduced 3px lip socket + aperture + verified closing bite; no native gel",
         "seed": arguments.seed,
         "ticks": arguments.ticks,
         "speed": arguments.speed,

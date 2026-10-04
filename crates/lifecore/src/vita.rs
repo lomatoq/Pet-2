@@ -15,6 +15,16 @@ pub const VITA_CONTEXT_SIZE: usize = 12;
 const MAX_EMOTION_EPISODES: usize = 4;
 const MAX_FAVORITE_PLACES: usize = 24;
 
+/// A pleasant organism outcome is not evidence that the user accepted a bid.
+/// Legacy scalar rewards remain uncredited unless the caller supplies a source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FeedbackProvenance {
+    #[default]
+    Unattributed,
+    VoluntarySocial,
+    OrganismOutcome,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StimulusKind {
@@ -744,14 +754,41 @@ impl InfluencePolicy {
         };
         pending.elapsed += dt;
         if pending.elapsed >= pending.response_window {
-            let expired = self.pending.take().expect("pending influence exists");
-            self.learn(expired.strategy, &expired.context, -0.22);
+            // Silence updates availability/cooldown, never the value of the
+            // user or an unobserved social outcome.
+            self.pending = None;
             self.consecutive_ignored = self.consecutive_ignored.saturating_add(1);
             self.cooldown_seconds = 15.0 + self.consecutive_ignored.min(6) as f32 * 8.0;
         }
     }
 
     pub fn apply_feedback(&mut self, event: &FeedbackEvent) {
+        self.apply_feedback_with_provenance(event, FeedbackProvenance::Unattributed);
+    }
+
+    pub fn apply_feedback_with_provenance(
+        &mut self,
+        event: &FeedbackEvent,
+        provenance: FeedbackProvenance,
+    ) {
+        if matches!(
+            event,
+            FeedbackEvent::Reward(_) | FeedbackEvent::CursorApproached
+        ) && provenance != FeedbackProvenance::VoluntarySocial
+        {
+            return;
+        }
+        if matches!(
+            event,
+            FeedbackEvent::Ignored
+                | FeedbackEvent::FocusModeEnabled
+                | FeedbackEvent::FocusModeDisabled
+                | FeedbackEvent::MuteOrHide
+        ) {
+            self.pending = None;
+            self.cooldown_seconds = self.cooldown_seconds.max(30.0);
+            return;
+        }
         let reward = event.reward();
         let Some(pending) = self.pending.take() else {
             return;
@@ -875,12 +912,27 @@ pub struct FavoritePlace {
     pub play_value: f32,
     pub safety_value: f32,
     pub visits: u32,
+    /// Old tick-based visit counts must not become high-confidence recall.
+    #[serde(default)]
+    pub observed_seconds: f32,
+    #[serde(default)]
+    pub last_seen_seconds: f64,
+    #[serde(default)]
+    pub support_surface: Option<crate::SurfaceId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FavoritePlaceRecall {
+    pub position: Vec2,
+    pub confidence: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VitaState {
     #[serde(default)]
     pub next_gesture_episode_id: u64,
+    #[serde(default)]
+    pub last_closed_social_episode_id: u64,
     pub schema_version: u32,
     pub attention: AttentionState,
     pub appraisal: AppraisalState,
@@ -901,6 +953,7 @@ impl Default for VitaState {
     fn default() -> Self {
         Self {
             next_gesture_episode_id: 1,
+            last_closed_social_episode_id: 0,
             schema_version: VITA_STATE_SCHEMA_VERSION,
             attention: AttentionState::default(),
             appraisal: AppraisalState::default(),
@@ -983,6 +1036,10 @@ impl VitaState {
                     && place.comfort_value.is_finite()
                     && place.play_value.is_finite()
                     && place.safety_value.is_finite()
+                    && place.observed_seconds.is_finite()
+                    && (0.0..=86_400.0).contains(&place.observed_seconds)
+                    && place.last_seen_seconds.is_finite()
+                    && place.last_seen_seconds >= 0.0
             })
     }
 }
@@ -991,6 +1048,9 @@ impl VitaState {
 pub struct VitaMind {
     pub state: VitaState,
     identity_seed: u64,
+    active_place: Option<usize>,
+    place_visit_age: f32,
+    place_visit_recorded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1056,6 +1116,9 @@ impl VitaMind {
         Self {
             state: VitaState::default(),
             identity_seed,
+            active_place: None,
+            place_visit_age: 0.0,
+            place_visit_recorded: false,
         }
     }
 
@@ -1069,6 +1132,9 @@ impl VitaMind {
         Self {
             state,
             identity_seed,
+            active_place: None,
+            place_visit_age: 0.0,
+            place_visit_recorded: false,
         }
     }
 
@@ -1193,6 +1259,57 @@ impl VitaMind {
 
     pub fn apply_feedback(&mut self, event: &FeedbackEvent) {
         self.state.influence.apply_feedback(event);
+    }
+
+    pub fn apply_feedback_with_provenance(
+        &mut self,
+        event: &FeedbackEvent,
+        provenance: FeedbackProvenance,
+    ) {
+        self.state
+            .influence
+            .apply_feedback_with_provenance(event, provenance);
+    }
+
+    /// Recall only a measured support that is still offered by perception.
+    /// It returns a bounded ranking hint, never a world-coordinate command.
+    #[must_use]
+    pub fn recall_supported_place(
+        &self,
+        surface: &crate::SurfaceId,
+        app_category_index: usize,
+        minimum: Vec2,
+        maximum: Vec2,
+    ) -> Option<FavoritePlaceRecall> {
+        if !minimum.is_finite() || !maximum.is_finite() || !maximum.cmpgt(minimum).all() {
+            return None;
+        }
+        self.state
+            .favorite_places
+            .iter()
+            .filter(|place| {
+                place.support_surface.as_ref() == Some(surface)
+                    && place.app_category_index == app_category_index
+                    && place.observed_seconds >= 8.0
+                    && place.safety_value >= 0.5
+            })
+            .filter_map(|place| {
+                let point = place.relative_position.clamp(minimum, maximum);
+                // A moving/resized support no longer validates an old position.
+                if point.distance(place.relative_position) > 0.10 {
+                    return None;
+                }
+                let age = (self.state.elapsed_seconds - place.last_seen_seconds).max(0.0);
+                let recency = (-age / (7.0 * 86_400.0)).exp() as f32;
+                let exposure = (place.observed_seconds / 60.0).clamp(0.0, 1.0);
+                let repeated = (place.visits.min(4) as f32 / 4.0).clamp(0.0, 1.0);
+                let confidence = exposure * (0.35 + 0.65 * repeated) * recency;
+                (confidence >= 0.08).then_some(FavoritePlaceRecall {
+                    position: point,
+                    confidence: confidence.clamp(0.0, 1.0),
+                })
+            })
+            .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
     }
 
     pub fn note_metamorphosis(&mut self) {
@@ -1531,6 +1648,12 @@ impl VitaMind {
         dt: f32,
     ) {
         if !body.grounded && !body.clinging {
+            self.active_place = None;
+            self.place_visit_age = 0.0;
+            self.place_visit_recorded = false;
+            return;
+        }
+        if !body.world_position.is_finite() || dt <= 0.0 {
             return;
         }
         let position = body.world_position;
@@ -1538,12 +1661,22 @@ impl VitaMind {
         let hue = percept.dominant_hue;
         let index = self.state.favorite_places.iter().position(|place| {
             place.app_category_index == app_index
+                && (place.support_surface.is_none()
+                    || place.support_surface == body.current_surface)
                 && place.relative_position.distance(position) < 0.08
         });
         let reward = life.recent_reward;
         if let Some(index) = index {
             let place = &mut self.state.favorite_places[index];
-            place.relative_position = place.relative_position.lerp(position, 0.02);
+            if place.observed_seconds == 0.0 {
+                // v1 `visits` counted ticks; migrate only this measured place,
+                // preserving its location/values rather than treating old
+                // counters as independent evidence.
+                place.visits = 0;
+            }
+            place.relative_position = place
+                .relative_position
+                .lerp(position, 1.0 - (-dt / 2.5).exp());
             place.comfort_value = smooth(
                 place.comfort_value,
                 (1.0 - life.drives.comfort + reward.max(0.0) * 0.2).clamp(0.0, 1.0),
@@ -1552,7 +1685,11 @@ impl VitaMind {
             );
             place.play_value = smooth(place.play_value, 1.0 - life.drives.play, 0.08, dt);
             place.safety_value = smooth(place.safety_value, 1.0 - life.drives.safety, 0.18, dt);
-            place.visits = place.visits.saturating_add(u32::from(dt > 0.0));
+            place.observed_seconds = (place.observed_seconds + dt).min(86_400.0);
+            place.last_seen_seconds = self.state.elapsed_seconds;
+            if place.support_surface.is_none() {
+                place.support_surface = body.current_surface.clone();
+            }
             if hue.is_some() {
                 place.hue = hue;
             }
@@ -1565,8 +1702,32 @@ impl VitaMind {
                 comfort_value: 1.0 - life.drives.comfort,
                 play_value: 1.0 - life.drives.play,
                 safety_value: 1.0 - life.drives.safety,
-                visits: 1,
+                visits: 0,
+                observed_seconds: dt.min(86_400.0),
+                last_seen_seconds: self.state.elapsed_seconds,
+                support_surface: body.current_surface.clone(),
             });
+        }
+        let selected = index.or_else(|| {
+            self.state.favorite_places.iter().position(|place| {
+                place.app_category_index == app_index
+                    && place.support_surface == body.current_surface
+                    && place.relative_position.distance(position) < 0.08
+            })
+        });
+        if selected != self.active_place {
+            self.active_place = selected;
+            self.place_visit_age = 0.0;
+            self.place_visit_recorded = false;
+        }
+        self.place_visit_age += dt;
+        if self.place_visit_age >= 2.0
+            && !self.place_visit_recorded
+            && let Some(index) = selected
+        {
+            self.state.favorite_places[index].visits =
+                self.state.favorite_places[index].visits.saturating_add(1);
+            self.place_visit_recorded = true;
         }
     }
 
@@ -1913,6 +2074,115 @@ fn bool_value(value: bool) -> f32 {
 mod tests {
     use super::*;
     use crate::{Genome, LifeCore};
+
+    #[test]
+    fn unavailable_user_does_not_train_a_failed_social_outcome() {
+        let mut policy = InfluencePolicy::default();
+        let pending = PendingInfluence {
+            strategy: InfluenceStrategy::DirectEyeContact,
+            context: [0.5; VITA_CONTEXT_SIZE],
+            elapsed: 0.0,
+            response_window: 1.0,
+        };
+        policy.pending = Some(pending.clone());
+        let before = policy.weights.clone();
+        policy.tick_pending(2.0);
+        assert_eq!(policy.weights, before);
+        assert!(policy.pending.is_none() && policy.cooldown_seconds > 0.0);
+        policy.pending = Some(pending.clone());
+        policy.apply_feedback(&FeedbackEvent::Reward(0.8));
+        assert_eq!(policy.weights, before);
+        assert!(policy.pending.is_some());
+        policy.apply_feedback_with_provenance(
+            &FeedbackEvent::Reward(0.8),
+            FeedbackProvenance::VoluntarySocial,
+        );
+        assert_ne!(policy.weights, before);
+        policy.pending = Some(pending);
+        let trained = policy.weights.clone();
+        policy.apply_feedback(&FeedbackEvent::Ignored);
+        assert_eq!(policy.weights, trained);
+        assert!(policy.pending.is_none());
+    }
+
+    #[test]
+    fn supported_place_recall_requires_measured_exposure_and_survives_restore() {
+        let core = LifeCore::new(Genome::from_seed(7), 9);
+        let mut mind = VitaMind::new(7);
+        let body = BodyFeedback {
+            grounded: true,
+            world_position: Vec2::new(0.5, 0.55),
+            current_surface: Some(crate::SurfaceId("window:a".into())),
+            ..Default::default()
+        };
+        let sensors = SensorFrame::default();
+        let surface = body.current_surface.as_ref().unwrap();
+        for _ in 0..200 {
+            mind.state.elapsed_seconds += 0.05;
+            mind.learn_place(
+                &VitaPerceptFrame::default(),
+                &sensors,
+                &core.state,
+                &body,
+                0.05,
+            );
+        }
+        assert_eq!(mind.state.favorite_places[0].visits, 1);
+        assert!(
+            mind.recall_supported_place(
+                surface,
+                sensors.active_app_category.index(),
+                Vec2::new(0.2, 0.5),
+                Vec2::new(0.8, 0.6)
+            )
+            .is_some()
+        );
+        let restored = VitaMind::restore(
+            7,
+            serde_json::from_slice(&serde_json::to_vec(&mind.snapshot()).unwrap()).unwrap(),
+        );
+        assert!(
+            restored
+                .recall_supported_place(
+                    surface,
+                    sensors.active_app_category.index(),
+                    Vec2::new(0.2, 0.5),
+                    Vec2::new(0.8, 0.6)
+                )
+                .is_some()
+        );
+        assert!(
+            restored
+                .recall_supported_place(
+                    &crate::SurfaceId("window:b".into()),
+                    0,
+                    Vec2::new(0.2, 0.5),
+                    Vec2::new(0.8, 0.6)
+                )
+                .is_none()
+        );
+        assert!(
+            restored
+                .recall_supported_place(
+                    surface,
+                    sensors.active_app_category.index(),
+                    Vec2::new(0.2, 0.1),
+                    Vec2::new(0.8, 0.2)
+                )
+                .is_none()
+        );
+        mind.state.favorite_places[0].observed_seconds = 0.0;
+        mind.state.favorite_places[0].visits = 100_000;
+        assert!(
+            mind.recall_supported_place(
+                surface,
+                sensors.active_app_category.index(),
+                Vec2::new(0.2, 0.5),
+                Vec2::new(0.8, 0.6)
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn self_model_learns_and_stays_bounded() {

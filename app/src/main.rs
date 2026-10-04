@@ -2,19 +2,21 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 mod activity_glance;
-mod excitation_runtime;
 mod birth_runtime;
-mod startup_reveal;
+mod care_menu_runtime;
+mod care_menu_probe;
 mod companion_runtime;
 mod cradle_runtime;
-mod ecology_runtime;
 mod digestion_runtime;
+mod ecology_runtime;
 mod evolution_runner;
+mod excitation_runtime;
 mod hearing_bridge;
 mod local_voice_context;
+mod material_observer;
 mod motor_context;
 mod nearby_gaze;
 mod nervous_system_runtime;
@@ -27,6 +29,8 @@ mod repertoire_object_events;
 mod repertoire_perception_events;
 #[allow(dead_code)]
 mod replay;
+mod scene_execution;
+mod startup_reveal;
 mod surface_care_runtime;
 mod vita_runtime;
 mod voice_actions;
@@ -146,14 +150,6 @@ const CAUSAL_TELEMETRY_SCHEMA_VERSION: u32 = 4;
 const TELEMETRY_RECENT_MEMORY_LIMIT: usize = 16;
 const TELEMETRY_EPISODE_MEMORY_LIMIT: usize = 16;
 
-fn spawn_companion_menu(root: &std::path::Path, idle: bool) -> Option<std::process::Child> {
-    let folder = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let menu = [folder.join("Pet2 Dev Console.exe"), folder.join("body_lab.exe")].into_iter().find(|p| p.is_file())?;
-    std::process::Command::new(menu)
-        .arg(if idle { "--pet-menu-idle" } else { "--pet-menu" })
-        .arg("--data-dir").arg(root).spawn().map_err(|error| eprintln!("companion menu: {error}")).ok()
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments = Arguments::parse(env::args().skip(1))?;
     startup_probe(arguments.debug_log, "arguments parsed");
@@ -161,12 +157,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         print_help();
         return Ok(());
     }
+    if arguments.care_menu_probe && arguments.data_dir.is_none() {
+        return Err("--care-menu-probe requires an explicit isolated --data-dir".into());
+    }
     let store = arguments
         .data_dir
         .as_ref()
         .map(StateStore::at)
         .map_or_else(StateStore::discover, Ok)?;
     startup_probe(arguments.debug_log, "state store ready");
+    if arguments.care_menu_probe { return care_menu_probe::run(store); }
     if arguments.pointer_replay.is_some() {
         let prepared = prepare_state(&arguments, &store)?;
         return pointer_replay_runner::run(&arguments, &store, prepared);
@@ -190,6 +190,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     startup_probe(application.arguments.debug_log, "application assembled");
     event_loop.run_app(&mut application)?;
     Ok(())
+}
+
+fn den_menu_hit_width(size_scale: f32, desktop_size: Vec2) -> f32 {
+    (310.0 * size_scale)
+        .min(desktop_size.x * 0.8)
+        .min(desktop_size.y * 0.65)
+}
+fn cursor_hits_den_menu(cursor: Vec2, nest: Vec2, width: f32) -> bool {
+    if !cursor.is_finite() || !nest.is_finite() || !width.is_finite() || width <= 0.0 {
+        return false;
+    }
+    let local =
+        (cursor - nest - Vec2::new(0.0, width * 0.10)) / Vec2::new(width * 0.49, width * 0.23);
+    local.length_squared() <= 1.0
+}
+fn request_companion_care_menu(runtime: &mut PetRuntime, _store: &StateStore) {
+    runtime.feeding_seconds = 0.0;
+    runtime.cleanup_mode = false;
+    let nest =
+        virtual_normalized_to_physical(&runtime.topology, runtime.ecology.state().den.anchor);
+    let bounds = runtime
+        .topology
+        .monitors
+        .iter()
+        .find(|m| {
+            m.physical_bounds
+                .contains(desktop_host::PhysicalDesktopPoint {
+                    x: nest.x as i32,
+                    y: nest.y as i32,
+                })
+        })
+        .map_or(runtime.topology.virtual_physical_bounds, |m| m.working_area);
+    let placement = serde_json::json!({"x":nest.x,"y":nest.y,"left":bounds.minimum.x,"top":bounds.minimum.y,"right":bounds.maximum.x,"bottom":bounds.maximum.y});
+    if let Err(error) = runtime.companion_menu.open(&placement) {
+        eprintln!("care menu open: {error}");
+    }
 }
 
 fn startup_probe(enabled: bool, stage: &str) {
@@ -293,6 +329,7 @@ impl SingleInstanceGuard {
 struct Arguments {
     seed: Option<u64>,
     headless: bool,
+    care_menu_probe: bool,
     headless_smoke_seconds: Option<f32>,
     simulate_hours: Option<f32>,
     pointer_replay: Option<PathBuf>,
@@ -328,6 +365,7 @@ impl Arguments {
             match argument.as_str() {
                 "--seed" => parsed.seed = Some(value("--seed", &mut arguments)?.parse()?),
                 "--headless" => parsed.headless = true,
+                "--care-menu-probe" => parsed.care_menu_probe = true,
                 "--headless-smoke" => {
                     parsed.headless_smoke_seconds =
                         Some(value("--headless-smoke", &mut arguments)?.parse()?);
@@ -844,8 +882,9 @@ impl AudioManager {
         let urgent = request.priority >= 220;
         if !self.pending_requests.is_empty()
             || self.recent_voice_accepts.len() >= 3
-            || self.last_nonurgent_voice.is_some_and(|instant|
-                now.duration_since(instant) < Duration::from_secs(if urgent { 8 } else { 25 }))
+            || self.last_nonurgent_voice.is_some_and(|instant| {
+                now.duration_since(instant) < Duration::from_secs(if urgent { 8 } else { 25 })
+            })
         {
             return false;
         }
@@ -1192,7 +1231,7 @@ fn prepare_state(
         store.load_morph_brain::<MorphBrainState>()?
     };
     let morph = MorphBrain::new(identity_seed, morph_state)?;
-    let ecology = EcologyRuntime::load_or_create(
+    let mut ecology = EcologyRuntime::load_or_create(
         store,
         identity_seed,
         arguments.reset_pet || imported_state,
@@ -1200,6 +1239,7 @@ fn prepare_state(
     if arguments.reset_learning {
         life.reset_learning();
         vita.reset_learning(identity_seed);
+        ecology.reset_learning();
     }
     life.set_focus_mode(arguments.focus_mode);
     let loaded_life_state_hash =
@@ -1378,6 +1418,7 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             segment,
             life.state.focus_mode || vita.state().desktop_rhythm.protects_focused_work(),
         );
+        let previous_ecology_episode = ecology.active_episode().copied();
         let ecology_output = ecology.resolve_intent(
             output.body_intent,
             EcologyResolveFrame {
@@ -1416,6 +1457,20 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
             }
         }
         nervous.observe_outcomes(&ecology_output.outcomes[..ecology_output.outcome_count]);
+        scene_execution::credit_object_contacts(
+            &mut life,
+            ecology
+                .active_episode()
+                .or(previous_ecology_episode.as_ref()),
+            &ecology_output.outcomes[..ecology_output.outcome_count],
+        );
+        scene_execution::synchronize(
+            &mut vita,
+            ecology.active_episode(),
+            ecology.state(),
+            &ecology_output.body_intent,
+            output.selected_action,
+        );
         output.body_intent = ecology_output.body_intent;
         nervous.apply_offline_actuation(
             &mut life,
@@ -1473,6 +1528,9 @@ fn run_headless(arguments: Arguments, store: StateStore) -> Result<(), Box<dyn E
                 VoiceVisualState::default(),
                 SENSOR_DT,
             );
+            // Offline fixtures present at the fixed cadence as well; physics
+            // ticks alone may never satisfy a visible gaze acquisition gate.
+            body.presentation_update(SENSOR_DT);
             let mut completed_sensors = sensors.clone();
             completed_sensors.timestamp += f64::from(SENSOR_DT) * f64::from(substep + 1);
             nervous.observe_body(&body, &output.body_intent, &completed_sensors);
@@ -1958,6 +2016,20 @@ impl LabSessionState {
     }
 }
 
+fn apply_lab_session_command(session: &mut LabSessionState, command: &LabControlCommand, token: Option<&str>, now: Instant) -> Option<bool> {
+    match command {
+        LabControlCommand::OpenSession { lease_seconds, .. } => Some(session.open(token.unwrap_or_default().to_owned(),*lease_seconds,now)),
+        LabControlCommand::RenewSession { lease_seconds } => Some(token.is_some_and(|token| session.renew(token,*lease_seconds,now))),
+        LabControlCommand::CloseSession => Some(token.is_some_and(|token| session.close(token,now))),
+        _ => None,
+    }
+}
+
+fn apply_feeding_mode(enabled: bool, feeding_seconds: &mut f32, cleanup_mode: &mut bool) {
+    *cleanup_mode=false;
+    *feeding_seconds=if enabled {90.0} else {0.0};
+}
+
 impl Default for LabInterventionState {
     fn default() -> Self {
         Self::new(0)
@@ -2112,7 +2184,7 @@ struct PetRuntime {
     cleanup_mode: bool,
     digestion_site: Option<Vec2>,
     food_click_cooldown: f32,
-    companion_menu: Option<std::process::Child>,
+    companion_menu: care_menu_runtime::CareMenuRuntime,
     organic: organic_runtime::OrganicRuntime,
     sensors: SensorFrame,
     intent: BodyIntent,
@@ -2138,6 +2210,7 @@ struct PetRuntime {
     screen_tick_jump_events: u64,
     collision_impulse_count: u64,
     presented_pose: PresentedPoseMonitor,
+    material_observer: material_observer::MaterialObserver,
     presentation_cadence: PresentationCadence,
     skipped_render_frames: u64,
     life_accumulator: f32,
@@ -2429,11 +2502,13 @@ impl PetApplication {
             runtime.feeding_seconds = 0.0;
             runtime.cleanup_mode = false;
         }
-        runtime.window.set_cursor(if runtime.feeding_seconds > 0.0 || runtime.cleanup_mode {
-            winit::window::CursorIcon::Crosshair
-        } else {
-            winit::window::CursorIcon::Default
-        });
+        runtime
+            .window
+            .set_cursor(if runtime.feeding_seconds > 0.0 || runtime.cleanup_mode {
+                winit::window::CursorIcon::Crosshair
+            } else {
+                winit::window::CursorIcon::Default
+            });
         runtime.hearing.poll(
             elapsed,
             runtime.audio.callback_levels().rms,
@@ -2444,7 +2519,10 @@ impl PetApplication {
         runtime.body.set_presentation_scale(
             production_presentation_scale(runtime.window.inner_size().height) / growth,
         );
-        runtime.body.simulation.set_metabolic_mass(runtime.ecology.state().metabolism.relative_mass());
+        runtime
+            .body
+            .simulation
+            .set_metabolic_mass(runtime.ecology.state().metabolism.relative_mass());
         runtime.body_accumulator += elapsed;
         runtime.life_accumulator += elapsed;
         runtime.sensor_accumulator += elapsed;
@@ -2591,7 +2669,8 @@ impl PetApplication {
                     4.0,
                 )
             });
-            let primary_down = !runtime.cleanup_mode && runtime.feeding_seconds <= 0.0
+            let primary_down = !runtime.cleanup_mode
+                && runtime.feeding_seconds <= 0.0
                 && snapshot.primary_button_down.unwrap_or(runtime.pointer.down);
             let pet_capture_active = runtime.pointer_tracker.captured;
             let petting_started = update_pointer_state(
@@ -2603,7 +2682,7 @@ impl PetApplication {
             let pet_dragged = runtime.pointer.pet_dragged;
             let orb_touched = runtime.ecology.observe_pointer(
                 cursor_normalized,
-                primary_down,
+                primary_down && !runtime.pointer_tracker.suppress_until_release,
                 !pet_dragged,
                 desktop_aspect,
                 desktop_size.y,
@@ -2613,14 +2692,9 @@ impl PetApplication {
                 &runtime.topology,
                 runtime.ecology.state().den.anchor,
             );
-            let nest_width = (310.0 * runtime.ecology.state().den.size_scale)
-                .min(desktop_size.x * 0.8)
-                .min(desktop_size.y * 0.65);
+            let nest_width = den_menu_hit_width(runtime.ecology.state().den.size_scale, desktop_size);
             let den_hover = snapshot.cursor.is_some_and(|p| {
-                let q =
-                    (Vec2::new(p.x as f32, p.y as f32) - nest - Vec2::new(0.0, nest_width * 0.10))
-                        / Vec2::new(nest_width * 0.49, nest_width * 0.23);
-                q.length_squared() <= 1.0
+                cursor_hits_den_menu(Vec2::new(p.x as f32, p.y as f32), nest, nest_width)
             });
             let accepts_cursor = runtime.cursor_hittest_latch.resolve(
                 hovered_predictive || ecology_hover_predictive,
@@ -2629,7 +2703,10 @@ impl PetApplication {
             );
             let _ = runtime.platform.set_cursor_hittest(
                 &runtime.window,
-                (accepts_cursor || den_hover || runtime.feeding_seconds > 0.0 || runtime.cleanup_mode)
+                (accepts_cursor
+                    || den_hover
+                    || runtime.feeding_seconds > 0.0
+                    || runtime.cleanup_mode)
                     && runtime.birth.started.is_none(),
             );
             runtime.sensors = runtime.normalizer.normalize(
@@ -2762,7 +2839,16 @@ impl PetApplication {
             if runtime.sensors.pet_dragged {
                 runtime.voice_motion = None;
             }
+            // The committed rest scene already owns navigation and physical
+            // support. A second autonomous taskbar rest used to replace it
+            // every recovery cycle, moving the support plane through the body.
+            let rest_scene_owned = runtime.cradle_seat.inside
+                || matches!(runtime.ecology.active_episode().map(|e| e.goal),
+                    Some(EpisodeGoal::SleepInDen))
+                || runtime.last_motor_packet.locomotion.pose
+                    == pet_motor::MotorPoseIntent::SupportedSleep;
             let care_busy = runtime.ecology.feeding_navigation().is_some()
+                || rest_scene_owned
                 || runtime.hearing.training()
                 || runtime.sensors.pet_dragged
                 || runtime.hearing.name_attention();
@@ -2919,8 +3005,20 @@ impl PetApplication {
                 .body
                 .main_liquid_contact_bounds_pixels(cradle_viewport[1] as f32);
             digestion_runtime::update(runtime, body_dt);
-            let original_target =
-                virtual_normalized_to_physical(&runtime.topology, runtime.intent.target_position);
+            // A local protective posture has no exit destination. While the
+            // admitted sleep scene still owns navigation, its fallback brain
+            // target must not be interpreted as a command to climb out.
+            let sleep_scene_owns_navigation = runtime.life.state.current_action == ActionId::Sleep
+                && runtime.ecology.active_episode().is_some_and(|episode| {
+                    episode.goal == EpisodeGoal::SleepInDen
+                })
+                && runtime.last_motor_packet.program
+                    != Some(pet_motor::BehaviorProgramId::DefenseStartleOrientFreeze);
+            let original_target = runtime.cradle_seat.scene_target(
+                cradle_geometry,
+                virtual_normalized_to_physical(&runtime.topology, runtime.intent.target_position),
+                sleep_scene_owns_navigation,
+            );
             let wants_cradle = cradle_geometry.contains_target(original_target);
             let cognitive_navigation = (
                 runtime.intent.target_position,
@@ -2940,7 +3038,7 @@ impl PetApplication {
                 runtime.intent.target_position =
                     physical_to_virtual_normalized(&runtime.topology, target);
                 runtime.intent.locomotion = LocomotionMode::Arrive;
-                runtime.intent.desired_speed = runtime.intent.desired_speed.clamp(0.24, 0.50);
+                runtime.intent.desired_speed = runtime.intent.desired_speed.clamp(0.10, 0.30);
             }
             runtime.body.fixed_update(
                 &runtime.life.state.genome,
@@ -2983,12 +3081,17 @@ impl PetApplication {
                 runtime.ecology.release_food_support();
                 None
             } else {
-                runtime.ecology.update_food_contact(&runtime.body, orb_contact_height)
+                runtime
+                    .ecology
+                    .update_food_contact(&runtime.body, orb_contact_height)
             };
             runtime
                 .body
                 .set_feeding_mouth(food_mouth, orb_contact_height, body_dt);
-            runtime.body.set_feeding_expression_active(matches!(runtime.ecology.active_episode().map(|e|e.goal),Some(EpisodeGoal::EatMorsel)));
+            runtime.body.set_feeding_expression_active(matches!(
+                runtime.ecology.active_episode().map(|e| e.goal),
+                Some(EpisodeGoal::EatMorsel)
+            ));
             if runtime.birth.started.is_none() {
                 runtime.ecology.set_den_viewport([
                     runtime.topology.virtual_physical_bounds.width().max(1) as u32,
@@ -3021,6 +3124,8 @@ impl PetApplication {
                             | pet_motor::BehaviorProgramId::RestSitSettle
                             | pet_motor::BehaviorProgramId::RestNremSleep
                             | pet_motor::BehaviorProgramId::RestRemDreamWake
+                            | pet_motor::BehaviorProgramId::DefenseLocalPainGuard
+                            | pet_motor::BehaviorProgramId::DefenseOverpressureBoundary
                     )
                 );
             apply_screen_domain(
@@ -3028,11 +3133,12 @@ impl PetApplication {
                 &runtime.topology,
                 runtime.window.inner_size(),
                 bottom_edge_sleep,
-                matches!(
+                (matches!(
                     runtime.last_motor_packet.locomotion.pose,
                     pet_motor::MotorPoseIntent::SupportedRest
                         | pet_motor::MotorPoseIntent::SupportedSleep
-                ) && runtime.screen_edge_supported
+                ) || (local_guard_keeps_floor(&runtime.last_motor_packet)
+                    && runtime.intent.desired_speed <= 0.001)) && runtime.screen_edge_supported
                     && runtime
                         .last_motor_packet
                         .support
@@ -3116,11 +3222,15 @@ impl PetApplication {
                 voice,
                 body_dt,
             );
-            if !runtime.sensors.pet_dragged && runtime.ecology.settle_food_body(
-                &mut runtime.body, orb_contact_height, body_dt,
-            ) {
+            if !runtime.sensors.pet_dragged
+                && runtime
+                    .ecology
+                    .settle_food_body(&mut runtime.body, orb_contact_height, body_dt)
+            {
                 runtime.screen_body_center = virtual_normalized_to_physical(
-                    &runtime.topology, runtime.body.simulation.feedback.world_position);
+                    &runtime.topology,
+                    runtime.body.simulation.feedback.world_position,
+                );
                 runtime.screen_velocity_px = runtime.body.simulation.feedback.velocity * extent;
             }
             runtime
@@ -3132,6 +3242,35 @@ impl PetApplication {
                 runtime.intent.locomotion,
                 runtime.intent.desired_speed,
             ) = cognitive_navigation;
+            if let Some(observation) = runtime.material_observer.observe(
+                runtime.body.embodiment.liquid.diagnostics(),
+                runtime.normalizer.monotonic_seconds(), body_dt, runtime.sensors.pet_dragged,
+            ) {
+                let mut evidence = serde_json::json!({
+                    "build": "V65", "sample": observation.sample,
+                    "action": format!("{:?}", runtime.life.state.current_action),
+                    "pose": format!("{:?}", runtime.intent.pose),
+                    "program": runtime.body.somatic_actuation().program,
+                    "in_cradle": runtime.cradle_seat.inside,
+                    "support": runtime.body.somatic_actuation().support,
+                    "feeding": runtime.ecology.feeding_evidence(),
+                });
+                if observation.anomaly {
+                    evidence["preceding_material"] = serde_json::json!(observation.history);
+                    evidence["body_snapshot"] = serde_json::json!(runtime.body.body_material_snapshot());
+                    evidence["profile"] = serde_json::json!(runtime.body.tuning_profile());
+                    evidence["somatic"] = serde_json::json!(runtime.body.somatic_actuation());
+                }
+                let incident = EventLogEntry {
+                    monotonic_seconds: runtime.normalizer.monotonic_seconds(),
+                    kind: if observation.anomaly {"material_anomaly"} else {"material_sample"}.into(),
+                    details: evidence,
+                };
+                if observation.anomaly {
+                    let _ = self.store.append_material_incident(&incident);
+                }
+                let _ = self.store.append_telemetry(&incident);
+            }
             runtime.body_accumulator -= body_dt;
             physics_steps += 1;
         }
@@ -3412,8 +3551,12 @@ impl PetApplication {
                 runtime.window.inner_size().height as f32,
                 LIFE_DT,
             );
-            runtime.ecology.set_play_state(runtime.life.state.affect,
-                runtime.nervous_system.snapshot().felt, &runtime.life.state.genome.temperament);
+            runtime.ecology.set_play_state(
+                runtime.life.state.affect,
+                runtime.nervous_system.snapshot().felt,
+                &runtime.life.state.genome.temperament,
+            );
+            let previous_ecology_episode = runtime.ecology.active_episode().copied();
             let ecology_output = runtime.ecology.resolve_intent(
                 output.body_intent,
                 EcologyResolveFrame {
@@ -3537,14 +3680,34 @@ impl PetApplication {
                     .observe_repeated_motor_failure(episode.id, episode.attempts);
             }
 
-            if ecology_output.outcomes[..ecology_output.outcome_count]
-                .iter()
-                .any(|o| matches!(o, EcologyOutcome::MorselConsumed(_)))
-            {
-                motor_context.world_event = MotorWorldEvent::FoodConsumed;
-                apply_shared_feedback(runtime, FeedbackEvent::Reward(0.18));
-                runtime.save_accumulator = 30.0;
+            for outcome in &ecology_output.outcomes[..ecology_output.outcome_count] {
+                if let EcologyOutcome::MorselConsumed(id) = outcome {
+                    motor_context.world_event = MotorWorldEvent::FoodConsumed;
+                    runtime.life.apply_measured_relief(
+                        (1_u64 << 62) | id,
+                        lifecore::DriveKind::Comfort,
+                        0.06,
+                    );
+                    runtime.save_accumulator = 30.0;
+                }
             }
+            let executed_action = scene_execution::synchronize(
+                &mut runtime.vita,
+                runtime.ecology.active_episode(),
+                runtime.ecology.state(),
+                &ecology_output.body_intent,
+                output.selected_action,
+            );
+            scene_execution::credit_object_contacts(
+                &mut runtime.life,
+                runtime
+                    .ecology
+                    .active_episode()
+                    .or(previous_ecology_episode.as_ref()),
+                &ecology_output.outcomes[..ecology_output.outcome_count],
+            );
+            motor_context.companion_intent = runtime.vita.companion_intent().primary;
+            motor_context.orientation = runtime.body.embodiment.orientation_evidence();
             let nervous_snapshot = runtime.nervous_system.snapshot();
             runtime
                 .nervous_system
@@ -3553,7 +3716,7 @@ impl PetApplication {
                 .last()
                 .map(|outcome| stable_hash_bytes(format!("{outcome:?}").as_bytes()));
             let motor_goal = BehaviorGoalFrame {
-                action: output.selected_action,
+                action: executed_action,
                 body_intent: ecology_output.body_intent.clone(),
                 affect: output.affect,
                 drives: runtime.life.state.drives,
@@ -3567,7 +3730,12 @@ impl PetApplication {
                 recent_outcome,
             };
             update_surface_care(runtime, &motor_goal, &mut motor_context);
-            runtime.organic.tick(
+            runtime.vita.enrich_rest_surface_memory(
+                motor_goal.action,
+                &runtime.sensors,
+                &mut motor_context,
+            );
+            let organic_output = runtime.organic.tick(
                 &motor_goal,
                 &mut motor_context,
                 organic_runtime::OrganicRuntimeInput {
@@ -3579,10 +3747,31 @@ impl PetApplication {
                     prediction_error: runtime.vita.companion_intent().surprise,
                     direct_contact: f32::from(runtime.sensors.pet_touched),
                     expected: Some(runtime.vita.companion_intent().expected_outcome),
+                    execution_id: runtime.ecology.active_episode().map_or(0, |e| e.id),
                     ..Default::default()
                 },
                 LIFE_DT,
             );
+            if let (Some(drive), Some(trace)) = (
+                organic_output.regulation.relief.drive,
+                organic_output.regulation.trace.as_ref(),
+            ) && !runtime.ecology.active_episode().is_some_and(|e| {
+                matches!(
+                    e.goal,
+                    EpisodeGoal::ChaseOrb | EpisodeGoal::InterceptOrb | EpisodeGoal::SoloOrbPlay
+                )
+            }) && !matches!(
+                runtime.vita.companion_intent().primary,
+                lifecore::PrimaryIntent::EatInspect
+                    | lifecore::PrimaryIntent::EatAccept
+                    | lifecore::PrimaryIntent::EatReject
+            ) {
+                runtime.life.apply_measured_relief(
+                    (1_u64 << 63) | trace.episode_id,
+                    drive,
+                    organic_output.regulation.relief.amount,
+                );
+            }
             let mut motor_packet = if let Some(program) = runtime.lab_motor_program {
                 if runtime.lab_motor_restart {
                     runtime
@@ -3844,6 +4033,25 @@ impl PetApplication {
             } else {
                 (attention, kind)
             };
+            let (attention, kind) = if motor_packet.program.is_some_and(|program| {
+                pet_motor::orientation_acquisition_required(
+                    program,
+                    &motor_packet.phase_name,
+                    &motor_context,
+                )
+            }) && motor_packet.locomotion.target_locked
+                && !danger
+                && !runtime.sensors.pet_dragged
+                && !runtime.sensors.pet_touched
+            {
+                runtime.body.embodiment.near_attention = false;
+                (
+                    motor_packet.locomotion.target_position,
+                    lifecore::AttentionTargetKind::ObjectGoal,
+                )
+            } else {
+                (attention, kind)
+            };
             if danger {
                 motor_packet.expression.gaze_target = attention;
             }
@@ -3884,11 +4092,9 @@ impl PetApplication {
             // The cushion seat is a real local support patch using the existing
             // V22 contact solver. Outside the nest the original physics is unchanged.
             let den_anchor = runtime.ecology.state().den.anchor;
-            let in_nest = runtime.cradle_seat.inside
-                && !runtime.sensors.pet_dragged
-                && !motor_packet
-                    .program
-                    .is_some_and(|p| p.family() == pet_motor::ProgramFamily::DefenseIntegrity);
+            // A defensive program changes intention, never removes the
+            // physical floor while the body is still inside the cushion.
+            let in_nest = runtime.cradle_seat.inside && !runtime.sensors.pet_dragged;
             if in_nest {
                 let viewport = [
                     runtime.topology.virtual_physical_bounds.width().max(1) as u32,
@@ -3912,6 +4118,12 @@ impl PetApplication {
                     break_force: 0.7,
                     release_half_life: 0.25,
                 });
+            } else if runtime.screen_edge_supported && !runtime.sensors.pet_dragged {
+                retain_measured_floor_for_local_guard(
+                    &mut motor_packet,
+                    runtime.body.simulation.feedback.world_position,
+                    runtime.topology.virtual_physical_bounds.height().max(1) as f32,
+                );
             }
             if runtime.emotion_burst.active {
                 motor_packet.fields.fill(None);
@@ -3953,6 +4165,13 @@ impl PetApplication {
             if runtime.last_surface_care.target.is_none()
                 && !runtime.sensors.pet_dragged
                 && !runtime.life.state.focus_mode
+                && !motor_packet.program.is_some_and(|p| {
+                    pet_motor::orientation_acquisition_required(
+                        p,
+                        &motor_packet.phase_name,
+                        &motor_context,
+                    )
+                })
             {
                 restore_orb_play_navigation(
                     runtime.ecology.active_episode().map(|e| e.goal),
@@ -3967,53 +4186,110 @@ impl PetApplication {
             let contact = runtime.sensors.embodied_interaction.contact;
             let pleasant = motor_goal.felt.contact_pleasantness;
             let episode = runtime.ecology.active_episode().map(|e| e.goal);
-            let orb_play = matches!(episode, Some(EpisodeGoal::ChaseOrb | EpisodeGoal::InterceptOrb
-                | EpisodeGoal::SoloOrbPlay | EpisodeGoal::RetrieveOrb));
+            let orb_play = matches!(
+                episode,
+                Some(
+                    EpisodeGoal::ChaseOrb
+                        | EpisodeGoal::InterceptOrb
+                        | EpisodeGoal::SoloOrbPlay
+                        | EpisodeGoal::RetrieveOrb
+                )
+            );
             let gentle = contact.active && contact.pointer_speed < 1.2 && pleasant > 0.1;
             let quick_play = runtime.sensors.cursor_distance_to_pet < 0.18
                 && runtime.sensors.cursor_velocity.length() > 0.12
                 && motor_goal.felt.play_readiness > 0.1;
-            let cue = if gentle { Some(lifecore::ExcitationCue::GentleStroke) }
-                else if orb_play { Some(lifecore::ExcitationCue::OrbGame) }
-                else if quick_play { Some(lifecore::ExcitationCue::QuickPlay) } else { None };
-            let observed_play = if orb_play {
-                (runtime.body.simulation.feedback.velocity.length()*5.0).clamp(0.0,1.0)
+            let cue = if gentle {
+                Some(lifecore::ExcitationCue::GentleStroke)
+            } else if orb_play {
+                Some(lifecore::ExcitationCue::OrbGame)
             } else if quick_play {
-                (runtime.sensors.cursor_velocity.length()*3.0).clamp(0.0,1.0)
-            } else { 0.0 };
-            let cue_strength = if gentle { pleasant } else if cue.is_some() {
+                Some(lifecore::ExcitationCue::QuickPlay)
+            } else {
+                None
+            };
+            let observed_play = if orb_play {
+                (runtime.body.simulation.feedback.velocity.length() * 5.0).clamp(0.0, 1.0)
+            } else if quick_play {
+                (runtime.sensors.cursor_velocity.length() * 3.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let cue_strength = if gentle {
+                pleasant
+            } else if cue.is_some() {
                 observed_play
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             let excitation_blocked = runtime.birth.started.is_some()
-                || runtime.sensors.pet_dragged || runtime.life.state.focus_mode
-                || runtime.lab_face_pose.is_some() || runtime.lab_motor_program.is_some()
-                || runtime.emotion_burst.active || runtime.voice_motion.is_some()
-                || runtime.digestion_site.is_some() || runtime.last_surface_care.target.is_some()
-                || motor_goal.felt.startle > 0.2 || motor_goal.felt.pain_like > 0.15
+                || runtime.sensors.pet_dragged
+                || runtime.life.state.focus_mode
+                || runtime.lab_face_pose.is_some()
+                || runtime.lab_motor_program.is_some()
+                || runtime.emotion_burst.active
+                || runtime.voice_motion.is_some()
+                || runtime.digestion_site.is_some()
+                || runtime.last_surface_care.target.is_some()
+                || motor_goal.felt.startle > 0.2
+                || motor_goal.felt.pain_like > 0.15
                 || !runtime.body.self_care_available(&output.body_intent)
-                || matches!(episode, Some(EpisodeGoal::EatMorsel | EpisodeGoal::InspectMorsel
-                    | EpisodeGoal::SleepInDen | EpisodeGoal::EscapePressure | EpisodeGoal::RecoverAfterPressure));
-            let feedback = runtime.excitation.observe(cue, cue_strength, output.affect.arousal,
-                if contact.active { pleasant } else { output.affect.valence * motor_goal.felt.agency_match },
-                runtime.body.simulation.feedback.world_position, LIFE_DT);
-            let excitation = runtime.life.update_excitation(lifecore::ExcitationInput {
-                play_engagement: observed_play,
-                energy: runtime.ecology.state().metabolism.reserve,
-                physical_load: motor_goal.felt.physical_load,
-                blocked: excitation_blocked,
-                executing: runtime.excitation.executing,
-                allow_roll: true,
-                wall_available: runtime.topology.monitors.len() == 1,
-                cue, cue_strength, feedback,
-                ..Default::default()
-            }, LIFE_DT);
+                || matches!(
+                    episode,
+                    Some(
+                        EpisodeGoal::EatMorsel
+                            | EpisodeGoal::InspectMorsel
+                            | EpisodeGoal::SleepInDen
+                            | EpisodeGoal::EscapePressure
+                            | EpisodeGoal::RecoverAfterPressure
+                    )
+                );
+            let feedback = runtime.excitation.observe(
+                cue,
+                cue_strength,
+                output.affect.arousal,
+                if contact.active {
+                    pleasant
+                } else {
+                    output.affect.valence * motor_goal.felt.agency_match
+                },
+                runtime.body.simulation.feedback.world_position,
+                LIFE_DT,
+            );
+            let excitation = runtime.life.update_excitation(
+                lifecore::ExcitationInput {
+                    play_engagement: observed_play,
+                    energy: runtime.ecology.state().metabolism.reserve,
+                    physical_load: motor_goal.felt.physical_load,
+                    blocked: excitation_blocked,
+                    executing: runtime.excitation.executing,
+                    allow_roll: true,
+                    wall_available: runtime.topology.monitors.len() == 1,
+                    cue,
+                    cue_strength,
+                    feedback,
+                    ..Default::default()
+                },
+                LIFE_DT,
+            );
             // Object handling owns its route. Excitement can accumulate during play,
             // then finds an outlet when the mouth/hands and navigation are free.
-            let route_free = !excitation_blocked && !runtime.cradle_seat.inside
-                && episode.is_none_or(|e| matches!(e, EpisodeGoal::SharedAttention | EpisodeGoal::PeekFromDen));
-            let presentation = if route_free { excitation } else { Default::default() };
-            let exciting = runtime.excitation.apply(presentation,
-                runtime.body.simulation.feedback.world_position, LIFE_DT, &mut output.body_intent);
+            let route_free = !excitation_blocked
+                && !runtime.cradle_seat.inside
+                && episode.is_none_or(|e| {
+                    matches!(e, EpisodeGoal::SharedAttention | EpisodeGoal::PeekFromDen)
+                });
+            let presentation = if route_free {
+                excitation
+            } else {
+                Default::default()
+            };
+            let exciting = runtime.excitation.apply(
+                presentation,
+                runtime.body.simulation.feedback.world_position,
+                LIFE_DT,
+                &mut output.body_intent,
+            );
             runtime.body.set_excitation_presentation(presentation);
             if exciting {
                 motor_packet.support = None;
@@ -4021,7 +4297,8 @@ impl PetApplication {
                 runtime.body.set_somatic_actuation(motor_packet.clone());
             }
             let gut = &runtime.ecology.state().metabolism.tract;
-            let self_care_busy = exciting || runtime.birth.started.is_some()
+            let self_care_busy = exciting
+                || runtime.birth.started.is_some()
                 || !runtime.body.self_care_available(&output.body_intent)
                 || voice_visual_state(&runtime.audio).active
                 || runtime.lab_face_pose.is_some()
@@ -4029,22 +4306,37 @@ impl PetApplication {
                 || runtime.emotion_burst.active
                 || runtime.voice_motion.is_some()
                 || runtime.last_surface_care.target.is_some()
-                || gut.strain > 0.03 || gut.burp > 0.05
+                || gut.strain > 0.03
+                || gut.burp > 0.05
                 || runtime.digestion_site.is_some()
-                || motor_goal.felt.startle > 0.2 || motor_goal.felt.pain_like > 0.15
+                || motor_goal.felt.startle > 0.2
+                || motor_goal.felt.pain_like > 0.15
                 || output.body_intent.locomotion == LocomotionMode::Sleep
-                || runtime.ecology.active_episode().is_some_and(|episode|
-                    !matches!(episode.goal, EpisodeGoal::SharedAttention | EpisodeGoal::PeekFromDen))
+                || runtime.ecology.active_episode().is_some_and(|episode| {
+                    !matches!(
+                        episode.goal,
+                        EpisodeGoal::SharedAttention | EpisodeGoal::PeekFromDen
+                    )
+                })
                 || repertoire.active_id.is_some();
-            let self_care = runtime.life.update_self_care(&runtime.sensors,
-                &runtime.body.simulation.feedback, self_care_busy, LIFE_DT);
+            let self_care = runtime.life.update_self_care(
+                &runtime.sensors,
+                &runtime.body.simulation.feedback,
+                self_care_busy,
+                LIFE_DT,
+            );
             runtime.body.set_self_care_motor(self_care);
             // Food owns the jaw while an actual bite is being processed. Generic
             // mood/scene faces must not replace its close-chew-open trajectory.
-            if matches!(runtime.ecology.active_episode().map(|e|e.goal),Some(EpisodeGoal::EatMorsel))
-                && motor_goal.felt.startle < 0.35 && motor_goal.felt.pain_like < 0.2 {
+            if matches!(
+                runtime.ecology.active_episode().map(|e| e.goal),
+                Some(EpisodeGoal::EatMorsel)
+            ) && motor_goal.felt.startle < 0.35
+                && motor_goal.felt.pain_like < 0.2
+            {
                 output.body_intent.expression.mouth_open = feeding_expression.mouth_open;
-                output.body_intent.expression.mouth_compression = feeding_expression.mouth_compression;
+                output.body_intent.expression.mouth_compression =
+                    feeding_expression.mouth_compression;
                 output.body_intent.expression.mouth_curve = feeding_expression.mouth_curve;
             }
             if let Some(pose) = runtime.lab_face_pose {
@@ -4065,7 +4357,11 @@ impl PetApplication {
                 output.body_intent.target_position =
                     physical_to_virtual_normalized(&runtime.topology, center);
                 output.body_intent.locomotion = LocomotionMode::Arrive;
-                output.body_intent.desired_speed = if contact { 0.12 } else { 0.45 + 0.50 * runtime.ecology.state().metabolism.feeding_appetite() };
+                output.body_intent.desired_speed = if contact {
+                    0.12
+                } else {
+                    0.45 + 0.50 * runtime.ecology.state().metabolism.feeding_appetite()
+                };
             }
             runtime.nervous_system.commit_intent(
                 &mut runtime.life,
@@ -4078,7 +4374,8 @@ impl PetApplication {
             runtime.last_vita = vita_output;
             runtime.last_morph = morph_output;
             runtime.intent = output.body_intent;
-            let sleeping = output.selected_action == ActionId::Sleep;
+            let sleeping = motor_goal.action == ActionId::Sleep
+                && runtime.intent.locomotion == LocomotionMode::Sleep;
             if sleeping && !runtime.was_sleeping {
                 runtime.life.consolidate_sleep();
                 runtime.save_accumulator = 30.0;
@@ -4161,6 +4458,8 @@ impl PetApplication {
                         serde_json::json!({
                             "goal": score.goal.map(|goal| format!("{goal:?}")),
                             "score": score.score,
+                            "utility": score.utility,
+                            "activation": score.activation,
                             "eligible": score.eligible,
                             "reason": format!("{:?}", score.reason),
                         })
@@ -4225,6 +4524,11 @@ impl PetApplication {
                     "density_error": liquid.density_error,
                     "maximum_speed": liquid.maximum_speed,
                     "maximum_bond_strain": liquid.maximum_bond_strain,
+                    "stretch_ratio": liquid.stretch_ratio,
+                    "maximum_compression": liquid.maximum_compression,
+                    "kinetic_energy": liquid.kinetic_energy,
+                    "failsafe_hits": liquid.failsafe_hits,
+                    "recovery_count": liquid.recovery_count,
                     "support_field_load": liquid.support_field_load,
                     "permanent_field_aspect": liquid.permanent_field_aspect,
                     "visual_weber": liquid.visual_weber,
@@ -4573,6 +4877,7 @@ impl PetApplication {
                         "ecology_schema": ecology_state.schema_version,
                         "active_episode_id": active_ecology.map(|episode| episode.id),
                         "active_goal": ecology_debug.active_goal.map(|goal| format!("{goal:?}")),
+                        "selected_goal": ecology_debug.selected_goal.map(|goal| format!("{goal:?}")),
                         "phase": ecology_debug.active_phase.map(|phase| format!("{phase:?}")),
                         "reason": format!("{:?}", ecology_debug.selected_reason),
                         "phase_elapsed": active_ecology.map(|episode| episode.elapsed_seconds),
@@ -4606,6 +4911,8 @@ impl PetApplication {
                         "metabolic_reserve": ecology_state.metabolism.reserve,
                         "satiation": ecology_state.metabolism.satiation,
                         "active_food_effect": ecology_state.metabolism.active_effect,
+                        "feeding_evidence": runtime.ecology.feeding_evidence(),
+                        "toileting_execution": runtime.ecology.toileting_execution(),
                         "window_pressure": ecology_environment.pressure,
                         "external_contacts": ecology_contacts,
                         "saliency_target": saliency_target.map(|target| target.position.to_array()),
@@ -4710,8 +5017,10 @@ impl PetApplication {
                     "capabilities": runtime.platform.capabilities(),
                 });
                 debug_details["cleanup"] = serde_json::json!({"enabled":runtime.cleanup_mode,"traces":runtime.ecology.state().waste.chains.len()});
-                debug_details["digestion"] = serde_json::json!(runtime.ecology.state().metabolism.tract);
-                debug_details["orb_motivation"] = serde_json::json!(runtime.ecology.debug().orb_motivation);
+                debug_details["digestion"] =
+                    serde_json::json!(runtime.ecology.state().metabolism.tract);
+                debug_details["orb_motivation"] =
+                    serde_json::json!(runtime.ecology.debug().orb_motivation);
                 debug_details["nutrition"] = serde_json::json!({"body_condition":runtime.ecology.state().metabolism.body_condition,"size_multiplier":runtime.ecology.state().metabolism.size_multiplier(),"relative_mass":runtime.ecology.state().metabolism.relative_mass()});
                 debug_details["cradle_inside"] = serde_json::json!(runtime.cradle_seat.inside);
                 debug_details["den_background_mode"] =
@@ -4929,11 +5238,24 @@ impl ApplicationHandler for PetApplication {
             .set_den_anchor(physical_to_virtual_normalized(&topology, nest));
         let startup = startup_reveal::StartupReveal::new(birth.started.is_none());
         if birth.started.is_none() {
-            let side = if nest.x - nest_monitor.minimum.x as f32 > nest_monitor.maximum.x as f32 - nest.x { -1.0 } else { 1.0 };
-            initial_center = safe_body_center(&topology, nest + Vec2::new(side * (den_width * 0.5 + 85.0), -8.0), host_size);
-            body.simulation.feedback.world_position = physical_to_virtual_normalized(&topology, initial_center);
+            let side = if nest.x - nest_monitor.minimum.x as f32
+                > nest_monitor.maximum.x as f32 - nest.x
+            {
+                -1.0
+            } else {
+                1.0
+            };
+            initial_center = safe_body_center(
+                &topology,
+                nest + Vec2::new(side * (den_width * 0.5 + 85.0), -8.0),
+                host_size,
+            );
+            body.simulation.feedback.world_position =
+                physical_to_virtual_normalized(&topology, initial_center);
             body.simulation.feedback.velocity = Vec2::ZERO;
-            prepared.ecology.prepare_startup_orb([window.inner_size().width, window.inner_size().height]);
+            prepared
+                .ecology
+                .prepare_startup_orb([window.inner_size().width, window.inner_size().height]);
         }
         // A hidden Win32 composition surface may never become presentable, which would
         // deadlock the old "show after Presented" startup path. At this point the GPU
@@ -4957,9 +5279,16 @@ impl ApplicationHandler for PetApplication {
             startup,
             startup_center: initial_center,
             startup_floor: (if cfg!(target_os = "macos") {
-                topology.monitor_at(desktop_host::PhysicalDesktopPoint { x: nest.x as i32, y: nest.y as i32 })
+                topology
+                    .monitor_at(desktop_host::PhysicalDesktopPoint {
+                        x: nest.x as i32,
+                        y: nest.y as i32,
+                    })
                     .map_or(nest_monitor.maximum.y, |m| m.physical_bounds.maximum.y)
-            } else { nest_monitor.maximum.y }) as f32 - desktop_bounds.minimum.y as f32,
+            } else {
+                nest_monitor.maximum.y
+            }) as f32
+                - desktop_bounds.minimum.y as f32,
             cradle_seat: cradle_runtime::CradleSeat::default(),
             birth_monitor,
             platform,
@@ -5007,8 +5336,17 @@ impl ApplicationHandler for PetApplication {
             cleanup_mode: false,
             digestion_site: None,
             food_click_cooldown: 0.0,
-            companion_menu: spawn_companion_menu(&self.store.paths.root, true),
-            organic: organic_runtime::OrganicRuntime::load(&self.store.paths.root),
+            companion_menu: care_menu_runtime::CareMenuRuntime::new(&self.store.paths.root),
+            organic: {
+                let mut organic = organic_runtime::OrganicRuntime::load(&self.store.paths.root);
+                if self.arguments.reset_learning
+                    || self.arguments.reset_pet
+                    || self.arguments.import_state.is_some()
+                {
+                    organic.reset_learning();
+                }
+                organic
+            },
             pointer: PointerState::default(),
             pointer_tracker: DesktopPointerTracker::default(),
             cursor_hittest_latch: CursorHitTestLatch::default(),
@@ -5031,6 +5369,7 @@ impl ApplicationHandler for PetApplication {
             screen_tick_jump_events: 0,
             collision_impulse_count: 0,
             presented_pose: PresentedPoseMonitor::default(),
+            material_observer: material_observer::MaterialObserver::default(),
             presentation_cadence: PresentationCadence::default(),
             skipped_render_frames: 0,
             life_accumulator: 0.0,
@@ -5177,40 +5516,7 @@ impl ApplicationHandler for PetApplication {
                 button: MouseButton::Right,
                 ..
             } => {
-                runtime.feeding_seconds = 0.0;
-                runtime.cleanup_mode = false;
-                let nest = virtual_normalized_to_physical(
-                    &runtime.topology,
-                    runtime.ecology.state().den.anchor,
-                );
-                let bounds = runtime
-                    .topology
-                    .monitors
-                    .iter()
-                    .find(|m| {
-                        m.physical_bounds
-                            .contains(desktop_host::PhysicalDesktopPoint {
-                                x: nest.x as i32,
-                                y: nest.y as i32,
-                            })
-                    })
-                    .map_or(runtime.topology.virtual_physical_bounds, |m| m.working_area);
-                let placement = serde_json::json!({"x":nest.x,"y":nest.y,"left":bounds.minimum.x,"top":bounds.minimum.y,"right":bounds.maximum.x,"bottom":bounds.maximum.y});
-                let _ = std::fs::write(
-                    self.store.paths.root.join("companion-menu-placement.json"),
-                    placement.to_string(),
-                );
-                let running = runtime
-                    .companion_menu
-                    .as_mut()
-                    .is_some_and(|child| child.try_wait().ok().flatten().is_none());
-                if running {
-                    let _ =
-                        std::fs::write(self.store.paths.root.join("companion-menu-open"), b"open");
-                }
-                if !running {
-                    runtime.companion_menu = spawn_companion_menu(&self.store.paths.root, false);
-                }
+                request_companion_care_menu(runtime, &self.store);
             }
             WindowEvent::MouseInput {
                 state,
@@ -5218,7 +5524,24 @@ impl ApplicationHandler for PetApplication {
                 ..
             } => {
                 let down = state == ElementState::Pressed;
-                if runtime.feeding_seconds > 0.0 {
+                let cursor = virtual_normalized_to_physical(
+                    &runtime.topology, runtime.sensors.cursor_position,
+                );
+                let nest = virtual_normalized_to_physical(
+                    &runtime.topology, runtime.ecology.state().den.anchor,
+                );
+                let desktop_size = Vec2::new(
+                    runtime.topology.virtual_physical_bounds.width() as f32,
+                    runtime.topology.virtual_physical_bounds.height() as f32,
+                );
+                let nest_width = den_menu_hit_width(runtime.ecology.state().den.size_scale, desktop_size);
+                if down && cursor_hits_den_menu(cursor, nest, nest_width)
+                {
+                    // A house click belongs to care controls, including when the
+                    // creature is resting on its bed. Do not also begin a pet drag.
+                    runtime.pointer_tracker.suppress_until_release = true;
+                    request_companion_care_menu(runtime, &self.store);
+                } else if runtime.feeding_seconds > 0.0 {
                     if down && runtime.food_click_cooldown <= 0.0 {
                         runtime.ecology.sprinkle_food(
                             runtime.sensors.cursor_position,
@@ -5376,7 +5699,8 @@ impl ApplicationHandler for PetApplication {
                     .clamp(0.0, 0.05);
                 runtime.last_present = present_now;
                 let birth_time = runtime.birth.elapsed();
-                let ecology_ready = runtime.background_clean_seed_frames >= BACKGROUND_CLEAN_SEED_FRAMES
+                let ecology_ready = runtime.background_clean_seed_frames
+                    >= BACKGROUND_CLEAN_SEED_FRAMES
                     || runtime.normalizer.monotonic_seconds() > BACKGROUND_CAPTURE_FALLBACK_SECONDS;
                 let startup = runtime.startup.frame(ecology_ready, birth_time.is_some());
                 let growth = pet_body::birth_scene::growth_scale(runtime.birth.age_seconds())
@@ -5395,7 +5719,9 @@ impl ApplicationHandler for PetApplication {
                     &runtime.topology,
                     runtime.body.simulation.feedback.world_position,
                 );
-                if startup.active { center = runtime.startup_center.lerp(center, startup.release); }
+                if startup.active {
+                    center = runtime.startup_center.lerp(center, startup.release);
+                }
                 if let Some(t) = birth_time {
                     let m = runtime.birth_monitor;
                     let capsule_center = Vec2::new(
@@ -5444,26 +5770,48 @@ impl ApplicationHandler for PetApplication {
                 parameters.shadow_horizontal_offset = 0.0;
                 parameters.shadow_vertical_offset = 0.0;
                 parameters.exposure = 1.0;
-                parameters.presentation_visibility =
-                    birth_time.map_or(startup.pet_alpha, |t| pet_body::birth_scene::smooth(7.96, 8.65, t));
+                parameters.presentation_visibility = birth_time.map_or(startup.pet_alpha, |t| {
+                    pet_body::birth_scene::smooth(7.96, 8.65, t)
+                });
                 let render_started = Instant::now();
                 let bounds = runtime.topology.virtual_physical_bounds;
                 let desktop_aspect = bounds.width().max(1) as f32 / bounds.height().max(1) as f32;
-                let mut startup_ecology = runtime.ecology.feeding_render_state()
+                let mut startup_ecology = runtime
+                    .ecology
+                    .feeding_render_state()
                     .or_else(|| startup.active.then(|| runtime.ecology.state().clone()));
-                if let Some(state) = &mut startup_ecology && startup.active {
-                    if !startup.orb_visible { state.objects.retain(|o| o.kind != pet_ecology::ObjectKind::Orb); }
+                if let Some(state) = &mut startup_ecology
+                    && startup.active
+                {
+                    if !startup.orb_visible {
+                        state
+                            .objects
+                            .retain(|o| o.kind != pet_ecology::ObjectKind::Orb);
+                    }
                     for object in &mut state.objects {
                         if object.kind == pet_ecology::ObjectKind::Orb {
                             object.position.y += startup.orb_drop / bounds.height().max(1) as f32;
-                            if startup.orb_drop < -1.0 { object.lifecycle = pet_ecology::ObjectLifecycle::Free; }
+                            if startup.orb_drop < -1.0 {
+                                object.lifecycle = pet_ecology::ObjectLifecycle::Free;
+                            }
                         }
                     }
                 }
-                let ecology_state = startup_ecology.as_ref().unwrap_or_else(|| runtime.ecology.state());
-                let den_width = (310.0 * ecology_state.den.size_scale).min(bounds.width() as f32 * 0.8).min(bounds.height() as f32 * 0.65);
-                runtime.birth_scene.set_den_reveal(startup.den_drop * den_width * 0.72, startup.den_alpha,
-                    if startup.active { runtime.startup_floor } else { 0.0 });
+                let ecology_state = startup_ecology
+                    .as_ref()
+                    .unwrap_or_else(|| runtime.ecology.state());
+                let den_width = (310.0 * ecology_state.den.size_scale)
+                    .min(bounds.width() as f32 * 0.8)
+                    .min(bounds.height() as f32 * 0.65);
+                runtime.birth_scene.set_den_reveal(
+                    startup.den_drop * den_width * 0.72,
+                    startup.den_alpha,
+                    if startup.active {
+                        runtime.startup_floor
+                    } else {
+                        0.0
+                    },
+                );
                 let birth_scene = std::cell::RefCell::new(&mut runtime.birth_scene);
                 let seated_in_cradle = runtime.cradle_seat.inside || startup.active;
                 let m = runtime.birth_monitor;
@@ -5709,10 +6057,7 @@ fn apply_shared_feedback(runtime: &mut PetRuntime, event: FeedbackEvent) {
     // Attribute a same-frame response to a performance the callback has already
     // started, even when the UI event arrives before the normal frame poll.
     synchronize_audio_learning(runtime);
-    if matches!(
-        event,
-        FeedbackEvent::Ignored | FeedbackEvent::PushedAway | FeedbackEvent::MuteOrHide
-    ) {
+    if matches!(event, FeedbackEvent::PushedAway | FeedbackEvent::MuteOrHide) {
         runtime
             .ecology
             .observe_explicit_refusal(runtime.sensors.timestamp);
@@ -5990,22 +6335,12 @@ fn poll_lab_control(
     }
     let changed = match envelope.command {
         LabControlCommand::OpenSession {
-            protocol_version: _,
+            protocol_version,
             lease_seconds,
-        } => runtime.lab_session.open(
-            session_token.unwrap_or_default(),
-            lease_seconds,
-            monotonic_now,
-        ),
-        LabControlCommand::RenewSession { lease_seconds } => {
-            session_token.as_deref().is_some_and(|token| {
-                runtime
-                    .lab_session
-                    .renew(token, lease_seconds, monotonic_now)
-            })
-        }
+        } => apply_lab_session_command(&mut runtime.lab_session,&LabControlCommand::OpenSession {protocol_version,lease_seconds},session_token.as_deref(),monotonic_now).expect("session command"),
+        LabControlCommand::RenewSession { lease_seconds } => apply_lab_session_command(&mut runtime.lab_session,&LabControlCommand::RenewSession {lease_seconds},session_token.as_deref(),monotonic_now).expect("session command"),
         LabControlCommand::CloseSession => session_token.as_deref().is_some_and(|token| {
-            let closed = runtime.lab_session.close(token, monotonic_now);
+            let closed = apply_lab_session_command(&mut runtime.lab_session,&LabControlCommand::CloseSession,Some(token),monotonic_now).expect("session command");
             if closed {
                 runtime.lab_pointer_fixture = None;
                 runtime.lab_face_pose = None;
@@ -6139,14 +6474,15 @@ fn poll_lab_control(
         }
         LabControlCommand::Cleanup { enabled } => {
             runtime.cleanup_mode = enabled;
-            if enabled { runtime.feeding_seconds = 0.0; }
+            if enabled {
+                runtime.feeding_seconds = 0.0;
+            }
             true
         }
         LabControlCommand::Feeding { enabled } => {
-            runtime.cleanup_mode = false;
             // This switches cursor sprinkling only. Existing food and any
             // in-progress bite belong to the world, independently of the menu.
-            runtime.feeding_seconds = if enabled { 90.0 } else { 0.0 };
+            apply_feeding_mode(enabled,&mut runtime.feeding_seconds,&mut runtime.cleanup_mode);
             runtime.window.set_cursor(if enabled {
                 winit::window::CursorIcon::Crosshair
             } else {
@@ -6492,6 +6828,8 @@ fn activity_telemetry_json(
             serde_json::json!({
                 "goal": score.goal.map(|goal| format!("{goal:?}")),
                 "score": score.score,
+                "utility": score.utility,
+                "activation": score.activation,
                 "reason": format!("{:?}", score.reason),
             })
         })
@@ -6671,7 +7009,17 @@ fn build_motor_context(runtime: &mut PetRuntime) -> BehaviorContextFrame {
     context.den_supported = runtime.cradle_seat.inside
         && !runtime.sensors.pet_dragged
         && (runtime.body.simulation.feedback.velocity
-            * Vec2::new(desktop_size.x / desktop_size.y, 1.0)).length() < 0.035;
+            * Vec2::new(desktop_size.x / desktop_size.y, 1.0))
+        .length()
+            < 0.035;
+    context.den_support_point = (runtime.cradle_seat.inside && !runtime.sensors.pet_dragged)
+        .then(|| {
+            let den = &runtime.ecology.state().den;
+            Vec2::new(den.anchor.x, den.anchor.y
+                + pet_body::birth_scene::den_seat_depth_pixels(
+                    [desktop_size.x as u32, desktop_size.y as u32], den.size_scale,
+                ) / desktop_size.y)
+        });
     context.surfaces.push(SurfaceCandidate {
         surface_id: SurfaceId("screen:bottom_edge".into()),
         minimum: Vec2::new(0.0, 1.0 - 1.0 / desktop_size.y),
@@ -8177,6 +8525,7 @@ struct DesktopPointerTracker {
     event_pressed: bool,
     event_released: bool,
     synthetic_release_pending: bool,
+    suppress_until_release: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -8239,6 +8588,23 @@ fn update_pointer_state(
     down: bool,
     hovered: bool,
 ) -> bool {
+    if tracker.suppress_until_release {
+        tracker.event_pressed = false;
+        tracker.event_released = false;
+        tracker.captured = false;
+        tracker.sampled_down = false;
+        tracker.synthetic_release_pending = false;
+        pointer.down = false;
+        pointer.pressed = false;
+        pointer.released = false;
+        pointer.pet_hovered = hovered;
+        pointer.pet_touched = false;
+        pointer.pet_dragged = false;
+        if !down {
+            tracker.suppress_until_release = false;
+        }
+        return false;
+    }
     let quick_click = tracker.event_pressed && tracker.event_released && !down;
     let (effective_down, pressed, released) = if tracker.synthetic_release_pending {
         tracker.synthetic_release_pending = false;
@@ -8399,6 +8765,39 @@ fn apply_screen_domain(
     *was_in_contact = collided;
 }
 
+fn local_guard_keeps_floor(packet: &SomaticActuationPacket) -> bool {
+    matches!(packet.program, Some(
+        pet_motor::BehaviorProgramId::DefenseLocalPainGuard
+            | pet_motor::BehaviorProgramId::DefenseOverpressureBoundary
+    )) && packet.locomotion.target_position.is_none()
+}
+
+fn retain_measured_floor_for_local_guard(
+    packet: &mut SomaticActuationPacket,
+    body_position: Vec2,
+    desktop_height: f32,
+) {
+    // A local brace changes shape; it does not remove the acquired solid
+    // boundary or command takeoff. Explicit destinations and escape bouts
+    // retain their own navigation and support ownership.
+    if packet.support.is_none() && local_guard_keeps_floor(packet) {
+        packet.support = Some(pet_motor::SurfaceAttachmentCommand {
+            surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
+            anchor_point: Vec2::new(body_position.x, 1.0 - desktop_height.recip()),
+            normal: -Vec2::Y,
+            tangent: Vec2::X,
+            target_contact_fraction: 0.30,
+            normal_compliance: 0.30,
+            tangent_friction: 0.70,
+            adhesion: 0.0,
+            load_fraction: 0.30,
+            break_force: 0.75,
+            release_half_life: 0.20,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn update_screen_edge_support_state(
     sleep_approach_active: bool,
     gap_px: f32,
@@ -8660,8 +9059,12 @@ mod tests {
         projected.desired_speed = 0.02;
         projected.target_position = Vec2::ZERO;
         let mut packet = pet_motor::SomaticActuationPacket::default();
-        for goal in [EpisodeGoal::SoloOrbPlay, EpisodeGoal::RetrieveOrb,
-            EpisodeGoal::CarryOrbHome, EpisodeGoal::OfferOrb] {
+        for goal in [
+            EpisodeGoal::SoloOrbPlay,
+            EpisodeGoal::RetrieveOrb,
+            EpisodeGoal::CarryOrbHome,
+            EpisodeGoal::OfferOrb,
+        ] {
             projected.target_position = Vec2::ZERO;
             projected.desired_speed = 0.02;
             restore_orb_play_navigation(Some(goal), &packet, &authored, &mut projected, false);
@@ -9254,7 +9657,10 @@ mod tests {
         assert!(manager.pending_requests.is_empty());
         // Ordinary chatter and repeated alarm nominations share a finite budget.
         assert!(!manager.enqueue(&voice, &second_motif, &second_request));
-        let urgent_request = lifecore::VocalRequest { priority: 255, ..second_request };
+        let urgent_request = lifecore::VocalRequest {
+            priority: 255,
+            ..second_request
+        };
         assert!(!manager.enqueue(&voice, &second_motif, &urgent_request));
         manager.last_nonurgent_voice = Some(Instant::now() - Duration::from_secs(15));
         assert!(!manager.enqueue(&voice, &second_motif, &second_request));
@@ -9601,7 +10007,10 @@ mod tests {
     fn supported_rest_forms_a_flat_patch_without_moving_its_reference_frame() {
         let genome = Genome::from_seed(5784121873664838231);
         let mut body = ProceduralBody::generate(&genome).unwrap();
-        body.apply_tuning_profile(production_liquid_tuning(approved_production_liquid_tuning(genome.identity_seed))).unwrap();
+        body.apply_tuning_profile(production_liquid_tuning(approved_production_liquid_tuning(
+            genome.identity_seed,
+        )))
+        .unwrap();
         body.set_presentation_scale(2.0);
         let topology = two_monitor_topology();
         let size = PhysicalSize::new(3840, 1080);
@@ -9618,31 +10027,57 @@ mod tests {
         let mut velocity = Vec2::ZERO;
         let mut extent = Vec2::ZERO;
         let mut contact = false;
-        let mut packet = SomaticActuationPacket::default();
-        packet.support = Some(pet_motor::SurfaceAttachmentCommand {
+        let mut packet = SomaticActuationPacket {
+            support: Some(pet_motor::SurfaceAttachmentCommand {
             surface_id: lifecore::SurfaceId("screen:bottom_edge".into()),
-            anchor_point: Vec2::new(center.x / span.x, 1.0), normal: -Vec2::Y, tangent: Vec2::X,
-            target_contact_fraction: 0.30, normal_compliance: 0.3, tangent_friction: 0.7,
-            adhesion: 0.0, load_fraction: 0.30, break_force: 0.75, release_half_life: 0.2,
-        });
+            anchor_point: Vec2::new(center.x / span.x, 1.0),
+            normal: -Vec2::Y,
+            tangent: Vec2::X,
+            target_contact_fraction: 0.30,
+            normal_compliance: 0.3,
+            tangent_friction: 0.7,
+            adhesion: 0.0,
+            load_fraction: 0.30,
+            break_force: 0.75,
+            release_half_life: 0.2,
+            }),
+            ..Default::default()
+        };
         packet.fields[0] = Some(pet_motor::LocalSomaticField {
             kind: pet_motor::SomaticFieldKind::Flatten,
             space: pet_motor::FieldSpace::SurfaceTangentNormal,
-            center: Vec2::Y * 0.24, axis: Vec2::Y, radius: 0.68,
-            strength: 0.34, falloff: 2.0, frequency_hz: 0.0,
-            phase_01: 1.0, target_component: None,
+            center: Vec2::Y * 0.24,
+            axis: Vec2::Y,
+            radius: 0.68,
+            strength: 0.34,
+            falloff: 2.0,
+            frequency_hz: 0.0,
+            phase_01: 1.0,
+            target_component: None,
         });
         packet.fields[1] = Some(pet_motor::LocalSomaticField {
             kind: pet_motor::SomaticFieldKind::Wave,
             space: pet_motor::FieldSpace::SurfaceTangentNormal,
-            center: Vec2::ZERO, axis: Vec2::X, radius: 0.54,
-            strength: 0.10, falloff: 2.0, frequency_hz: 0.7,
-            phase_01: 0.0, target_component: None,
+            center: Vec2::ZERO,
+            axis: Vec2::X,
+            radius: 0.54,
+            strength: 0.10,
+            falloff: 2.0,
+            frequency_hz: 0.7,
+            phase_01: 0.0,
+            target_component: None,
         });
-        let mut intent = BodyIntent { locomotion: LocomotionMode::Sleep,
+        let mut intent = BodyIntent {
+            locomotion: LocomotionMode::Sleep,
             target_position: body.simulation.feedback.world_position,
-            target_surface: None, desired_speed: 0.0, facing_direction: 1.0,
-            gaze_target: None, pose: PoseIntent::Neutral, expression: Default::default(), interaction_target: None };
+            target_surface: None,
+            desired_speed: 0.0,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Neutral,
+            expression: Default::default(),
+            interaction_target: None,
+        };
         let sensors = SensorFrame::default();
         let mut contact_min = [f32::INFINITY; 5];
         let mut contact_max = [f32::NEG_INFINITY; 5];
@@ -9651,29 +10086,54 @@ mod tests {
             body.set_somatic_actuation(packet.clone());
             intent.target_position = body.simulation.feedback.world_position;
             body.fixed_update(&genome, &intent, &sensors, 1.0 / 120.0);
-            apply_screen_domain(&mut body, &topology, size, true, true,
-                &mut center, &mut velocity, &mut extent, &mut contact, 1.0 / 120.0);
-            body.embodied_update(&intent, &sensors, Default::default(), Default::default(), Default::default(), 1.0 / 120.0);
+            apply_screen_domain(
+                &mut body,
+                &topology,
+                size,
+                true,
+                true,
+                &mut center,
+                &mut velocity,
+                &mut extent,
+                &mut contact,
+                1.0 / 120.0,
+            );
+            body.embodied_update(
+                &intent,
+                &sensors,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                1.0 / 120.0,
+            );
             body.presentation_update(1.0 / 120.0);
             if tick == 360 {
                 let settled = body.main_liquid_contact_bounds_pixels(height);
                 let span = settled.maximum - settled.minimum;
-                assert!(span.x > initial_span.x * 1.40,
-                    "supported bulk remains narrow: {initial_span:?} -> {span:?}");
-                assert!(span.y < initial_span.y * 0.62,
-                    "upper lobe does not settle with the liquid: {initial_span:?} -> {span:?}");
+                assert!(
+                    span.x > initial_span.x * 1.40,
+                    "supported bulk remains narrow: {initial_span:?} -> {span:?}"
+                );
+                assert!(
+                    span.y < initial_span.y * 0.62,
+                    "upper lobe does not settle with the liquid: {initial_span:?} -> {span:?}"
+                );
                 assert_eq!(settled.particle_count, initial_hull.particle_count);
             }
             if tick >= 720 && tick % 12 == 0 {
                 for (i, x) in [-40.0, -20.0, 0.0, 20.0, 40.0].iter().enumerate() {
                     let p = Vec2::new(*x, height - center.y + 10.0);
-                    let hit = body.liquid_physical_circle_contact_pixels(p, p, 24.0, height).unwrap();
+                    let hit = body
+                        .liquid_physical_circle_contact_pixels(p, p, 24.0, height)
+                        .unwrap();
                     contact_min[i] = contact_min[i].min(hit.body_point.y);
                     contact_max[i] = contact_max[i].max(hit.body_point.y);
                 }
             }
         }
-        let jitter = (0..5).map(|i| contact_max[i] - contact_min[i]).fold(0.0_f32, f32::max);
+        let jitter = (0..5)
+            .map(|i| contact_max[i] - contact_min[i])
+            .fold(0.0_f32, f32::max);
         eprintln!("contact temporal range: {jitter}px, min={contact_min:?}, max={contact_max:?}");
         assert!(jitter < 0.05, "resting contact keeps boiling: {jitter}px");
         let hull = body.main_liquid_contact_bounds_pixels(height);
@@ -9681,12 +10141,69 @@ mod tests {
         let half_patch = (hull.maximum.x - hull.minimum.x) * 0.20;
         for x in [-1.0, -0.5, 0.0, 0.5, 1.0] {
             let p = Vec2::new(x * half_patch, floor - 2.0);
-            assert!(body.liquid_physical_circle_contact_pixels(p, p, 1.0, height).is_some(),
-                "rounded/concave support at x={}: floor={floor}, hull={hull:?}", p.x);
+            assert!(
+                body.liquid_physical_circle_contact_pixels(p, p, 1.0, height)
+                    .is_some(),
+                "rounded/concave support at x={}: floor={floor}, hull={hull:?}",
+                p.x
+            );
         }
-        assert!((center.y - start_y).abs() < 0.1, "rest reference drifted by {}px", center.y - start_y);
-        assert!((floor - hull.maximum.y).abs() < 2.0, "visible surface left floor");
+        assert!(
+            (center.y - start_y).abs() < 0.1,
+            "rest reference drifted by {}px",
+            center.y - start_y
+        );
+        assert!(
+            (floor - hull.maximum.y).abs() < 2.0,
+            "visible surface left floor"
+        );
         assert!(body.embodiment.liquid.diagnostics().detached_mass < 1.0);
+
+        // Reproduce the next ownership transition through the actual solver:
+        // a stationary local guard follows loaded rest at the same solid floor.
+        packet = SomaticActuationPacket {
+            program: Some(pet_motor::BehaviorProgramId::DefenseLocalPainGuard),
+            ..Default::default()
+        };
+        packet.locomotion.pose = pet_motor::MotorPoseIntent::Threat;
+        packet.material.density_compliance_multiplier = 0.78;
+        packet.material.viscosity_multiplier = 1.30;
+        packet.material.surface_tension_multiplier = 1.20;
+        packet.fields[0] = Some(pet_motor::LocalSomaticField {
+            kind: pet_motor::SomaticFieldKind::Brace,
+            space: pet_motor::FieldSpace::BodyLocal,
+            center: Vec2::new(-0.16, 0.0),
+            axis: Vec2::X,
+            radius: 0.56,
+            strength: 0.26,
+            falloff: 2.2,
+            frequency_hz: 0.0,
+            phase_01: 0.0,
+            target_component: None,
+        });
+        retain_measured_floor_for_local_guard(&mut packet, body.simulation.feedback.world_position, height);
+        assert_eq!(packet.support.as_ref().unwrap().surface_id.0, "screen:bottom_edge");
+        let acquired_center = center;
+        for _ in 0..600 {
+            body.set_somatic_actuation(packet.clone());
+            intent.target_position = body.simulation.feedback.world_position;
+            body.fixed_update(&genome, &intent, &sensors, 1.0 / 120.0);
+            apply_screen_domain(&mut body, &topology, size, true, local_guard_keeps_floor(&packet),
+                &mut center, &mut velocity, &mut extent, &mut contact, 1.0 / 120.0);
+            body.embodied_update(&intent, &sensors, Default::default(), Default::default(), Default::default(), 1.0 / 120.0);
+            body.presentation_update(1.0 / 120.0);
+            let diagnostics = body.embodiment.liquid.diagnostics();
+            assert!(diagnostics.finite && diagnostics.component_count == 1);
+            assert_eq!(diagnostics.detached_mass, 0.0);
+            assert_eq!(diagnostics.failsafe_hits, 0);
+            assert!((center.y - acquired_center.y).abs() < 0.02);
+        }
+        // An explicit protective escape still owns its destination.
+        packet.support = None;
+        packet.program = Some(pet_motor::BehaviorProgramId::DefenseOverpressureBoundary);
+        packet.locomotion.target_position = Some(Vec2::new(0.5, 0.4));
+        retain_measured_floor_for_local_guard(&mut packet, body.simulation.feedback.world_position, height);
+        assert!(packet.support.is_none());
     }
 
     #[test]
@@ -10134,4 +10651,36 @@ mod tests {
             BACKGROUND_CLEAN_SEED_FRAMES
         ));
     }
+    #[test]
+    fn house_click_hit_shape_matches_native_cursor_routing() {
+        let nest = Vec2::new(-300.0, 900.0);
+        let width = den_menu_hit_width(1.0, Vec2::new(3440.0, 1440.0));
+        assert!(cursor_hits_den_menu(nest + Vec2::new(0.0, width * 0.1), nest, width));
+        assert!(cursor_hits_den_menu(nest + Vec2::new(width * 0.4, width * 0.1), nest, width));
+        assert!(!cursor_hits_den_menu(nest + Vec2::new(width * 0.6, width * 0.1), nest, width));
+        assert!(!cursor_hits_den_menu(nest + Vec2::new(0.0, -width), nest, width));
+        assert!(!cursor_hits_den_menu(Vec2::splat(f32::NAN), nest, width));
+    }
+    #[test]
+    fn house_click_cannot_also_drag_a_sleeping_creature_and_next_pet_click_still_works() {
+        // A global input sample may have captured the body just before the
+        // native MouseInput event is dispatched. The house click still owns it.
+        let mut pointer = PointerState { down: true, pet_dragged: true, ..Default::default() };
+        let mut tracker = DesktopPointerTracker {
+            suppress_until_release: true, captured: true, sampled_down: true,
+            ..Default::default()
+        };
+        tracker.record_window_event(true);
+        for _ in 0..8 {
+            assert!(!update_pointer_state(&mut pointer, &mut tracker, true, true));
+            assert!(!pointer.pet_dragged && !pointer.pet_touched && !tracker.captured);
+        }
+        tracker.record_window_event(false);
+        update_pointer_state(&mut pointer, &mut tracker, false, true);
+        assert!(!tracker.suppress_until_release);
+        tracker.record_window_event(true);
+        assert!(update_pointer_state(&mut pointer, &mut tracker, true, true));
+        assert!(pointer.pet_touched && pointer.pet_dragged && tracker.captured);
+    }
+
 }

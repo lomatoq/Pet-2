@@ -63,7 +63,11 @@ impl Capture {
         let excitement_only = std::env::args().any(|arg| arg == "--excitement-only");
         let spectrum_only = std::env::args().any(|arg| arg == "--spectrum-only");
         for scale in [1.0_f32, 1.5, 2.0] {
-            if (care_only || mood_only || sleep_only || excitement_only || spectrum_only) && scale != 1.0 {continue;}
+            if (care_only || mood_only || sleep_only || excitement_only || spectrum_only)
+                && scale != 1.0
+            {
+                continue;
+            }
             let pixels = (512.0 * scale) as u32;
             let _ = window.request_inner_size(PhysicalSize::new(pixels, pixels));
             renderer.resize(PhysicalSize::new(pixels, pixels));
@@ -122,96 +126,159 @@ impl Capture {
                 }
                 if eyes_only {
                     fixtures.clear();
-                    for (name, curve) in [("Neutral",0.0),("JoyMild",0.3),("JoyStrong",0.95),("SadMild",-0.25),("SadStrong",-0.85)] {
-                        let mut expression=FacePose::Awake.expression();
-                        expression.mouth_curve=curve;
-                        expression.brow_tension=0.0;
-                        expression.brow_raise=0.0;
-                        expression.squint=0.0;
-                        expression.blink_left=0.0;
-                        expression.blink_right=0.0;
-                        fixtures.push((name.to_owned(),expression,true));
-                    }
-                    fixtures.push(("AngerControl".into(),FacePose::Boundary.expression(),true));
-                    fixtures.push(("SurpriseControl".into(),FacePose::Startled.expression(),true));
-                    for (name,curve,tension,raise) in [
-                        ("SmallFrown",-0.10,0.0,0.0),
-                        ("TenseFrown",-0.42,0.60,0.05),
-                        ("AlarmFrown",-0.42,0.68,0.70),
-                        ("JoyAlert",0.48,0.06,0.70),
+                    for (name, curve) in [
+                        ("Neutral", 0.0),
+                        ("JoyMild", 0.3),
+                        ("JoyStrong", 0.95),
+                        ("SadMild", -0.25),
+                        ("SadStrong", -0.85),
                     ] {
-                        let mut expression=FacePose::Awake.expression();
-                        expression.mouth_curve=curve;
-                        expression.brow_tension=tension;
-                        expression.brow_raise=raise;
-                        expression.mouth_open=0.35;
-                        expression.blink_left=0.0;
-                        expression.blink_right=0.0;
-                        fixtures.push((name.into(),expression,true));
+                        let mut expression = FacePose::Awake.expression();
+                        expression.mouth_curve = curve;
+                        expression.brow_tension = 0.0;
+                        expression.brow_raise = 0.0;
+                        expression.squint = 0.0;
+                        expression.blink_left = 0.0;
+                        expression.blink_right = 0.0;
+                        fixtures.push((name.to_owned(), expression, true));
+                    }
+                    fixtures.push(("AngerControl".into(), FacePose::Boundary.expression(), true));
+                    fixtures.push((
+                        "SurpriseControl".into(),
+                        FacePose::Startled.expression(),
+                        true,
+                    ));
+                    for (name, curve, tension, raise) in [
+                        ("SmallFrown", -0.10, 0.0, 0.0),
+                        ("TenseFrown", -0.42, 0.60, 0.05),
+                        ("AlarmFrown", -0.42, 0.68, 0.70),
+                        ("JoyAlert", 0.48, 0.06, 0.70),
+                    ] {
+                        let mut expression = FacePose::Awake.expression();
+                        expression.mouth_curve = curve;
+                        expression.brow_tension = tension;
+                        expression.brow_raise = raise;
+                        expression.mouth_open = 0.35;
+                        expression.blink_left = 0.0;
+                        expression.blink_right = 0.0;
+                        fixtures.push((name.into(), expression, true));
                     }
                 }
                 if care_only {
                     fixtures.clear();
-                    for name in ["CareNeutral","CareGroom","CareGroomShort","CareGroomLeft","CareScratch","CareNuzzle","CareDecline","CareFeedingPriority"] {
-                        fixtures.push((name.into(),FacePose::Awake.expression(),true));
-                    }
-                    for (name,primary) in [
-                        ("GeneralJoy",lifecore::PrimaryIntent::Celebrate),
-                        ("GeneralConcern",lifecore::PrimaryIntent::RecoverFromMiss),
-                        ("GeneralBoundary",lifecore::PrimaryIntent::RejectContact),
-                        ("GeneralStartle",lifecore::PrimaryIntent::StartleFreeze),
-                        ("GeneralCurious",lifecore::PrimaryIntent::Inspect),
-                        ("GeneralRest",lifecore::PrimaryIntent::Rest),
+                    for name in [
+                        "CareNeutral",
+                        "CareGroom",
+                        "CareGroomShort",
+                        "CareGroomLeft",
+                        "CareScratch",
+                        "CareNuzzle",
+                        "CareDecline",
+                        "CareFeedingPriority",
                     ] {
-                        let mut director=pet_body::CompanionExpressionDirector::new(42);
-                        let motor=lifecore::CompanionIntentFrame {primary,confidence:0.8,
-                            curiosity:0.8,play_readiness:0.8,frustration:0.8,surprise:0.8,
-                            ..Default::default()};
-                        let mut target=pet_body::CompanionExpressionTarget::default();
-                        for _ in 0..30 {target=director.tick(motor,Default::default(),0.05);}
-                        let f=target.face;
-                        let expression=lifecore::ExpressionState {eye_aperture:f.eye_aperture,
-                            squint:f.squint,pupil_size:f.pupil_size,pupil_focus:f.pupil_focus,
-                            brow_raise:f.brow_raise,brow_tension:f.brow_tension,brow_asymmetry:f.brow_asymmetry,
-                            mouth_curve:f.mouth_curve,mouth_open:f.mouth_open,mouth_tension:f.mouth_tension,
-                            mouth_compression:f.mouth_compression,mouth_asymmetry:f.mouth_asymmetry,
-                            ..Default::default()};
-                        fixtures.push((name.into(),expression,true));
+                        fixtures.push((name.into(), FacePose::Awake.expression(), true));
+                    }
+                    for (name, primary) in [
+                        ("GeneralJoy", lifecore::PrimaryIntent::Celebrate),
+                        ("GeneralConcern", lifecore::PrimaryIntent::RecoverFromMiss),
+                        ("GeneralBoundary", lifecore::PrimaryIntent::RejectContact),
+                        ("GeneralStartle", lifecore::PrimaryIntent::StartleFreeze),
+                        ("GeneralCurious", lifecore::PrimaryIntent::Inspect),
+                        ("GeneralRest", lifecore::PrimaryIntent::Rest),
+                    ] {
+                        let mut director = pet_body::CompanionExpressionDirector::new(42);
+                        let motor = lifecore::CompanionIntentFrame {
+                            primary,
+                            confidence: 0.8,
+                            curiosity: 0.8,
+                            play_readiness: 0.8,
+                            frustration: 0.8,
+                            surprise: 0.8,
+                            ..Default::default()
+                        };
+                        let mut target = pet_body::CompanionExpressionTarget::default();
+                        for _ in 0..30 {
+                            target = director.tick(motor, Default::default(), 0.05);
+                        }
+                        let f = target.face;
+                        let expression = lifecore::ExpressionState {
+                            eye_aperture: f.eye_aperture,
+                            squint: f.squint,
+                            pupil_size: f.pupil_size,
+                            pupil_focus: f.pupil_focus,
+                            brow_raise: f.brow_raise,
+                            brow_tension: f.brow_tension,
+                            brow_asymmetry: f.brow_asymmetry,
+                            mouth_curve: f.mouth_curve,
+                            mouth_open: f.mouth_open,
+                            mouth_tension: f.mouth_tension,
+                            mouth_compression: f.mouth_compression,
+                            mouth_asymmetry: f.mouth_asymmetry,
+                            ..Default::default()
+                        };
+                        fixtures.push((name.into(), expression, true));
                     }
                 }
                 if mood_only {
                     fixtures.clear();
-                    for (name,curve,tension,raise) in [
-                        ("Calm",0.0,0.0,0.0), ("Delight",0.95,0.0,0.0),
-                        ("DelightOnset",0.95,0.0,0.0), ("Content",0.45,0.0,0.0),
-                        ("Concern",-0.7,0.0,0.0), ("Tense",-0.4,0.8,0.0),
-                        ("Curious",0.05,0.0,0.8),
+                    for (name, curve, tension, raise) in [
+                        ("Calm", 0.0, 0.0, 0.0),
+                        ("Delight", 0.95, 0.0, 0.0),
+                        ("DelightOnset", 0.95, 0.0, 0.0),
+                        ("Content", 0.45, 0.0, 0.0),
+                        ("Concern", -0.7, 0.0, 0.0),
+                        ("Tense", -0.4, 0.8, 0.0),
+                        ("Curious", 0.05, 0.0, 0.8),
                     ] {
-                        let mut face=FacePose::Awake.expression();
-                        face.mouth_curve=curve;face.brow_tension=tension;face.brow_raise=raise;
-                        fixtures.push((name.into(),face,true));
+                        let mut face = FacePose::Awake.expression();
+                        face.mouth_curve = curve;
+                        face.brow_tension = tension;
+                        face.brow_raise = raise;
+                        fixtures.push((name.into(), face, true));
                     }
                 }
                 if sleep_only {
                     fixtures.clear();
-                    for (name,left,right) in [("SleepStaleFace",0.70,0.70),("SleepCheck",0.28,1.0),
-                        ("AwakeControl",0.0,0.0),("BlinkEarly",0.35,0.35),
-                        ("BlinkMiddle",0.55,0.55),("BlinkClosing",0.8,0.8)] {
-                        let mut face=FacePose::Awake.expression();
-                        face.blink_left=left;face.blink_right=right;
-                        fixtures.push((name.into(),face,true));
+                    for (name, left, right) in [
+                        ("SleepStaleFace", 0.70, 0.70),
+                        ("SleepCheck", 0.28, 1.0),
+                        ("AwakeControl", 0.0, 0.0),
+                        ("BlinkEarly", 0.35, 0.35),
+                        ("BlinkMiddle", 0.55, 0.55),
+                        ("BlinkClosing", 0.8, 0.8),
+                    ] {
+                        let mut face = FacePose::Awake.expression();
+                        face.blink_left = left;
+                        face.blink_right = right;
+                        fixtures.push((name.into(), face, true));
                     }
                 }
                 if excitement_only {
                     fixtures.clear();
                     for name in ["ExcitedWarm", "ExcitedCool", "ExcitedInverted"] {
-                        fixtures.push((name.into(),FacePose::Playful.expression(),true));
+                        fixtures.push((name.into(), FacePose::Playful.expression(), true));
                     }
                 }
                 if spectrum_only {
                     fixtures.clear();
-                    for name in ["SpectrumIdle", "SpectrumRight", "SpectrumLeft", "SpectrumDown"] {
-                        fixtures.push((name.into(),FacePose::Awake.expression(),true));
+                    for name in [
+                        "SpectrumIdle",
+                        "SpectrumRight",
+                        "SpectrumLeft",
+                        "SpectrumDown",
+                        "SpectrumUp",
+                        "SpectrumDiagonal",
+                        "SpectrumSlow",
+                        "SpectrumOpposedLag",
+                        "SpectrumRightLater",
+                        "SpectrumIdleLater",
+                        "SpectrumStoppedLag",
+                        "SpectrumFlightRight",
+                        "SpectrumFlightRightControl",
+                        "SpectrumFlightDown",
+                        "SpectrumFlightDownControl",
+                    ] {
+                        fixtures.push((name.into(), FacePose::Awake.expression(), true));
                     }
                 }
                 for (fixture, expression, managed) in fixtures {
@@ -226,48 +293,103 @@ impl Capture {
                     body.set_presentation_scale(0.8);
                     let care = match fixture.as_str() {
                         "CareGroomShort" | "CareGroomLeft" => lifecore::SelfCareMotorFrame {
-                            kind:lifecore::SelfCareKind::Groom,strength:0.95,side:-1.0,
-                            tongue_extension:if fixture=="CareGroomShort" {0.3} else {0.95},
-                            mouth_open:0.28,squint:0.25,face_lowering:0.7,face_turn:-0.25,
-                            body_lean:-0.3,..Default::default()},
+                            kind: lifecore::SelfCareKind::Groom,
+                            strength: 0.95,
+                            side: -1.0,
+                            tongue_extension: if fixture == "CareGroomShort" {
+                                0.3
+                            } else {
+                                0.95
+                            },
+                            mouth_open: 0.28,
+                            squint: 0.25,
+                            face_lowering: 0.7,
+                            face_turn: -0.25,
+                            body_lean: -0.3,
+                            ..Default::default()
+                        },
                         "CareGroom" | "CareFeedingPriority" => lifecore::SelfCareMotorFrame {
-                            kind:lifecore::SelfCareKind::Groom,strength:0.95,side:1.0,
-                            tongue_extension:0.95,mouth_open:0.28,squint:0.25,
-                            face_lowering:0.7,face_turn:0.25,body_lean:0.3,..Default::default()},
+                            kind: lifecore::SelfCareKind::Groom,
+                            strength: 0.95,
+                            side: 1.0,
+                            tongue_extension: 0.95,
+                            mouth_open: 0.28,
+                            squint: 0.25,
+                            face_lowering: 0.7,
+                            face_turn: 0.25,
+                            body_lean: 0.3,
+                            ..Default::default()
+                        },
                         "CareScratch" => lifecore::SelfCareMotorFrame {
-                            kind:lifecore::SelfCareKind::Scratch,strength:0.9,side:-1.0,
-                            squint:0.75,mouth_asymmetry:-0.7,body_lean:-0.8,body_pulse:0.8,
-                            face_turn:-0.6,..Default::default()},
+                            kind: lifecore::SelfCareKind::Scratch,
+                            strength: 0.9,
+                            side: -1.0,
+                            squint: 0.75,
+                            mouth_asymmetry: -0.7,
+                            body_lean: -0.8,
+                            body_pulse: 0.8,
+                            face_turn: -0.6,
+                            ..Default::default()
+                        },
                         "CareNuzzle" => lifecore::SelfCareMotorFrame {
-                            kind:lifecore::SelfCareKind::Nuzzle,strength:0.9,side:1.0,
-                            squint:0.65,face_turn:0.6,body_lean:0.7,..Default::default()},
+                            kind: lifecore::SelfCareKind::Nuzzle,
+                            strength: 0.9,
+                            side: 1.0,
+                            squint: 0.65,
+                            face_turn: 0.6,
+                            body_lean: 0.7,
+                            ..Default::default()
+                        },
                         "CareDecline" => lifecore::SelfCareMotorFrame {
-                            kind:lifecore::SelfCareKind::Decline,strength:0.9,side:-1.0,
-                            squint:0.4,face_turn:-0.65,body_lean:-0.5,reluctance:0.85,..Default::default()},
+                            kind: lifecore::SelfCareKind::Decline,
+                            strength: 0.9,
+                            side: -1.0,
+                            squint: 0.4,
+                            face_turn: -0.65,
+                            body_lean: -0.5,
+                            reluctance: 0.85,
+                            ..Default::default()
+                        },
                         _ => lifecore::SelfCareMotorFrame::default(),
                     };
                     body.set_self_care_motor(care);
                     if excitement_only {
                         body.set_excitation_presentation(lifecore::ExcitationMotorFrame {
-                            intensity:0.85,
-                            chroma_pulse:if fixture=="ExcitedWarm" {0.0} else {0.09},
-                            roll_radians:if fixture=="ExcitedInverted" {std::f32::consts::PI} else {0.0},
+                            intensity: 0.85,
+                            chroma_pulse: if fixture == "ExcitedWarm" { 0.0 } else { 0.09 },
+                            roll_radians: if fixture == "ExcitedInverted" {
+                                std::f32::consts::PI
+                            } else {
+                                0.0
+                            },
                             ..Default::default()
                         });
                     }
-                    body.set_feeding_expression_active(fixture=="CareFeedingPriority");
+                    body.set_feeding_expression_active(fixture == "CareFeedingPriority");
                     let intent = BodyIntent {
-                        locomotion: if fixture.starts_with("Sleep") {LocomotionMode::Sleep} else {LocomotionMode::Hover},
+                        locomotion: if fixture.starts_with("Sleep") {
+                            LocomotionMode::Sleep
+                        } else {
+                            LocomotionMode::Hover
+                        },
                         target_position: Vec2::splat(0.5),
                         target_surface: None,
                         desired_speed: 0.0,
                         facing_direction: 1.0,
                         gaze_target: Some(Vec2::new(0.55, 0.5)),
-                        pose: if fixture.starts_with("Sleep") {PoseIntent::Compact} else {PoseIntent::Neutral},
+                        pose: if fixture.starts_with("Sleep") {
+                            PoseIntent::Compact
+                        } else {
+                            PoseIntent::Neutral
+                        },
                         expression,
                         interaction_target: None,
                     };
-                    for _ in 0..if mood_only || excitement_only {if fixture=="DelightOnset" {60} else {720}} else {180} {
+                    for _ in 0..if mood_only || excitement_only {
+                        if fixture == "DelightOnset" { 60 } else { 720 }
+                    } else {
+                        180
+                    } {
                         body.embodied_update(
                             &intent,
                             &SensorFrame::default(),
@@ -287,19 +409,57 @@ impl Capture {
                             1.0 / 120.0,
                         );
                     }
+                    if fixture.starts_with("SpectrumFlight") {
+                        let direction = if fixture.contains("Right") {
+                            Vec2::X
+                        } else {
+                            Vec2::Y
+                        };
+                        let flight = BodyIntent {
+                            locomotion: LocomotionMode::Seek,
+                            desired_speed: 0.7,
+                            target_position: Vec2::splat(0.5) + direction * 0.8,
+                            gaze_target: Some(Vec2::splat(0.5) + direction * 0.5),
+                            ..intent.clone()
+                        };
+                        for _ in 0..72 {
+                            body.embodied_update(
+                                &flight,
+                                &SensorFrame::default(),
+                                AffectState::default(),
+                                VisualMindInput::default(),
+                                VoiceVisualState::default(),
+                                1.0 / 120.0,
+                            );
+                        }
+                    }
                     body.presentation_update(1.0 / 60.0);
                     renderer.set_review_background(background);
                     renderer.reset_perceptual_capture_state();
                     let mut parameters = body.render_parameters(&genome, 0.0);
                     if spectrum_only {
                         parameters.chromatic_motion = match fixture.as_str() {
-                            "SpectrumRight"=>Vec2::new(0.65,0.0),
-                            "SpectrumLeft"=>Vec2::new(-0.65,0.0),
-                            "SpectrumDown"=>Vec2::new(0.0,0.65),
-                            _=>Vec2::ZERO,
+                            "SpectrumRight" => Vec2::new(0.65, 0.0),
+                            "SpectrumLeft" => Vec2::new(-0.65, 0.0),
+                            "SpectrumDown" => Vec2::new(0.0, 0.65),
+                            "SpectrumUp" => Vec2::new(0.0, -0.65),
+                            "SpectrumDiagonal" => Vec2::new(0.46, -0.46),
+                            "SpectrumSlow" => Vec2::new(0.04, 0.0),
+                            "SpectrumRightLater" | "SpectrumOpposedLag" => Vec2::new(0.65, 0.0),
+                            "SpectrumFlightRight" => Vec2::new(0.65, 0.0),
+                            "SpectrumFlightDown" => Vec2::new(0.0, 0.65),
+                            _ => Vec2::ZERO,
                         };
+                        if fixture.ends_with("Later") {
+                            parameters.time = 3.7;
+                        }
+                        if fixture == "SpectrumOpposedLag" || fixture == "SpectrumStoppedLag" {
+                            parameters.tail_lag = Vec2::new(1.0, 0.8);
+                        }
                     }
+                    let capture_started = std::time::Instant::now();
                     let frame = renderer.render_capture(parameters)?;
+                    let capture_wall_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
                     let name =
                         format!("{fixture}-{background_name}-{}.ppm", (scale * 100.0) as u32);
                     let mut file = fs::File::create(self.output.join(&name))?;
@@ -311,6 +471,8 @@ impl Capture {
                         .collect();
                     file.write_all(&rgb)?;
                     records.push(serde_json::json!({"file": name, "fixture": fixture, "managed_blink": managed,
+                        "chromatic_motion":parameters.chromatic_motion,"time":parameters.time,"tail_lag":parameters.tail_lag,
+                        "capture_wall_ms_including_readback":capture_wall_ms,
                         "desired": intent.expression, "smoothed": body.expression.current,
                         "renderer_geometry": parameters.geometry, "renderer_mouth_open": parameters.mouth_open,
                         "renderer_eye_scales": parameters.eye_scales,
@@ -321,7 +483,10 @@ impl Capture {
             }
         }
         if eyes_only || care_only || mood_only || sleep_only || excitement_only || spectrum_only {
-            fs::write(self.output.join("channels.json"),serde_json::to_vec_pretty(&records)?)?;
+            fs::write(
+                self.output.join("channels.json"),
+                serde_json::to_vec_pretty(&records)?,
+            )?;
             return Ok(());
         }
         let _ = window.request_inner_size(PhysicalSize::new(512, 512));

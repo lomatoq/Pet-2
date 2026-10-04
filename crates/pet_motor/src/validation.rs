@@ -302,11 +302,11 @@ fn activation_fixture(
             EmbodiedGestureKind::Hold,
             "gesture=hold, confidence=0.80 (>0.44)",
         ),
-        P::TouchPullReleaseRebound => gesture_fixture(
-            &mut context,
-            EmbodiedGestureKind::PullAndRelease,
-            "gesture=pull_and_release, confidence=0.80 (>0.44)",
-        ),
+        P::TouchPullReleaseRebound => {
+            context.body.shape.neck_tension = 0.6;
+            gesture_fixture(&mut context, EmbodiedGestureKind::PullAndRelease,
+                "gesture=pull_and_release, confidence=0.80, measured neck_tension=0.60 (>0.30)")
+        }
         P::TouchStrokeFollow => gesture_fixture(
             &mut context,
             EmbodiedGestureKind::SlowStretch,

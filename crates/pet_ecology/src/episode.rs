@@ -336,7 +336,9 @@ impl EpisodeAdaptation {
         if id == 0 || self.recent.contains(&id) {
             return false;
         }
-        if id & (1u64 << 63) == 0 { self.placement_event_sequence = self.placement_event_sequence.max(id); }
+        if id & (1u64 << 63) == 0 {
+            self.placement_event_sequence = self.placement_event_sequence.max(id);
+        }
         self.recent[self.cursor] = id;
         self.cursor = (self.cursor + 1) % self.recent.len();
         true
@@ -362,17 +364,30 @@ pub struct EpisodeMemory {
 }
 impl EpisodeMemory {
     pub fn is_valid(&self) -> bool {
-        self.adaptation.placement.iter().all(|v| v.is_finite() && (-4.0..=8.0).contains(v))
-            && self.adaptation.game.iter().all(|v| v.is_finite() && (-6.0..=8.0).contains(v))
+        self.adaptation
+            .placement
+            .iter()
+            .all(|v| v.is_finite() && (-4.0..=8.0).contains(v))
+            && self
+                .adaptation
+                .game
+                .iter()
+                .all(|v| v.is_finite() && (-6.0..=8.0).contains(v))
             && self.adaptation.cursor < 16
             && self.adaptation.placement_event_sequence < (1u64 << 63)
-            && [self.orb_bid_cooldown, self.endogenous_play_cooldown, self.petting_cooldown]
-                .iter().all(|v| v.is_finite() && (0.0..=120.0).contains(v))
+            && [
+                self.orb_bid_cooldown,
+                self.endogenous_play_cooldown,
+                self.petting_cooldown,
+            ]
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=120.0).contains(v))
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct EpisodeDirector {
+    activations: [f32; crate::EPISODE_GOAL_COUNT],
     adaptation: EpisodeAdaptation,
     prediction_observer: crate::orb_experience::OrbPredictionObserver,
     active: Option<ActivityEpisode>,
@@ -390,6 +405,7 @@ pub struct EpisodeDirector {
 impl Default for EpisodeDirector {
     fn default() -> Self {
         Self {
+            activations: [0.0; crate::EPISODE_GOAL_COUNT],
             adaptation: EpisodeAdaptation::default(),
             prediction_observer: Default::default(),
             active: None,
@@ -408,32 +424,63 @@ impl Default for EpisodeDirector {
 
 impl EpisodeDirector {
     pub fn from_memory(memory: &EpisodeMemory) -> Self {
-        if !memory.is_valid() { return Self::default(); }
-        Self { adaptation: memory.adaptation.clone(), orb_bid_cooldown: memory.orb_bid_cooldown,
+        if !memory.is_valid() {
+            return Self::default();
+        }
+        Self {
+            adaptation: memory.adaptation.clone(),
+            orb_bid_cooldown: memory.orb_bid_cooldown,
             endogenous_play_cooldown: memory.endogenous_play_cooldown,
-            petting_cooldown: memory.petting_cooldown, ..Self::default() }
+            petting_cooldown: memory.petting_cooldown,
+            ..Self::default()
+        }
     }
     pub fn memory(&self) -> EpisodeMemory {
-        EpisodeMemory { adaptation: self.adaptation.clone(), orb_bid_cooldown: self.orb_bid_cooldown,
-            endogenous_play_cooldown: self.endogenous_play_cooldown, petting_cooldown: self.petting_cooldown }
+        EpisodeMemory {
+            adaptation: self.adaptation.clone(),
+            orb_bid_cooldown: self.orb_bid_cooldown,
+            endogenous_play_cooldown: self.endogenous_play_cooldown,
+            petting_cooldown: self.petting_cooldown,
+        }
     }
-    pub fn placement_event_sequence(&self) -> u64 { self.adaptation.placement_event_sequence }
+    pub fn placement_event_sequence(&self) -> u64 {
+        self.adaptation.placement_event_sequence
+    }
     /// A measured bite can select the crumb actually at the lips, even when
     /// attention was aimed at a different crumb. Never restart chewing/refusal.
     pub fn observe_mouth_contact(&mut self, state: &mut EcologyState, object_id: ObjectId) {
-        if self.active.is_some_and(|a| matches!(a.goal,
-            EpisodeGoal::EscapePressure | EpisodeGoal::RecoverAfterPressure |
-            EpisodeGoal::SleepInDen | EpisodeGoal::RefuseMorsel)
-            || (a.goal == EpisodeGoal::EatMorsel && (a.phase == EpisodePhase::Recover
-                || a.object_id == Some(object_id)
-                || state.objects.iter().any(|o| Some(o.id) == a.object_id
-                    && o.lifecycle == ObjectLifecycle::CarriedByPet)))) { return; }
-        let Some(food) = state.objects.iter().find(|o| o.id == object_id
-            && o.kind == ObjectKind::Morsel && o.morsel_profile.is_some()
-            && matches!(o.lifecycle, ObjectLifecycle::Free | ObjectLifecycle::Sleeping)) else { return; };
+        if self.active.is_some_and(|a| {
+            matches!(
+                a.goal,
+                EpisodeGoal::EscapePressure
+                    | EpisodeGoal::RecoverAfterPressure
+                    | EpisodeGoal::SleepInDen
+                    | EpisodeGoal::RefuseMorsel
+            ) || (a.goal == EpisodeGoal::EatMorsel
+                && (a.phase == EpisodePhase::Recover
+                    || a.object_id == Some(object_id)
+                    || state.objects.iter().any(|o| {
+                        Some(o.id) == a.object_id && o.lifecycle == ObjectLifecycle::CarriedByPet
+                    })))
+        }) {
+            return;
+        }
+        let Some(food) = state.objects.iter().find(|o| {
+            o.id == object_id
+                && o.kind == ObjectKind::Morsel
+                && o.morsel_profile.is_some()
+                && matches!(
+                    o.lifecycle,
+                    ObjectLifecycle::Free | ObjectLifecycle::Sleeping
+                )
+        }) else {
+            return;
+        };
         let target = food.position;
         if let Some(active) = &mut self.active
-            && active.goal == EpisodeGoal::InspectMorsel && active.object_id == Some(object_id) {
+            && active.goal == EpisodeGoal::InspectMorsel
+            && active.object_id == Some(object_id)
+        {
             set_phase(active, EpisodePhase::Evaluate);
             return;
         }
@@ -445,14 +492,24 @@ impl EpisodeDirector {
         state.episode_stats.next_episode_id = id.saturating_add(1).max(1);
         state.episode_stats.started[goal.index()] += 1;
         self.active = Some(ActivityEpisode {
-            play_variant: 0, play_evidence_recorded: false,
-            feeding_bite: crate::FeedingBite::default(), id, goal,
-            phase: EpisodePhase::Evaluate, object_id: Some(object_id),
-            target_position: Some(target), reason_code: EpisodeReason::FoodOpportunity,
-            elapsed_seconds: 0.0, phase_elapsed_seconds: 0.0,
-            commitment_remaining: commitment_for(goal), attempts: 0,
-            prediction_confidence: 1.0, bout_play_drive: 0.0, bout_fatigue: 0.0,
-            contact_side: 0.0, expected_outcome: expected_outcome_for(goal),
+            play_variant: 0,
+            play_evidence_recorded: false,
+            feeding_bite: crate::FeedingBite::default(),
+            id,
+            goal,
+            phase: EpisodePhase::Evaluate,
+            object_id: Some(object_id),
+            target_position: Some(target),
+            reason_code: EpisodeReason::FoodOpportunity,
+            elapsed_seconds: 0.0,
+            phase_elapsed_seconds: 0.0,
+            commitment_remaining: commitment_for(goal),
+            attempts: 0,
+            prediction_confidence: 1.0,
+            bout_play_drive: 0.0,
+            bout_fatigue: 0.0,
+            contact_side: 0.0,
+            expected_outcome: expected_outcome_for(goal),
         });
     }
 
@@ -630,7 +687,8 @@ impl EpisodeDirector {
         } else {
             0.0
         };
-        self.prediction_observer.observe(state,frame.desktop_aspect,dt,frame.timestamp);
+        self.prediction_observer
+            .observe(state, frame.desktop_aspect, dt, frame.timestamp);
         self.visual_episode_cooldown = (self.visual_episode_cooldown - dt).max(0.0);
         self.orb_bid_cooldown = (self.orb_bid_cooldown - dt).max(0.0);
         self.endogenous_play_cooldown = (self.endogenous_play_cooldown - dt).max(0.0);
@@ -671,9 +729,8 @@ impl EpisodeDirector {
         let mut output = empty_output(brain_intent);
         output.debug.tick = self.tick;
         output.debug.focus_mode_filtered = frame.focus_mode;
-        fill_candidate_trace(&mut output.debug, state, frame);
 
-        if frame.window_pressure >= 0.34
+        if frame.window_pressure >= 0.22
             && self
                 .active
                 .is_some_and(|episode| episode.goal != EpisodeGoal::EscapePressure)
@@ -704,6 +761,20 @@ impl EpisodeDirector {
             push_outcome(
                 &mut output,
                 EcologyOutcome::EpisodeAborted(interrupted.goal, EpisodeReason::FocusModeRetreat),
+            );
+        }
+
+        if (frame.sleeping || frame.selected_action == ActionId::Sleep)
+            && frame.window_pressure < 0.22
+            && self
+                .active
+                .is_some_and(|e| e.goal != EpisodeGoal::SleepInDen)
+            && let Some(interrupted) = self.active.take()
+        {
+            state.episode_stats.aborted[interrupted.goal.index()] += 1;
+            push_outcome(
+                &mut output,
+                EcologyOutcome::EpisodeAborted(interrupted.goal, EpisodeReason::SafetyAbort),
             );
         }
 
@@ -753,7 +824,8 @@ impl EpisodeDirector {
             let in_diameters = offset / diameter;
             let follow = in_diameters.clamp_length_max(0.35) * diameter;
             self.active = Some(ActivityEpisode {
-                play_variant: 0, play_evidence_recorded: false,
+                play_variant: 0,
+                play_evidence_recorded: false,
                 feeding_bite: crate::FeedingBite::default(),
                 id,
                 goal: EpisodeGoal::SharedAttention,
@@ -779,26 +851,27 @@ impl EpisodeDirector {
                 EcologyOutcome::EpisodeStarted(EpisodeGoal::SharedAttention),
             );
         }
-        if self.active.is_none()
-            && let Some((mut goal, mut reason, object_id)) = select_episode(state, frame)
+        let selected = self.compete(state, frame, dt, &mut output.debug);
+        if let Some(current) = self.active
+            && selected.is_some_and(|candidate| candidate.0 != current.goal)
         {
-            if goal == EpisodeGoal::SoloOrbPlay
-                && reason == EpisodeReason::AutonomousPlay
-                && frame.user_available > 0.65
-                && !frame.focus_mode
-                && self.orb_bid_cooldown <= 0.0
-                && self.adaptation.game[0] >= 3.0
-                && self.adaptation.game[0] > self.adaptation.game[1] + 0.5
-            {
-                goal = EpisodeGoal::OfferOrb;
-                reason = EpisodeReason::UserEngaged;
-            }
+            self.active = None;
+            state.episode_stats.aborted[current.goal.index()] += 1;
+            push_outcome(
+                &mut output,
+                EcologyOutcome::EpisodeAborted(current.goal, EpisodeReason::ObjectNovelty),
+            );
+        }
+        if self.active.is_none()
+            && let Some((goal, reason, object_id)) = selected
+        {
             let id = state.episode_stats.next_episode_id;
             state.episode_stats.next_episode_id = id.saturating_add(1).max(1);
             state.episode_stats.started[goal.index()] =
                 state.episode_stats.started[goal.index()].saturating_add(1);
             self.active = Some(ActivityEpisode {
-                play_variant: 0, play_evidence_recorded: false,
+                play_variant: 0,
+                play_evidence_recorded: false,
                 feeding_bite: crate::FeedingBite::default(),
                 id,
                 goal,
@@ -816,10 +889,16 @@ impl EpisodeDirector {
                 contact_side: 0.0,
                 expected_outcome: expected_outcome_for(goal),
             });
-            if matches!(goal,EpisodeGoal::SoloOrbPlay|EpisodeGoal::ChaseOrb)
-                && let Some(orb)=state.objects.iter().find(|o|Some(o.id)==object_id) {
-                    let variant=state.orb_experience.choose(frame,orb.position,orb.velocity,state.identity_seed);
-                    self.active.as_mut().unwrap().play_variant=variant;
+            if matches!(goal, EpisodeGoal::SoloOrbPlay | EpisodeGoal::ChaseOrb)
+                && let Some(orb) = state.objects.iter().find(|o| Some(o.id) == object_id)
+            {
+                let variant = state.orb_experience.choose(
+                    frame,
+                    orb.position,
+                    orb.velocity,
+                    state.identity_seed,
+                );
+                self.active.as_mut().unwrap().play_variant = variant;
             }
             if goal == EpisodeGoal::SoloOrbPlay && reason == EpisodeReason::AutonomousPlay {
                 self.endogenous_idle_seconds = 0.0;
@@ -829,11 +908,16 @@ impl EpisodeDirector {
             output.debug.selected_reason = reason;
         }
 
-        let held_orb = state.objects.iter().find(|o| o.kind == ObjectKind::Orb
-            && o.lifecycle == ObjectLifecycle::GrabbedByUser).map(|o| o.position);
-        if held_orb.is_some() && held_orb_play_margin(state, frame) < -0.06
+        let held_orb = state
+            .objects
+            .iter()
+            .find(|o| o.kind == ObjectKind::Orb && o.lifecycle == ObjectLifecycle::GrabbedByUser)
+            .map(|o| o.position);
+        if held_orb.is_some()
+            && held_orb_play_margin(state, frame) < -0.06
             && self.active.is_some_and(|e| e.goal == EpisodeGoal::ChaseOrb)
-            && let Some(mut ended) = self.active.take() {
+            && let Some(mut ended) = self.active.take()
+        {
             ended.phase = EpisodePhase::Complete;
             state.episode_stats.completed[ended.goal.index()] += 1;
             push_outcome(&mut output, EcologyOutcome::EpisodeCompleted(ended.goal));
@@ -841,7 +925,10 @@ impl EpisodeDirector {
         let Some(mut active) = self.active.take() else {
             if let Some(orb_position) = held_orb
                 && held_orb_play_margin(state, frame) <= 0.0
-                && !frame.sleeping && !frame.focus_mode && frame.window_pressure < 0.22 {
+                && !frame.sleeping
+                && !frame.focus_mode
+                && frame.window_pressure < 0.22
+            {
                 output.body_intent.target_position = frame.pet_position;
                 output.body_intent.target_surface = None;
                 output.body_intent.locomotion = LocomotionMode::Arrive;
@@ -853,31 +940,51 @@ impl EpisodeDirector {
             output.visual_context = visual_context(state, None, frame);
             return output;
         };
-        active.bout_play_drive += (frame.play_drive-active.bout_play_drive)*(1.0-(-dt/0.8).exp());
-        active.bout_fatigue += (frame.social_contact.fatigue-active.bout_fatigue)*(1.0-(-dt/1.2).exp());
+        active.bout_play_drive +=
+            (frame.play_drive - active.bout_play_drive) * (1.0 - (-dt / 0.8).exp());
+        active.bout_fatigue +=
+            (frame.social_contact.fatigue - active.bout_fatigue) * (1.0 - (-dt / 1.2).exp());
         active.elapsed_seconds += dt;
         active.phase_elapsed_seconds += dt;
         active.commitment_remaining = (active.commitment_remaining - dt).max(0.0);
         let previous_goal = active.goal;
         let step = drive_episode(state, frame, &mut active, &mut output, dt);
-        if !matches!(previous_goal,EpisodeGoal::ChaseOrb|EpisodeGoal::SoloOrbPlay)
-            && matches!(active.goal,EpisodeGoal::ChaseOrb|EpisodeGoal::SoloOrbPlay)
-            && let Some(orb)=state.objects.iter().find(|o|Some(o.id)==active.object_id) {
-                active.play_variant=state.orb_experience.choose(frame,orb.position,orb.velocity,state.identity_seed);
-                active.play_evidence_recorded=false;
+        if !matches!(
+            previous_goal,
+            EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay
+        ) && matches!(
+            active.goal,
+            EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay
+        ) && let Some(orb) = state
+            .objects
+            .iter()
+            .find(|o| Some(o.id) == active.object_id)
+        {
+            active.play_variant =
+                state
+                    .orb_experience
+                    .choose(frame, orb.position, orb.velocity, state.identity_seed);
+            active.play_evidence_recorded = false;
         }
-        if matches!(previous_goal,EpisodeGoal::ChaseOrb|EpisodeGoal::SoloOrbPlay)
-            && !active.play_evidence_recorded {
-            let free_object=state.objects.iter().any(|o|Some(o.id)==active.object_id
-                && o.lifecycle!=ObjectLifecycle::GrabbedByUser);
+        if matches!(
+            previous_goal,
+            EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay
+        ) && !active.play_evidence_recorded
+        {
+            let free_object = state.objects.iter().any(|o| {
+                Some(o.id) == active.object_id && o.lifecycle != ObjectLifecycle::GrabbedByUser
+            });
             let contact=frame.orb_physical.contact && free_object
                 && output.object_commands[..output.object_command_count].iter().any(|command|
                     matches!(command,ObjectCommand::ApplyImpulse{object_id,..} if Some(*object_id)==active.object_id));
-            let failed=free_object && active.elapsed_seconds>0.5
-                && matches!(step,EpisodeStep::Abort(EpisodeReason::TimedOut));
+            let failed = free_object
+                && active.elapsed_seconds > 0.5
+                && matches!(step, EpisodeStep::Abort(EpisodeReason::TimedOut));
             if contact || failed {
-                state.orb_experience.observe_contact(active.play_variant,contact);
-                active.play_evidence_recorded=true;
+                state
+                    .orb_experience
+                    .observe_contact(active.play_variant, contact);
+                active.play_evidence_recorded = true;
             }
         }
 
@@ -981,188 +1088,26 @@ fn empty_output(body_intent: BodyIntent) -> EcologyOutput {
     }
 }
 
-fn select_episode(
-    state: &EcologyState,
-    frame: EcologyBehaviorFrame,
-) -> Option<(EpisodeGoal, EpisodeReason, Option<ObjectId>)> {
-    let orb = state
-        .objects
-        .iter()
-        .find(|object| object.kind == ObjectKind::Orb)?;
-    if frame.window_pressure >= 0.22 {
-        return Some((
-            EpisodeGoal::EscapePressure,
-            EpisodeReason::WindowPressure,
-            None,
-        ));
-    }
-    if frame.focus_mode {
-        return (frame.pet_position.distance(state.den.anchor) > 0.045).then_some((
-            EpisodeGoal::ReturnHome,
-            EpisodeReason::FocusModeRetreat,
-            None,
-        ));
-    }
-    // Opportunistic food must not repeatedly wake a sleeping animal.
-    if frame.sleeping || frame.selected_action == ActionId::Sleep {
-        return Some((EpisodeGoal::SleepInDen, EpisodeReason::ReturnToDen, None));
-    }
-    if let Some(morsel) = state.objects.iter().find(|object| {
-        object.kind == ObjectKind::Morsel
-            && (state.metabolism.satiation < 0.88 || object.radius_px_at_reference > 3.0)
-            && matches!(
-                object.lifecycle,
-                ObjectLifecycle::Free | ObjectLifecycle::Sleeping
-            )
-            && object.morsel_profile.is_some()
-            && (object.preference >= -0.01
-                || frame.timestamp - object.last_interaction_seconds >= 45.0)
-    }) {
-        return Some((
-            EpisodeGoal::InspectMorsel,
-            EpisodeReason::FoodOpportunity,
-            Some(morsel.id),
-        ));
-    }
-    if frame.orb_trapped {
-        return Some((
-            EpisodeGoal::RetrieveOrb,
-            EpisodeReason::TrappedObject,
-            Some(orb.id),
-        ));
-    }
-    if frame.selected_action == ActionId::MimicClickRhythm && frame.click_rhythm.is_some() {
-        return Some((EpisodeGoal::RhythmEcho, EpisodeReason::UserEngaged, None));
-    }
-    if frame.shared_attention && frame.visual_target.is_some() {
-        return Some((
-            EpisodeGoal::SharedAttention,
-            EpisodeReason::SharedAttentionCue,
-            None,
-        ));
-    }
-    if frame.visual_target.is_some()
-        && frame.visual_strength >= 0.12
-        && (frame.visual_surprise >= 0.18
-            || (frame.selected_action == ActionId::ExploreScreen
-                && (frame.visual_colorfulness >= 0.42 || frame.visual_structure >= 0.24)))
-    {
-        let color_dominates =
-            frame.visual_colorfulness >= frame.visual_structure.max(frame.visual_surprise);
-        return Some((
-            if color_dominates {
-                EpisodeGoal::ChromaticEcho
-            } else {
-                EpisodeGoal::SharedAttention
-            },
-            EpisodeReason::VisualNovelty,
-            None,
-        ));
-    }
-    if orb.lifecycle == ObjectLifecycle::GrabbedByUser {
-        if held_orb_play_margin(state, frame) <= 0.0 { return None; }
-        return Some((
-            EpisodeGoal::ChaseOrb,
-            EpisodeReason::UserEngaged,
-            Some(orb.id),
-        ));
-    }
-    if frame.autonomous_play_ready
-        && frame.selected_action != ActionId::BringProceduralOrb
-        && (orb.novelty > 0.04 || orb.preference > 0.1)
-    {
-        return Some((
-            if orb.lifecycle == ObjectLifecycle::StoredInDen {
-                EpisodeGoal::RetrieveOrb
-            } else {
-                EpisodeGoal::SoloOrbPlay
-            },
-            EpisodeReason::AutonomousPlay,
-            Some(orb.id),
-        ));
-    }
-    match frame.selected_action {
-        ActionId::HappyDisplay => state
-            .skills
-            .skills
-            .iter()
-            .filter(|skill| {
-                frame.timestamp - skill.last_used_seconds >= crate::MIN_PRACTICE_COOLDOWN_SECONDS
-            })
-            .max_by(|left, right| {
-                // Competence supports a confident display, while recent use
-                // makes room for another learned movement. No fabricated win.
-                practice_score(left, frame).total_cmp(&practice_score(right, frame))
-            })
-            .map(|skill| {
-                (
-                    EpisodeGoal::PerformSkill,
-                    EpisodeReason::PracticeDue,
-                    Some(skill.id),
-                )
-            }),
-        ActionId::HideAndSeek if frame.visual_target.is_some() => Some((
-            EpisodeGoal::Camouflage,
-            EpisodeReason::SharedAttentionCue,
-            None,
-        )),
-        ActionId::ExploreScreen
-            if frame.visual_target.is_some() && frame.visual_strength >= 0.28 =>
-        {
-            Some((
-                EpisodeGoal::ChromaticEcho,
-                EpisodeReason::SharedAttentionCue,
-                None,
-            ))
-        }
-        ActionId::BringProceduralOrb => Some((
-            if orb.lifecycle == ObjectLifecycle::StoredInDen {
-                EpisodeGoal::RetrieveOrb
-            } else {
-                EpisodeGoal::OfferOrb
-            },
-            EpisodeReason::BrainRequestedOrb,
-            Some(orb.id),
-        )),
-        ActionId::PlayCursorChase | ActionId::InviteCursorChase => Some((
-            EpisodeGoal::ChaseOrb,
-            EpisodeReason::UserEngaged,
-            Some(orb.id),
-        )),
-        ActionId::SelfPlay if orb.lifecycle != ObjectLifecycle::GrabbedByUser => Some((
-            if orb.lifecycle == ObjectLifecycle::StoredInDen {
-                EpisodeGoal::RetrieveOrb
-            } else {
-                EpisodeGoal::SoloOrbPlay
-            },
-            EpisodeReason::AutonomousPlay,
-            Some(orb.id),
-        )),
-        ActionId::LandOnWindow if frame.nearest_window_edge.is_some() => {
-            Some((EpisodeGoal::RideWindow, EpisodeReason::ObjectNovelty, None))
-        }
-        ActionId::ClingToWindowSide if frame.nearest_window_edge.is_some() => Some((
-            EpisodeGoal::InspectWindow,
-            EpisodeReason::ObjectNovelty,
-            None,
-        )),
-        _ => None,
-    }
-}
-
 // Offering a toy is an invitation. Current recovery costs can outweigh its
 // appeal without changing attachment or the learned value of the toy.
 fn held_orb_play_margin(state: &EcologyState, frame: EcologyBehaviorFrame) -> f32 {
-    let affinity = state.objects.iter().find(|o| o.kind == ObjectKind::Orb)
+    let affinity = state
+        .objects
+        .iter()
+        .find(|o| o.kind == ObjectKind::Orb)
         .map_or(0.0, |o| o.preference.max(0.0) * o.familiarity);
     let fatigue = frame.social_contact.fatigue.clamp(0.0, 1.0);
     let stress = frame.play_state.affect.stress.clamp(0.0, 1.0);
-    let interest = frame.play_drive * 0.65 + frame.curiosity_drive * 0.3
-        + frame.play_state.playfulness * 0.18 + affinity * 0.2
+    let interest = frame.play_drive * 0.65
+        + frame.curiosity_drive * 0.3
+        + frame.play_state.playfulness * 0.18
+        + affinity * 0.2
         + frame.play_state.felt.play_readiness * 0.25;
     let engagement = interest * state.metabolism.reserve * (1.0 - fatigue) * (1.0 - stress);
-    let recovery = fatigue * 0.45 + stress * 0.55
-        + state.metabolism.satiation.powi(2) * 0.18 + frame.autonomy_drive * 0.1;
+    let recovery = fatigue * 0.45
+        + stress * 0.55
+        + state.metabolism.satiation.powi(2) * 0.18
+        + frame.autonomy_drive * 0.1;
     engagement - recovery
 }
 
@@ -1170,195 +1115,390 @@ fn practice_score(skill: &crate::LearnedSkill, frame: EcologyBehaviorFrame) -> f
     let age = (frame.timestamp - skill.last_used_seconds).max(0.0) as f32;
     let freshness = 1.0 - (-age / 180.0).exp();
     let learning = skill.uncertainty * (0.25 + frame.curiosity_drive * 0.4);
-    skill.competence * 0.35 + freshness * 0.75 + learning
-        + skill.social_value.max(0.0) * 0.15
+    skill.competence * 0.35 + freshness * 0.75 + learning + skill.social_value.max(0.0) * 0.15
 }
 
-fn fill_candidate_trace(
-    trace: &mut EcologyDecisionTrace,
-    state: &EcologyState,
-    frame: EcologyBehaviorFrame,
-) {
-    let orb = state
-        .objects
-        .iter()
-        .find(|object| object.kind == ObjectKind::Orb);
-    let morsel = state.objects.iter().find(|object| {
-        object.kind == ObjectKind::Morsel
-            && (state.metabolism.satiation < 0.88 || object.radius_px_at_reference > 3.0)
-            && matches!(
-                object.lifecycle,
-                ObjectLifecycle::Free | ObjectLifecycle::Sleeping
-            )
-    });
-    let practice_skill = state
-        .skills
-        .skills
-        .iter()
-        .filter(|skill| {
-            frame.timestamp - skill.last_used_seconds >= crate::MIN_PRACTICE_COOLDOWN_SECONDS
-        })
-        .max_by(|left, right| practice_score(left, frame).total_cmp(&practice_score(right, frame)));
-    let candidates = [
-        (
-            EpisodeGoal::EscapePressure,
-            frame.window_pressure,
-            frame.window_pressure >= 0.22,
-            EpisodeReason::WindowPressure,
-        ),
-        (
-            EpisodeGoal::RetrieveOrb,
-            if frame.orb_trapped { 0.96 } else { 0.0 },
-            frame.orb_trapped,
-            EpisodeReason::TrappedObject,
-        ),
-        (
-            EpisodeGoal::ReturnHome,
-            if frame.focus_mode { 1.0 } else { 0.0 },
-            frame.focus_mode,
-            EpisodeReason::FocusModeRetreat,
-        ),
-        (
-            EpisodeGoal::SleepInDen,
-            if frame.sleeping { 0.95 } else { 0.0 },
-            frame.sleeping,
-            EpisodeReason::ReturnToDen,
-        ),
-        (
-            EpisodeGoal::OfferOrb,
-            if frame.selected_action == ActionId::BringProceduralOrb {
-                0.86
+#[derive(Clone, Copy, Default)]
+struct EpisodeCandidate {
+    utility: f32,
+    eligible: bool,
+    reason: EpisodeReason,
+    object_id: Option<ObjectId>,
+}
+
+impl EpisodeDirector {
+    fn compete(
+        &mut self,
+        state: &EcologyState,
+        frame: EcologyBehaviorFrame,
+        dt: f32,
+        trace: &mut EcologyDecisionTrace,
+    ) -> Option<(EpisodeGoal, EpisodeReason, Option<ObjectId>)> {
+        let mut candidates = [EpisodeCandidate::default(); crate::EPISODE_GOAL_COUNT];
+        let fatigue = frame.social_contact.fatigue.clamp(0.0, 1.0);
+        let stress = frame.play_state.affect.stress.clamp(0.0, 1.0);
+        let capacity = (1.0 - fatigue).powi(2) * state.metabolism.reserve * (1.0 - stress * 0.7);
+        let mut add = |goal: EpisodeGoal, utility: f32, reason, object_id| {
+            let candidate = &mut candidates[goal.index()];
+            let utility = if utility.is_finite() {
+                utility.clamp(0.0, 1.5)
             } else {
                 0.0
-            },
-            orb.is_some() && !frame.focus_mode,
-            EpisodeReason::BrainRequestedOrb,
-        ),
-        (
-            EpisodeGoal::ChaseOrb,
-            if matches!(
-                frame.selected_action,
-                ActionId::PlayCursorChase | ActionId::InviteCursorChase
-            ) {
-                0.78
-            } else {
-                0.0
-            },
-            orb.is_some() && !frame.focus_mode,
-            EpisodeReason::UserEngaged,
-        ),
-        (
-            EpisodeGoal::SoloOrbPlay,
-            if frame.autonomous_play_ready {
-                0.76
-            } else if frame.selected_action == ActionId::SelfPlay {
-                0.70
-            } else {
-                0.0
-            },
-            orb.is_some() && !frame.focus_mode,
-            if frame.autonomous_play_ready {
-                EpisodeReason::AutonomousPlay
-            } else {
-                EpisodeReason::ObjectNovelty
-            },
-        ),
-        (
-            EpisodeGoal::RideWindow,
-            if frame.selected_action == ActionId::LandOnWindow {
-                0.74 + frame.window_motion * 0.12
-            } else {
-                0.0
-            },
-            frame.nearest_window_edge.is_some() && !frame.focus_mode,
-            EpisodeReason::ObjectNovelty,
-        ),
-        (
-            EpisodeGoal::InspectWindow,
-            if frame.selected_action == ActionId::ClingToWindowSide {
-                0.72
-            } else {
-                0.0
-            },
-            frame.nearest_window_edge.is_some() && !frame.focus_mode,
-            EpisodeReason::ObjectNovelty,
-        ),
-        (
-            EpisodeGoal::InspectMorsel,
-            morsel.map_or(0.0, |object| 0.62 + object.novelty * 0.22),
-            morsel.is_some() && !frame.focus_mode && frame.window_pressure < 0.22,
-            EpisodeReason::FoodOpportunity,
-        ),
-        (
-            EpisodeGoal::SharedAttention,
-            if frame.shared_attention {
-                0.98
-            } else {
-                frame.visual_strength * frame.visual_structure.max(frame.visual_surprise) * 0.92
-            },
-            frame.visual_target.is_some()
-                && (frame.shared_attention
-                    || frame.visual_surprise >= 0.18
-                    || (frame.selected_action == ActionId::ExploreScreen
-                        && frame.visual_structure >= 0.24))
-                && !frame.focus_mode,
-            if frame.shared_attention {
-                EpisodeReason::SharedAttentionCue
-            } else {
-                EpisodeReason::VisualNovelty
-            },
-        ),
-        (
-            EpisodeGoal::ChromaticEcho,
-            frame.visual_strength * frame.visual_colorfulness.max(0.35) * 0.90,
-            frame.visual_target.is_some()
-                && (frame.selected_action == ActionId::ExploreScreen
-                    || (frame.visual_surprise >= 0.18 && frame.visual_colorfulness >= 0.42))
-                && !frame.focus_mode,
-            if frame.visual_colorfulness >= 0.42 {
-                EpisodeReason::VisualNovelty
-            } else {
-                EpisodeReason::SharedAttentionCue
-            },
-        ),
-        (
-            EpisodeGoal::Camouflage,
-            if frame.selected_action == ActionId::HideAndSeek {
-                0.72
-            } else {
-                0.0
-            },
-            frame.visual_target.is_some() && !frame.focus_mode,
-            EpisodeReason::SharedAttentionCue,
-        ),
-        (
-            EpisodeGoal::PerformSkill,
-            practice_skill.map_or(0.0, |skill| practice_score(skill, frame)),
-            practice_skill.is_some()
-                && frame.selected_action == ActionId::HappyDisplay
-                && !frame.focus_mode,
-            EpisodeReason::PracticeDue,
-        ),
-        (
-            EpisodeGoal::RhythmEcho,
-            frame
-                .click_rhythm
-                .map_or(0.0, |rhythm| 0.48 + rhythm.beat_count as f32 / 9.0 * 0.32),
-            frame.click_rhythm.is_some()
-                && frame.selected_action == ActionId::MimicClickRhythm
-                && !frame.focus_mode,
-            EpisodeReason::UserEngaged,
-        ),
-    ];
-    for (index, (goal, score, eligible, reason)) in candidates.into_iter().enumerate() {
-        trace.scores[index] = GoalScore {
-            goal: Some(goal),
-            score,
-            eligible,
-            reason,
+            };
+            if !candidate.eligible || utility > candidate.utility {
+                *candidate = EpisodeCandidate {
+                    utility,
+                    eligible: true,
+                    reason,
+                    object_id,
+                };
+            }
         };
+        // Invariants filter the action space before object-dependent affordances.
+        let hard_goal = if frame.window_pressure >= 0.22 {
+            add(
+                EpisodeGoal::EscapePressure,
+                1.5,
+                EpisodeReason::WindowPressure,
+                None,
+            );
+            Some(EpisodeGoal::EscapePressure)
+        } else if frame.focus_mode {
+            if !frame.seated_in_den && frame.pet_position.distance(state.den.anchor) > 0.045 {
+                add(
+                    EpisodeGoal::ReturnHome,
+                    1.5,
+                    EpisodeReason::FocusModeRetreat,
+                    None,
+                );
+                Some(EpisodeGoal::ReturnHome)
+            } else {
+                None
+            }
+        } else if frame.sleeping || frame.selected_action == ActionId::Sleep {
+            add(
+                EpisodeGoal::SleepInDen,
+                1.5,
+                EpisodeReason::ReturnToDen,
+                None,
+            );
+            Some(EpisodeGoal::SleepInDen)
+        } else {
+            // Food competes by actual physiological need, taste, familiarity and
+            // travel cost. Select the best real morsel rather than vector order.
+            for morsel in state.objects.iter().filter(|o| {
+                o.kind == ObjectKind::Morsel
+                    && (state.metabolism.satiation < 0.88 || o.radius_px_at_reference > 3.0)
+                    && matches!(
+                        o.lifecycle,
+                        ObjectLifecycle::Free | ObjectLifecycle::Sleeping
+                    )
+                    && (o.preference >= -0.01
+                        || frame.timestamp - o.last_interaction_seconds >= 45.0)
+            }) {
+                if let Some(profile) = &morsel.morsel_profile {
+                    let taste =
+                        evaluate_food_utility(&state.metabolism, &state.taste, profile, stress);
+                    let distance =
+                        desktop_distance(frame.pet_position, morsel.position, frame.desktop_aspect);
+                    let utility = 0.24
+                        + state.metabolism.feeding_appetite() * 0.85
+                        + taste.total * 0.30
+                        + morsel.novelty * 0.10
+                        + morsel.preference * 0.12
+                        - distance.min(1.0) * 0.18
+                        - fatigue * 0.10;
+                    add(
+                        EpisodeGoal::InspectMorsel,
+                        utility.max(0.14),
+                        EpisodeReason::FoodOpportunity,
+                        Some(morsel.id),
+                    );
+                }
+            }
+            let far_from_den =
+                !frame.seated_in_den && frame.pet_position.distance(state.den.anchor) > 0.045;
+            if fatigue > 0.68 && far_from_den {
+                add(
+                    EpisodeGoal::ReturnHome,
+                    fatigue.powi(2) * 0.85 + state.den.familiarity * 0.12,
+                    EpisodeReason::ReturnToDen,
+                    None,
+                );
+            }
+            if let Some(orb) = state.objects.iter().find(|o| o.kind == ObjectKind::Orb) {
+                let distance =
+                    desktop_distance(frame.pet_position, orb.position, frame.desktop_aspect)
+                        .min(1.0);
+                let appeal = frame.play_drive * 0.50
+                    + frame.curiosity_drive * 0.24
+                    + frame.play_state.playfulness * 0.16
+                    + orb.novelty * 0.18
+                    + orb.preference * orb.familiarity * 0.20;
+                let play = capacity * (0.26 + appeal) - distance * 0.10;
+                let free = matches!(
+                    orb.lifecycle,
+                    ObjectLifecycle::Free
+                        | ObjectLifecycle::Sleeping
+                        | ObjectLifecycle::CarriedByPet
+                );
+                let stored = orb.lifecycle == ObjectLifecycle::StoredInDen;
+                let self_prior = if frame.selected_action == ActionId::SelfPlay {
+                    0.40 * capacity
+                } else {
+                    0.0
+                };
+                let offer_prior = if frame.selected_action == ActionId::BringProceduralOrb {
+                    0.40 * capacity
+                } else {
+                    0.0
+                };
+                let chase_prior = if matches!(
+                    frame.selected_action,
+                    ActionId::PlayCursorChase | ActionId::InviteCursorChase
+                ) {
+                    0.40 * capacity
+                } else {
+                    0.0
+                };
+                if frame.orb_trapped {
+                    add(
+                        EpisodeGoal::RetrieveOrb,
+                        0.85 + frame.curiosity_drive * 0.2 - fatigue * 0.2,
+                        EpisodeReason::TrappedObject,
+                        Some(orb.id),
+                    );
+                }
+                if orb.lifecycle == ObjectLifecycle::GrabbedByUser
+                    && held_orb_play_margin(state, frame) > 0.0
+                {
+                    add(
+                        EpisodeGoal::ChaseOrb,
+                        play + 0.35 * capacity,
+                        EpisodeReason::UserEngaged,
+                        Some(orb.id),
+                    );
+                } else if free && chase_prior > 0.0 {
+                    add(
+                        EpisodeGoal::ChaseOrb,
+                        play + chase_prior,
+                        EpisodeReason::UserEngaged,
+                        Some(orb.id),
+                    );
+                }
+                let solo_ready =
+                    frame.autonomous_play_ready && (orb.novelty > 0.04 || orb.preference > 0.1);
+                if (free || stored)
+                    && (solo_ready || self_prior > 0.0)
+                    && self.endogenous_play_cooldown <= 0.0
+                {
+                    add(
+                        if stored {
+                            EpisodeGoal::RetrieveOrb
+                        } else {
+                            EpisodeGoal::SoloOrbPlay
+                        },
+                        play + self_prior + self.adaptation.game[1].clamp(-3.0, 6.0) * 0.035,
+                        EpisodeReason::AutonomousPlay,
+                        Some(orb.id),
+                    );
+                }
+                let learned_offer = (solo_ready || self_prior > 0.0)
+                    && frame.user_available > 0.65
+                    && self.adaptation.game[0] >= 3.0
+                    && self.adaptation.game[0] > self.adaptation.game[1] + 0.5;
+                if (free || stored)
+                    && self.orb_bid_cooldown <= 0.0
+                    && (offer_prior > 0.0 || learned_offer)
+                {
+                    add(
+                        if stored {
+                            EpisodeGoal::RetrieveOrb
+                        } else {
+                            EpisodeGoal::OfferOrb
+                        },
+                        play + offer_prior
+                            + frame.user_available * 0.14
+                            + self.adaptation.game[0].clamp(-3.0, 6.0) * 0.065,
+                        if offer_prior > 0.0 {
+                            EpisodeReason::BrainRequestedOrb
+                        } else {
+                            EpisodeReason::UserEngaged
+                        },
+                        Some(orb.id),
+                    );
+                }
+                if orb.lifecycle == ObjectLifecycle::CarriedByPet && self.active.is_none() {
+                    add(
+                        EpisodeGoal::CarryOrbHome,
+                        0.35 + fatigue * 0.35 + state.den.familiarity * 0.12,
+                        EpisodeReason::ReturnToDen,
+                        Some(orb.id),
+                    );
+                }
+            }
+            if frame.click_rhythm.is_some() && frame.selected_action == ActionId::MimicClickRhythm {
+                add(
+                    EpisodeGoal::RhythmEcho,
+                    0.35 + frame.user_available * 0.25 + capacity * 0.3,
+                    EpisodeReason::UserEngaged,
+                    None,
+                );
+            }
+            if frame.visual_target.is_some() && frame.visual_strength >= 0.12 {
+                let novelty = frame.visual_surprise.max(frame.visual_structure * 0.65);
+                if frame.shared_attention {
+                    add(
+                        EpisodeGoal::SharedAttention,
+                        1.12 * frame.user_available.max(0.5),
+                        EpisodeReason::SharedAttentionCue,
+                        None,
+                    );
+                } else if frame.visual_surprise >= 0.18
+                    || (frame.selected_action == ActionId::ExploreScreen
+                        && frame.visual_structure >= 0.24)
+                {
+                    add(
+                        EpisodeGoal::SharedAttention,
+                        frame.visual_strength
+                            * (0.25 + novelty * 0.65 + frame.curiosity_drive * 0.30),
+                        EpisodeReason::VisualNovelty,
+                        None,
+                    );
+                }
+                if frame.selected_action == ActionId::ExploreScreen
+                    || (frame.visual_surprise >= 0.18 && frame.visual_colorfulness >= 0.42)
+                {
+                    add(
+                        EpisodeGoal::ChromaticEcho,
+                        frame.visual_strength
+                            * (0.30
+                                + frame.visual_colorfulness * 0.70
+                                + frame.curiosity_drive * 0.25),
+                        EpisodeReason::VisualNovelty,
+                        None,
+                    );
+                }
+                if frame.selected_action == ActionId::HideAndSeek {
+                    add(
+                        EpisodeGoal::Camouflage,
+                        0.35 + frame.visual_structure * 0.35 + frame.autonomy_drive * 0.20,
+                        EpisodeReason::SharedAttentionCue,
+                        None,
+                    );
+                }
+            }
+            if frame.nearest_window_edge.is_some() {
+                let prior = if matches!(
+                    frame.selected_action,
+                    ActionId::LandOnWindow | ActionId::ClingToWindowSide
+                ) {
+                    0.45
+                } else {
+                    0.0
+                };
+                if prior > 0.0 {
+                    add(
+                        if frame.selected_action == ActionId::LandOnWindow {
+                            EpisodeGoal::RideWindow
+                        } else {
+                            EpisodeGoal::InspectWindow
+                        },
+                        (prior + frame.window_motion * 0.20 + frame.curiosity_drive * 0.25)
+                            * (1.0 - fatigue * 0.65),
+                        EpisodeReason::ObjectNovelty,
+                        None,
+                    );
+                }
+            }
+            if frame.selected_action == ActionId::HappyDisplay {
+                for skill in state.skills.skills.iter().filter(|s| {
+                    frame.timestamp - s.last_used_seconds >= crate::MIN_PRACTICE_COOLDOWN_SECONDS
+                }) {
+                    add(
+                        EpisodeGoal::PerformSkill,
+                        practice_score(skill, frame) * capacity + 0.25 * capacity,
+                        EpisodeReason::PracticeDue,
+                        Some(skill.id),
+                    );
+                }
+            }
+            None
+        };
+        // Exact exponential update is independent of the sensor tick cadence.
+        let blend = 1.0 - (-dt / 0.45).exp();
+        for (i, candidate) in candidates.iter().enumerate() {
+            let target = if candidate.eligible {
+                candidate.utility
+            } else {
+                0.0
+            };
+            self.activations[i] =
+                (self.activations[i] + (target - self.activations[i]) * blend).clamp(0.0, 1.5);
+        }
+        let hard_filtered = frame.focus_mode
+            || frame.sleeping
+            || frame.selected_action == ActionId::Sleep
+            || frame.window_pressure >= 0.22;
+        let incumbent = self.active;
+        let protected = incumbent.is_some_and(|active| {
+            let carried = active.object_id.is_some_and(|id| {
+                state
+                    .objects
+                    .iter()
+                    .any(|o| o.id == id && o.lifecycle == ObjectLifecycle::CarriedByPet)
+            });
+            !matches!(
+                active.phase,
+                EpisodePhase::Orient
+                    | EpisodePhase::Approach
+                    | EpisodePhase::Inspect
+                    | EpisodePhase::Evaluate
+                    | EpisodePhase::Retry
+            ) || carried
+                || matches!(
+                    active.goal,
+                    EpisodeGoal::EatMorsel | EpisodeGoal::RefuseMorsel | EpisodeGoal::CarryOrbHome
+                )
+                || active.elapsed_seconds < 0.35 + frame.play_state.patience.clamp(0.0, 1.0) * 0.45
+        });
+        if let Some(active) = incumbent
+            && (!hard_filtered || hard_goal == Some(active.goal))
+        {
+            let current = &mut candidates[active.goal.index()];
+            current.eligible = true;
+            current.reason = active.reason_code;
+            current.object_id = active.object_id;
+        }
+        let mut winner = None;
+        let mut best = 0.12;
+        for goal in EpisodeGoal::ALL {
+            let i = goal.index();
+            let c = candidates[i];
+            let is_current = incumbent.is_some_and(|a| a.goal == goal);
+            let eligible = c.eligible && (!protected || is_current || hard_filtered);
+            let commitment = incumbent.filter(|a| a.goal == goal).map_or(0.0, |a| {
+                0.12 + 0.18 * (a.commitment_remaining / commitment_for(a.goal)).clamp(0.0, 1.0)
+            });
+            let score =
+                (c.utility * 0.75 + self.activations[i] * 0.25 + commitment).clamp(0.0, 1.8);
+            trace.scores[i] = GoalScore {
+                goal: Some(goal),
+                score,
+                utility: c.utility,
+                activation: self.activations[i],
+                eligible,
+                reason: c.reason,
+            };
+            if eligible && (score > best || (is_current && score == best)) {
+                winner = Some((goal, c.reason, c.object_id));
+                best = score;
+            }
+        }
+        trace.score_count = crate::EPISODE_GOAL_COUNT;
+        trace.selected_goal = winner.map(|w| w.0);
+        winner
     }
-    trace.score_count = candidates.len();
 }
 
 fn drive_episode(
@@ -1389,17 +1529,28 @@ fn drive_episode(
                 return EpisodeStep::Complete;
             }
             let seated = frame.seated_in_den
-                && Vec2::new(frame.pet_velocity.x * frame.desktop_aspect, frame.pet_velocity.y).length() < 0.035
+                && Vec2::new(
+                    frame.pet_velocity.x * frame.desktop_aspect,
+                    frame.pet_velocity.y,
+                )
+                .length()
+                    < 0.035
                 && (frame.pet_position.x - state.den.anchor.x).abs() * frame.desktop_aspect < 0.10;
-            let arrival_radius = if active.goal == EpisodeGoal::SleepInDen { 0.04 } else { 0.035 };
+            let arrival_radius = if active.goal == EpisodeGoal::SleepInDen {
+                0.04
+            } else {
+                0.035
+            };
             let arrived = seated || frame.pet_position.distance(state.den.anchor) <= arrival_radius;
             // Keep the semantic den target: native cradle navigation uses it to distinguish staying from exiting.
             output.body_intent.target_position = state.den.anchor;
             output.body_intent.gaze_target = Some(state.den.anchor);
-            output.body_intent.desired_speed = if seated { 0.0 } else { output.body_intent.desired_speed.max(0.34) };
-            output.body_intent.locomotion = if active.goal == EpisodeGoal::SleepInDen
-                && arrived
-            {
+            output.body_intent.desired_speed = if seated {
+                0.0
+            } else {
+                output.body_intent.desired_speed.max(0.34)
+            };
+            output.body_intent.locomotion = if active.goal == EpisodeGoal::SleepInDen && arrived {
                 LocomotionMode::Sleep
             } else {
                 LocomotionMode::Arrive
@@ -1409,17 +1560,13 @@ fn drive_episode(
             } else {
                 PoseIntent::Neutral
             };
-            if active.goal == EpisodeGoal::ReturnHome
-                && arrived
-            {
+            if active.goal == EpisodeGoal::ReturnHome && arrived {
                 state.den.visits = state.den.visits.saturating_add(1);
                 state.den.familiarity = (state.den.familiarity + 0.006).clamp(0.0, 1.0);
                 output.vocal_trigger = Some(EcologyVocalTrigger::HomeReturn);
                 return EpisodeStep::Complete;
             }
-            if active.goal == EpisodeGoal::SleepInDen
-                && arrived
-            {
+            if active.goal == EpisodeGoal::SleepInDen && arrived {
                 state.den.comfort_value = (state.den.comfort_value + dt * 0.002).clamp(0.0, 1.0);
                 if !frame.sleeping && active.elapsed_seconds > 0.5 {
                     return EpisodeStep::Complete;
@@ -1460,7 +1607,9 @@ fn drive_episode(
             // yield control when its bounded approach commitment is exhausted.
             // This is a recovery watchdog, not evidence of user refusal.
             if active.phase == EpisodePhase::Approach
-                && !frame.orb_physical.contact && active.commitment_remaining <= 0.0 {
+                && !frame.orb_physical.contact
+                && active.commitment_remaining <= 0.0
+            {
                 return EpisodeStep::Abort(EpisodeReason::TimedOut);
             }
             match active.phase {
@@ -1564,10 +1713,17 @@ fn drive_episode(
             };
             let orb_distance =
                 desktop_distance(frame.pet_position, orb.position, frame.desktop_aspect);
-            let affinity=orb.preference.max(0.0)*orb.familiarity;
-            let relative_speed=(orb.velocity-frame.pet_velocity*Vec2::new(frame.desktop_aspect,1.0)).length();
-            let motivation=frame.play_state.motivation(&state.metabolism,active.bout_play_drive,active.bout_fatigue,affinity,relative_speed);
-            output.debug.orb_motivation=Some(motivation);
+            let affinity = orb.preference.max(0.0) * orb.familiarity;
+            let relative_speed =
+                (orb.velocity - frame.pet_velocity * Vec2::new(frame.desktop_aspect, 1.0)).length();
+            let motivation = frame.play_state.motivation(
+                &state.metabolism,
+                active.bout_play_drive,
+                active.bout_fatigue,
+                affinity,
+                relative_speed,
+            );
+            output.debug.orb_motivation = Some(motivation);
             let play_plan = crate::orb_play_plan(
                 u64::from(active.play_variant),
                 active.attempts,
@@ -1617,7 +1773,8 @@ fn drive_episode(
                 output.body_intent.locomotion = LocomotionMode::Arrive;
                 output.body_intent.interaction_target = Some(InteractionTarget::ProceduralOrb);
                 if active.phase == EpisodePhase::Manipulate {
-                    output.body_intent.target_position = active.target_position.unwrap_or(frame.pet_position);
+                    output.body_intent.target_position =
+                        active.target_position.unwrap_or(frame.pet_position);
                     output.body_intent.desired_speed = 0.20 + active.bout_play_drive * 0.12;
                 }
                 // Ownership survives brief loss of silhouette contact while the
@@ -1633,16 +1790,24 @@ fn drive_episode(
                         < 0.12;
                 if active.phase == EpisodePhase::Manipulate
                     && held
-                    && (desktop_distance(output.body_intent.target_position, frame.pet_position,
-                        frame.desktop_aspect) < 0.025
-                        || active.phase_elapsed_seconds * motivation.effort_rate > motivation.grip + motivation.explore)
+                    && (desktop_distance(
+                        output.body_intent.target_position,
+                        frame.pet_position,
+                        frame.desktop_aspect,
+                    ) < 0.025
+                        || active.phase_elapsed_seconds * motivation.effort_rate
+                            > motivation.grip + motivation.explore)
                 {
                     let wants_home = motivation.home > motivation.explore
-                        && desktop_distance(orb.position, state.den.anchor, frame.desktop_aspect) > DEN_EXIT_DISTANCE;
+                        && desktop_distance(orb.position, state.den.anchor, frame.desktop_aspect)
+                            > DEN_EXIT_DISTANCE;
                     if wants_home {
                         state.episode_stats.completed[EpisodeGoal::SoloOrbPlay.index()] += 1;
                         state.episode_stats.started[EpisodeGoal::CarryOrbHome.index()] += 1;
-                        push_outcome(output, EcologyOutcome::EpisodeCompleted(EpisodeGoal::SoloOrbPlay));
+                        push_outcome(
+                            output,
+                            EcologyOutcome::EpisodeCompleted(EpisodeGoal::SoloOrbPlay),
+                        );
                         active.goal = EpisodeGoal::CarryOrbHome;
                         active.reason_code = EpisodeReason::ReturnToDen;
                         active.elapsed_seconds = 0.0;
@@ -1664,8 +1829,7 @@ fn drive_episode(
                     active.bout_play_drive,
                     active.id,
                 );
-                let preparation =
-                    motivation.preparation * (1.0 + f32::from(plan.strong) * 0.4);
+                let preparation = motivation.preparation * (1.0 + f32::from(plan.strong) * 0.4);
                 if active.phase == EpisodePhase::Prepare
                     && held
                     && active.phase_elapsed_seconds >= preparation
@@ -1703,7 +1867,11 @@ fn drive_episode(
                     );
                 }
                 // Watchdog only: ordinary release follows arrival or accumulated effort.
-                let timeout = if active.phase == EpisodePhase::Manipulate { 30.0 } else { 8.0 };
+                let timeout = if active.phase == EpisodePhase::Manipulate {
+                    30.0
+                } else {
+                    8.0
+                };
                 if active.phase_elapsed_seconds > timeout {
                     return EpisodeStep::Abort(EpisodeReason::TimedOut);
                 }
@@ -1722,7 +1890,10 @@ fn drive_episode(
                 if active.goal == EpisodeGoal::ChaseOrb {
                     state.episode_stats.completed[EpisodeGoal::ChaseOrb.index()] += 1;
                     state.episode_stats.started[EpisodeGoal::SoloOrbPlay.index()] += 1;
-                    push_outcome(output, EcologyOutcome::EpisodeCompleted(EpisodeGoal::ChaseOrb));
+                    push_outcome(
+                        output,
+                        EcologyOutcome::EpisodeCompleted(EpisodeGoal::ChaseOrb),
+                    );
                     active.elapsed_seconds = 0.0;
                     active.commitment_remaining = commitment_for(EpisodeGoal::SoloOrbPlay);
                 }
@@ -1730,9 +1901,11 @@ fn drive_episode(
                 let scale = Vec2::new(frame.desktop_aspect.clamp(0.25, 8.0), 1.0);
                 let direction = ((frame.cursor_position - frame.pet_position) * scale)
                     .normalize_or(Vec2::NEG_Y);
-                active.target_position = Some((frame.pet_position
-                    + (direction * motivation.travel - Vec2::Y * 0.045) / scale)
-                    .clamp(Vec2::splat(0.08), Vec2::splat(0.92)));
+                active.target_position = Some(
+                    (frame.pet_position
+                        + (direction * motivation.travel - Vec2::Y * 0.045) / scale)
+                        .clamp(Vec2::splat(0.08), Vec2::splat(0.92)),
+                );
                 push_command(
                     output,
                     ObjectCommand::MoveToward {
@@ -1845,11 +2018,18 @@ fn drive_episode(
                 EpisodePhase::Prepare => {
                     let lead_seconds =
                         (0.10 + active.prediction_confidence * 0.20).clamp(0.10, 0.30);
-                    let uncertainty=state.object_memories.iter().find(|m|m.object_id==orb_id)
-                        .map_or(0.5,|m|m.prediction_error_ema);
-                    let lead_seconds=lead_seconds*(1.0-uncertainty*0.45);
+                    let uncertainty = state
+                        .object_memories
+                        .iter()
+                        .find(|m| m.object_id == orb_id)
+                        .map_or(0.5, |m| m.prediction_error_ema);
+                    let lead_seconds = lead_seconds * (1.0 - uncertainty * 0.45);
                     active.target_position = Some(state.orb_experience.predict(
-                        orb_position,orb_velocity,frame.desktop_aspect,lead_seconds));
+                        orb_position,
+                        orb_velocity,
+                        frame.desktop_aspect,
+                        lead_seconds,
+                    ));
                     set_phase(active, EpisodePhase::Execute);
                 }
                 EpisodePhase::Execute => {
@@ -1926,6 +2106,8 @@ fn drive_episode(
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             }
             if orb_lifecycle == ObjectLifecycle::StoredInDen {
+                state.den.visits = state.den.visits.saturating_add(1);
+                state.den.familiarity = (state.den.familiarity + 0.012).clamp(0.0, 1.0);
                 return EpisodeStep::Complete;
             }
             let target = if orb_lifecycle == ObjectLifecycle::CarriedByPet {
@@ -1969,9 +2151,8 @@ fn drive_episode(
                         slot,
                     },
                 );
-                state.den.visits = state.den.visits.saturating_add(1);
-                state.den.familiarity = (state.den.familiarity + 0.012).clamp(0.0, 1.0);
-                return EpisodeStep::Complete;
+                // Store is a proposal. Only the next observed stored lifecycle
+                // acknowledges success; a rejected handoff keeps the carrier.
             }
         }
         EpisodeGoal::RetrieveOrb if active.reason_code == EpisodeReason::TrappedObject => {
@@ -2122,7 +2303,9 @@ fn drive_episode(
                     && (orb_position.x - state.den.anchor.x).abs() * frame.desktop_aspect < 0.16
                 {
                     output.body_intent.target_position = Vec2::new(
-                        frame.pet_position.x, (frame.pet_position.y - 0.14).max(0.08));
+                        frame.pet_position.x,
+                        (frame.pet_position.y - 0.14).max(0.08),
+                    );
                 }
                 if orb_lifecycle == ObjectLifecycle::CarriedByPet || frame.orb_physical.contact {
                     push_command(
@@ -2305,9 +2488,13 @@ fn drive_episode(
                         .object_id
                         .and_then(|id| state.objects.iter().find(|o| o.id == id))
                         .is_some_and(|o| o.radius_px_at_reference <= 3.0);
-                    let next_goal = if crate::accepts_morsel(&state.metabolism,
-                        &state.taste, &profile, frame.window_pressure, offered_crumb)
-                    {
+                    let next_goal = if crate::accepts_morsel(
+                        &state.metabolism,
+                        &state.taste,
+                        &profile,
+                        frame.window_pressure,
+                        offered_crumb,
+                    ) {
                         EpisodeGoal::EatMorsel
                     } else if offered_crumb || utility.total <= -0.10 {
                         EpisodeGoal::RefuseMorsel
@@ -2343,9 +2530,14 @@ fn drive_episode(
                 LocomotionMode::Hover
             };
             if active.phase == EpisodePhase::Approach {
-                let target = frame.food_physical.map_or(morsel_position, |f| f.socket_position);
-                let proximity = (1.0 - desktop_distance(frame.pet_position, target, frame.desktop_aspect) / 0.12).clamp(0.0, 1.0);
-                output.body_intent.expression.mouth_open = proximity * (0.18 + 0.62 * state.metabolism.feeding_appetite());
+                let target = frame
+                    .food_physical
+                    .map_or(morsel_position, |f| f.socket_position);
+                let proximity = (1.0
+                    - desktop_distance(frame.pet_position, target, frame.desktop_aspect) / 0.12)
+                    .clamp(0.0, 1.0);
+                output.body_intent.expression.mouth_open =
+                    proximity * (0.18 + 0.62 * state.metabolism.feeding_appetite());
             }
             output.visual_context.active_target = Some(morsel_position);
         }
@@ -2356,7 +2548,7 @@ fn drive_episode(
                 output.body_intent.expression.mouth_open =
                     active.feeding_bite.aperture(active.phase_elapsed_seconds);
                 output.body_intent.expression.mouth_compression =
-                    0.22*(1.0-output.body_intent.expression.mouth_open);
+                    0.22 * (1.0 - output.body_intent.expression.mouth_open);
                 output.body_intent.expression.mouth_curve =
                     if active.feeding_bite.settling(active.phase_elapsed_seconds) {
                         -0.12
@@ -2379,13 +2571,7 @@ fn drive_episode(
                 if food.lifecycle == ObjectLifecycle::GrabbedByUser {
                     return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
                 }
-                if !frame.food_physical.map_or_else(
-                    || {
-                        desktop_distance(frame.pet_position, food.position, frame.desktop_aspect)
-                            <= 0.055
-                    },
-                    |f| f.contact,
-                ) {
+                if !frame.food_physical.is_some_and(|f| f.contact) {
                     active.phase_elapsed_seconds = 0.0;
                     output.body_intent.target_position = frame
                         .food_physical
@@ -2416,7 +2602,12 @@ fn drive_episode(
                 output.body_intent.locomotion = LocomotionMode::Arrive;
                 output.body_intent.desired_speed = 0.12;
                 output.body_intent.pose = PoseIntent::Compact;
-                output.body_intent.expression.mouth_open = 0.42 * (1.0 - crate::ingestion_progress(active.phase_elapsed_seconds, state.metabolism.feeding_appetite()));
+                output.body_intent.expression.mouth_open = 0.42
+                    * (1.0
+                        - crate::ingestion_progress(
+                            active.phase_elapsed_seconds,
+                            state.metabolism.feeding_appetite(),
+                        ));
                 if active.phase_elapsed_seconds
                     < crate::ingestion_seconds(state.metabolism.feeding_appetite())
                 {
@@ -2455,8 +2646,10 @@ fn drive_episode(
             return EpisodeStep::Continue;
         }
         EpisodeGoal::RefuseMorsel => {
-            let Some(morsel) = active.object_id.and_then(|id|
-                state.objects.iter_mut().find(|object| object.id == id)) else {
+            let Some(morsel) = active
+                .object_id
+                .and_then(|id| state.objects.iter_mut().find(|object| object.id == id))
+            else {
                 return EpisodeStep::Abort(EpisodeReason::SafetyAbort);
             };
             if morsel.lifecycle == ObjectLifecycle::GrabbedByUser {
@@ -2466,16 +2659,25 @@ fn drive_episode(
             // Push along the support, not down through a floor crumb.
             let side = if (morsel.position.x - frame.pet_position.x).abs() > 0.001 {
                 (morsel.position.x - frame.pet_position.x).signum()
-            } else if active.id.is_multiple_of(2) { 1.0 } else { -1.0 };
+            } else if active.id.is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            };
             if active.attempts == 0 {
                 morsel.preference = (morsel.preference - 0.18).clamp(-1.0, 1.0);
                 morsel.novelty = (morsel.novelty - 0.12).clamp(0.0, 1.0);
                 morsel.last_interaction_seconds = frame.timestamp.max(0.0);
-                push_command(output, ObjectCommand::ApplyImpulse {
-                    object_id: morsel.id,
-                    impulse: Vec2::new(side * (0.08 + 0.07 * refusal) / frame.desktop_aspect.max(0.1), -0.035)
-                        * morsel.mass.max(0.05),
-                });
+                push_command(
+                    output,
+                    ObjectCommand::ApplyImpulse {
+                        object_id: morsel.id,
+                        impulse: Vec2::new(
+                            side * (0.08 + 0.07 * refusal) / frame.desktop_aspect.max(0.1),
+                            -0.035,
+                        ) * morsel.mass.max(0.05),
+                    },
+                );
                 output.vocal_trigger = Some(EcologyVocalTrigger::FoodRefused);
                 active.attempts = 1;
             }
@@ -2484,16 +2686,20 @@ fn drive_episode(
             output.body_intent.desired_speed = 0.0;
             output.body_intent.locomotion = LocomotionMode::Hover;
             output.body_intent.pose = PoseIntent::Neutral;
-            output.body_intent.gaze_target = Some((frame.pet_position
-                + Vec2::new(-side * 0.045 / frame.desktop_aspect.max(0.1), -0.035) * ease)
-                .clamp(Vec2::ZERO, Vec2::ONE));
+            output.body_intent.gaze_target = Some(
+                (frame.pet_position
+                    + Vec2::new(-side * 0.045 / frame.desktop_aspect.max(0.1), -0.035) * ease)
+                    .clamp(Vec2::ZERO, Vec2::ONE),
+            );
             output.body_intent.expression.mouth_open = 0.0;
             output.body_intent.expression.mouth_compression = 0.25 + 0.35 * refusal;
             output.body_intent.expression.mouth_curve = -0.06 - 0.12 * refusal;
             output.body_intent.expression.squint = (0.12 + 0.22 * refusal) * ease;
             return if active.phase_elapsed_seconds >= 0.55 + 0.40 * refusal {
                 EpisodeStep::Complete
-            } else { EpisodeStep::Continue };
+            } else {
+                EpisodeStep::Continue
+            };
         }
         EpisodeGoal::StoreMorsel => {
             let Some(morsel_id) = active.object_id else {
@@ -2680,8 +2886,16 @@ fn drive_episode(
                 return EpisodeStep::Complete;
             }
             if active.elapsed_seconds >= skill.prototype.duration_seconds + 2.0 {
-                let _ = state.skills.record_attempt(skill_id, 1.0, frame.timestamp.max(0.0), None);
-                push_outcome(output, EcologyOutcome::SkillMotorError { skill_id, error: 1.0 });
+                let _ = state
+                    .skills
+                    .record_attempt(skill_id, 1.0, frame.timestamp.max(0.0), None);
+                push_outcome(
+                    output,
+                    EcologyOutcome::SkillMotorError {
+                        skill_id,
+                        error: 1.0,
+                    },
+                );
                 return EpisodeStep::Abort(EpisodeReason::TimedOut);
             }
         }
@@ -2994,6 +3208,151 @@ mod tests {
     use super::*;
 
     #[test]
+    fn procedural_real_food_opportunity_preempts_approach_but_not_carried_manipulation() {
+        let mut state = EcologyState::new(826);
+        let mut director = EpisodeDirector::default();
+        let frame = behavior_frame(ActionId::SelfPlay);
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        let mut active = *director.active_episode().unwrap();
+        active.phase = EpisodePhase::Approach;
+        active.elapsed_seconds = 2.0;
+        active.commitment_remaining = 2.0;
+        director.active = Some(active);
+        state.metabolism.satiation = 0.0;
+        state.metabolism.reserve = crate::METABOLIC_RESERVE_FLOOR;
+        state
+            .spawn_morsel(Vec2::splat(0.5), test_morsel(0.5), 1.0)
+            .unwrap();
+        let mut trace = EcologyDecisionTrace::default();
+        assert_eq!(
+            director.compete(&state, frame, 0.05, &mut trace).unwrap().0,
+            EpisodeGoal::InspectMorsel
+        );
+        state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
+        active.phase = EpisodePhase::Manipulate;
+        director.active = Some(active);
+        assert_eq!(
+            director.compete(&state, frame, 0.05, &mut trace).unwrap().0,
+            active.goal
+        );
+    }
+
+    #[test]
+    fn procedural_hunger_beats_play_but_fullness_reverses_the_choice() {
+        let mut hungry = EcologyState::new(820);
+        hungry.metabolism.reserve = crate::METABOLIC_RESERVE_FLOOR;
+        hungry.metabolism.satiation = 0.0;
+        hungry
+            .spawn_morsel(Vec2::splat(0.5), test_morsel(0.4), 1.0)
+            .unwrap();
+        let mut full = hungry.clone();
+        full.metabolism.reserve = 0.95;
+        full.metabolism.satiation = 0.99;
+        let mut frame = behavior_frame(ActionId::SelfPlay);
+        frame.play_drive = 0.95;
+        let select = |state: &EcologyState| {
+            EpisodeDirector::default()
+                .compete(state, frame, 0.05, &mut EcologyDecisionTrace::default())
+                .unwrap()
+                .0
+        };
+        assert_eq!(select(&hungry), EpisodeGoal::InspectMorsel);
+        assert_eq!(select(&full), EpisodeGoal::SoloOrbPlay);
+    }
+
+    #[test]
+    fn procedural_high_fatigue_suppresses_play_proposal() {
+        let state = EcologyState::new(821);
+        let mut frame = behavior_frame(ActionId::SelfPlay);
+        frame.play_drive = 1.0;
+        frame.social_contact.fatigue = 0.95;
+        let mut trace = EcologyDecisionTrace::default();
+        let winner = EpisodeDirector::default().compete(&state, frame, 0.05, &mut trace);
+        assert_ne!(winner.map(|w| w.0), Some(EpisodeGoal::SoloOrbPlay));
+        assert!(trace.scores[EpisodeGoal::SoloOrbPlay.index()].utility < 0.03);
+    }
+
+    #[test]
+    fn procedural_pressure_and_food_do_not_require_an_orb() {
+        let mut state = EcologyState::new(822);
+        state.objects.retain(|o| o.kind != ObjectKind::Orb);
+        state
+            .spawn_morsel(Vec2::splat(0.5), test_morsel(0.4), 1.0)
+            .unwrap();
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.window_pressure = 0.7;
+        let output =
+            EpisodeDirector::default().tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(output.debug.active_goal, Some(EpisodeGoal::EscapePressure));
+        frame.window_pressure = 0.0;
+        let output =
+            EpisodeDirector::default().tick(&mut state, frame, representative_intent(), 0.05);
+        assert_eq!(output.debug.active_goal, Some(EpisodeGoal::InspectMorsel));
+    }
+
+    #[test]
+    fn procedural_debug_reports_the_actual_winner_and_activation() {
+        let state = EcologyState::new(823);
+        let frame = behavior_frame(ActionId::SelfPlay);
+        let mut trace = EcologyDecisionTrace::default();
+        let (winner, _, _) = EpisodeDirector::default()
+            .compete(&state, frame, 0.05, &mut trace)
+            .unwrap();
+        let strongest = trace
+            .scores
+            .iter()
+            .filter(|s| s.eligible)
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .unwrap();
+        assert_eq!(strongest.goal, Some(winner));
+        assert!(strongest.utility > strongest.activation && strongest.activation > 0.0);
+        assert_eq!(
+            strongest.score,
+            strongest.utility * 0.75 + strongest.activation * 0.25
+        );
+        assert_eq!(trace.score_count, EpisodeGoal::ALL.len());
+    }
+
+    #[test]
+    fn procedural_activation_is_cadence_stable() {
+        let state = EcologyState::new(824);
+        let frame = behavior_frame(ActionId::SelfPlay);
+        let mut reference: Option<f32> = None;
+        for hz in [20, 60, 120] {
+            let mut director = EpisodeDirector::default();
+            let mut trace = EcologyDecisionTrace::default();
+            let mut winner = None;
+            for _ in 0..(hz * 2) {
+                winner = director.compete(&state, frame, 1.0 / hz as f32, &mut trace);
+            }
+            let value = trace.scores[EpisodeGoal::SoloOrbPlay.index()].activation;
+            if let Some(previous) = reference {
+                assert!((value - previous).abs() < 0.00001);
+            }
+            reference = Some(value);
+            assert_eq!(winner.map(|w| w.0), Some(EpisodeGoal::SoloOrbPlay));
+        }
+    }
+
+    #[test]
+    fn procedural_small_context_changes_do_not_restart_a_committed_approach() {
+        let mut state = EcologyState::new(825);
+        let mut frame = behavior_frame(ActionId::SelfPlay);
+        frame.play_drive = 0.7;
+        let mut director = EpisodeDirector::default();
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+        let id = director.active_episode().unwrap().id;
+        for i in 0..30 {
+            frame.play_drive = 0.7 + if i % 2 == 0 { 0.01 } else { -0.01 };
+            frame.visual_target = Some(Vec2::new(0.2, 0.3));
+            frame.visual_strength = 0.25;
+            frame.visual_surprise = 0.25;
+            let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+            assert_eq!(director.active_episode().unwrap().id, id);
+        }
+    }
+
+    #[test]
     fn interception_miss_reduces_confidence_in_the_failed_prediction() {
         let mut state = EcologyState::default();
         let mut director = EpisodeDirector::default();
@@ -3015,9 +3374,13 @@ mod tests {
     #[test]
     fn learned_memory_is_bounded_reversible_and_rejects_corruption() {
         let mut director = EpisodeDirector::default();
-        for id in 1..80 { director.observe_game_response(id | (1u64 << 63), EpisodeGoal::OfferOrb, true); }
+        for id in 1..80 {
+            director.observe_game_response(id | (1u64 << 63), EpisodeGoal::OfferOrb, true);
+        }
         assert_eq!(director.adaptation.game[0], 8.0);
-        for id in 80..100 { director.observe_game_response(id | (1u64 << 63), EpisodeGoal::OfferOrb, false); }
+        for id in 80..100 {
+            director.observe_game_response(id | (1u64 << 63), EpisodeGoal::OfferOrb, false);
+        }
         assert_eq!(director.adaptation.game[0], -6.0);
         let memory = director.memory();
         assert!(memory.is_valid());
@@ -3027,7 +3390,11 @@ mod tests {
         let mut restored = EpisodeDirector::from_memory(&memory);
         let before = restored.memory();
         restored.observe_game_response(99 | (1u64 << 63), EpisodeGoal::OfferOrb, true);
-        assert_eq!(restored.memory(), before, "duplicate evidence after restart");
+        assert_eq!(
+            restored.memory(),
+            before,
+            "duplicate evidence after restart"
+        );
     }
 
     #[test]
@@ -3038,7 +3405,7 @@ mod tests {
         let mut frame = behavior_frame(ActionId::PlayCursorChase);
         frame.play_drive = 0.8;
         let mut director = EpisodeDirector::default();
-        director.tick(&mut state, frame, representative_intent(), 0.05);
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
         assert_eq!(director.active.unwrap().goal, EpisodeGoal::ChaseOrb);
         frame.social_contact.fatigue = 0.95;
         frame.play_state.affect.stress = 0.7;
@@ -3046,12 +3413,15 @@ mod tests {
         assert!(director.active.is_none());
         assert_eq!(rest.body_intent.target_position, frame.pet_position);
         assert_eq!(rest.body_intent.desired_speed, 0.0);
-        assert_eq!(rest.body_intent.gaze_target, Some(state.objects[0].position));
+        assert_eq!(
+            rest.body_intent.gaze_target,
+            Some(state.objects[0].position)
+        );
         assert_eq!(state.objects[0].preference, preference);
         assert_eq!(director.adaptation.game, [0.0; 2]);
         frame.social_contact.fatigue = 0.0;
         frame.play_state.affect.stress = 0.0;
-        director.tick(&mut state, frame, representative_intent(), 0.05);
+        let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
         assert_eq!(director.active.unwrap().goal, EpisodeGoal::ChaseOrb);
         // Fullness can tip a mildly interested pet toward observation, without
         // preventing an energetic pet from choosing play after a meal.
@@ -3149,7 +3519,10 @@ mod tests {
 
     #[test]
     fn airborne_or_wrong_side_is_not_a_den_arrival() {
-        for (seated, offset) in [(false, Vec2::new(0.0, -0.05246)), (true, Vec2::new(-0.2, -0.05246))] {
+        for (seated, offset) in [
+            (false, Vec2::new(0.0, -0.05246)),
+            (true, Vec2::new(-0.2, -0.05246)),
+        ] {
             let mut state = EcologyState::new(28);
             let mut director = EpisodeDirector::default();
             let mut frame = behavior_frame(ActionId::Sleep);
@@ -3294,9 +3667,11 @@ mod tests {
         let orb = state.objects[0].clone();
         let mut director = EpisodeDirector {
             adaptation: EpisodeAdaptation::default(),
+            activations: [0.0; crate::EPISODE_GOAL_COUNT],
             prediction_observer: Default::default(),
             active: Some(ActivityEpisode {
-                play_variant: 0, play_evidence_recorded: false,
+                play_variant: 0,
+                play_evidence_recorded: false,
                 feeding_bite: crate::FeedingBite::default(),
                 id: 9,
                 goal: EpisodeGoal::OfferOrb,
@@ -3364,7 +3739,7 @@ mod tests {
             let mut frame = behavior_frame(ActionId::IdleHover);
             frame.timestamp = tick as f64 * 0.05;
             frame.play_drive = 0.48;
-            state.objects[0].velocity = Vec2::new(0.3,0.0); // A moving toy is batted instead of held.
+            state.objects[0].velocity = Vec2::new(0.3, 0.0); // A moving toy is batted instead of held.
             frame.curiosity_drive = 0.52;
             frame.pet_position = orb_position;
             frame.orb_physical = PhysicalGrabFrame {
@@ -3397,13 +3772,25 @@ mod tests {
             state.objects[0].novelty = 0.0;
             state.objects[0].preference = 1.0;
             state.objects[0].familiarity = 1.0;
-            state.objects[0].lifecycle = if stored { ObjectLifecycle::StoredInDen } else { ObjectLifecycle::Free };
+            state.objects[0].lifecycle = if stored {
+                ObjectLifecycle::StoredInDen
+            } else {
+                ObjectLifecycle::Free
+            };
             let mut director = EpisodeDirector::default();
             let mut frame = behavior_frame(ActionId::IdleHover);
             frame.play_drive = 0.25;
-            for _ in 0..80 { director.tick(&mut state, frame, representative_intent(), 0.05); }
-            assert_eq!(director.active_episode().unwrap().goal,
-                if stored { EpisodeGoal::RetrieveOrb } else { EpisodeGoal::SoloOrbPlay });
+            for _ in 0..80 {
+                let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+            }
+            assert_eq!(
+                director.active_episode().unwrap().goal,
+                if stored {
+                    EpisodeGoal::RetrieveOrb
+                } else {
+                    EpisodeGoal::SoloOrbPlay
+                }
+            );
         }
     }
 
@@ -3421,32 +3808,49 @@ mod tests {
             frame.play_drive = play;
             frame.orb_physical.contact = true;
             let out = director.tick(&mut state, frame, representative_intent(), 0.05);
-            assert!(out.object_commands[..out.object_command_count].iter().any(|c| matches!(c,ObjectCommand::MoveToward {..})));
+            assert!(
+                out.object_commands[..out.object_command_count]
+                    .iter()
+                    .any(|c| matches!(c, ObjectCommand::MoveToward { .. }))
+            );
             // Runtime has acquired the grip; a deforming surface briefly no
             // longer reports contact. It must not time out or drop the toy.
             state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
             frame.orb_physical.contact = false;
-            let destination=director.active_episode().unwrap().target_position.unwrap();
-            frame.pet_position=destination;
-            frame.orb_physical.socket_position=destination;
-            state.objects[0].position=destination;
-            for _ in 0..1 { director.tick(&mut state, frame, representative_intent(), 0.05); }
+            let destination = director.active_episode().unwrap().target_position.unwrap();
+            frame.pet_position = destination;
+            frame.orb_physical.socket_position = destination;
+            state.objects[0].position = destination;
+            for _ in 0..1 {
+                let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+            }
             let ep = director.active_episode().unwrap();
             if play < 0.5 {
                 assert_eq!(ep.goal, EpisodeGoal::CarryOrbHome);
                 frame.orb_physical.socket_position = frame.pet_position + Vec2::new(0.03, 0.04);
                 let home = director.tick(&mut state, frame, representative_intent(), 0.05);
-                assert!(home.body_intent.target_position.distance(Vec2::new(0.87,0.86)) < 1e-5);
+                assert!(
+                    home.body_intent
+                        .target_position
+                        .distance(Vec2::new(0.87, 0.86))
+                        < 1e-5
+                );
                 state.objects[0].position = state.den.anchor;
                 let placed = director.tick(&mut state, frame, representative_intent(), 0.05);
-                assert!(placed.object_commands[..placed.object_command_count].iter().any(|c| matches!(c,ObjectCommand::Store {..})));
+                assert!(
+                    placed.object_commands[..placed.object_command_count]
+                        .iter()
+                        .any(|c| matches!(c, ObjectCommand::Store { .. }))
+                );
             } else {
                 assert_eq!(ep.goal, EpisodeGoal::SoloOrbPlay);
                 assert_eq!(ep.phase, EpisodePhase::Prepare);
                 let mut released = false;
                 for _ in 0..15 {
                     let out = director.tick(&mut state, frame, representative_intent(), 0.05);
-                    released |= out.object_commands[..out.object_command_count].iter().any(|c| matches!(c,ObjectCommand::Release {..}));
+                    released |= out.object_commands[..out.object_command_count]
+                        .iter()
+                        .any(|c| matches!(c, ObjectCommand::Release { .. }));
                 }
                 assert!(released);
             }
@@ -3455,10 +3859,10 @@ mod tests {
 
     #[test]
     fn familiar_orb_play_has_real_spaced_impulses_and_fatigue_rest() {
-        for fatigue in [0.0, 0.9] {
+        for fatigue in [0.0, 0.4] {
             let mut state = EcologyState::new(9101);
             state.objects[0].novelty = 0.0;
-            state.objects[0].velocity = Vec2::new(0.3,0.0);
+            state.objects[0].velocity = Vec2::new(0.3, 0.0);
             state.objects[0].familiarity = 1.0;
             let mut director = EpisodeDirector::default();
             let mut hits = Vec::new();
@@ -3506,7 +3910,9 @@ mod tests {
                     frame.orb_physical.contact = contact;
                     let output = director.tick(&mut state, frame, representative_intent(), 0.05);
                     for command in &output.object_commands[..output.object_command_count] {
-                        if matches!(command,ObjectCommand::MoveToward {..}) { hits += 1; }
+                        if matches!(command, ObjectCommand::MoveToward { .. }) {
+                            hits += 1;
+                        }
                         if let ObjectCommand::ApplyImpulse { impulse, .. } = command {
                             hits += 1;
                             assert!(impulse.is_finite() && impulse.length() <= 0.31);
@@ -3536,14 +3942,23 @@ mod tests {
             frame.orb_physical.socket_position = state.objects[0].position;
             let pickup = director.tick(&mut state, frame, representative_intent(), 0.05);
             assert_eq!(pickup.debug.active_goal, Some(EpisodeGoal::RetrieveOrb));
-            assert!(pickup.object_commands[..pickup.object_command_count].iter()
-                .any(|c| matches!(c, ObjectCommand::MoveToward { .. })));
+            assert!(
+                pickup.object_commands[..pickup.object_command_count]
+                    .iter()
+                    .any(|c| matches!(c, ObjectCommand::MoveToward { .. }))
+            );
             state.objects[0].lifecycle = ObjectLifecycle::CarriedByPet;
             let carry = director.tick(&mut state, frame, representative_intent(), 0.05);
             assert!(carry.body_intent.target_position.y < frame.pet_position.y - 0.1);
             assert_eq!(carry.body_intent.target_position.x, frame.pet_position.x);
-            assert!(!carry.object_commands[..carry.object_command_count].iter()
-                .any(|c| matches!(c, ObjectCommand::ApplyImpulse { .. } | ObjectCommand::Release { .. })));
+            assert!(
+                !carry.object_commands[..carry.object_command_count]
+                    .iter()
+                    .any(|c| matches!(
+                        c,
+                        ObjectCommand::ApplyImpulse { .. } | ObjectCommand::Release { .. }
+                    ))
+            );
         }
     }
 
@@ -3660,8 +4075,14 @@ mod tests {
         let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
         let continued = director.active_episode().unwrap();
         assert_eq!(continued.id, original.id);
-        assert!(continued.bout_play_drive > original.bout_play_drive && continued.bout_play_drive < frame.play_drive);
-        assert!(continued.bout_fatigue > original.bout_fatigue && continued.bout_fatigue < frame.social_contact.fatigue);
+        assert!(
+            continued.bout_play_drive > original.bout_play_drive
+                && continued.bout_play_drive < frame.play_drive
+        );
+        assert!(
+            continued.bout_fatigue > original.bout_fatigue
+                && continued.bout_fatigue < frame.social_contact.fatigue
+        );
     }
 
     #[test]
@@ -3767,10 +4188,12 @@ mod tests {
         let mut state = EcologyState::new(93);
         let orb_id = state.objects[0].id;
         let mut director = EpisodeDirector {
+            activations: [0.0; crate::EPISODE_GOAL_COUNT],
             adaptation: EpisodeAdaptation::default(),
             prediction_observer: Default::default(),
             active: Some(ActivityEpisode {
-                play_variant: 0, play_evidence_recorded: false,
+                play_variant: 0,
+                play_evidence_recorded: false,
                 feeding_bite: crate::FeedingBite::default(),
                 id: 1,
                 goal: EpisodeGoal::CarryOrbHome,
@@ -3806,7 +4229,20 @@ mod tests {
         assert!(output.object_commands[..output.object_command_count]
             .iter()
             .any(|command| matches!(command, ObjectCommand::Store { object_id, .. } if *object_id == orb_id)));
+        assert!(director.active_episode().is_some());
+        assert_eq!(state.den.visits, 0);
+        state.objects[0].lifecycle = ObjectLifecycle::StoredInDen;
+        let ack = director.tick(&mut state, frame, representative_intent(), 0.05);
         assert!(director.active_episode().is_none());
+        assert_eq!(state.den.visits, 1);
+        assert!(
+            ack.outcomes[..ack.outcome_count]
+                .iter()
+                .any(|outcome| matches!(
+                    outcome,
+                    EcologyOutcome::EpisodeCompleted(EpisodeGoal::CarryOrbHome)
+                ))
+        );
 
         let next = director.tick(
             &mut state,
@@ -4033,6 +4469,7 @@ mod tests {
         let morsel_id = state.spawn_morsel(Vec2::splat(0.5), profile, 1.0).unwrap();
         let mut frame = behavior_frame(ActionId::IdleHover);
         frame.pet_position = Vec2::splat(0.5);
+        frame.food_physical = Some(PhysicalGrabFrame { contact: true, socket_position: frame.pet_position, ..Default::default() });
         let mut director = EpisodeDirector::default();
         let mut consumed = false;
         for _ in 0..10 {
@@ -4047,6 +4484,20 @@ mod tests {
         assert!(state.metabolism.active_effect.is_some());
         assert!(state.taste.confidence > 0.0);
         assert!(state.taste.confidence <= 1.0);
+    }
+
+    #[test]
+    fn colocated_food_without_measured_mouth_contact_is_never_consumed() {
+        let mut state = EcologyState::new(63);
+        let id = state.spawn_morsel(Vec2::splat(0.5), test_morsel(0.2), 1.0).unwrap();
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.pet_position = Vec2::splat(0.5);
+        let mut director = EpisodeDirector::default();
+        for _ in 0..120 {
+            let output = director.tick(&mut state, frame, representative_intent(), 0.05);
+            assert!(!output.outcomes[..output.outcome_count].contains(&EcologyOutcome::MorselConsumed(id)));
+        }
+        assert_eq!(state.metabolism.tract.ingested, 0.0);
     }
 
     #[test]
@@ -4266,38 +4717,65 @@ mod tests {
         for satiation in [0.1, 0.96] {
             let mut state = EcologyState::new(100);
             state.metabolism.satiation = satiation;
-            let id = state.spawn_morsel(Vec2::splat(0.5), test_morsel(0.31), 1.0).unwrap();
-            state.objects.iter_mut().find(|o| o.id == id).unwrap().radius_px_at_reference = 2.5;
+            let id = state
+                .spawn_morsel(Vec2::splat(0.5), test_morsel(0.31), 1.0)
+                .unwrap();
+            state
+                .objects
+                .iter_mut()
+                .find(|o| o.id == id)
+                .unwrap()
+                .radius_px_at_reference = 2.5;
             let mut frame = behavior_frame(ActionId::IdleHover);
             frame.timestamp = 12.0;
             frame.pet_position = Vec2::splat(0.5);
-            frame.food_physical = Some(PhysicalGrabFrame { contact: true,
-                socket_position: frame.pet_position, ..Default::default() });
+            frame.food_physical = Some(PhysicalGrabFrame {
+                contact: true,
+                socket_position: frame.pet_position,
+                ..Default::default()
+            });
             let mut director = EpisodeDirector::default();
             director.observe_mouth_contact(&mut state, id);
             let output = director.tick(&mut state, frame, representative_intent(), 0.05);
-            assert_eq!(output.debug.active_goal, Some(if satiation < 0.5 {
-                EpisodeGoal::EatMorsel } else { EpisodeGoal::RefuseMorsel }));
+            assert_eq!(
+                output.debug.active_goal,
+                Some(if satiation < 0.5 {
+                    EpisodeGoal::EatMorsel
+                } else {
+                    EpisodeGoal::RefuseMorsel
+                })
+            );
             let mut consumed = 0;
             let mut impulses = 0;
             let mut visible_refusal_frames = 0;
             for tick in 0..18 {
                 let output = director.tick(&mut state, frame, representative_intent(), 0.05);
-                consumed += output.outcomes[..output.outcome_count].iter()
-                    .filter(|o| matches!(o, EcologyOutcome::MorselConsumed(_))).count();
-                impulses += output.object_commands[..output.object_command_count].iter()
-                    .filter(|c| matches!(c, ObjectCommand::ApplyImpulse { .. })).count();
+                consumed += output.outcomes[..output.outcome_count]
+                    .iter()
+                    .filter(|o| matches!(o, EcologyOutcome::MorselConsumed(_)))
+                    .count();
+                impulses += output.object_commands[..output.object_command_count]
+                    .iter()
+                    .filter(|c| matches!(c, ObjectCommand::ApplyImpulse { .. }))
+                    .count();
                 if output.debug.active_goal == Some(EpisodeGoal::RefuseMorsel) {
                     assert_eq!(output.body_intent.expression.mouth_open, 0.0);
                     assert!(output.body_intent.expression.mouth_compression > 0.25);
                     visible_refusal_frames += 1;
                 }
-                if satiation < 0.5 && tick == 5 { assert_eq!(consumed, 1, "mouth contact stalled intake"); }
+                if satiation < 0.5 && tick == 5 {
+                    assert_eq!(consumed, 1, "mouth contact stalled intake");
+                }
             }
-            if satiation < 0.5 { assert_eq!(consumed, 1); assert_eq!(impulses, 0); }
-            else { assert_eq!(consumed, 0); assert_eq!(impulses, 1);
-                assert!(visible_refusal_frames >= 8); assert_eq!(state.metabolism.satiation, satiation); }
+            if satiation < 0.5 {
+                assert_eq!(consumed, 1);
+                assert_eq!(impulses, 0);
+            } else {
+                assert_eq!(consumed, 0);
+                assert_eq!(impulses, 1);
+                assert!(visible_refusal_frames >= 8);
+                assert_eq!(state.metabolism.satiation, satiation);
+            }
         }
     }
-
 }

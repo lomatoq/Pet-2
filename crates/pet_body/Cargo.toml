@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 bytemuck.workspace = true
 glam.workspace = true
+half = "2.7.1"
 lifecore = { path = "../lifecore" }
 pet_audio = { path = "../pet_audio" }
 pet_ecology = { path = "../pet_ecology" }

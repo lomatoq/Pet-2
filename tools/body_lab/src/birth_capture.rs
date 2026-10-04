@@ -43,6 +43,7 @@ impl Capture {
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
+                    .with_visible(false)
                     .with_title("Pet 2 · First Light verification")
                     .with_inner_size(PhysicalSize::new(1280, 800)),
             )?,
@@ -64,6 +65,13 @@ impl Capture {
         );
         for (name, width, height, time, pose) in [
             ("trails", 1280, 800, 1.9, FacePose::Awake),
+            ("trails-early", 1280, 800, 0.9, FacePose::Awake),
+            ("trails-late", 1280, 800, 3.1, FacePose::Awake),
+            ("trails-settling", 1280, 800, 5.0, FacePose::Awake),
+            ("trails-fading", 1280, 800, 5.8, FacePose::Awake),
+            ("trails-small", 640, 480, 1.9, FacePose::Awake),
+            ("trails-portrait", 800, 1280, 1.9, FacePose::Awake),
+            ("trails-release", 1280, 800, 7.95, FacePose::Awake),
             ("wink", 640, 480, 15.0, FacePose::Awake),
             ("neutral", 640, 480, 15.0, FacePose::Awake),
             ("seated", 640, 480, 15.0, FacePose::Awake),
@@ -97,6 +105,9 @@ impl Capture {
             ("sad", 640, 480, 12.0, FacePose::Awake),
             ("scared", 640, 480, 12.0, FacePose::Startled),
         ] {
+            if std::env::args().any(|arg| arg == "--trails-only") && !name.starts_with("trails") {
+                continue;
+            }
             body = ProceduralBody::generate(&genome)?;
             body.apply_tuning_profile(profile.clone())?;
             let size = PhysicalSize::new(width, height);

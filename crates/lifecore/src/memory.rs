@@ -88,6 +88,13 @@ pub struct MemorySystem {
     pub habits: Vec<Habit>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MemoryRecall {
+    pub expected_reward: f32,
+    pub confidence: f32,
+    pub observations: u32,
+}
+
 impl Default for MemorySystem {
     fn default() -> Self {
         Self {
@@ -100,6 +107,47 @@ impl Default for MemorySystem {
 }
 
 impl MemorySystem {
+    /// Contextual retrieval reuses the stored episodes, not a second learner.
+    /// Silence/neutral observations carry availability, not negative value.
+    /// Callers may use `expected_reward * confidence` as a small bounded prior.
+    #[must_use]
+    pub fn recall(&self, action: ActionId, context: &ContextVector, now: f64) -> MemoryRecall {
+        if !now.is_finite() || !context.iter().all(|v| v.is_finite()) {
+            return MemoryRecall::default();
+        }
+        let mut weight_sum = 0.0;
+        let mut reward_sum = 0.0;
+        let mut observations = 0u32;
+        for episode in &self.episodic {
+            let event = &episode.representative;
+            if event.action != action
+                || !matches!(event.outcome, Outcome::Success | Outcome::Rejected)
+                || !event.timestamp.is_finite()
+                || !episode.mean_reward.is_finite()
+            {
+                continue;
+            }
+            let distance = context_distance(&event.context, context);
+            if distance >= 0.42 {
+                continue;
+            }
+            let age = (now - event.timestamp).max(0.0);
+            let recency = (-age / (7.0 * 86_400.0)).exp() as f32;
+            let evidence = episode.occurrence_count.min(16) as f32;
+            let weight = (1.0 - distance / 0.42) * recency * evidence;
+            reward_sum += weight * episode.mean_reward.clamp(-1.0, 1.0);
+            weight_sum += weight;
+            observations = observations.saturating_add(episode.occurrence_count);
+        }
+        if weight_sum < 0.1 {
+            return MemoryRecall::default();
+        }
+        MemoryRecall {
+            expected_reward: (reward_sum / weight_sum).clamp(-1.0, 1.0),
+            confidence: (weight_sum / (weight_sum + 4.0)).clamp(0.0, 1.0),
+            observations,
+        }
+    }
     pub fn record(&mut self, event: EventRecord) {
         if self.short_term.len() == SHORT_TERM_CAPACITY {
             self.short_term.pop_front();
@@ -154,12 +202,16 @@ impl MemorySystem {
         }) {
             existing.occurrence_count = existing.occurrence_count.saturating_add(1);
             let count = existing.occurrence_count as f32;
-            existing.mean_reward += (event.reward - existing.mean_reward) / count;
+            // Repeated old evidence cannot make a changed context impossible
+            // to relearn; keep a finite effective sample horizon.
+            existing.mean_reward += (event.reward - existing.mean_reward) / count.min(16.0);
             existing.representative.salience = existing
                 .representative
                 .salience
                 .max(event.salience)
                 .clamp(0.0, 1.0);
+            existing.representative.timestamp = event.timestamp;
+            existing.representative.context = event.context;
             return;
         }
         if self.episodic.len() == EPISODIC_CAPACITY
@@ -243,6 +295,52 @@ fn context_distance(left: &ContextVector, right: &ContextVector) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contextual_recall_changes_with_outcomes_but_silence_is_not_rejection() {
+        let mut memory = MemorySystem::default();
+        for _ in 0..8 {
+            memory.record(event(Outcome::Success));
+        }
+        let context = event(Outcome::Success).context;
+        let recalled = memory.recall(ActionId::Chirp, &context, 500_010.0);
+        assert!(recalled.expected_reward > 0.7 && recalled.confidence > 0.6);
+        let mut other = context;
+        other[3] = 0.0;
+        other[4] = 0.0;
+        assert_eq!(
+            memory.recall(ActionId::Chirp, &other, 500_010.0),
+            MemoryRecall::default()
+        );
+        for _ in 0..40 {
+            memory.record(event(Outcome::Ignored));
+        }
+        assert_eq!(
+            memory.recall(ActionId::Chirp, &context, 500_010.0),
+            recalled
+        );
+        assert!(
+            memory
+                .recall(ActionId::Chirp, &context, 500_000.0 + 30.0 * 86_400.0)
+                .confidence
+                < recalled.confidence * 0.1
+        );
+        for _ in 0..16 {
+            memory.record(event(Outcome::Rejected));
+        }
+        assert!(
+            memory
+                .recall(ActionId::Chirp, &context, 500_010.0)
+                .expected_reward
+                < 0.0
+        );
+        let restored: MemorySystem =
+            serde_json::from_slice(&serde_json::to_vec(&memory).unwrap()).unwrap();
+        assert_eq!(
+            restored.recall(ActionId::Chirp, &context, 500_010.0),
+            memory.recall(ActionId::Chirp, &context, 500_010.0)
+        );
+    }
 
     fn event(outcome: Outcome) -> EventRecord {
         let mut context = [0.5; CONTEXT_SIZE];

@@ -61,6 +61,10 @@ pub(crate) fn apply(
                 P::MoveInspectPauseScan | P::MoveCheckBackSocialReference => 0.34,
                 _ => 0.72,
             };
+            if crate::orientation_acquisition_required(active.program, phase, context) {
+                packet.locomotion.speed_multiplier = 0.0;
+                packet.locomotion.pose = MotorPoseIntent::Orient;
+            }
             packet.locomotion.approach_arc = sign
                 * if active.program == P::MoveCuriosityArcApproach {
                     0.22

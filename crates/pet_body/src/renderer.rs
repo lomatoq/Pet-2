@@ -10,6 +10,7 @@ use crate::{
     BodyRenderMode, DropletRenderState, LiquidRenderState, MAX_DROPLETS, MAX_PARTICLES,
     MaterialVariant, ProceduralMesh,
     liquid_render::{DensityInstance, pack_particles_for_material, vertex_layout},
+    optical_volume::{OPTICAL_VOLUME_SIZE, OpticalVolumeGrid},
 };
 
 const SUPERSAMPLE_SCALE: u32 = 2;
@@ -108,6 +109,7 @@ struct Globals {
     self_care: [f32; 4],
     mood_tint: [f32; 4],
     mood_trail: [f32; 4],
+    optical_volume_bounds: [f32; 4],
 }
 
 #[repr(C)]
@@ -119,6 +121,21 @@ struct ComposeGlobals {
     post: [f32; 4],
     mood_aura: [f32; 4],
     chromatic_motion: [f32; 4],
+    spectral_phase: [f32; 4],
+}
+
+/// Optical magnitude has a soft onset, but the wake must follow this frame's
+/// actual travel direction. A stale filtered vector must never illuminate the
+/// new leading edge after a reversal, or leave a wake on a stationary body.
+pub(crate) fn spectral_motion_for(filtered: Vec2, current: Vec2) -> Vec2 {
+    if !filtered.is_finite() || !current.is_finite() {
+        return Vec2::ZERO;
+    }
+    let speed = current.length();
+    if speed <= 0.015 {
+        return Vec2::ZERO;
+    }
+    current / speed * filtered.length().min(speed).min(1.0)
 }
 
 #[repr(C)]
@@ -570,6 +587,8 @@ pub struct Renderer {
     material_flow_view: wgpu::TextureView,
     macro_texture: wgpu::Texture,
     macro_view: wgpu::TextureView,
+    optical_volume_texture: wgpu::Texture,
+    optical_volume_view: wgpu::TextureView,
     density_sampler: wgpu::Sampler,
     _studio_texture: wgpu::Texture,
     studio_view: wgpu::TextureView,
@@ -850,6 +869,16 @@ impl Renderer {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let liquid_filter_bind_group_layout =
@@ -1070,6 +1099,21 @@ impl Renderer {
             material_flow_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let macro_texture = create_macro_texture(&device, config.width, config.height);
         let macro_view = macro_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let optical_volume_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("silhouette inflated volume normals"),
+            size: wgpu::Extent3d {
+                width: OPTICAL_VOLUME_SIZE as u32,
+                height: OPTICAL_VOLUME_SIZE as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let optical_volume_view = optical_volume_texture.create_view(&Default::default());
         let density_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("liquid density reconstruction sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1116,6 +1160,7 @@ impl Renderer {
             &material_flow_view,
             &studio_view,
             &studio_sampler,
+            &optical_volume_view,
         );
         let liquid_filter_bind_group = create_liquid_filter_bind_group(
             &device,
@@ -1615,6 +1660,8 @@ impl Renderer {
             material_flow_view,
             macro_texture,
             macro_view,
+            optical_volume_texture,
+            optical_volume_view,
             density_sampler,
             _studio_texture: studio_texture,
             studio_view,
@@ -1776,6 +1823,7 @@ impl Renderer {
             &self.material_flow_view,
             &self.studio_view,
             &self.studio_sampler,
+            &self.optical_volume_view,
         );
         self.liquid_filter_bind_group = create_liquid_filter_bind_group(
             &self.device,
@@ -1960,6 +2008,7 @@ impl Renderer {
                 &self.material_flow_view,
                 &self.studio_view,
                 &self.studio_sampler,
+                &self.optical_volume_view,
             );
         }
         self.queue.write_texture(
@@ -2125,23 +2174,53 @@ impl Renderer {
                 bytemuck::cast_slice(&particle_instances[..particle_count]),
             );
         }
-        self.queue.write_buffer(
-            &self.globals_buffer,
-            0,
-            bytemuck::bytes_of(&globals_for_resolved(
-                &self.config,
-                parameters,
-                self.organism_scale,
-                self.premultiplied_output,
-                self.review_background,
-                self.background_valid,
-                self.render_scale,
-                Some(internal_features),
-                self.studio_material_backdrop,
-                self.background_uv_transform,
-                self.background_freshness,
-            )),
+        let mut globals = globals_for_resolved(
+            &self.config,
+            parameters,
+            self.organism_scale,
+            self.premultiplied_output,
+            self.review_background,
+            self.background_valid,
+            self.render_scale,
+            Some(internal_features),
+            self.studio_material_backdrop,
+            self.background_uv_transform,
+            self.background_freshness,
         );
+        if use_liquid {
+            // Reconstruct from exactly the particles submitted to the density
+            // pass. The compact 64-square field is independent of desktop size.
+            let volume = OpticalVolumeGrid::reconstruct(
+                &particle_instances[..particle_count],
+                globals.liquid_meta[2],
+            );
+            globals.optical_volume_bounds = volume.bounds;
+            let texels: Vec<u16> = volume
+                .texels
+                .iter()
+                .flat_map(|texel| {
+                    texel
+                        .iter()
+                        .map(|value| half::f16::from_f32(*value).to_bits())
+                })
+                .collect();
+            self.queue.write_texture(
+                self.optical_volume_texture.as_image_copy(),
+                bytemuck::cast_slice(&texels),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(OPTICAL_VOLUME_SIZE as u32 * 8),
+                    rows_per_image: Some(OPTICAL_VOLUME_SIZE as u32),
+                },
+                wgpu::Extent3d {
+                    width: OPTICAL_VOLUME_SIZE as u32,
+                    height: OPTICAL_VOLUME_SIZE as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.queue
+            .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
         self.queue.write_buffer(
             &self.compose_globals_buffer,
             0,
@@ -2655,7 +2734,15 @@ fn liquid_scissor_rect(
     }
     let organism_minimum = minimum;
     let organism_maximum = maximum;
-    let rim_padding = 12.0 + parameters.material_edge_light_width.clamp(2.0, 32.0);
+    // The dispersed wake can reach 42 px plus transverse filtering. Its work
+    // bounds must not depend on a user's shadow feather or rim-width settings.
+    let wake_padding = if parameters.chromatic_motion.length() > 0.015 {
+        48.0
+    } else {
+        0.0
+    };
+    let rim_padding =
+        (12.0 + parameters.material_edge_light_width.clamp(2.0, 32.0)).max(wake_padding);
     minimum -= Vec2::splat(rim_padding);
     maximum += Vec2::splat(rim_padding);
 
@@ -3041,6 +3128,7 @@ fn create_liquid_surface_bind_group(
     material_flow_view: &wgpu::TextureView,
     studio_view: &wgpu::TextureView,
     studio_sampler: &wgpu::Sampler,
+    optical_volume_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     let background_view = background_texture.create_view(&wgpu::TextureViewDescriptor::default());
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3082,6 +3170,10 @@ fn create_liquid_surface_bind_group(
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: wgpu::BindingResource::Sampler(studio_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(optical_volume_view),
             },
         ],
     })
@@ -3268,9 +3360,28 @@ fn compose_globals_for(
     render_scale: u32,
 ) -> ComposeGlobals {
     ComposeGlobals {
-        mood_aura: [parameters.mood_tint.x,parameters.mood_tint.y,parameters.mood_tint.z,parameters.joy_aura.clamp(0.0,1.0)],
-        chromatic_motion: [parameters.chromatic_motion.x,parameters.chromatic_motion.y,
-            parameters.tail_lag.x,parameters.tail_lag.y],
+        mood_aura: [
+            parameters.mood_tint.x,
+            parameters.mood_tint.y,
+            parameters.mood_tint.z,
+            parameters.joy_aura.clamp(0.0, 1.0),
+        ],
+        chromatic_motion: [
+            parameters.chromatic_motion.x,
+            parameters.chromatic_motion.y,
+            parameters.tail_lag.x,
+            parameters.tail_lag.y,
+        ],
+        spectral_phase: [
+            if parameters.time.is_finite() {
+                parameters.time
+            } else {
+                0.0
+            },
+            0.0,
+            0.0,
+            0.0,
+        ],
         output_mode: [
             if premultiplied_output { 1.0 } else { 0.0 },
             review_background.shader_value(),
@@ -3534,9 +3645,25 @@ fn globals_for_resolved(
         }
     });
     Globals {
-        self_care: [bounded(parameters.tongue_extension,0.0,1.0,0.0), bounded(parameters.tongue_side,-1.0,1.0,0.0),0.0,0.0],
-        mood_tint: [parameters.mood_tint.x,parameters.mood_tint.y,parameters.mood_tint.z,parameters.joy_aura],
-        mood_trail: [parameters.mood_trail.x,parameters.mood_trail.y,parameters.mood_trail.z,0.0],
+        optical_volume_bounds: [-1.0, -1.0, 0.5, 0.5],
+        self_care: [
+            bounded(parameters.tongue_extension, 0.0, 1.0, 0.0),
+            bounded(parameters.tongue_side, -1.0, 1.0, 0.0),
+            0.0,
+            0.0,
+        ],
+        mood_tint: [
+            parameters.mood_tint.x,
+            parameters.mood_tint.y,
+            parameters.mood_tint.z,
+            parameters.joy_aura,
+        ],
+        mood_trail: [
+            parameters.mood_trail.x,
+            parameters.mood_trail.y,
+            parameters.mood_trail.z,
+            0.0,
+        ],
         face_eye_scales: [
             bounded(parameters.eye_scales[0].x, 0.85, 1.28, 1.0),
             bounded(parameters.eye_scales[0].y, 0.75, 1.45, 1.0),
@@ -4491,6 +4618,91 @@ mod tests {
 
         assert_eq!(native.post[1], 1.0);
         assert_eq!(supersampled.post[1], SUPERSAMPLE_SCALE as f32);
+    }
+
+    #[test]
+    fn spectral_compositor_uniform_layout_and_finite_phase() {
+        let shader = naga::front::wgsl::parse_str(include_str!("compose.wgsl")).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&shader)
+        .unwrap();
+        let span = shader
+            .types
+            .iter()
+            .find_map(|(_, ty)| {
+                if ty.name.as_deref() == Some("ComposeGlobals") {
+                    if let naga::TypeInner::Struct { span, .. } = ty.inner {
+                        Some(span as usize)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(span, size_of::<ComposeGlobals>());
+        assert_eq!(span % 16, 0);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            width: 512,
+            height: 512,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+            view_formats: vec![],
+        };
+        for (time, expected) in [(3.7, 3.7), (f32::NAN, 0.0), (f32::INFINITY, 0.0)] {
+            let globals = compose_globals_for(
+                &config,
+                true,
+                ReviewBackground::Black,
+                RenderParameters {
+                    time,
+                    ..Default::default()
+                },
+                1,
+            );
+            assert_eq!(globals.spectral_phase, [expected, 0.0, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn optical_wake_tracks_current_reversal_and_stop_with_soft_speed() {
+        let filtered = Vec2::new(0.65, 0.0);
+        assert_eq!(
+            spectral_motion_for(filtered, Vec2::new(-0.65, 0.0)),
+            Vec2::new(-0.65, 0.0)
+        );
+        assert_eq!(
+            spectral_motion_for(filtered, Vec2::new(0.0, -0.65)),
+            Vec2::new(0.0, -0.65)
+        );
+        assert_eq!(spectral_motion_for(filtered, Vec2::ZERO), Vec2::ZERO);
+        assert_eq!(
+            spectral_motion_for(filtered, Vec2::splat(0.001)),
+            Vec2::ZERO
+        );
+        assert_eq!(
+            spectral_motion_for(Vec2::new(0.1, 0.0), Vec2::new(0.65, 0.0)),
+            Vec2::new(0.1, 0.0)
+        );
+        assert_eq!(
+            spectral_motion_for(filtered, Vec2::new(0.04, 0.0)),
+            Vec2::new(0.04, 0.0)
+        );
+        assert_eq!(
+            spectral_motion_for(Vec2::splat(f32::NAN), Vec2::X),
+            Vec2::ZERO
+        );
+        assert_eq!(
+            spectral_motion_for(filtered, Vec2::splat(f32::INFINITY)),
+            Vec2::ZERO
+        );
     }
 
     #[test]

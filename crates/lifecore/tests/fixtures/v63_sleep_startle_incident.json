@@ -1,0 +1,604 @@
+{
+  "provenance": "Readonly extraction of original V63 incident-context.jsonl; body/derived/drive/affect values exact, three nearest recorded timestamps; no original save write.",
+  "source_times": [
+    1880.81594,
+    1881.02413,
+    1881.22062
+  ],
+  "rows": [
+    {
+      "monotonic_seconds": 1880.8159412,
+      "action": "Sleep",
+      "program": "rest_nrem_sleep",
+      "body": {
+        "contact": {
+          "area": 0.0,
+          "component_id": null,
+          "contact_count": 0,
+          "duration": 0.0,
+          "normal": [
+            0.3730575442314148,
+            -0.9278082251548767
+          ],
+          "point_local": [
+            3.635697066783905e-05,
+            0.23154868185520172
+          ],
+          "point_world": [
+            0.44331395626068115,
+            0.3361110985279083
+          ],
+          "pressure": 0.0,
+          "tangential_speed": 0.0,
+          "user_force_estimate": [
+            0.0,
+            0.0
+          ]
+        },
+        "efference_copy": {
+          "actual_shape_delta": [
+            0.7999999523162842,
+            -0.4444444179534912,
+            0.34527164697647095
+          ],
+          "actual_turn": 6.242119707167149e-05,
+          "actual_velocity": [
+            -2.942726775082116e-44,
+            0.0
+          ],
+          "intended_shape_delta": [
+            1.0,
+            -0.5651177167892456,
+            0.000900347251445055
+          ],
+          "intended_turn": 0.7200000286102295,
+          "intended_velocity": [
+            0.0,
+            0.0
+          ]
+        },
+        "environment": {
+          "available_motion_radius": 0.12560510635375977,
+          "clipped_fraction": 0.0,
+          "cursor_distance": 0.7269442081451416,
+          "cursor_loom_rate": 0.0,
+          "distance_to_screen_edge": 0.12560510635375977,
+          "seconds_since_interaction": 0.07800000160932541,
+          "user_present": true
+        },
+        "fluid": {
+          "internal_relative_speed": 0.005283032078295946,
+          "pressure_variance": 0.003948435187339783,
+          "settle_error": 0.03488292917609215,
+          "slosh_energy": 0.002794613130390644
+        },
+        "frame_id": 224577,
+        "motion": {
+          "acceleration": [
+            0.0,
+            0.0
+          ],
+          "clinging": false,
+          "collision_impulse": 1.2611686178923354e-44,
+          "grounded": true,
+          "jerk": [
+            0.0,
+            0.0
+          ],
+          "object_load": 0.0,
+          "velocity": [
+            -2.942726775082116e-44,
+            0.0
+          ],
+          "world_position": [
+            0.852145254611969,
+            0.9371974468231201
+          ]
+        },
+        "schema_version": 1,
+        "shape": {
+          "angular_velocity": 6.242119707167149e-05,
+          "body_area_ratio": 1.0,
+          "body_length_ratio": 1.7999999523162842,
+          "body_width_ratio": 0.5555555820465088,
+          "center_of_mass_offset": [
+            -7.450580596923828e-09,
+            2.9802322387695312e-08
+          ],
+          "deformation_energy": 0.15472836792469025,
+          "maximum_strain": 0.2823259234428406,
+          "neck_tension": 0.0,
+          "orientation_radians": 2.1308753490448,
+          "roundness": 0.845271646976471
+        },
+        "topology": {
+          "budget_remaining": 1.0,
+          "connected_components": 1,
+          "detached_mass_fraction": 0.0,
+          "largest_fragment_fraction": 1.0,
+          "merge_progress": 0.0,
+          "recovery_active": false
+        }
+      },
+      "derived": {
+        "arousal": 0.640038788318634,
+        "attention_commitment": 1.0,
+        "attention_strength": 0.19451269507408142,
+        "confidence": 0.584017813205719,
+        "curiosity": 0.5069794058799744,
+        "fatigue": 0.9598845839500427,
+        "habituation": 1.0,
+        "negative_valence": 0.0,
+        "neural_approach": 0.6099847555160522,
+        "neural_novelty": 0.0033686310052871704,
+        "neural_rest": 0.0,
+        "neural_threat": 0.20243500173091888,
+        "positive_valence": 0.2021988034248352,
+        "self_uncertainty": 0.25958481431007385,
+        "social_warmth": 0.4883198142051697,
+        "stress": 0.031941987574100494
+      },
+      "recorded_felt": {
+        "activation": 0.36821335554122925,
+        "agency_match": 0.6990006566047668,
+        "balance": 0.8499781489372253,
+        "body_integrity": 0.9481388330459595,
+        "body_ownership": 0.8531724810600281,
+        "boredom": 0.6704135537147522,
+        "comfort": 0.506019651889801,
+        "contact_pleasantness": 0.43740832805633545,
+        "effort": 0.20354881882667542,
+        "exploration_readiness": 0.25676581263542175,
+        "loneliness": 0.04845235124230385,
+        "motor_efficacy": 0.6922109127044678,
+        "pain_like": 0.0037889983505010605,
+        "physical_load": 0.11811089515686035,
+        "play_readiness": 0.10274821519851685,
+        "relief": 0.3219960927963257,
+        "restraint": 9.80908925027372e-45,
+        "sleep_pressure": 0.9297780394554138,
+        "social_safety": 0.6363580822944641,
+        "startle": 0.4784947633743286,
+        "surprise": 0.32224059104919434,
+        "vulnerability": 0.16764847934246063
+      },
+      "drives": {
+        "autonomy": 0.9990782141685486,
+        "comfort": 0.9991176128387451,
+        "curiosity": 0.999043345451355,
+        "novelty": 0.9991320967674255,
+        "play": 0.999076247215271,
+        "safety": 0.0004000000189989805,
+        "sleep": 0.9573363661766052,
+        "social": 0.10351724922657013
+      },
+      "affect": {
+        "arousal": 0.6880974173545837,
+        "attachment": 0.29418954253196716,
+        "confidence": 0.5019317865371704,
+        "frustration": 0.05077178776264191,
+        "stress": 0.03168139234185219,
+        "valence": 0.1354040950536728
+      },
+      "cradle_inside": null,
+      "screen_edge_contact": false,
+      "somatic": {
+        "completion_reason": "support_confirmed",
+        "contact_fraction": 0.4270833432674408,
+        "frame_id": 224571,
+        "local_deformation_energy": 0.2508733570575714,
+        "locality_fraction": 0.22791233658790588,
+        "mass_conservation_error": 0.0,
+        "maximum_strain": 0.28383591771125793,
+        "motor_error": 5.108969389766571e-07,
+        "phase": {
+          "index": 1,
+          "program": "rest_nrem_sleep"
+        },
+        "phase_progress": 0.5320776104927063,
+        "program_id": "rest_nrem_sleep",
+        "support_stability": 1.0,
+        "supported": true,
+        "supported_seconds": 303.7978820800781,
+        "target_locked": true,
+        "user_response_credit": 0.0
+      }
+    },
+    {
+      "monotonic_seconds": 1881.0241328,
+      "action": "Sleep",
+      "program": "rest_nrem_sleep",
+      "body": {
+        "contact": {
+          "area": 0.0,
+          "component_id": null,
+          "contact_count": 0,
+          "duration": 0.0,
+          "normal": [
+            0.3730575442314148,
+            -0.9278082251548767
+          ],
+          "point_local": [
+            -6.5204999373236205e-06,
+            0.23164445161819458
+          ],
+          "point_world": [
+            0.44331395626068115,
+            0.3361110985279083
+          ],
+          "pressure": 0.0,
+          "tangential_speed": 0.0,
+          "user_force_estimate": [
+            0.0,
+            0.0
+          ]
+        },
+        "efference_copy": {
+          "actual_shape_delta": [
+            0.7999999523162842,
+            -0.4444444179534912,
+            0.3508880138397217
+          ],
+          "actual_turn": 0.00032143888529390097,
+          "actual_velocity": [
+            -2.942726775082116e-44,
+            0.0
+          ],
+          "intended_shape_delta": [
+            1.0,
+            -0.5645060539245605,
+            0.0008689213427715003
+          ],
+          "intended_turn": 0.7200000286102295,
+          "intended_velocity": [
+            0.0,
+            0.0
+          ]
+        },
+        "environment": {
+          "available_motion_radius": 0.12560510635375977,
+          "clipped_fraction": 0.0,
+          "cursor_distance": 0.7269442081451416,
+          "cursor_loom_rate": 0.0,
+          "distance_to_screen_edge": 0.12560510635375977,
+          "seconds_since_interaction": 0.28200000524520874,
+          "user_present": true
+        },
+        "fluid": {
+          "internal_relative_speed": 0.005019843578338623,
+          "pressure_variance": 0.003025978570804,
+          "settle_error": 0.03433002904057503,
+          "slosh_energy": 0.002531559206545353
+        },
+        "frame_id": 224601,
+        "motion": {
+          "acceleration": [
+            0.0,
+            0.0
+          ],
+          "clinging": false,
+          "collision_impulse": 1.2611686178923354e-44,
+          "grounded": true,
+          "jerk": [
+            0.0,
+            0.0
+          ],
+          "object_load": 0.0,
+          "velocity": [
+            -2.942726775082116e-44,
+            0.0
+          ],
+          "world_position": [
+            0.852145254611969,
+            0.9371974468231201
+          ]
+        },
+        "schema_version": 1,
+        "shape": {
+          "angular_velocity": 0.00032143888529390097,
+          "body_area_ratio": 1.0,
+          "body_length_ratio": 1.7999999523162842,
+          "body_width_ratio": 0.5555555820465088,
+          "center_of_mass_offset": [
+            4.035427991766483e-09,
+            -1.4901161193847656e-08
+          ],
+          "deformation_energy": 0.1491120159626007,
+          "maximum_strain": 0.24779123067855835,
+          "neck_tension": 0.0,
+          "orientation_radians": 2.1369783878326416,
+          "roundness": 0.8508880138397217
+        },
+        "topology": {
+          "budget_remaining": 1.0,
+          "connected_components": 1,
+          "detached_mass_fraction": 0.0,
+          "largest_fragment_fraction": 1.0,
+          "merge_progress": 0.0,
+          "recovery_active": false
+        }
+      },
+      "derived": {
+        "arousal": 0.6403110027313232,
+        "attention_commitment": 0.8014333844184875,
+        "attention_strength": 0.20267894864082336,
+        "confidence": 0.5838373899459839,
+        "curiosity": 0.4895991086959839,
+        "fatigue": 0.9598464369773865,
+        "habituation": 0.7333911061286926,
+        "negative_valence": 0.0,
+        "neural_approach": 0.5584753751754761,
+        "neural_novelty": 0.030657902359962463,
+        "neural_rest": 0.3899412751197815,
+        "neural_threat": 0.10104632377624512,
+        "positive_valence": 0.21095725893974304,
+        "self_uncertainty": 0.25975698232650757,
+        "social_warmth": 0.48808062076568604,
+        "stress": 0.03022463247179985
+      },
+      "recorded_felt": {
+        "activation": 0.36732542514801025,
+        "agency_match": 0.6978445649147034,
+        "balance": 0.849970281124115,
+        "body_integrity": 0.9518173933029175,
+        "body_ownership": 0.8536264896392822,
+        "boredom": 0.6707965135574341,
+        "comfort": 0.5120922923088074,
+        "contact_pleasantness": 0.4749252200126648,
+        "effort": 0.1991087943315506,
+        "exploration_readiness": 0.24654610455036163,
+        "loneliness": 0.048330437391996384,
+        "motor_efficacy": 0.6919230222702026,
+        "pain_like": 0.003207318251952529,
+        "physical_load": 0.1097574457526207,
+        "play_readiness": 0.10323765873908997,
+        "relief": 0.3046209514141083,
+        "restraint": 9.80908925027372e-45,
+        "sleep_pressure": 0.9266093969345093,
+        "social_safety": 0.6540761590003967,
+        "startle": 0.39783424139022827,
+        "surprise": 0.23324115574359894,
+        "vulnerability": 0.16701091825962067
+      },
+      "drives": {
+        "autonomy": 0.9990779757499695,
+        "comfort": 0.9991173148155212,
+        "curiosity": 0.9990432858467102,
+        "novelty": 0.9991323351860046,
+        "play": 0.9990761876106262,
+        "safety": 0.0004000000189989805,
+        "sleep": 0.9584806561470032,
+        "social": 0.10362470149993896
+      },
+      "affect": {
+        "arousal": 0.6879323720932007,
+        "attachment": 0.29437455534935,
+        "confidence": 0.5015909671783447,
+        "frustration": 0.05080323666334152,
+        "stress": 0.02970443107187748,
+        "valence": 0.13115283846855164
+      },
+      "cradle_inside": null,
+      "screen_edge_contact": false,
+      "somatic": {
+        "completion_reason": "support_confirmed",
+        "contact_fraction": 0.4270833432674408,
+        "frame_id": 224595,
+        "local_deformation_energy": 0.021428002044558525,
+        "locality_fraction": 0.06145826727151871,
+        "mass_conservation_error": 0.0,
+        "maximum_strain": 0.2464713603258133,
+        "motor_error": 5.108969389766571e-07,
+        "phase": {
+          "index": 1,
+          "program": "rest_nrem_sleep"
+        },
+        "phase_progress": 0.533744215965271,
+        "program_id": "rest_nrem_sleep",
+        "support_stability": 1.0,
+        "supported": true,
+        "supported_seconds": 303.9978332519531,
+        "target_locked": true,
+        "user_response_credit": 0.0
+      }
+    },
+    {
+      "monotonic_seconds": 1881.2206211,
+      "action": "Sleep",
+      "program": "defense_startle_orient_freeze",
+      "body": {
+        "contact": {
+          "area": 0.0,
+          "component_id": null,
+          "contact_count": 0,
+          "duration": 0.0,
+          "normal": [
+            0.3730575442314148,
+            -0.9278082251548767
+          ],
+          "point_local": [
+            -0.00031538307666778564,
+            0.22663772106170654
+          ],
+          "point_world": [
+            0.4441860318183899,
+            0.3368055522441864
+          ],
+          "pressure": 0.0,
+          "tangential_speed": 0.0,
+          "user_force_estimate": [
+            0.0,
+            0.0
+          ]
+        },
+        "efference_copy": {
+          "actual_shape_delta": [
+            0.7999999523162842,
+            -0.4444444179534912,
+            0.31813156604766846
+          ],
+          "actual_turn": -0.0003138389438390732,
+          "actual_velocity": [
+            -0.0029732699040323496,
+            -0.005959608592092991
+          ],
+          "intended_shape_delta": [
+            0.9269933700561523,
+            -0.46629035472869873,
+            0.0008928626193664968
+          ],
+          "intended_turn": 0.7200000286102295,
+          "intended_velocity": [
+            -0.14674118161201477,
+            -0.4761166572570801
+          ]
+        },
+        "environment": {
+          "available_motion_radius": 0.12586021423339844,
+          "clipped_fraction": 0.0,
+          "cursor_distance": 0.725829541683197,
+          "cursor_loom_rate": 0.0,
+          "distance_to_screen_edge": 0.12586021423339844,
+          "seconds_since_interaction": 0.06300000101327896,
+          "user_present": true
+        },
+        "fluid": {
+          "internal_relative_speed": 0.015523276291787624,
+          "pressure_variance": 0.027536896988749504,
+          "settle_error": 0.035510558634996414,
+          "slosh_energy": 0.017001621425151825
+        },
+        "frame_id": 224626,
+        "motion": {
+          "acceleration": [
+            -0.09550688415765762,
+            -0.21979182958602905
+          ],
+          "clinging": false,
+          "collision_impulse": 1.2611686178923354e-44,
+          "grounded": false,
+          "jerk": [
+            -0.012102998793125153,
+            -0.044816285371780396
+          ],
+          "object_load": 0.0,
+          "velocity": [
+            -0.0029732699040323496,
+            -0.005959608592092991
+          ],
+          "world_position": [
+            0.852077305316925,
+            0.9370698928833008
+          ]
+        },
+        "schema_version": 1,
+        "shape": {
+          "angular_velocity": -0.0003138389438390732,
+          "body_area_ratio": 1.0,
+          "body_length_ratio": 1.7999999523162842,
+          "body_width_ratio": 0.5555555820465088,
+          "center_of_mass_offset": [
+            8.381903171539307e-09,
+            -1.4901161193847656e-08
+          ],
+          "deformation_energy": 0.18186844885349274,
+          "maximum_strain": 0.40121525526046753,
+          "neck_tension": 0.0,
+          "orientation_radians": 2.1611082553863525,
+          "roundness": 0.8181315660476685
+        },
+        "topology": {
+          "budget_remaining": 1.0,
+          "connected_components": 1,
+          "detached_mass_fraction": 0.0,
+          "largest_fragment_fraction": 1.0,
+          "merge_progress": 0.0,
+          "recovery_active": false
+        }
+      },
+      "derived": {
+        "arousal": 0.641059160232544,
+        "attention_commitment": 0.5514333248138428,
+        "attention_strength": 0.20788246393203735,
+        "confidence": 0.5833478569984436,
+        "curiosity": 0.48320531845092773,
+        "fatigue": 0.9598402976989746,
+        "habituation": 0.7907151579856873,
+        "negative_valence": 0.0,
+        "neural_approach": 0.6327410936355591,
+        "neural_novelty": 0.02045951783657074,
+        "neural_rest": 0.0,
+        "neural_threat": 0.20000000298023224,
+        "positive_valence": 0.20403456687927246,
+        "self_uncertainty": 0.2624526917934418,
+        "social_warmth": 0.48834505677223206,
+        "stress": 0.02944454550743103
+      },
+      "recorded_felt": {
+        "activation": 0.3648241460323334,
+        "agency_match": 0.6876290440559387,
+        "balance": 0.8277604579925537,
+        "body_integrity": 0.9488099813461304,
+        "body_ownership": 0.8501521944999695,
+        "boredom": 0.6737737655639648,
+        "comfort": 0.5085489153862,
+        "contact_pleasantness": 0.49665939807891846,
+        "effort": 0.26357501745224,
+        "exploration_readiness": 0.2345738559961319,
+        "loneliness": 0.0482090599834919,
+        "motor_efficacy": 0.6879166960716248,
+        "pain_like": 0.002714936388656497,
+        "physical_load": 0.1262785643339157,
+        "play_readiness": 0.10350487381219864,
+        "relief": 0.27126041054725647,
+        "restraint": 9.80908925027372e-45,
+        "sleep_pressure": 0.9269677996635437,
+        "social_safety": 0.669567346572876,
+        "startle": 0.5180853605270386,
+        "surprise": 0.16759812831878662,
+        "vulnerability": 0.18388530611991882
+      },
+      "drives": {
+        "autonomy": 0.9990782141685486,
+        "comfort": 0.9991176724433899,
+        "curiosity": 0.9990434050559998,
+        "novelty": 0.9991320967674255,
+        "play": 0.9990761280059814,
+        "safety": 0.0004000000189989805,
+        "sleep": 0.9596244692802429,
+        "social": 0.1036977767944336
+      },
+      "affect": {
+        "arousal": 0.6891536712646484,
+        "attachment": 0.2954634428024292,
+        "confidence": 0.50054931640625,
+        "frustration": 0.050980713218450546,
+        "stress": 0.03077852353453636,
+        "valence": 0.12614154815673828
+      },
+      "cradle_inside": null,
+      "screen_edge_contact": false,
+      "somatic": {
+        "completion_reason": "none",
+        "contact_fraction": 0.0,
+        "frame_id": 224620,
+        "local_deformation_energy": 0.024698499590158463,
+        "locality_fraction": 1.0,
+        "mass_conservation_error": 0.0,
+        "maximum_strain": 0.40081942081451416,
+        "motor_error": 0.19408011436462402,
+        "phase": {
+          "index": 1,
+          "program": "defense_startle_orient_freeze"
+        },
+        "phase_progress": 0.0,
+        "program_id": "defense_startle_orient_freeze",
+        "support_stability": 0.0,
+        "supported": false,
+        "supported_seconds": 0.0,
+        "target_locked": true,
+        "user_response_credit": 0.0
+      }
+    }
+  ]
+}

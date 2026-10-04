@@ -11,6 +11,7 @@ struct Sprite {
     effect: [f32; 4], // time, sprite kind, reserved
     style: [f32; 4],  // angle, opacity, inverse viewport
     color: [f32; 4],
+    ribbon_edges: [f32; 4], // shared start/end cross-section offsets, in pixels
 }
 
 pub struct BirthScene {
@@ -74,9 +75,9 @@ impl BirthScene {
                     entry_point: Some("vertex_main"),
                     compilation_options: Default::default(),
                     buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: 64,
+                        array_stride: std::mem::size_of::<Sprite>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4],
                     }],
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -262,6 +263,7 @@ impl BirthScene {
                     effect: [t, if side == 0.0 { 1.0 } else { 0.0 }, 0.0, 0.0],
                     style: [pose.angle(side), opacity, 1.0 / w, 1.0 / h],
                     color: [1.0; 4],
+                    ribbon_edges: [0.0; 4],
                 });
             }
             // Three time-offset holder silhouettes from the reference release trail.
@@ -288,6 +290,7 @@ impl BirthScene {
                             effect: [t, 0.0, 0.0, texture],
                             style: [previous.angle(side), alpha, 1.0 / w, 1.0 / h],
                             color: [1.0, 1.0, 1.0, 0.0],
+                            ribbon_edges: [0.0; 4],
                         });
                     }
                 }
@@ -404,6 +407,7 @@ fn den_sprite(viewport: [u32; 2], den: [f32; 2], scale: f32, front: bool) -> Spr
         effect: [0.0, if front { -1.0 } else { -2.0 }, 0.0, 0.0],
         style: [0.0, 1.0, 1.0 / w, 1.0 / h],
         color: [1.0; 4],
+        ribbon_edges: [0.0; 4],
     }
 }
 pub fn smooth(a: f32, b: f32, t: f32) -> f32 {

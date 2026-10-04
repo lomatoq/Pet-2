@@ -332,20 +332,33 @@ fn derive_felt(
         .max(2.2 * b.topology.detached_mass_fraction);
     let pain_like =
         unit(smoothstep(0.52, 0.90, pain_stimulus) * (0.65 + 0.35 * (1.0 - a.controllability)));
+    // Touch is an observed contact, never the feathered pressure band's
+    // non-zero tail at pressure zero. Resting support is a separate channel.
+    let touch_present = bool_value(b.contact.contact_count > 0);
+    let gentle_motion = 1.0 - smoothstep(0.18, 0.55, b.contact.tangential_speed);
     let pleasant = unit(
-        soft_band(
+        touch_present * soft_band(
             b.contact.pressure,
             0.03,
             source.soft_touch_pressure_max.max(0.031),
             0.10,
         ) * (1.0 - pain_like)
-            * (0.35 + 0.65 * d.social_warmth)
-            * (0.40 + 0.60 * a.expectedness),
+            * (0.75 + 0.25 * d.social_warmth)
+            * (0.75 + 0.25 * a.expectedness)
+            * (0.65 + 0.35 * gentle_motion),
     );
+    // An external transfer need not block the pet's intended movement. Count
+    // opposing progress only when pressure/stretch also loads the body.
+    let intended_speed = intent.intended_velocity.length();
+    let blocked_progress = if intended_speed > 0.01 {
+        ((intent.intended_velocity - intent.actual_velocity)
+            .dot(intent.intended_velocity / intended_speed) / 0.25).clamp(0.0, 1.0)
+    } else { 0.0 };
+    let mechanical_load = smoothstep(0.30, 0.70,
+        b.contact.pressure.max(b.shape.maximum_strain).max(b.shape.neck_tension));
     let restraint = unit(
-        b.contact.duration / 1.2
-            * (intent.intended_velocity - intent.actual_velocity).length()
-            * (0.45 + 0.55 * b.contact.pressure),
+        touch_present * (b.contact.duration / 1.2).clamp(0.0, 1.0)
+            * blocked_progress * mechanical_load,
     );
     let comfort = unit(
         0.35 * (1.0 - source.drives.comfort)
@@ -391,7 +404,15 @@ fn derive_felt(
         previous.previous_cursor_loom,
         dt,
     );
-    let startle = unit(0.52 * threat_rise + 0.28 * b.motion.collision_impulse + 0.20 * loom_rise);
+    // The spiking population oscillates even in a motionless sleeper. Its
+    // rising readout is appraisal, not an external impact. A startle reflex
+    // needs a sensed event; sustained danger still reaches stress/pain guards.
+    let external_witness = smoothstep(0.08, 0.25, b.environment.cursor_loom_rate)
+        .max(smoothstep(0.08, 0.35, b.motion.collision_impulse))
+        .max(smoothstep(0.20, 0.50, pain_like))
+        .max(smoothstep(0.12, 0.40, b.contact.user_force_estimate.length()));
+    let startle = unit(0.52 * threat_rise * external_witness
+        + 0.28 * b.motion.collision_impulse + 0.20 * loom_rise);
     let relief = unit(
         0.45 * fall(d.stress, previous.previous_stress, dt)
             + 0.25 * fall(d.neural_threat, previous.previous_threat, dt)
@@ -690,6 +711,7 @@ mod tests {
         let mut director = BodyInteroceptionDirector::default();
         let mut gentle = source();
         gentle.body.contact.area = 0.55;
+        gentle.body.contact.contact_count = 1;
         gentle.body.contact.pressure = 0.18;
         gentle.vita.appraisal.expectedness = 0.9;
         gentle.vita.appraisal.controllability = 0.9;
@@ -712,6 +734,7 @@ mod tests {
         let mut director = BodyInteroceptionDirector::default();
         let mut free = source();
         free.body.contact.duration = 2.0;
+        free.body.contact.contact_count = 1;
         free.body.contact.pressure = 0.5;
         free.body.efference_copy.intended_velocity = glam::Vec2::new(0.7, 0.0);
         free.body.efference_copy.actual_velocity = glam::Vec2::new(0.7, 0.0);
@@ -745,5 +768,83 @@ mod tests {
                 .into_iter()
                 .all(|v| v.is_finite() && (0.0..=1.0).contains(&v))
         );
+    }
+
+    #[test]
+    fn care_requires_actual_contact_and_distinguishes_transfer_from_loaded_restraint() {
+        let mut absent = source();
+        absent.body.contact.pressure = 0.18; // stale pressure is not a new touch
+        let absent_felt = derive_felt(&absent, DerivedNervousState::default(), &BodyInteroceptionDirector::default(), 0.05);
+        assert_eq!(absent_felt.contact_pleasantness, 0.0);
+        let mut carried = absent.clone();
+        carried.body.contact.contact_count = 1;
+        carried.body.contact.duration = 2.0;
+        carried.body.efference_copy.actual_velocity = glam::Vec2::new(0.6, 0.0);
+        let carried_felt = derive_felt(&carried, DerivedNervousState::default(), &BodyInteroceptionDirector::default(), 0.05);
+        assert!(carried_felt.contact_pleasantness > 0.45);
+        assert_eq!(carried_felt.restraint, 0.0);
+        let mut loaded = carried.clone();
+        loaded.body.contact.pressure = 0.85;
+        loaded.body.shape.neck_tension = 0.8;
+        loaded.body.efference_copy.intended_velocity = glam::Vec2::new(-0.5, 0.0);
+        let loaded_felt = derive_felt(&loaded, DerivedNervousState::default(), &BodyInteroceptionDirector::default(), 0.05);
+        assert!(loaded_felt.restraint > 0.9);
+        assert!(loaded_felt.pain_like > 0.4);
+        assert!(loaded_felt.contact_pleasantness < carried_felt.contact_pleasantness * 0.2);
+    }
+
+    #[test]
+    fn endogenous_threat_oscillation_is_not_an_external_startle_but_real_loom_is() {
+        let quiet = source();
+        let previous = BodyInteroceptionDirector::default();
+        let threat = DerivedNervousState { neural_threat: 0.2, ..Default::default() };
+        let resting = derive_felt(&quiet, threat, &previous, 0.05);
+        assert_eq!(resting.startle, 0.0);
+        let mut loom = quiet.clone();
+        loom.body.environment.cursor_loom_rate = 0.8;
+        assert!(derive_felt(&loom, threat, &previous, 0.05).startle > 0.6);
+        let mut impact = quiet;
+        impact.body.motion.collision_impulse = 0.9;
+        assert!(derive_felt(&impact, threat, &previous, 0.05).startle > 0.6);
+    }
+
+    #[test]
+    fn recorded_v63_nrem_to_startle_incident_requires_an_external_witness() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/v63_sleep_startle_incident.json")).unwrap();
+        let mut previous = BodyInteroceptionDirector::default();
+        for row in fixture["rows"].as_array().unwrap() {
+            let mut recorded = source();
+            recorded.body = serde_json::from_value(row["body"].clone()).unwrap();
+            recorded.drives = serde_json::from_value(row["drives"].clone()).unwrap();
+            recorded.affect = serde_json::from_value(row["affect"].clone()).unwrap();
+            let derived: DerivedNervousState = serde_json::from_value(row["derived"].clone()).unwrap();
+            let old: FeltStateV1 = serde_json::from_value(row["recorded_felt"].clone()).unwrap();
+            assert_eq!(recorded.body.contact.contact_count, 0);
+            assert_eq!(recorded.body.environment.cursor_loom_rate, 0.0);
+            assert!(recorded.body.motion.collision_impulse < 1e-8);
+            assert!(old.startle > 0.35);
+            let target = derive_felt(&recorded, derived, &previous, 0.05);
+            assert!(target.startle < 1e-8, "t={} regenerated a startle from quiet recorded input", row["monotonic_seconds"]);
+            previous.previous_threat = derived.neural_threat;
+        }
+        let row = &fixture["rows"][0];
+        let mut control = source();
+        control.body = serde_json::from_value(row["body"].clone()).unwrap();
+        control.body.environment.cursor_loom_rate = 0.8;
+        let derived: DerivedNervousState = serde_json::from_value(row["derived"].clone()).unwrap();
+        assert!(derive_felt(&control, derived, &BodyInteroceptionDirector::default(), 0.05).startle > 0.6,
+            "the same recorded body with genuine loom must retain its reflex");
+        // Even a previously latched legacy startle must dissipate when replay
+        // presents no sensed event; no direct clearing of its filter is needed.
+        let mut recovery = BodyInteroceptionDirector {
+            felt: serde_json::from_value(fixture["rows"][2]["recorded_felt"].clone()).unwrap(),
+            ..Default::default()
+        };
+        control.body.environment.cursor_loom_rate = 0.0;
+        for _ in 0..80 {
+            recovery.filter_felt(derive_felt(&control, derived, &recovery, 0.05), 0.05);
+            recovery.previous_threat = derived.neural_threat;
+        }
+        assert!(recovery.felt.startle < 1e-6);
     }
 }

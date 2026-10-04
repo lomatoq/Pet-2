@@ -311,8 +311,10 @@ mod tests {
         genome.temperament.sociability = 1.0;
         let mut life = crate::LifeCore::new(genome, 8);
         life.state.affect.attachment = 0.9;
-        let mut sensors = SensorFrame::default();
-        sensors.pet_dragged = true;
+        let mut sensors = SensorFrame {
+            pet_dragged: true,
+            ..Default::default()
+        };
         sensors.pointer_down = true;
         sensors.pet_hovered = true;
         sensors.embodied_interaction.contact.active = true;
@@ -434,9 +436,11 @@ mod tests {
             stress: 0.0,
             ..Default::default()
         };
-        let mut sensors = SensorFrame::default();
         // Native capture sets this even for gentle stationary pressure.
-        sensors.pet_dragged = true;
+        let mut sensors = SensorFrame {
+            pet_dragged: true,
+            ..Default::default()
+        };
         sensors.embodied_interaction.contact.active = true;
         sensors.embodied_interaction.contact.point_local.x = 0.5;
         let mut state = SelfCareState::default();
@@ -484,8 +488,10 @@ mod tests {
             stress: 0.0,
             ..Default::default()
         };
-        let mut sensors = SensorFrame::default();
-        sensors.pet_dragged = true;
+        let mut sensors = SensorFrame {
+            pet_dragged: true,
+            ..Default::default()
+        };
         sensors.embodied_interaction.contact.active = true;
         sensors.embodied_interaction.contact.point_local.x = 0.5;
         sensors.embodied_interaction.contact.pointer_speed = 2.5;

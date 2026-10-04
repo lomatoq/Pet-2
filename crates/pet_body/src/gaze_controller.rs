@@ -88,19 +88,22 @@ impl GazeController {
         let primary = plan.primary_target.filter(|point| point.is_finite());
         let secondary = plan.secondary_target.filter(|point| point.is_finite());
         self.social_refractory = (self.social_refractory - dt).max(0.0);
-        let social_pair = primary.zip(secondary).filter(|(a,b)| a.distance(*b)>0.07);
+        let social_pair = primary
+            .zip(secondary)
+            .filter(|(a, b)| a.distance(*b) > 0.07);
         if plan.mode != GazeMode::SocialReference || social_pair.is_none() {
             self.checkback_phase = false;
             self.social_anchor = None;
             self.social_completed = false;
         } else if let Some(pair) = social_pair {
-            let changed = self.social_anchor.is_none_or(|(a,b)|
-                a.distance(pair.0)>0.10 || b.distance(pair.1)>0.08);
+            let changed = self
+                .social_anchor
+                .is_none_or(|(a, b)| a.distance(pair.0) > 0.10 || b.distance(pair.1) > 0.08);
             if changed && self.social_refractory <= 0.0 {
-                self.social_anchor=Some(pair);
-                self.social_completed=false;
-                self.checkback_phase=false;
-                self.dwell_seconds=0.0;
+                self.social_anchor = Some(pair);
+                self.social_completed = false;
+                self.checkback_phase = false;
+                self.dwell_seconds = 0.0;
             }
         }
         let target = match plan.mode {
@@ -171,20 +174,20 @@ impl GazeController {
         }
 
         if plan.mode == GazeMode::SocialReference && social_pair.is_some() {
-            let minimum=plan.dwell_min.clamp(0.25,1.2);
-            let maximum=plan.dwell_max.max(minimum).clamp(minimum,2.5);
-            let dwell=minimum+(maximum-minimum)*(1.0-plan.confidence.clamp(0.0,1.0));
+            let minimum = plan.dwell_min.clamp(0.25, 1.2);
+            let maximum = plan.dwell_max.max(minimum).clamp(minimum, 2.5);
+            let dwell = minimum + (maximum - minimum) * (1.0 - plan.confidence.clamp(0.0, 1.0));
             // One referential glance and return, not a perpetual metronome.
             // Another glance needs a meaningful change by the object/recipient.
-            if self.current.distance(target)<0.03 && self.dwell_seconds>dwell {
+            if self.current.distance(target) < 0.03 && self.dwell_seconds > dwell {
                 if self.checkback_phase {
-                    self.checkback_phase=false;
-                    self.social_completed=true;
-                    self.social_refractory=maximum*2.0;
-                    self.dwell_seconds=0.0;
+                    self.checkback_phase = false;
+                    self.social_completed = true;
+                    self.social_refractory = maximum * 2.0;
+                    self.dwell_seconds = 0.0;
                 } else if !self.social_completed {
-                    self.checkback_phase=true;
-                    self.dwell_seconds=0.0;
+                    self.checkback_phase = true;
+                    self.dwell_seconds = 0.0;
                 }
             }
         }
@@ -225,26 +228,43 @@ mod tests {
 
     #[test]
     fn stationary_social_bid_checks_once_noise_does_not_restart_and_response_can() {
-        let mut c=GazeController::default();
-        let mut p=GazePlan { primary_target:Some(Vec2::new(0.3,0.4)),
-            secondary_target:Some(Vec2::new(0.8,0.4)),mode:GazeMode::SocialReference,
-            dwell_min:0.4,dwell_max:0.9,confidence:0.7,acquire_tau:0.08,..Default::default() };
-        let mut visits=0;let mut previously=false;
+        let mut c = GazeController::default();
+        let mut p = GazePlan {
+            primary_target: Some(Vec2::new(0.3, 0.4)),
+            secondary_target: Some(Vec2::new(0.8, 0.4)),
+            mode: GazeMode::SocialReference,
+            dwell_min: 0.4,
+            dwell_max: 0.9,
+            confidence: 0.7,
+            acquire_tau: 0.08,
+            ..Default::default()
+        };
+        let mut visits = 0;
+        let mut previously = false;
         for i in 0..600 {
-            p.secondary_target=Some(Vec2::new(0.8+(i as f32).sin()*0.002,0.4));
-            let gaze=c.tick(p,0.05).target.unwrap();
-            let near=gaze.x>0.7;
-            if near && !previously {visits+=1;} previously=near;
+            p.secondary_target = Some(Vec2::new(0.8 + (i as f32).sin() * 0.002, 0.4));
+            let gaze = c.tick(p, 0.05).target.unwrap();
+            let near = gaze.x > 0.7;
+            if near && !previously {
+                visits += 1;
+            }
+            previously = near;
         }
-        assert_eq!(visits,1,"unchanged invitations must not stare back and forth");
-        p.secondary_target=Some(Vec2::new(0.8,0.65));
+        assert_eq!(
+            visits, 1,
+            "unchanged invitations must not stare back and forth"
+        );
+        p.secondary_target = Some(Vec2::new(0.8, 0.65));
         for _ in 0..120 {
-            let gaze=c.tick(p,0.05).target.unwrap();
-            let near=gaze.x>0.7;
-            if near && !previously {visits+=1;} previously=near;
+            let gaze = c.tick(p, 0.05).target.unwrap();
+            let near = gaze.x > 0.7;
+            if near && !previously {
+                visits += 1;
+            }
+            previously = near;
         }
-        assert_eq!(visits,2,"a real response re-arms the glance");
-        assert!(c.current.distance(p.primary_target.unwrap())<0.01);
+        assert_eq!(visits, 2, "a real response re-arms the glance");
+        assert!(c.current.distance(p.primary_target.unwrap()) < 0.01);
     }
 
     #[test]

@@ -7,32 +7,34 @@
 mod affordance;
 mod debug;
 mod den;
+mod digestion;
 mod episode;
 mod food;
-mod digestion;
 mod gesture_conventions;
 mod mimesis;
 mod object;
-mod orb_play;
 mod orb_experience;
+mod orb_play;
 mod persistence;
 mod physics;
 mod state;
+mod toileting;
 
 pub use affordance::*;
 pub use debug::*;
 pub use den::*;
+pub use digestion::*;
 pub use episode::*;
 pub use food::*;
-pub use digestion::*;
 pub use gesture_conventions::*;
 pub use mimesis::*;
 pub use object::*;
-pub use orb_play::*;
 pub use orb_experience::*;
+pub use orb_play::*;
 pub use persistence::*;
 pub use physics::*;
 pub use state::*;
+pub use toileting::*;
 
 pub const ECOLOGY_HZ: f32 = 20.0;
 pub const ECOLOGY_PHYSICS_HZ: f32 = 120.0;

@@ -22,16 +22,16 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
     let right = monitor.map_or(1.0, |m| {
         (m.working_area.maximum.x - bounds.minimum.x) as f32 / extent.x
     });
-    let bottom = runtime
-        .body
-        .liquid_physical_support_pixels(Vec2::Y, extent.y);
+    let contact_bounds = runtime.body.main_liquid_contact_bounds_pixels(extent.y);
+    let bottom = contact_bounds.maximum;
     let mouth = runtime.body.feeding_mouth_tip_pixels(extent.y);
     let state = runtime.ecology.state();
     let active = state.waste.active();
     let wants = state.metabolism.tract.needs_to_go() || active;
     let allowed = !runtime.sensors.pet_dragged
         && runtime.ecology.feeding_navigation().is_none()
-        && runtime.life.state.affect.stress < 0.75;
+        && runtime.life.state.affect.stress < 0.75
+        && !runtime.vita.companion_intent().protective();
     if wants && allowed && runtime.digestion_site.is_none() {
         // Nearby free ground, clear of the bed and previous traces. Identity
         // breaks equal-distance ties without a new random scripted animation.
@@ -72,8 +72,32 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
     }
     let mut settled = false;
     let tolerance = if active { 2.0 } else { 1.0 };
+    // Eyelids are not sleep evidence: blinks and effort stay legitimate.
+    // Let the existing wake motor run before physiology takes navigation.
+    let sleeping = runtime.life.state.current_action == lifecore::ActionId::Sleep
+        || runtime.intent.locomotion == LocomotionMode::Sleep
+        || runtime.intent.pose == PoseIntent::Sleeping
+        || runtime.last_motor_packet.locomotion.pose == pet_motor::MotorPoseIntent::SupportedSleep;
+    let waking = runtime.life.state.current_action == lifecore::ActionId::WakeUp
+        || runtime.last_motor_packet.program == Some(pet_motor::BehaviorProgramId::RestRemDreamWake);
+    let supported = !runtime.cradle_seat.inside
+        && (feedback.world_position.y * extent.y + bottom.y - floor * extent.y).abs() < 3.0
+        && feedback.velocity.y.abs() * extent.y < 12.0;
+    let execution = runtime.ecology.prepare_toileting(pet_ecology::ToiletingEvidence {
+        needed: wants,
+        allowed,
+        sleeping,
+        waking,
+        at_site: runtime.digestion_site.is_some_and(|site|
+            (feedback.world_position.x - site.x).abs() * aspect < 0.025 * tolerance),
+        supported,
+        slow: (feedback.velocity * Vec2::new(aspect, 1.0)).length() < 0.08 * tolerance,
+    }, dt);
+    if execution.reserve_awake {
+        runtime.life.reserve_awake_for_physiology();
+    }
     if let Some(site) = runtime.digestion_site
-        && allowed
+        && execution.may_approach
     {
         runtime.voice_motion = None;
         let target = Vec2::new(site.x, (site.y - bottom.y / extent.y).clamp(0.08, 0.98));
@@ -81,11 +105,19 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
         runtime.intent.target_surface = None;
         runtime.intent.locomotion = LocomotionMode::Arrive;
         runtime.intent.desired_speed = 0.22;
-        settled = (feedback.world_position.x - site.x).abs() * aspect < 0.025 * tolerance
-            && (feedback.world_position.y + bottom.y / extent.y - site.y).abs() < 0.014 * tolerance
-            && (feedback.velocity * Vec2::new(aspect, 1.0)).length() < 0.08 * tolerance;
-        let mut packet = runtime.last_motor_packet.clone();
-        packet.fields.fill(None);
+        runtime.intent.pose = PoseIntent::Neutral;
+        runtime.intent.gaze_target = Some(site);
+        settled = execution.may_eliminate;
+        // The physiological route now owns execution; do not inherit a sleep
+        // pose, REM face or voice from an unrelated previously presented bout.
+        let mut packet = pet_motor::SomaticActuationPacket {
+            frame_id: runtime.last_motor_packet.frame_id,
+            phase_name: format!("toileting_{:?}", execution.phase).to_lowercase(),
+            ..Default::default()
+        };
+        packet.locomotion.target_position = Some(target);
+        packet.locomotion.pose = pet_motor::MotorPoseIntent::Travel;
+        packet.expression.gaze_target = Some(site);
         packet.support = (!runtime.cradle_seat.inside
             && (feedback.world_position.y + bottom.y / extent.y - site.y).abs() < 0.07)
             .then_some(pet_motor::SurfaceAttachmentCommand {
@@ -104,6 +136,7 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
         if settled {
             runtime.intent.desired_speed = 0.0;
             runtime.intent.pose = PoseIntent::Compact;
+            packet.locomotion.pose = pet_motor::MotorPoseIntent::SupportedRest;
             let effort = runtime.ecology.state().metabolism.tract.strain;
             packet.fields[0] = Some(pet_motor::LocalSomaticField {
                 kind: pet_motor::SomaticFieldKind::Gather,
@@ -118,17 +151,37 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
                 target_component: None,
             });
         }
+        runtime.vita.synchronize_execution_scene(
+            if settled { lifecore::PrimaryIntent::Rest } else { lifecore::PrimaryIntent::Approach },
+            lifecore::IntentTarget { kind: lifecore::IntentTargetKind::Surface, position: Some(site), confidence: 1.0, ..Default::default() },
+            lifecore::ExpectedOutcome { continuation: 1.0, success: f32::from(settled), ..Default::default() },
+        );
+        runtime.last_motor_packet = packet.clone();
         runtime.body.set_somatic_actuation(packet);
     }
     let contour = runtime.body.main_liquid_contact_bounds_pixels(extent.y);
-    let outlet = lateral_outlet(feedback.world_position, contour.minimum, contour.maximum,
-        extent, left, right, floor, runtime.ecology.state().identity_seed);
+    let outlet = lateral_outlet(
+        feedback.world_position,
+        contour.minimum,
+        contour.maximum,
+        extent,
+        left,
+        right,
+        floor,
+        runtime.ecology.state().identity_seed,
+    );
     let frame = pet_ecology::DigestionFrame {
-        body_bounds: Some([feedback.world_position+contour.minimum/extent,
-            feedback.world_position+contour.maximum/extent]),
+        body_bounds: Some([
+            feedback.world_position + contour.minimum / extent,
+            feedback.world_position + contour.maximum / extent,
+        ]),
         outlet,
         mouth: feedback.world_position + mouth / extent,
-        gas_outlet: feedback.world_position + runtime.body.liquid_physical_support_pixels(Vec2::new(1.0,0.45).normalize(),extent.y) / extent,
+        gas_outlet: feedback.world_position
+            + runtime
+                .body
+                .liquid_physical_support_pixels(Vec2::new(1.0, 0.45).normalize(), extent.y)
+                / extent,
         body_velocity: feedback.velocity,
         floor,
         settled: settled && allowed,
@@ -139,7 +192,7 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
     };
     runtime.ecology.step_digestion(frame, dt);
     let gut = &runtime.ecology.state().metabolism.tract;
-    if gut.strain > 0.03 && allowed {
+    if gut.strain > 0.03 && execution.may_eliminate {
         let face = &mut runtime.intent.expression;
         face.eye_aperture = (1.0 - gut.strain * 0.65).max(0.25);
         face.brow_tension = gut.strain * 0.55;
@@ -160,18 +213,33 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
 // measured silhouette, so it emerges beside the lower flank rather than being
 // painted across the belly. Clearance includes the largest emitted radius.
 #[allow(clippy::too_many_arguments)]
-fn lateral_outlet(center: Vec2, minimum: Vec2, maximum: Vec2, extent: Vec2,
-    left: f32, right: f32, floor: f32, seed: u64) -> Vec2 {
+fn lateral_outlet(
+    center: Vec2,
+    minimum: Vec2,
+    maximum: Vec2,
+    extent: Vec2,
+    left: f32,
+    right: f32,
+    floor: f32,
+    seed: u64,
+) -> Vec2 {
     let clearance = 7.0 * extent.y / 1152.0;
     let low = center.x + (minimum.x - clearance) / extent.x;
     let high = center.x + (maximum.x + clearance) / extent.x;
     let room_left = (low - left) * extent.x;
     let room_right = (right - high) * extent.x;
     let prefer_right = seed.is_multiple_of(2);
-    let right_side = if room_left < clearance { true }
-        else if room_right < clearance { false } else { prefer_right };
-    Vec2::new(if right_side { high } else { low },
-        (center.y + (maximum.y - clearance * 2.0) / extent.y).min(floor - clearance / extent.y))
+    let right_side = if room_left < clearance {
+        true
+    } else if room_right < clearance {
+        false
+    } else {
+        prefer_right
+    };
+    Vec2::new(
+        if right_side { high } else { low },
+        (center.y + (maximum.y - clearance * 2.0) / extent.y).min(floor - clearance / extent.y),
+    )
 }
 
 #[cfg(test)]
@@ -180,17 +248,18 @@ mod tests {
     #[test]
     fn waste_exits_lower_flank_outside_body_at_all_desktop_aspects() {
         for aspect in [0.75, 1.0, 2.4, 3.5] {
-            let extent=Vec2::new(1152.0*aspect,1152.0);
-            let lo=Vec2::new(-90.0,-65.0);let hi=Vec2::new(80.0,48.0);
-            for seed in [1,2] {
-                let p=Vec2::new(0.5,0.9);
-                let outlet=lateral_outlet(p,lo,hi,extent,0.0,1.0,0.95,seed);
-                let local=(outlet-p)*extent;
-                assert!(local.x<lo.x-6.0 || local.x>hi.x+6.0);
-                assert!(local.y>0.0 && outlet.y<0.95);
+            let extent = Vec2::new(1152.0 * aspect, 1152.0);
+            let lo = Vec2::new(-90.0, -65.0);
+            let hi = Vec2::new(80.0, 48.0);
+            for seed in [1, 2] {
+                let p = Vec2::new(0.5, 0.9);
+                let outlet = lateral_outlet(p, lo, hi, extent, 0.0, 1.0, 0.95, seed);
+                let local = (outlet - p) * extent;
+                assert!(local.x < lo.x - 6.0 || local.x > hi.x + 6.0);
+                assert!(local.y > 0.0 && outlet.y < 0.95);
             }
-            let p=Vec2::new(1.0-hi.x/extent.x,0.9);
-            assert!(lateral_outlet(p,lo,hi,extent,0.0,1.0,0.95,2).x<p.x);
+            let p = Vec2::new(1.0 - hi.x / extent.x, 0.9);
+            assert!(lateral_outlet(p, lo, hi, extent, 0.0, 1.0, 0.95, 2).x < p.x);
         }
     }
 }

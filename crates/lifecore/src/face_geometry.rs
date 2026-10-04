@@ -160,9 +160,11 @@ impl FacePose {
             Self::Tired => {
                 e.eye_aperture = 0.45;
                 e.brow_raise = -0.35;
-                e.mouth_curve = -0.25;
+                // Heavy lids communicate sleepiness. Valence belongs to the
+                // affect owner; fatigue alone must not author a displeased lip.
+                e.mouth_curve = 0.0;
                 e.geometry.brows = [[-0.2, -0.15, 0.0, 0.85]; 2];
-                e.geometry.mouth = [0.8, -0.15, -0.15, 0.25];
+                e.geometry.mouth = [0.8, 0.0, 0.0, 0.0];
             }
             Self::Startled => {
                 e.brow_raise = 0.7;

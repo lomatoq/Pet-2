@@ -71,7 +71,10 @@ pub(crate) fn choose_program_with_rest_commitment(
         EmbodiedGestureKind::PullAndRelease
             if !context.gesture_ended && context.gesture_confidence > 0.44 =>
         {
-            Some((P::TouchPullReleaseRebound, MotorCause::UserGesture))
+            let loaded = context.body.shape.neck_tension > 0.30
+                || context.body.shape.maximum_strain > 0.45
+                || goal.felt.restraint > 0.2;
+            Some((if loaded { P::TouchPullReleaseRebound } else { P::TouchStrokeFollow }, MotorCause::UserGesture))
         }
         EmbodiedGestureKind::Hold
             if !context.gesture_ended && context.gesture_confidence > 0.44 =>
@@ -145,7 +148,10 @@ pub(crate) fn choose_program_with_rest_commitment(
             && context.body.contact.duration >= 0.12
             && external_cursor_speed >= 0.05 =>
         {
-            Some((P::TouchPullReleaseRebound, MotorCause::UserGesture))
+            let loaded = context.body.shape.neck_tension > 0.30
+                || context.body.shape.maximum_strain > 0.45
+                || goal.felt.restraint > 0.2;
+            Some((if loaded { P::TouchPullReleaseRebound } else { P::TouchStrokeFollow }, MotorCause::UserGesture))
         }
         _ => None,
     };
@@ -197,7 +203,12 @@ pub(crate) fn choose_program_with_rest_commitment(
     }
 
     if rest_requested {
-        let program = if context.has_bottom_screen_edge() && goal.action != ActionId::LandOnWindow {
+        let program = if context.den_supported && !context.pet_dragged {
+            // A bed is an independently admitted physical support. Its height
+            // is above the desktop edge; searching for the taskbar here can
+            // never satisfy the intended sleep scene and repeatedly reorients.
+            if goal.action == ActionId::Sleep { P::RestNremSleep } else { P::RestSitSettle }
+        } else if context.has_bottom_screen_edge() && goal.action != ActionId::LandOnWindow {
             // Bottom-edge sleep is one measured physical sequence:
             // fast approach (>8 px) -> soft landing (<=8 px) -> 300 ms real
             // contact dwell -> short loaded settle -> NREM. The self-generated
@@ -580,7 +591,20 @@ pub fn lock_target(
         | P::RestSitSettle
         | P::RestNremSleep
         | P::RestRemDreamWake => {
-            if supported_rest_requested(goal, context) && goal.action != ActionId::LandOnWindow {
+            if context.den_supported {
+                // The body's admitted bed plane owns this bout. Never remember
+                // or silently fall back to the unrelated desktop floor.
+                context.den_support_point.filter(|p| p.is_finite()).map(|point| {
+                    BehaviorTarget::Surface(crate::SurfaceTarget {
+                        surface_id: lifecore::SurfaceId("den:cushion".into()),
+                        anchor_point: point,
+                        normal: Vec2::NEG_Y,
+                        tangent: Vec2::X,
+                        center_clearance: context.body_bottom_extent.clamp(0.012, 0.25),
+                        score: 1.0,
+                    })
+                })
+            } else if supported_rest_requested(goal, context) && goal.action != ActionId::LandOnWindow {
                 rank_surface(context, true, false).map(BehaviorTarget::Surface)
             } else {
                 remembered_surface

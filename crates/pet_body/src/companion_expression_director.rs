@@ -218,7 +218,10 @@ impl CompanionExpressionDirector {
             face.mouth_tension = face.mouth_tension.max(0.20 + pain * 0.42);
             face.mouth_compression = face.mouth_compression.max(0.12 + pain * 0.28);
             face.brow_tension = face.brow_tension.max(0.28 + pain * 0.40);
-            if matches!(intent.primary, PrimaryIntent::StartleFreeze | PrimaryIntent::EscapePressure) {
+            if matches!(
+                intent.primary,
+                PrimaryIntent::StartleFreeze | PrimaryIntent::EscapePressure
+            ) {
                 // Alertness raises the brows; it must not become an angry knit
                 // merely because protective ownership won arbitration.
                 face.brow_raise = face.brow_raise.max(0.60 + intent.surprise * 0.24);
@@ -341,7 +344,12 @@ impl CompanionExpressionDirector {
 fn gaze_mode_for(intent: PrimaryIntent, uncertainty: f32) -> CompanionGazeMode {
     // Urgent interception, contact and defense own attention even when the
     // outcome is uncertain. Social referencing is only for recipient-directed bids.
-    if uncertainty > 0.45 && matches!(intent, PrimaryIntent::OfferObject | PrimaryIntent::InvitePlay) {
+    if uncertainty > 0.45
+        && matches!(
+            intent,
+            PrimaryIntent::OfferObject | PrimaryIntent::InvitePlay
+        )
+    {
         return CompanionGazeMode::SocialReference;
     }
     match intent {
@@ -421,7 +429,11 @@ fn face_prototype(intent: PrimaryIntent) -> FaceTarget {
         PrimaryIntent::GuardPain | PrimaryIntent::RejectContact | PrimaryIntent::EscapePressure => {
             face.eye_aperture = 0.80;
             face.squint = 0.22;
-            face.brow_tension = if intent==PrimaryIntent::RejectContact {0.64} else {0.32};
+            face.brow_tension = if intent == PrimaryIntent::RejectContact {
+                0.64
+            } else {
+                0.32
+            };
             face.mouth_curve = -0.30;
             face.mouth_tension = 0.34;
             face.mouth_compression = 0.25;
@@ -548,26 +560,56 @@ mod tests {
 
     #[test]
     fn protective_alert_and_boundary_remain_distinct_and_joy_recruits_a_readable_smile() {
-        let mut director=CompanionExpressionDirector::new(42);
-        let mut alert=intent(PrimaryIntent::StartleFreeze);
-        alert.surprise=0.9;
-        let alarm=director.tick(alert,ExpressionEvidence {protective_reflex:true,..Default::default()},0.05);
-        let boundary=director.tick(intent(PrimaryIntent::RejectContact),ExpressionEvidence {protective_reflex:true,..Default::default()},0.05);
-        let joy=director.tick(intent(PrimaryIntent::Celebrate),Default::default(),0.05);
-        assert!(alarm.face.brow_raise>0.65 && alarm.face.mouth_open>0.4);
-        assert!(alarm.face.brow_tension<0.25);
-        assert!(boundary.face.brow_tension>0.6 && boundary.face.mouth_curve<0.0);
-        assert!(joy.face.mouth_curve>0.6 && joy.face.squint>0.1);
+        let mut director = CompanionExpressionDirector::new(42);
+        let mut alert = intent(PrimaryIntent::StartleFreeze);
+        alert.surprise = 0.9;
+        let alarm = director.tick(
+            alert,
+            ExpressionEvidence {
+                protective_reflex: true,
+                ..Default::default()
+            },
+            0.05,
+        );
+        let boundary = director.tick(
+            intent(PrimaryIntent::RejectContact),
+            ExpressionEvidence {
+                protective_reflex: true,
+                ..Default::default()
+            },
+            0.05,
+        );
+        let joy = director.tick(intent(PrimaryIntent::Celebrate), Default::default(), 0.05);
+        assert!(alarm.face.brow_raise > 0.65 && alarm.face.mouth_open > 0.4);
+        assert!(alarm.face.brow_tension < 0.25);
+        assert!(boundary.face.brow_tension > 0.6 && boundary.face.mouth_curve < 0.0);
+        assert!(joy.face.mouth_curve > 0.6 && joy.face.squint > 0.1);
     }
 
     #[test]
     fn uncertainty_does_not_steal_interception_or_protective_attention() {
-        for intent in [PrimaryIntent::Chase,PrimaryIntent::Intercept,PrimaryIntent::Catch] {
-            assert_eq!(gaze_mode_for(intent,1.0),CompanionGazeMode::PredictiveIntercept);
+        for intent in [
+            PrimaryIntent::Chase,
+            PrimaryIntent::Intercept,
+            PrimaryIntent::Catch,
+        ] {
+            assert_eq!(
+                gaze_mode_for(intent, 1.0),
+                CompanionGazeMode::PredictiveIntercept
+            );
         }
-        assert_eq!(gaze_mode_for(PrimaryIntent::Sleep,1.0),CompanionGazeMode::Sleep);
-        assert_eq!(gaze_mode_for(PrimaryIntent::RejectContact,1.0),CompanionGazeMode::AvoidantCheck);
-        assert_eq!(gaze_mode_for(PrimaryIntent::Explore,1.0),CompanionGazeMode::Inspect);
+        assert_eq!(
+            gaze_mode_for(PrimaryIntent::Sleep, 1.0),
+            CompanionGazeMode::Sleep
+        );
+        assert_eq!(
+            gaze_mode_for(PrimaryIntent::RejectContact, 1.0),
+            CompanionGazeMode::AvoidantCheck
+        );
+        assert_eq!(
+            gaze_mode_for(PrimaryIntent::Explore, 1.0),
+            CompanionGazeMode::Inspect
+        );
     }
 
     #[test]

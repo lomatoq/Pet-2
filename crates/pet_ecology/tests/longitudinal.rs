@@ -21,7 +21,7 @@ fn intent(position: Vec2) -> BodyIntent {
 
 fn frame(action: ActionId, position: Vec2, timestamp: f64) -> EcologyBehaviorFrame {
     EcologyBehaviorFrame {
-            seated_in_den: false,
+        seated_in_den: false,
         play_state: Default::default(),
         social_contact: Default::default(),
         selected_action: action,
@@ -109,7 +109,10 @@ fn seven_daily_ten_minute_sessions_have_honest_active_and_offline_time() {
             for tick in 0..SESSION_TICKS {
                 let timestamp = f64::from(day) * 86_400.0 + (tick + 1) as f64 * f64::from(DT);
                 let output = director.tick(
-                    &mut state, frame(action, position, timestamp), intent(position), DT,
+                    &mut state,
+                    frame(action, position, timestamp),
+                    intent(position),
+                    DT,
                 );
                 // No invented contact or movement: this fixture deliberately
                 // tests stalled policy recovery, not successful toy transport.
@@ -144,18 +147,27 @@ fn thirty_minutes_of_focus_does_not_solicit_or_vocalize() {
     let mut director = EpisodeDirector::default();
     let position = state.den.anchor;
     for tick in 0..36_000 {
-        let mut input = frame(ActionId::BringProceduralOrb, position, (tick + 1) as f64 * 0.05);
+        let mut input = frame(
+            ActionId::BringProceduralOrb,
+            position,
+            (tick + 1) as f64 * 0.05,
+        );
         input.focus_mode = true;
         input.play_drive = 0.9;
         input.curiosity_drive = 0.9;
         let output = director.tick(&mut state, input, intent(position), 0.05);
         assert!(output.vocal_trigger.is_none());
         assert!(output.body_intent.target_position.is_finite());
-        assert!(!matches!(output.debug.active_goal,
-            Some(EpisodeGoal::OfferOrb | EpisodeGoal::SoloOrbPlay | EpisodeGoal::SharedAttention)));
+        assert!(!matches!(
+            output.debug.active_goal,
+            Some(EpisodeGoal::OfferOrb | EpisodeGoal::SoloOrbPlay | EpisodeGoal::SharedAttention)
+        ));
         state.metabolism.advance(0.05);
     }
-    assert_eq!(state.episode_stats.started[EpisodeGoal::OfferOrb.index()], 0);
+    assert_eq!(
+        state.episode_stats.started[EpisodeGoal::OfferOrb.index()],
+        0
+    );
     state.validate().unwrap();
 }
 

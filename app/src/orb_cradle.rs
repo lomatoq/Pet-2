@@ -5,10 +5,17 @@ use pet_ecology::{ObjectKind, ObjectLifecycle, WorldObject};
 
 /// Support under food, using the same floor and walls as swept bowl contact.
 /// Food already below the base remains below it rather than teleporting inside.
-pub fn food_floor(object: &WorldObject, anchor: Vec2, scale: f32, viewport: [u32; 2], desktop_floor: f32) -> f32 {
+pub fn food_floor(
+    object: &WorldObject,
+    anchor: Vec2,
+    scale: f32,
+    viewport: [u32; 2],
+    desktop_floor: f32,
+) -> f32 {
     let extent = Vec2::new(viewport[0].max(1) as f32, viewport[1].max(1) as f32);
     let g = CradleGeometry::new(anchor * extent, viewport, scale);
-    let radius = object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * extent.y;
+    let radius =
+        object.radius_px_at_reference / pet_ecology::REFERENCE_DESKTOP_HEIGHT_PX * extent.y;
     let p = object.position * extent;
     let dx = (p.x - g.anchor.x).abs();
     let width = g.half_width / 0.285;

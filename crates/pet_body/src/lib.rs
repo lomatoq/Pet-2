@@ -9,17 +9,18 @@ mod droplets;
 mod ecology_render;
 mod embodiment;
 mod expression;
-mod self_care_presentation;
 mod gaze_controller;
 mod graph;
 mod liquid;
 mod liquid_render;
 mod locomotion;
 mod mesh;
-mod morph;
 mod mood_color;
+mod morph;
+mod optical_volume;
 mod physiology;
 mod renderer;
+mod self_care_presentation;
 mod tuning;
 mod visual_traits;
 
@@ -293,6 +294,11 @@ impl ProceduralBody {
         self.embodiment.liquid.set_somatic_actuation(actuation);
     }
 
+    #[must_use]
+    pub fn somatic_actuation(&self) -> &SomaticActuationPacket {
+        &self.base_somatic_actuation
+    }
+
     /// Returns measured consequences of the most recently applied somatic
     /// packet. Cognition consumes this on the next tick, never algebraically on
     /// the same tick that produced the actuation.
@@ -339,20 +345,35 @@ impl ProceduralBody {
 
     /// Check before ticking physiology so an unseen action cannot receive relief.
     pub fn self_care_available(&self, intent: &BodyIntent) -> bool {
-        !self.feeding_expression_active && self.feeding_mouth_activity <= 0.05
+        !self.feeding_expression_active
+            && self.feeding_mouth_activity <= 0.05
             && self.embodiment.pose.audio_envelope <= 0.02
             && intent.locomotion != lifecore::LocomotionMode::Sleep
             && intent.expression.effort <= 0.2
             && !matches!(intent.pose, PoseIntent::Sleeping | PoseIntent::Cocoon)
-            && !matches!(intent.expression.face_pose, lifecore::FacePose::Startled | lifecore::FacePose::Boundary)
+            && !matches!(
+                intent.expression.face_pose,
+                lifecore::FacePose::Startled | lifecore::FacePose::Boundary
+            )
     }
 
-    pub fn set_self_care_motor(&mut self, motor: lifecore::SelfCareMotorFrame) { self.self_care_motor=motor; }
+    pub fn set_self_care_motor(&mut self, motor: lifecore::SelfCareMotorFrame) {
+        self.self_care_motor = motor;
+    }
     pub fn set_excitation_presentation(&mut self, frame: lifecore::ExcitationMotorFrame) {
         self.excitement_presentation = frame;
     }
 
-    pub fn set_feeding_expression_active(&mut self, active: bool) { self.feeding_expression_active=active; }
+    /// The expression director's geometry and effort outputs share one actuator
+    /// route. Material outputs still belong to the existing nervous-system bus.
+    pub fn set_companion_body_style(&mut self, style: BodyStyleTarget) {
+        self.embodiment.set_companion_body_style(style);
+        self.simulation.set_semantic_buoyancy(style.buoyancy);
+    }
+
+    pub fn set_feeding_expression_active(&mut self, active: bool) {
+        self.feeding_expression_active = active;
+    }
 
     pub fn set_feeding_mouth(&mut self, surface_pixels: Option<Vec2>, height: f32, dt: f32) {
         let target = surface_pixels.map_or(Vec2::ZERO, |p| {
@@ -454,6 +475,7 @@ impl ProceduralBody {
         let material = interaction.material;
         let diagnostics = self.embodiment.liquid.diagnostics();
         let contact = interaction.contact;
+        let measured_support = self.somatic_feedback();
         let observed =
             &interaction.components[..usize::from(interaction.component_observation_count)];
         let contact_component = contact
@@ -560,7 +582,9 @@ impl ProceduralBody {
                 acceleration: legacy.acceleration.clamp_length_max(1.0),
                 jerk: (legacy.acceleration.clamp_length_max(1.0) - previous_acceleration)
                     .clamp_length_max(1.0),
-                grounded: legacy.grounded,
+                // Legacy navigation knows screen landing; material feedback
+                // also measures the cushion's actual patch and 300 ms dwell.
+                grounded: legacy.grounded || measured_support.supported,
                 clinging: legacy.clinging,
                 object_load: diagnostics.object_load,
                 collision_impulse: legacy
@@ -647,18 +671,33 @@ impl ProceduralBody {
         }
         let suppressed = !self.self_care_available(intent) || voice.active;
         self.self_care.update(self.self_care_motor, suppressed, dt);
-        let excitement = if suppressed { lifecore::ExcitationMotorFrame::default() } else { self.excitement_presentation };
-        self.mood_color.set_excitation(excitement.intensity, excitement.chroma_pulse);
+        let excitement = if suppressed {
+            lifecore::ExcitationMotorFrame::default()
+        } else {
+            self.excitement_presentation
+        };
+        self.mood_color
+            .set_excitation(excitement.intensity, excitement.chroma_pulse);
         self.mood_color.update(affect, intent.expression, dt);
-        let velocity = self.simulation.feedback.velocity;
-        let optical_velocity = if velocity.is_finite() { velocity.clamp_length_max(1.0) } else { Vec2::ZERO };
-        self.chromatic_motion += (optical_velocity-self.chromatic_motion)
-            * (1.0-(-dt.clamp(0.0,0.1)/0.18).exp());
-        let roll_target = if excitement.roll_radians.is_finite() { excitement.roll_radians } else { 0.0 };
-        self.excitement_roll += (roll_target-self.excitement_roll)
-            * (1.0-(-dt.clamp(0.0,0.1)/0.30).exp());
+        let velocity = self.optical_screen_velocity();
+        let optical_velocity = if velocity.is_finite() {
+            velocity.clamp_length_max(1.0)
+        } else {
+            Vec2::ZERO
+        };
+        self.chromatic_motion +=
+            (optical_velocity - self.chromatic_motion) * (1.0 - (-dt.clamp(0.0, 0.1) / 0.18).exp());
+        let roll_target = if excitement.roll_radians.is_finite() {
+            excitement.roll_radians
+        } else {
+            0.0
+        };
+        self.excitement_roll +=
+            (roll_target - self.excitement_roll) * (1.0 - (-dt.clamp(0.0, 0.1) / 0.30).exp());
         let mut presented_intent = intent.clone();
-        if !suppressed { self.self_care.apply_face(&mut presented_intent); }
+        if !suppressed {
+            self.self_care.apply_face(&mut presented_intent);
+        }
         self.embodiment.self_care_lean = self.self_care.lean;
         self.embodiment.self_care_pulse = self.self_care.pulse;
         let mut care_packet = self.base_somatic_actuation.clone();
@@ -715,8 +754,11 @@ impl ProceduralBody {
         self.embodiment.liquid.set_face_attention_pose(
             (self.embodiment.pose.face_attention_offset
                 + self.fast_phenotype.face.translation_offset
-                + Vec2::new(self.self_care.turn * 0.028, -self.self_care.lowering * 0.028))
-                .clamp_length_max(0.082),
+                + Vec2::new(
+                    self.self_care.turn * 0.028,
+                    -self.self_care.lowering * 0.028,
+                ))
+            .clamp_length_max(0.082),
             (self.embodiment.pose.face_attention_roll + self.fast_phenotype.face.semantic_roll)
                 .clamp(
                     -self.tuning.face.maximum_roll_radians,
@@ -815,8 +857,12 @@ impl ProceduralBody {
         if supported.distance_squared(smooth) > 0.000001 {
             self.contained_face.velocity = Vec2::ZERO;
         }
-        self.contained_face.origin =
-            Some(previous + (supported - previous).clamp_length_max((0.65 + 0.75 * self.feeding_mouth_activity) * dt.clamp(0.0, 0.05)));
+        self.contained_face.origin = Some(
+            previous
+                + (supported - previous).clamp_length_max(
+                    (0.65 + 0.75 * self.feeding_mouth_activity) * dt.clamp(0.0, 0.05),
+                ),
+        );
     }
 
     #[must_use]
@@ -1054,7 +1100,7 @@ impl ProceduralBody {
                 .clamp(-96.0, 96.0),
         );
         let feather = self.tuning.compositor.shadow_feather.clamp(2.0, 128.0)
-            * (1.0+self.mood_color.joy*0.75);
+            * (1.0 + self.mood_color.joy * 0.75);
         minimum = minimum.min(organism_minimum + shadow_offset - Vec2::splat(feather));
         maximum = maximum.max(organism_maximum + shadow_offset + Vec2::splat(feather));
         // Screen contact belongs to material, not its halo. Keep all-particle
@@ -1251,6 +1297,12 @@ impl ProceduralBody {
             .set_world_to_body_scale(self.embodiment.world_to_body_scale() * ratio);
     }
 
+    /// Optical speed is measured relative to the visible body, not as a fraction
+    /// of the entire desktop per second. Preserve screen Y-down for compose.
+    fn optical_screen_velocity(&self) -> Vec2 {
+        self.simulation.feedback.velocity * self.embodiment.world_to_body_scale().abs()
+    }
+
     #[must_use]
     pub fn render_parameters(&self, genome: &Genome, arousal: f32) -> RenderParameters {
         let mut pose = self.embodiment.pose;
@@ -1266,10 +1318,14 @@ impl ProceduralBody {
         let voice_authority = pose.audio_envelope.clamp(0.0, 1.0);
         // Sustained emotion is an active cause too. The old idle-age fade
         // silently closed an alarm/joy mouth after three seconds.
-        let semantic_aperture = ((pose.brow_raise-0.35)/0.35).clamp(0.0,1.0)
-            .max(((pose.mouth_curve.abs()-0.22)/0.40).clamp(0.0,1.0));
-        pose.mouth_open *= settle.max(voice_authority).max(self.feeding_mouth_activity)
-            .max(f32::from(self.feeding_expression_active)).max(self.self_care.strength)
+        let semantic_aperture = ((pose.brow_raise - 0.35) / 0.35)
+            .clamp(0.0, 1.0)
+            .max(((pose.mouth_curve.abs() - 0.22) / 0.40).clamp(0.0, 1.0));
+        pose.mouth_open *= settle
+            .max(voice_authority)
+            .max(self.feeding_mouth_activity)
+            .max(f32::from(self.feeding_expression_active))
+            .max(self.self_care.strength)
             .max(semantic_aperture);
         // One brief tissue adjustment per long quiet interval, not a perpetual
         // mouth oscillator. Voice and food have independent opening authority.
@@ -1331,7 +1387,10 @@ impl ProceduralBody {
             mood_tint: self.mood_color.tint,
             mood_trail: self.mood_color.trail,
             joy_aura: self.mood_color.joy,
-            chromatic_motion: self.chromatic_motion,
+            chromatic_motion: renderer::spectral_motion_for(
+                self.chromatic_motion,
+                self.optical_screen_velocity(),
+            ),
             arousal,
             glow: (self.expression.current.body_glow * genome.body.bioluminescence
                 + effect.glow_boost * 0.34)
@@ -1391,8 +1450,14 @@ impl ProceduralBody {
             brow_asymmetry: pose.brow_asymmetry,
             geometry: pose.geometry,
             eye_aperture: pose.eye_aperture,
-            tongue_extension: if self.feeding_expression_active || self.feeding_mouth_activity>0.05
-                || pose.audio_envelope>0.02 {0.0} else {self.self_care.tongue},
+            tongue_extension: if self.feeding_expression_active
+                || self.feeding_mouth_activity > 0.05
+                || pose.audio_envelope > 0.02
+            {
+                0.0
+            } else {
+                self.self_care.tongue
+            },
             tongue_side: self.self_care.side,
             mouth_open: pose.mouth_open,
             feeding_mouth_offset: self.feeding_mouth_render_offset(),
@@ -1590,56 +1655,183 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optical_motion_preserves_pixel_speed_across_desktops_and_current_screen_direction() {
+        let genome = Genome::from_seed(64);
+        let mut baseline = ProceduralBody::generate(&genome).unwrap();
+        baseline.tuning.render_mode = BodyRenderMode::ParticlePbf;
+        let overlay_height = 320.0;
+        let physical_velocity = Vec2::new(16.0, 12.0); // pixels/s, screen Y down
+        let expected_local = physical_velocity * (2.0 * baseline.projection_scale() / overlay_height);
+        let mut visible_motion: Option<Vec2> = None;
+        for desktop in [Vec2::new(1_920.0, 1_080.0), Vec2::new(3_840.0, 2_160.0), Vec2::new(5_120.0, 1_440.0)] {
+            let mut body = baseline.clone();
+            body.set_desktop_motion_space(desktop, overlay_height);
+            assert!(body.embodiment.world_to_body_scale().y < 0.0);
+            body.simulation.feedback.velocity = physical_velocity / desktop;
+            assert!((body.optical_screen_velocity() - expected_local).length() < 1e-6);
+            let intent = intent(LocomotionMode::Hover, Vec2::splat(0.5));
+            for _ in 0..24 {
+                body.embodied_update(&intent, &SensorFrame::default(), AffectState::default(),
+                    VisualMindInput::default(), VoiceVisualState::default(), 1.0 / 120.0);
+            }
+            let rendered = body.render_parameters(&genome, 0.0).chromatic_motion;
+            assert!(rendered.x > 0.02 && rendered.y > 0.02,
+                "real right/down pixel motion vanished or flipped: desktop={desktop:?} rendered={rendered:?}");
+            if let Some(reference) = visible_motion {
+                assert!((rendered - reference).length() < 1e-6,
+                    "the same pixel speed changed optical strength on desktop={desktop:?}");
+            } else {
+                visible_motion = Some(rendered);
+            }
+            // Current reversal must beat the still-positive filtered history.
+            body.simulation.feedback.velocity = -physical_velocity / desktop;
+            let reversed = body.render_parameters(&genome, 0.0).chromatic_motion;
+            assert!(reversed.x < 0.0 && reversed.y < 0.0);
+            assert!(reversed.dot(rendered) < 0.0);
+            assert!((reversed + rendered).length() < 1e-6,
+                "a reversal must preserve bounded filtered strength while changing direction");
+            // A stop is not a lingering optical wake, even before the filter decays.
+            body.simulation.feedback.velocity = Vec2::ZERO;
+            assert_eq!(body.render_parameters(&genome, 0.0).chromatic_motion, Vec2::ZERO);
+        }
+    }
+
+    #[test]
+    fn companion_body_style_changes_actual_liquid_through_production_bridge() {
+        let genome = Genome::from_seed(42);
+        let mut neutral = ProceduralBody::generate(&genome).unwrap();
+        neutral.simulation.feedback.world_position = Vec2::splat(0.5);
+        let mut lean = neutral.clone();
+        let mut compact = neutral.clone();
+        lean.set_companion_body_style(BodyStyleTarget {
+            lean: Vec2::X,
+            ..BodyStyleTarget::default()
+        });
+        compact.set_companion_body_style(BodyStyleTarget {
+            compactness: 1.0,
+            ..BodyStyleTarget::default()
+        });
+        let mut intent = intent(LocomotionMode::Hover, Vec2::new(0.8, 0.5));
+        intent.desired_speed = 0.0;
+        for _ in 0..240 {
+            for body in [&mut neutral, &mut lean, &mut compact] {
+                body.embodied_update(
+                    &intent,
+                    &SensorFrame::default(),
+                    AffectState::default(),
+                    VisualMindInput::default(),
+                    VoiceVisualState::default(),
+                    1.0 / 120.0,
+                );
+                body.presentation_update(1.0 / 120.0);
+            }
+        }
+        let baseline = neutral.render_parameters(&genome, 0.0).liquid;
+        let leaned = lean.render_parameters(&genome, 0.0).liquid;
+        let guarded = compact.render_parameters(&genome, 0.0).liquid;
+        let difference = |variant: &LiquidRenderState| {
+            baseline.particles[..baseline.particle_count]
+                .iter()
+                .zip(&variant.particles[..variant.particle_count])
+                .map(|(a, b)| a.position.distance(b.position))
+                .sum::<f32>()
+                / baseline.particle_count as f32
+        };
+        let lean_delta = difference(&leaned);
+        let compact_delta = difference(&guarded);
+        println!(
+            "production style ablation: lean particle displacement={lean_delta:.7}, compact displacement={compact_delta:.7}"
+        );
+        assert!(lean_delta > 0.0001 && compact_delta > 0.0001);
+        assert_eq!(baseline.particle_count, leaned.particle_count);
+        assert_eq!(baseline.particle_count, guarded.particle_count);
+        assert_eq!(
+            neutral.simulation.feedback.world_position,
+            lean.simulation.feedback.world_position
+        );
+        assert_eq!(
+            neutral.simulation.feedback.world_position,
+            compact.simulation.feedback.world_position
+        );
+    }
+
+    #[test]
     fn sustained_emotion_retains_mouth_aperture_after_idle_fade() {
-        let genome=Genome::from_seed(42);
-        let mut body=ProceduralBody::generate(&genome).unwrap();
-        body.mouth_context_age=20.0;
-        body.embodiment.pose.mouth_open=0.5;
-        body.embodiment.pose.mouth_curve=0.70;
-        assert!(body.render_parameters(&genome,0.0).mouth_open>0.49);
-        body.embodiment.pose.mouth_curve=0.0;
-        body.embodiment.pose.brow_raise=0.8;
-        assert!(body.render_parameters(&genome,0.0).mouth_open>0.49);
-        body.embodiment.pose.brow_raise=0.0;
-        assert!(body.render_parameters(&genome,0.0).mouth_open<0.01);
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.mouth_context_age = 20.0;
+        body.embodiment.pose.mouth_open = 0.5;
+        body.embodiment.pose.mouth_curve = 0.70;
+        assert!(body.render_parameters(&genome, 0.0).mouth_open > 0.49);
+        body.embodiment.pose.mouth_curve = 0.0;
+        body.embodiment.pose.brow_raise = 0.8;
+        assert!(body.render_parameters(&genome, 0.0).mouth_open > 0.49);
+        body.embodiment.pose.brow_raise = 0.0;
+        assert!(body.render_parameters(&genome, 0.0).mouth_open < 0.01);
     }
 
     #[test]
     fn self_care_mouth_and_tongue_yield_to_feeding_sleep_and_voice() {
-        let genome=Genome::from_seed(42);
+        let genome = Genome::from_seed(42);
         for priority in 0..4 {
-            let mut body=ProceduralBody::generate(&genome).unwrap();
-            let mut goal=intent(LocomotionMode::Hover,Vec2::splat(0.5));
-            let motor=lifecore::SelfCareMotorFrame {kind:lifecore::SelfCareKind::Groom,
-                strength:1.0,tongue_extension:1.0,mouth_open:0.35,..Default::default()};
+            let mut body = ProceduralBody::generate(&genome).unwrap();
+            let mut goal = intent(LocomotionMode::Hover, Vec2::splat(0.5));
+            let motor = lifecore::SelfCareMotorFrame {
+                kind: lifecore::SelfCareKind::Groom,
+                strength: 1.0,
+                tongue_extension: 1.0,
+                mouth_open: 0.35,
+                ..Default::default()
+            };
             body.set_self_care_motor(motor);
-            for _ in 0..80 {body.embodied_update(&goal,&SensorFrame::default(),AffectState::default(),
-                VisualMindInput::default(),VoiceVisualState::default(),1.0/120.0);}
-            assert!(body.render_parameters(&genome,0.0).tongue_extension>0.95);
-            let mut voice=VoiceVisualState::default();
+            for _ in 0..80 {
+                body.embodied_update(
+                    &goal,
+                    &SensorFrame::default(),
+                    AffectState::default(),
+                    VisualMindInput::default(),
+                    VoiceVisualState::default(),
+                    1.0 / 120.0,
+                );
+            }
+            assert!(body.render_parameters(&genome, 0.0).tongue_extension > 0.95);
+            let mut voice = VoiceVisualState::default();
             match priority {
                 0 => body.set_feeding_expression_active(true),
-                1 => {goal.locomotion=LocomotionMode::Sleep;goal.pose=PoseIntent::Compact;},
-                2 => {voice.active=true;voice.mouth_open=0.6;voice.envelope=0.7;},
+                1 => {
+                    goal.locomotion = LocomotionMode::Sleep;
+                    goal.pose = PoseIntent::Compact;
+                }
+                2 => {
+                    voice.active = true;
+                    voice.mouth_open = 0.6;
+                    voice.envelope = 0.7;
+                }
                 _ => body.set_self_care_motor(Default::default()),
             }
-            body.embodied_update(&goal,&SensorFrame::default(),AffectState::default(),
-                VisualMindInput::default(),voice,1.0/120.0);
-            assert_eq!(body.render_parameters(&genome,0.0).tongue_extension,0.0);
+            body.embodied_update(
+                &goal,
+                &SensorFrame::default(),
+                AffectState::default(),
+                VisualMindInput::default(),
+                voice,
+                1.0 / 120.0,
+            );
+            assert_eq!(body.render_parameters(&genome, 0.0).tongue_extension, 0.0);
         }
     }
 
     #[test]
     fn chewing_keeps_jaw_visible_after_idle_mouth_has_settled() {
-        let genome=Genome::from_seed(42);
-        let mut body=ProceduralBody::generate(&genome).unwrap();
-        body.mouth_context_age=9.0;
-        body.embodiment.pose.mouth_open=0.4;
-        body.embodiment.pose.audio_envelope=0.0;
-        let quiet=body.render_parameters(&genome,0.3).mouth_open;
+        let genome = Genome::from_seed(42);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.mouth_context_age = 9.0;
+        body.embodiment.pose.mouth_open = 0.4;
+        body.embodiment.pose.audio_envelope = 0.0;
+        let quiet = body.render_parameters(&genome, 0.3).mouth_open;
         body.set_feeding_expression_active(true);
-        let chewing=body.render_parameters(&genome,0.3).mouth_open;
-        assert!(chewing>quiet+0.25);
+        let chewing = body.render_parameters(&genome, 0.3).mouth_open;
+        assert!(chewing > quiet + 0.25);
     }
 
     #[test]
@@ -1685,7 +1877,11 @@ mod tests {
             "tip={tip:?}, support={support:?}"
         );
         assert_eq!(after.feeding_mouth_offset, Vec2::ZERO);
-        assert!(after.feeding_mouth_offset.length() < 0.055, "mouth must stay close to face: {:?}", after.feeding_mouth_offset);
+        assert!(
+            after.feeding_mouth_offset.length() < 0.055,
+            "mouth must stay close to face: {:?}",
+            after.feeding_mouth_offset
+        );
         for _ in 0..360 {
             body.set_feeding_mouth(None, 1080.0, 1.0 / 120.0);
             body.presentation_update(1.0 / 120.0);

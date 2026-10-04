@@ -55,6 +55,8 @@ pub struct BodySimulation {
     blocked_effort: f32,
     pub exploratory_pressure: Vec2,
     metabolic_mass: f32,
+    semantic_buoyancy: f32,
+    semantic_buoyancy_target: f32,
 }
 
 impl BodySimulation {
@@ -74,13 +76,29 @@ impl BodySimulation {
             blocked_effort: 0.0,
             exploratory_pressure: Vec2::ZERO,
             metabolic_mass: 1.0,
+            semantic_buoyancy: 0.5,
+            semantic_buoyancy_target: 0.5,
         }
     }
 
     /// Nutritional mass changes slowly; its neutral value preserves the
     /// existing liquid solver and motion tuning.
     pub fn set_metabolic_mass(&mut self, relative_mass: f32) {
-        self.metabolic_mass = if relative_mass.is_finite() {relative_mass.clamp(0.7,1.9)} else {1.0};
+        self.metabolic_mass = if relative_mass.is_finite() {
+            relative_mass.clamp(0.7, 1.9)
+        } else {
+            1.0
+        };
+    }
+
+    /// Semantic 0..1 lightness modulates the existing actuator's bounded lift;
+    /// it never rewrites gravity, particle mass, or confirmed support.
+    pub fn set_semantic_buoyancy(&mut self, buoyancy: f32) {
+        self.semantic_buoyancy_target = if buoyancy.is_finite() {
+            buoyancy.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
     }
 
     #[must_use]
@@ -115,6 +133,12 @@ impl BodySimulation {
         dt: f32,
     ) -> &BodyFeedback {
         let dt = dt.clamp(0.0, 1.0 / 30.0);
+        self.semantic_buoyancy +=
+            (self.semantic_buoyancy_target - self.semantic_buoyancy) * (1.0 - (-6.0 * dt).exp());
+        let perceptual_hold = matches!(
+            intent.locomotion,
+            LocomotionMode::Hover | LocomotionMode::Arrive
+        ) && intent.desired_speed <= 0.001;
         let was_grounded = self.feedback.grounded;
         self.wander_phase += dt * 0.73;
         if let Some(impact) = &self.feedback.collision {
@@ -205,19 +229,20 @@ impl BodySimulation {
             0.0
         };
         let speed_cap = (base_speed_cap + burst_reserve) * expression_effort * cruise;
-        let desired_speed = (intent.desired_speed * BODY_MOVEMENT_TEMPO * cruise / self.metabolic_mass.sqrt())
-            .clamp(0.0, speed_cap)
+        let desired_speed = (intent.desired_speed * BODY_MOVEMENT_TEMPO * cruise
+            / self.metabolic_mass.sqrt())
+        .clamp(0.0, speed_cap)
             * reference_span;
         match intent.locomotion {
             LocomotionMode::Hover => {
-                target += Vec2::new(self.wander_phase.cos(), (self.wander_phase * 1.31).sin())
-                    * (0.012 * reference_span);
-                desired_velocity = arrive(
-                    position,
-                    target,
-                    desired_speed.max(BODY_MOVEMENT_TEMPO * 0.06 * reference_span),
-                    0.18 * reference_span,
-                );
+                if perceptual_hold {
+                    desired_velocity = Vec2::ZERO;
+                } else {
+                    target += Vec2::new(self.wander_phase.cos(), (self.wander_phase * 1.31).sin())
+                        * (0.012 * reference_span);
+                    desired_velocity =
+                        arrive(position, target, desired_speed, 0.18 * reference_span);
+                }
             }
             LocomotionMode::Seek => {
                 desired_velocity = direction(position, target) * desired_speed;
@@ -272,13 +297,15 @@ impl BodySimulation {
             }
         }
 
-        desired_velocity += avoid_surfaces(
-            position,
-            scale,
-            reference_span,
-            &sensors.visible_surfaces,
-            intent,
-        );
+        if !perceptual_hold {
+            desired_velocity += avoid_surfaces(
+                position,
+                scale,
+                reference_span,
+                &sensors.visible_surfaces,
+                intent,
+            );
+        }
         let velocity = self.feedback.velocity * scale;
         let purposeful_mode = matches!(
             intent.locomotion,
@@ -304,7 +331,8 @@ impl BodySimulation {
             // Purposeful launch/braking keeps its authored actuator reserve,
             // but it is no longer multiplied by the 2x travel tempo.
             * (1.0 + purposeful_response * 0.85);
-        let maximum_acceleration = unclamped_maximum_acceleration.min(1.85 * reference_span) / self.metabolic_mass;
+        let maximum_acceleration =
+            unclamped_maximum_acceleration.min(1.85 * reference_span) / self.metabolic_mass;
         let jerk_per_reference_span = match intent.locomotion {
             LocomotionMode::Flee => 14.0,
             LocomotionMode::Seek | LocomotionMode::Orbit => 8.0,
@@ -403,7 +431,11 @@ impl BodySimulation {
             LocomotionMode::Sleep | LocomotionMode::Cocoon => 0.0,
             LocomotionMode::EdgeCling => 1.0,
             LocomotionMode::Landing if self.feedback.grounded => 1.0,
-            _ => (0.74 + expression_energy * 0.18).clamp(0.0, 0.94),
+            // Hold still cancels the ordinary flight residual downward load.
+            // Existing acceleration/jerk limits decelerate; this is no snap.
+            _ if perceptual_hold => 1.0,
+            _ => (0.74 + expression_energy * 0.18 + (self.semantic_buoyancy - 0.5) * 0.22)
+                .clamp(0.0, 0.98),
         };
         let gravity = if supported {
             0.0
@@ -611,6 +643,88 @@ mod tests {
     use lifecore::{ExpressionState, Genome, PoseIntent, Rect, SurfaceId};
 
     use super::*;
+
+    #[test]
+    fn perceptual_hold_brakes_without_autonomous_drift_and_releases_for_escape() {
+        let genome = Genome::from_seed(17);
+        let mut sim = BodySimulation::new(17);
+        sim.set_motion_space_pixels(Vec2::new(1920.0, 1080.0));
+        sim.feedback.world_position = Vec2::splat(0.5);
+        sim.feedback.velocity = Vec2::new(0.08, -0.04);
+        let mut intent = BodyIntent {
+            locomotion: LocomotionMode::Hover,
+            desired_speed: 0.0,
+            target_position: Vec2::new(0.85, 0.2),
+            target_surface: None,
+            facing_direction: 1.0,
+            gaze_target: Some(Vec2::new(0.85, 0.2)),
+            pose: PoseIntent::Curious,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+        for _ in 0..480 {
+            sim.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        let settled = sim.feedback.world_position;
+        for _ in 0..240 {
+            sim.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        let drift_px =
+            ((sim.feedback.world_position - settled) * Vec2::new(1920.0, 1080.0)).length();
+        println!(
+            "perceptual hold: settled speed={:.7}, 2s drift={drift_px:.7}px",
+            sim.feedback.velocity.length()
+        );
+        assert_eq!(sim.motor_velocity, Vec2::ZERO);
+        assert!(drift_px < 0.01);
+        intent.locomotion = LocomotionMode::Flee;
+        intent.desired_speed = 0.8;
+        sim.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        assert!(sim.motor_velocity.length() > 0.1);
+    }
+
+    #[test]
+    fn semantic_buoyancy_changes_bounded_flight_load_but_not_sleep_support() {
+        let genome = Genome::from_seed(17);
+        let mut low = BodySimulation::new(17);
+        low.feedback.world_position = Vec2::splat(0.5);
+        let mut high = low.clone();
+        low.set_semantic_buoyancy(0.1);
+        high.set_semantic_buoyancy(0.9);
+        let mut intent = BodyIntent {
+            locomotion: LocomotionMode::Seek,
+            desired_speed: 0.2,
+            target_position: Vec2::new(0.85, 0.5),
+            target_surface: None,
+            facing_direction: 1.0,
+            gaze_target: None,
+            pose: PoseIntent::Neutral,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+        for _ in 0..120 {
+            low.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+            high.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        println!(
+            "buoyancy actual displacement: low={:.7}, high={:.7}",
+            low.feedback.world_position.y - 0.5,
+            high.feedback.world_position.y - 0.5
+        );
+        assert!(low.feedback.world_position.y > high.feedback.world_position.y + 0.001);
+        high = low.clone();
+        low.set_semantic_buoyancy(0.0);
+        high.set_semantic_buoyancy(1.0);
+        intent.locomotion = LocomotionMode::Sleep;
+        intent.desired_speed = 0.0;
+        low.feedback.grounded = true;
+        high.feedback.grounded = true;
+        for _ in 0..120 {
+            low.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+            high.fixed_update(&genome.body, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        assert_eq!(low.feedback.world_position, high.feedback.world_position);
+    }
 
     #[test]
     fn exuberant_misstep_is_bounded_and_recent_contact_generates_then_releases_probe() {

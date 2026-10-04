@@ -253,33 +253,87 @@ fn sprite(
             1.0 / v[1].max(1) as f32,
         ],
         color: [color[0], color[1], color[2], f32::from(front)],
+        ribbon_edges: [0.0; 4],
     });
 }
+fn ribbon_edge(points: &[(Vec2, f32)], i: usize) -> Vec2 {
+    let before = points[i].0 - points[i.saturating_sub(1)].0;
+    let after = points[(i + 1).min(points.len() - 1)].0 - points[i].0;
+    let previous = before.normalize_or_zero();
+    let next = after.normalize_or_zero();
+    let tangent = if next == Vec2::ZERO { previous } else { next };
+    let joined = (previous + next).normalize_or_zero();
+    let normal = if joined == Vec2::ZERO {
+        tangent.perp()
+    } else {
+        joined.perp()
+    };
+    if previous != Vec2::ZERO
+        && next != Vec2::ZERO
+        && (normal.dot(previous.perp()) <= 0.0 || normal.dot(next.perp()) <= 0.0)
+    {
+        return Vec2::ZERO;
+    }
+    // A shared, bounded miter gives both adjacent quads exactly the same edge.
+    let mut extent = points[i].1 * 0.5 / normal.dot(tangent.perp()).abs().max(0.5);
+    if before.length_squared() > 0.0001 && after.length_squared() > 0.0001 {
+        // A slow arrival can curl within its own width. Keep the miter's
+        // longitudinal projection inside both adjacent segments, so their
+        // triangles cannot fold across the centerline and double the glow.
+        let projection = normal.dot(previous).abs().max(normal.dot(next).abs());
+        extent = extent.min(0.45 * before.length().min(after.length()) / projection.max(0.0001));
+    }
+    normal * extent
+}
 fn ribbon(out: &mut Vec<Sprite>, points: &[(Vec2, f32)], color: [f32; 3], alpha: f32, v: [u32; 2]) {
+    if points.len() < 2 || alpha < 0.0005 {
+        return;
+    }
+    let mut edges: Vec<_> = (0..points.len()).map(|i| ribbon_edge(points, i)).collect();
+    let mut limits = vec![1.0_f32; points.len()];
     for (i, pair) in points.windows(2).enumerate() {
-        let (a, wa) = pair[0];
-        let (b, wb) = pair[1];
+        let delta = pair[1].0 - pair[0].0;
+        let cross = edges[i].perp_dot(edges[i + 1]).abs();
+        if cross > 0.000001 {
+            // Each triangle's area consists of one linear width term and
+            // one cross term. Bound the other endpoint's width; the bound
+            // still holds when neighbouring segments narrow either endpoint.
+            limits[i] = limits[i].min(0.9 * edges[i + 1].perp_dot(delta).abs() / cross);
+            limits[i + 1] = limits[i + 1].min(0.9 * edges[i].perp_dot(delta).abs() / cross);
+        }
+    }
+    for (edge, limit) in edges.iter_mut().zip(limits) {
+        *edge *= limit;
+    }
+    for (i, pair) in points.windows(2).enumerate() {
+        let (a, _) = pair[0];
+        let (b, _) = pair[1];
         let delta = b - a;
         if delta.length() < 0.01 {
             continue;
         }
-        sprite(
-            out,
-            (a + b) * 0.5,
-            Vec2::new((wa + wb) * 0.5, delta.length() + 0.65),
-            delta.y.atan2(delta.x) - PI * 0.5,
-            alpha,
-            color,
-            4.0,
-            false,
-            v,
-            [
+        let start = edges[i];
+        let end = edges[i + 1];
+        out.push(Sprite {
+            rect: [a.x, a.y, b.x, b.y],
+            effect: [
+                0.0,
+                4.0,
                 i as f32 / (points.len() - 1) as f32,
                 (i + 1) as f32 / (points.len() - 1) as f32,
             ],
-        );
+            style: [
+                0.0,
+                alpha,
+                1.0 / v[0].max(1) as f32,
+                1.0 / v[1].max(1) as f32,
+            ],
+            color: [color[0], color[1], color[2], 0.0],
+            ribbon_edges: [start.x, start.y, end.x, end.y],
+        });
     }
 }
+
 pub(super) fn append(out: &mut Vec<Sprite>, t: f32, m: [f32; 4], v: [u32; 2]) {
     let pose = Pose::new(t, m);
     let scale = pose.height / 1840.0 / 0.27;
@@ -767,5 +821,72 @@ pub(super) fn append(out: &mut Vec<Sprite>, t: f32, m: [f32; 4], v: [u32; 2]) {
             v,
             [0.0, 0.0],
         );
+    }
+}
+
+#[cfg(test)]
+mod ribbon_tests {
+    use super::*;
+
+    #[test]
+    fn curved_taper_has_identical_geometry_and_shading_at_every_join() {
+        let points = [
+            (Vec2::new(15.25, 10.5), 20.0),
+            (Vec2::new(17.0, 30.0), 32.0),
+            (Vec2::new(25.5, 52.75), 18.0),
+            (Vec2::new(24.0, 80.0), 8.0),
+        ];
+        let mut sprites = Vec::new();
+        ribbon(&mut sprites, &points, [1.0; 3], 0.5, [1280, 800]);
+        assert_eq!(sprites.len(), 3);
+        for pair in sprites.windows(2) {
+            // These are the actual endpoints consumed by vertex_main, not
+            // averages or overlapping rectangles. Both sides share coverage.
+            assert_eq!(pair[0].rect[2..], pair[1].rect[..2]);
+            assert_eq!(pair[0].ribbon_edges[2..], pair[1].ribbon_edges[..2]);
+            assert_eq!(pair[0].effect[3], pair[1].effect[2]);
+            assert_eq!(pair[0].style[1], pair[1].style[1]);
+        }
+    }
+
+    #[test]
+    fn ribbon_miters_remain_finite_at_coincident_points_and_reversals() {
+        let points = [
+            (Vec2::ZERO, 12.0),
+            (Vec2::ZERO, 12.0),
+            (Vec2::Y * 20.0, 8.0),
+            (Vec2::ZERO, 4.0),
+        ];
+        for i in 0..points.len() {
+            let edge = ribbon_edge(&points, i);
+            assert!(edge.is_finite());
+            assert!(edge.length() <= points[i].1 + 0.0001);
+        }
+        let mut sprites = Vec::new();
+        ribbon(&mut sprites, &points, [1.0; 3], 0.5, [1, 1]);
+        assert_eq!(sprites.len(), 2);
+    }
+
+    #[test]
+    fn production_trails_do_not_fold_their_segment_triangles() {
+        for viewport in [[1280, 800], [640, 480], [800, 1280], [3440, 1440]] {
+            let monitor = [0.0, 0.0, viewport[0] as f32, viewport[1] as f32];
+            for tick in 36..=1200 {
+                let mut sprites = Vec::new();
+                append(&mut sprites, tick as f32 / 120.0, monitor, viewport);
+                for s in sprites.iter().filter(|s| s.effect[1] == 4.0) {
+                    let a = Vec2::new(s.rect[0], s.rect[1]);
+                    let b = Vec2::new(s.rect[2], s.rect[3]);
+                    let ea = Vec2::new(s.ribbon_edges[0], s.ribbon_edges[1]);
+                    let eb = Vec2::new(s.ribbon_edges[2], s.ribbon_edges[3]);
+                    let triangle_a = (ea * 2.0).perp_dot(b - eb - (a - ea));
+                    let triangle_b = (a + ea - (b - eb)).perp_dot(b + eb - (b - eb));
+                    assert!(
+                        triangle_a * triangle_b >= -0.001,
+                        "folded trail at viewport={viewport:?}, tick={tick}: a={a:?} b={b:?} ea={ea:?} eb={eb:?} areas={triangle_a},{triangle_b}"
+                    );
+                }
+            }
+        }
     }
 }

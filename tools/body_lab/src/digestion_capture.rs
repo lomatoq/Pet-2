@@ -96,12 +96,17 @@ impl Capture {
         ] {
             renderer.set_review_background(background);
             if name == "poke" {
-                let point=state.waste.chains[0].nodes[0].position;
-                assert!(state.waste.poke(point,1.6));
+                let point = state.waste.chains[0].nodes[0].position;
+                assert!(state.waste.poke(point, 1.6));
                 for _ in 0..18 {
-                    state.waste.step(&mut state.metabolism.tract, DigestionFrame {
-                        aspect:1.6,..Default::default()
-                    },1.0/120.0);
+                    state.waste.step(
+                        &mut state.metabolism.tract,
+                        DigestionFrame {
+                            aspect: 1.6,
+                            ..Default::default()
+                        },
+                        1.0 / 120.0,
+                    );
                 }
             }
             if clean_time > 0 {
@@ -118,7 +123,7 @@ impl Capture {
                 }
             }
             objects.prepare(renderer.queue(), &state, 1.6, 300.0);
-            let mut params = body.render_parameters(&lifecore::Genome::from_seed(42),0.3);
+            let mut params = body.render_parameters(&lifecore::Genome::from_seed(42), 0.3);
             params.presentation_visibility = 0.0;
             let frame = renderer.render_capture_with_overlay(params, |_, _, encoder, view| {
                 objects.render_foreground_objects(encoder, view);

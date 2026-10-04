@@ -12,6 +12,57 @@ use pet_motor::{
 
 const DESKTOP: Vec2 = Vec2::new(1_920.0, 1_080.0);
 
+#[test]
+fn voluntary_family_preparation_does_not_translate_before_acquired_target() {
+    for program in [
+        BehaviorProgramId::MoveCuriosityArcApproach,
+        BehaviorProgramId::MoveCautiousApproach,
+        BehaviorProgramId::MoveInspectPauseScan,
+        BehaviorProgramId::MoveCheckBackSocialReference,
+    ] {
+        let genome = Genome::from_seed(42);
+        let goal = goal(&genome);
+        let mut body = ProceduralBody::generate(&genome).unwrap();
+        body.simulation.feedback.world_position = Vec2::splat(0.5);
+        body.simulation.set_motion_space_pixels(DESKTOP);
+        let mut context = BehaviorContextFrame::default();
+        context.body.motion.world_position = body.simulation.feedback.world_position;
+        context.orientation = Some(pet_motor::OrientationEvidence {
+            target_position: goal.body_intent.target_position,
+            gaze_error: 0.4,
+            acquired_seconds: 0.0,
+        });
+        let mut motor = BehaviorPerformanceRuntime::new(42);
+        motor.begin_lab_fixture(program, &goal, &context);
+        let origin = body.simulation.feedback.world_position;
+        for _ in 0..5 {
+            let packet = motor.tick_lab_fixture(&goal, &context, 0.05);
+            let mut intent = goal.body_intent.clone();
+            SomaticActuationBus::apply_to_intent(&packet, &context, &mut intent);
+            for _ in 0..6 {
+                body.fixed_update(&genome, &intent, &SensorFrame::default(), 1.0 / 120.0);
+            }
+        }
+        assert_eq!(
+            body.simulation.feedback.world_position, origin,
+            "{program:?} moved during acquisition"
+        );
+        context.orientation.as_mut().unwrap().gaze_error = 0.02;
+        context.orientation.as_mut().unwrap().acquired_seconds = 0.08;
+        let packet = motor.tick_lab_fixture(&goal, &context, 0.05);
+        assert_eq!(packet.phase_name, "prepare");
+        let mut intent = goal.body_intent.clone();
+        SomaticActuationBus::apply_to_intent(&packet, &context, &mut intent);
+        for _ in 0..6 {
+            body.fixed_update(&genome, &intent, &SensorFrame::default(), 1.0 / 120.0);
+        }
+        assert_eq!(
+            body.simulation.feedback.world_position, origin,
+            "{program:?} moved before preparation completed"
+        );
+    }
+}
+
 fn goal(genome: &Genome) -> BehaviorGoalFrame {
     let target = Vec2::new(0.74, 0.56);
     BehaviorGoalFrame {

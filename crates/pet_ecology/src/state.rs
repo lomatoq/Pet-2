@@ -174,8 +174,12 @@ impl EcologyState {
     /// A completed pleasant contact is evidence, not elapsed time or absence.
     /// Each new observation discounts older evidence so preference can reverse.
     pub fn observe_touch_preference(&mut self, side: f32) {
-        if !side.is_finite() || side.abs() <= 0.01 { return; }
-        for evidence in &mut self.touch_preference { *evidence *= 0.9; }
+        if !side.is_finite() || side.abs() <= 0.01 {
+            return;
+        }
+        for evidence in &mut self.touch_preference {
+            *evidence *= 0.9;
+        }
         let index = usize::from(side > 0.0);
         self.touch_preference[index] = (self.touch_preference[index] + 0.1).min(1.0);
     }
@@ -211,11 +215,19 @@ impl EcologyState {
     }
 
     pub fn validate(&self) -> Result<(), EcologyError> {
-        if !self.orb_experience.valid() { return Err(EcologyError::InvalidEpisodeMemory); }
-        if !self.touch_preference.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+        if !self.orb_experience.valid() {
+            return Err(EcologyError::InvalidEpisodeMemory);
+        }
+        if !self
+            .touch_preference
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
             return Err(EcologyError::InvalidTouchPreference);
         }
-        if !self.episode_memory.is_valid() { return Err(EcologyError::InvalidEpisodeMemory); }
+        if !self.episode_memory.is_valid() {
+            return Err(EcologyError::InvalidEpisodeMemory);
+        }
         if !matches!(self.schema_version, 1 | ECOLOGY_STATE_SCHEMA_VERSION) {
             return Err(EcologyError::UnsupportedSchema {
                 found: self.schema_version,
@@ -282,7 +294,9 @@ impl EcologyState {
             }
         }
         self.metabolism.validate()?;
-        if !self.waste.valid() { return Err(EcologyError::InvalidMetabolism); }
+        if !self.waste.valid() {
+            return Err(EcologyError::InvalidMetabolism);
+        }
         self.taste.validate()?;
         self.skills.validate()?;
         self.gesture_conventions.validate()?;

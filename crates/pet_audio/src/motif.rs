@@ -1098,7 +1098,11 @@ mod tests {
         let mut reference = SynthVoice::new(Arc::new(SpscRing::new()), 48_000);
         let voice = lifecore::Genome::from_seed(61).voice;
         let motif = lifecore::generate_initial_motifs(&voice)[0].clone();
-        let command = VoiceCommand::prepare(&voice, &motif, &request(motif.id, VocalStyle::SocialContact));
+        let command = VoiceCommand::prepare(
+            &voice,
+            &motif,
+            &request(motif.id, VocalStyle::SocialContact),
+        );
         quiet.start_command(command);
         reference.start_command(command);
         quiet.current = None;
@@ -1106,7 +1110,11 @@ mod tests {
         reference.presentation_gain = 1.0;
         let mut energy = 0.0;
         for n in 0..4800 {
-            let input = if n < 240 { (n as f32 * 0.13).sin() * 0.1 } else { 0.0 };
+            let input = if n < 240 {
+                (n as f32 * 0.13).sin() * 0.1
+            } else {
+                0.0
+            };
             let expected = reference.post_process_mono(input, 0.75);
             let actual = quiet.post_process_mono(input, 0.75);
             assert!((actual - expected * 0.2).abs() < 1e-6);

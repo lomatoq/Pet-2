@@ -17,7 +17,8 @@ pub const BODY_ACTION_TEMPO: f32 = 2.0;
 #[must_use]
 pub fn phase_clock_scale(program: BehaviorProgramId, phase_name: &str) -> f32 {
     use BehaviorProgramId as P;
-    if program == P::DefenseStartleOrientFreeze
+    if ordinary_orientation_phase(program, phase_name)
+        || program == P::DefenseStartleOrientFreeze
         || program == P::MoveInspectPauseScan
         || response_phase(phase_name)
         || matches!(
@@ -121,7 +122,16 @@ pub fn advance_phase(
             return PhaseAdvance::Finished(CompletionReason::Invalidated);
         }
     }
-    let performed_dt = dt * phase_clock_scale(active.program, spec.name);
+    let clock = if ordinary_orientation_phase(active.program, spec.name)
+        && !orientation_acquisition_required(active.program, spec.name, context)
+    {
+        // Pursuit, actual touch and urgent boundary responses retain the
+        // original physical tempo even when their program is generic travel.
+        BODY_ACTION_TEMPO
+    } else {
+        phase_clock_scale(active.program, spec.name)
+    };
+    let performed_dt = dt * clock;
     active.phase_time += performed_dt;
     if waiting && let Some(bid) = &mut active.social_bid {
         let elapsed = (context.timestamp_seconds - bid.started_at) as f32;
@@ -139,6 +149,14 @@ pub fn advance_phase(
         || (!evidence_complete && active.phase_time < spec.maximum_seconds)
     {
         return PhaseAdvance::Hold;
+    }
+    if !evidence_complete
+        && orientation_acquisition_required(active.program, spec.name, context)
+        && context.orientation.is_some()
+    {
+        // Acquisition failure is observable failure, not permission to perform
+        // toward an object the body never actually looked at.
+        return PhaseAdvance::Finished(CompletionReason::TimedOut);
     }
     if usize::from(active.phase.index) + 1 >= definition.phases.len() {
         let reason = active.social_bid.as_ref().map_or_else(
@@ -178,6 +196,23 @@ fn phase_evidence_complete(
             .is_some_and(|bid| bid.response_received);
     }
     let program = active.program;
+    if orientation_acquisition_required(program, phase_name, context)
+        && let Some(evidence) = context.orientation
+    {
+        let target_matches = active
+            .locked_target
+            .as_ref()
+            .and_then(crate::BehaviorTarget::world_position)
+            .is_none_or(|target| {
+                evidence.target_position.is_finite()
+                    && evidence.target_position.distance(target) <= 0.035
+            });
+        return target_matches
+            && evidence.gaze_error.is_finite()
+            && evidence.gaze_error <= 0.08
+            && evidence.acquired_seconds.is_finite()
+            && evidence.acquired_seconds >= 0.04;
+    }
     if phase_name == "hold" && program.family() == crate::ProgramFamily::TouchManipulation {
         return !context.pointer_down || context.gesture_ended;
     }
@@ -236,6 +271,43 @@ fn phase_evidence_complete(
     }
 }
 
+/// Only voluntary perceptual preparation consumes real time and measured gaze.
+/// Defensive startle/withdrawal, contact reflex and interception keep fast paths.
+#[must_use]
+pub fn ordinary_orientation_phase(program: BehaviorProgramId, phase_name: &str) -> bool {
+    use BehaviorProgramId as P;
+    match program {
+        P::MoveOrientReflex => matches!(phase_name, "eyes_first" | "front_axis_turn"),
+        P::MovePunctuatedTravel
+        | P::MoveCuriosityArcApproach
+        | P::MoveCautiousApproach
+        | P::MoveInspectPauseScan
+        | P::MoveCheckBackSocialReference => matches!(phase_name, "orient" | "prepare"),
+        _ => false,
+    }
+}
+
+/// Shared by phase evidence, motor defaults and final app gaze ownership. A
+/// predictive pursuit or direct physical interaction is not ordinary inspection;
+/// comparing its moving/led gaze to a frozen waypoint would create false failure.
+#[must_use]
+pub fn orientation_acquisition_required(
+    program: BehaviorProgramId,
+    phase_name: &str,
+    context: &BehaviorContextFrame,
+) -> bool {
+    ordinary_orientation_phase(program, phase_name)
+        && !context.pet_dragged
+        && !context.pet_touched
+        && context.boundary_violation < 0.18
+        && !matches!(
+            context.companion_intent,
+            lifecore::PrimaryIntent::Chase
+                | lifecore::PrimaryIntent::Intercept
+                | lifecore::PrimaryIntent::Catch
+        )
+}
+
 fn bottom_screen_edge(active: &ActivePerformance) -> bool {
     matches!(
         active.locked_target.as_ref(),
@@ -251,4 +323,145 @@ pub fn response_phase(name: &str) -> bool {
         name,
         "look_wait" | "wait" | "user_turn" | "listen" | "ambiguity_wait"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec2;
+
+    fn orient_performance() -> ActivePerformance {
+        ActivePerformance {
+            social_bid: None,
+            bout_id: 1,
+            program: BehaviorProgramId::MoveOrientReflex,
+            phase: crate::PhaseId {
+                program: BehaviorProgramId::MoveOrientReflex,
+                index: 1,
+            },
+            phase_time: 0.0,
+            total_time: 0.0,
+            locked_target: Some(crate::BehaviorTarget::Point(Vec2::new(0.8, 0.3))),
+            sampled_style: crate::BoutStyle::default(),
+            minimum_readability_reached: false,
+            interruption_request: None,
+            source_action: lifecore::ActionId::IdleHover,
+            cause: crate::MotorCause::BrainAction,
+        }
+    }
+
+    #[test]
+    fn ordinary_preparation_waits_for_measured_same_target_and_can_timeout() {
+        let mut active = orient_performance();
+        let mut context = BehaviorContextFrame {
+            orientation: Some(crate::OrientationEvidence {
+                target_position: Vec2::new(0.8, 0.3),
+                gaze_error: 0.4,
+                acquired_seconds: 0.0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.05),
+            PhaseAdvance::Hold
+        );
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.05),
+            PhaseAdvance::Hold
+        );
+        context.orientation.as_mut().unwrap().gaze_error = 0.02;
+        context.orientation.as_mut().unwrap().acquired_seconds = 0.08;
+        context.orientation.as_mut().unwrap().target_position = Vec2::new(0.2, 0.7);
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.05),
+            PhaseAdvance::Hold
+        );
+        context.orientation.as_mut().unwrap().target_position = Vec2::new(0.8, 0.3);
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.05),
+            PhaseAdvance::Advanced
+        );
+        println!(
+            "orientation trace: hold error -> hold error -> hold wrong target -> advance acquired at 0.20s"
+        );
+        active = orient_performance();
+        context.orientation.as_mut().unwrap().gaze_error = 0.4;
+        for _ in 0..14 {
+            assert_eq!(
+                advance_phase(&mut active, &context, 0.05),
+                PhaseAdvance::Hold
+            );
+        }
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.05),
+            PhaseAdvance::Finished(CompletionReason::TimedOut)
+        );
+        println!("orientation failure: TimedOut at 0.75s, no blind performance");
+        assert_eq!(
+            phase_clock_scale(BehaviorProgramId::MovePunctuatedTravel, "prepare"),
+            1.0
+        );
+        assert_eq!(
+            phase_clock_scale(BehaviorProgramId::DefenseStartleOrientFreeze, "eyes_first"),
+            1.0
+        );
+        assert_eq!(
+            phase_clock_scale(BehaviorProgramId::DefenseThreatHardenCompact, "prepare"),
+            BODY_ACTION_TEMPO
+        );
+    }
+
+    #[test]
+    fn predictive_pursuit_and_contact_do_not_wait_for_frozen_inspection_target() {
+        for intent in [
+            lifecore::PrimaryIntent::Chase,
+            lifecore::PrimaryIntent::Intercept,
+            lifecore::PrimaryIntent::Catch,
+        ] {
+            let context = BehaviorContextFrame {
+                companion_intent: intent,
+                orientation: Some(crate::OrientationEvidence {
+                    target_position: Vec2::new(0.1, 0.8),
+                    gaze_error: 0.9,
+                    acquired_seconds: 0.0,
+                }),
+                ..Default::default()
+            };
+            let mut active = orient_performance();
+            assert!(!orientation_acquisition_required(
+                active.program,
+                "eyes_first",
+                &context
+            ));
+            assert_eq!(
+                advance_phase(&mut active, &context, 0.02),
+                PhaseAdvance::Advanced
+            );
+            assert!((active.total_time - 0.04).abs() < 1.0e-6);
+        }
+        for (touched, dragged, boundary) in
+            [(true, false, 0.0), (false, true, 0.0), (false, false, 0.3)]
+        {
+            let context = BehaviorContextFrame {
+                pet_touched: touched,
+                pet_dragged: dragged,
+                boundary_violation: boundary,
+                ..Default::default()
+            };
+            assert!(!orientation_acquisition_required(
+                BehaviorProgramId::MovePunctuatedTravel,
+                "prepare",
+                &context
+            ));
+        }
+        let context = BehaviorContextFrame {
+            companion_intent: lifecore::PrimaryIntent::Inspect,
+            ..Default::default()
+        };
+        assert!(orientation_acquisition_required(
+            BehaviorProgramId::MoveInspectPauseScan,
+            "orient",
+            &context
+        ));
+    }
 }

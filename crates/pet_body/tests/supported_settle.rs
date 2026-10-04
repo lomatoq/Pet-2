@@ -149,7 +149,15 @@ fn check_supported_profile(startle: f32, hz: u64, production_tuning: bool) {
                 aspect_end = d.permanent_field_aspect;
             }
             assert!(d.finite);
-            assert_eq!(d.failsafe_hits, 0);
+            assert_eq!(
+                d.failsafe_hits,
+                0,
+                "frame={frame} body={index} mode={:?} speed={} position={:?} velocity={:?}",
+                current_intent.locomotion,
+                current_intent.desired_speed,
+                body.simulation.feedback.world_position,
+                body.simulation.feedback.velocity
+            );
             assert_eq!(d.recovery_count, 0);
             if index == 1 {
                 assert_eq!(d.support_field_load, 0.0);
@@ -165,7 +173,7 @@ fn check_supported_profile(startle: f32, hz: u64, production_tuning: bool) {
                 if let Some(previous) = previous_loaded_extent {
                     assert!(
                         (extent - previous).abs().max_element() < 3.0,
-                        "loaded shape changed discontinuously: {previous:?} -> {extent:?}"
+                        "loaded shape changed discontinuously frame={frame}: {previous:?} -> {extent:?}"
                     );
                 }
                 previous_loaded_extent = Some(extent);
@@ -248,7 +256,11 @@ fn check_supported_profile(startle: f32, hz: u64, production_tuning: bool) {
                     (extent - previous_loaded_extent.unwrap())
                         .abs()
                         .max_element()
-                        < 3.0
+                        < 3.0,
+                    "release jump frame={frame}: {:?} -> {extent:?}; root={:?}, velocity={:?}",
+                    previous_loaded_extent.unwrap(),
+                    body.simulation.feedback.world_position,
+                    body.simulation.feedback.velocity
                 );
                 previous_loaded_extent = Some(extent);
             }

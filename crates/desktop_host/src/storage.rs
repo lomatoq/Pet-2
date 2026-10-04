@@ -434,10 +434,36 @@ impl StateStore {
         self.append_telemetry_with_cap(event, TELEMETRY_LOG_MAX_BYTES)
     }
 
+    /// Material failure evidence has a separate bounded lifetime: frequent Lab
+    /// debug polling must not overwrite the incident's replay snapshot.
+    pub fn append_material_incident(&self, event: &EventLogEntry) -> Result<(), StorageError> {
+        self.append_bounded_log(
+            event,
+            20 * 1024 * 1024,
+            &self.paths.root.join("material-incidents.jsonl"),
+            &self.paths.root.join("material-incidents.previous.jsonl"),
+        )
+    }
+
     fn append_telemetry_with_cap(
         &self,
         event: &EventLogEntry,
         max_bytes: u64,
+    ) -> Result<(), StorageError> {
+        self.append_bounded_log(
+            event,
+            max_bytes,
+            &self.paths.telemetry,
+            &self.paths.telemetry_previous,
+        )
+    }
+
+    fn append_bounded_log(
+        &self,
+        event: &EventLogEntry,
+        max_bytes: u64,
+        path: &Path,
+        previous: &Path,
     ) -> Result<(), StorageError> {
         let line = encode_json_line(event)?;
         let record_bytes = line.len() as u64;
@@ -449,22 +475,19 @@ impl StateStore {
         }
 
         fs::create_dir_all(&self.paths.root)?;
-        let current_bytes = match fs::metadata(&self.paths.telemetry) {
+        let current_bytes = match fs::metadata(path) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error.into()),
         };
         if current_bytes > 0 && current_bytes.saturating_add(record_bytes) > max_bytes {
-            if self.paths.telemetry_previous.exists() {
-                fs::remove_file(&self.paths.telemetry_previous)?;
+            if previous.exists() {
+                fs::remove_file(previous)?;
             }
-            fs::rename(&self.paths.telemetry, &self.paths.telemetry_previous)?;
+            fs::rename(path, previous)?;
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.paths.telemetry)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         file.write_all(&line)?;
         file.flush()?;
         Ok(())
@@ -957,6 +980,31 @@ mod tests {
         assert_eq!(telemetry_sequences(&store.paths.telemetry), [2]);
         assert!(fs::metadata(&store.paths.telemetry).unwrap().len() <= max_bytes);
         assert!(fs::metadata(&store.paths.telemetry_previous).unwrap().len() <= max_bytes);
+    }
+
+    #[test]
+    fn material_incident_survives_frequent_debug_telemetry_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::at(directory.path());
+        let incident = EventLogEntry {
+            monotonic_seconds: 12.0,
+            kind: "material_anomaly".into(),
+            details: serde_json::json!({"body_snapshot": {"particles": [1, 2, 3]}}),
+        };
+        store.append_material_incident(&incident).unwrap();
+        let incident_path = directory.path().join("material-incidents.jsonl");
+        let before = fs::read(&incident_path).unwrap();
+        for sequence in 0..20 {
+            store
+                .append_telemetry_with_cap(&telemetry_event(sequence, 48), 200)
+                .unwrap();
+        }
+        assert!(store.paths.telemetry_previous.exists());
+        assert_eq!(fs::read(incident_path).unwrap(), before);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&before).unwrap()["kind"],
+            "material_anomaly"
+        );
     }
 
     #[test]

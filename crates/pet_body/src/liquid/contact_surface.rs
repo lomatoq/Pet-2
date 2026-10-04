@@ -184,7 +184,6 @@ pub fn contain_face_origin(
     safe
 }
 
-
 fn density(kernels: &[Kernel], point: Vec2, filter: Vec2) -> f32 {
     if filter == Vec2::ZERO {
         return raw_density(kernels, point);

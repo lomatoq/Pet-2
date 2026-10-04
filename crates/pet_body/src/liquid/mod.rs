@@ -19,10 +19,12 @@ mod particles;
 #[cfg(test)]
 mod rescue_tests;
 #[cfg(test)]
+mod incident_replay_tests;
+#[cfg(test)]
 mod shape_homeostasis;
-mod surface_tension;
 #[cfg(test)]
 mod surface_reconstruction_tests;
+mod surface_tension;
 mod topology_guard;
 mod viscoelastic_bonds;
 mod viscosity;
@@ -321,6 +323,7 @@ pub struct LiquidMorphRuntime {
     environment: EmbodiedEnvironmentFrame,
     runtime_actuation: PbfRuntimeActuation,
     somatic_actuation: SomaticActuationPacket,
+    companion_body_style: crate::BodyStyleTarget,
     somatic_feedback: SomaticPerformanceFeedback,
     support_key: u64,
     support_stable_seconds: f32,
@@ -461,6 +464,7 @@ impl LiquidMorphRuntime {
             environment: EmbodiedEnvironmentFrame::default(),
             runtime_actuation: PbfRuntimeActuation::default(),
             somatic_actuation: SomaticActuationPacket::default(),
+            companion_body_style: crate::BodyStyleTarget::default(),
             somatic_feedback: SomaticPerformanceFeedback::default(),
             support_key: 0,
             support_stable_seconds: 0.0,
@@ -543,6 +547,7 @@ impl LiquidMorphRuntime {
             replacement.interaction_tuning = interaction_tuning;
             replacement.pending_structural_tuning = None;
             replacement.somatic_actuation = self.somatic_actuation.clone();
+            replacement.companion_body_style = self.companion_body_style;
             replacement.somatic_feedback = self.somatic_feedback;
             replacement.support_key = self.support_key;
             replacement.support_stable_seconds = self.support_stable_seconds;
@@ -645,6 +650,10 @@ impl LiquidMorphRuntime {
     pub fn set_somatic_actuation(&mut self, mut actuation: SomaticActuationPacket) {
         actuation.sanitize();
         self.somatic_actuation = actuation;
+    }
+
+    pub fn set_companion_body_style(&mut self, style: crate::BodyStyleTarget) {
+        self.companion_body_style = style;
     }
 
     #[must_use]
@@ -852,11 +861,21 @@ impl LiquidMorphRuntime {
         let effective_density_compliance = self.effective_density_compliance();
         let spacing = PARTICLE_SPACING * self.tuning.spacing_scale;
         let kernel_radius = KERNEL_RADIUS * self.tuning.kernel_radius_scale;
+        let cradle = self.cradle_bounds.map(|(a, b)| xpbd::CradleBoundary {
+            minimum: self.body_origin + a + Vec2::splat(kernel_radius * 0.48),
+            maximum: self.body_origin + b - Vec2::splat(kernel_radius * 0.48),
+            component_id: self.components.main_component,
+        });
+        xpbd::repair_cradle_penetration(&mut self.particles, self.particle_count, cradle);
         let measured_load = self.measured_surface_load(motion, feedback.world_position);
         self.measured_support_load = measured_load.map_or(0.0, |(_, load)| load);
         self.update_field_shape(motion, dt, measured_load);
-        let support_plane =
-            self.measured_support_plane(motion, feedback.world_position, measured_load.is_some(), dt);
+        let support_plane = self.measured_support_plane(
+            motion,
+            feedback.world_position,
+            measured_load.is_some(),
+            dt,
+        );
         self.contact_plane = support_plane.filter(|_| !self.material_grab.is_active());
         let field_scale = self.tuning.character_field_radius_scale;
         // The root is a stable desktop reference, not the center of a seated
@@ -868,8 +887,8 @@ impl LiquidMorphRuntime {
             let current_depth = (self.body_origin - plane.point).dot(plane.normal);
             plane.normal * (plane.clearance + resting_depth - current_depth).min(0.0)
         });
-        self.support_well_offset += (support_offset - self.support_well_offset)
-            * (1.0 - (-6.0 * dt).exp());
+        self.support_well_offset +=
+            (support_offset - self.support_well_offset) * (1.0 - (-6.0 * dt).exp());
         if self.launch_preparation.1 > 0.0 {
             motor_field::apply_posture_field(
                 &mut self.particles,
@@ -1065,6 +1084,29 @@ impl LiquidMorphRuntime {
             motion.world_to_body_scale,
             self.tuning.posture_gain * 0.65,
         );
+        // Direct manipulation and supported sleep retain their existing shape
+        // ownership. Otherwise apply a low-frequency, zero-net-force bias to
+        // coherent mass only; detached material keeps its recovery field.
+        if !sensors.pet_dragged
+            && !matches!(
+                _intent.pose,
+                lifecore::PoseIntent::Sleeping | lifecore::PoseIntent::Cocoon
+            )
+        {
+            let support_normal = self.somatic_actuation.support.as_ref().map(|support| {
+                (support.normal * motion.world_to_body_scale.signum()).normalize_or_zero()
+            });
+            posture_energy += motor_field::apply_companion_style_field(
+                &mut self.particles,
+                self.particle_count,
+                self.components.main_component,
+                self.components.main_com,
+                self.companion_body_style,
+                motion.world_to_body_scale,
+                support_normal,
+                self.tuning.posture_gain,
+            );
+        }
         let mut somatic_step = apply_somatic_actuation(
             &mut self.particles,
             self.particle_count,
@@ -1145,11 +1187,6 @@ impl LiquidMorphRuntime {
                 self.flight_comet.length() * (1.0 - self.compliant_support_load).clamp(0.0, 1.0),
             );
         }
-        let cradle = self.cradle_bounds.map(|(a, b)| xpbd::CradleBoundary {
-            minimum: self.body_origin + a + Vec2::splat(kernel_radius * 0.48),
-            maximum: self.body_origin + b - Vec2::splat(kernel_radius * 0.48),
-            component_id: self.components.main_component,
-        });
         solve_density_constraints(
             &mut self.particles,
             self.particle_count,
@@ -1186,8 +1223,7 @@ impl LiquidMorphRuntime {
             kernel_radius,
             self.tuning.iso_threshold,
             self.cinematic_features,
-        ) * self.tuning.component_link_radius_scale
-            * 1.08;
+        ) * self.tuning.component_link_radius_scale;
         self.topology_decision = match self.interaction_tuning.topology_mode {
             TopologyConstraintMode::ObserveOnly => self.topology_guard.observe(
                 &self.particles,
@@ -1196,11 +1232,13 @@ impl LiquidMorphRuntime {
                 self.interaction_tuning,
             ),
             TopologyConstraintMode::GuardedNecks | TopologyConstraintMode::Viscoelastic => {
-                self.topology_guard.enforce(
+                self.topology_guard.enforce_with_budding(
                     &mut self.particles,
                     self.particle_count,
                     topology_link_distance,
                     self.interaction_tuning,
+                    sensors.interaction_actuation.allow_intentional_bud
+                        && self.material_grab.is_active(),
                 )
             }
         };
@@ -1208,8 +1246,11 @@ impl LiquidMorphRuntime {
         // Bond/topology corrections may follow the density pass; the wall
         // remains authoritative after those writers and before velocity commit.
         support_contact::settle_contact_layer(
-            &mut self.particles, self.particle_count, self.components.main_component,
-            self.contact_plane, dt,
+            &mut self.particles,
+            self.particle_count,
+            self.components.main_component,
+            self.contact_plane,
+            dt,
         );
         xpbd::project_support_plane(&mut self.particles, self.particle_count, support_plane);
         xpbd::project_cradle(&mut self.particles, self.particle_count, cradle);
@@ -1742,6 +1783,27 @@ impl LiquidMorphRuntime {
             return None;
         }
         let key = stable_text_hash(&support.surface_id.0);
+        let render = self.render_state();
+        let main: Vec<_> = render.particles[..render.particle_count]
+            .iter()
+            .copied()
+            .filter(|p| p.main_component)
+            .collect();
+        let contour =
+            contact_surface::contact_surface_support(&main, self.tuning.iso_threshold, -normal)?;
+        let lowest_center = main
+            .iter()
+            .map(|particle| particle.position.dot(normal))
+            .fold(f32::INFINITY, f32::min);
+        // Calibrate the kernel skirt from geometry, not an integral of root-to-
+        // wall error. The host already aligns the rendered contour to its floor;
+        // integrating the remaining small gap made the wall climb through
+        // the whole body on every projection and pumped supported mass apart.
+        let target_clearance = (lowest_center - contour.dot(normal))
+            .clamp(0.0, KERNEL_RADIUS * self.tuning.kernel_radius_scale * 1.5);
+        if !target_clearance.is_finite() {
+            return None;
+        }
         if self
             .support_plane_clearance
             .is_none_or(|(previous, _)| previous != key)
@@ -1749,31 +1811,14 @@ impl LiquidMorphRuntime {
             // Rendering has a finite kernel skirt. Calibrate one common center
             // plane at acquisition, never a separate plane for each particle,
             // and never chase the changing lowest particle during the bout.
-            let clearance = self.particles[..self.particle_count]
-                .iter()
-                .filter(|p| p.component_id == self.components.main_component)
-                .map(|p| (p.position - point).dot(normal))
-                .fold(f32::INFINITY, f32::min);
-            if !clearance.is_finite() || clearance < 0.0 {
-                return None;
-            }
-            self.support_plane_clearance = Some((key, clearance));
+            self.support_plane_clearance = Some((key, target_clearance));
         }
         // Kernel anisotropy changes the visible skirt as a round drop spreads.
         // Correct one shared wall clearance, never the host root or individual
         // particle rest positions. This keeps the density contour on the solid
         // plane without the root/constraint feedback that pumped the body apart.
-        let render = self.render_state();
-        let main: Vec<_> = render.particles[..render.particle_count].iter()
-            .copied().filter(|p| p.main_component).collect();
-        if let Some(contour) = contact_surface::contact_surface_support(
-            &main, self.tuning.iso_threshold, -normal,
-        ) {
-            let error = -(self.body_origin + contour - point).dot(normal);
-            if let Some((_, clearance)) = &mut self.support_plane_clearance {
-                *clearance = (*clearance + error * (1.0 - (-6.0 * dt).exp()))
-                    .clamp(0.0, KERNEL_RADIUS * self.tuning.kernel_radius_scale * 1.5);
-            }
+        if let Some((_, clearance)) = &mut self.support_plane_clearance {
+            *clearance += (target_clearance - *clearance) * (1.0 - (-6.0 * dt).exp());
         }
         Some(SupportPlane {
             point,
@@ -2982,7 +3027,11 @@ impl LiquidMorphRuntime {
             // The solid boundary supplies the reconstruction frame here.
             // Neighbour covariance from breathing gel must not rotate/resize
             // splats underneath a physically stationary contact row.
-            return (particle.position, plane.normal.perp(), 1.5_f32.min(self.tuning.anisotropy_max));
+            return (
+                particle.position,
+                plane.normal.perp(),
+                1.5_f32.min(self.tuning.anisotropy_max),
+            );
         }
         let kernel_radius = KERNEL_RADIUS * self.tuning.kernel_radius_scale;
         // Yu-Turk reconstruction needs a wider, weighted neighbourhood than the
@@ -3084,9 +3133,10 @@ impl LiquidMorphRuntime {
             (1.0 + anisotropy_confidence * 0.75 * (covariance_aspect - 1.0))
                 .clamp(1.0, authored_cap)
         };
-        let render_center = particle
-            .position
-            .lerp(local_mean / local_weight.max(1.0e-6), self.tuning.render_center_smoothing);
+        let render_center = particle.position.lerp(
+            local_mean / local_weight.max(1.0e-6),
+            self.tuning.render_center_smoothing,
+        );
         (render_center, axis, aspect)
     }
 

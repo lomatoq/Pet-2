@@ -11,6 +11,19 @@ pub struct ComponentSummary {
     pub main_com: Vec2,
 }
 
+pub(super) fn pair_link_distance_squared(
+    first: &LiquidParticle,
+    second: &LiquidParticle,
+    base_distance: f32,
+) -> f32 {
+    let hysteresis = if first.component_id == second.component_id {
+        1.08
+    } else {
+        0.92
+    };
+    (base_distance.max(1.0e-5) * hysteresis).powi(2)
+}
+
 /// A render-space topology observation. These labels describe the filtered
 /// anisotropic iso-field only; they must never feed forces or solver ownership.
 #[cfg(test)]
@@ -36,8 +49,6 @@ pub fn assign_components(
     let mut centers = [Vec2::ZERO; MAX_LIQUID_PARTICLES];
     let mut component_count = 0_usize;
     let threshold = spacing * link_radius_scale.clamp(1.0, 1.75);
-    let split_threshold_squared = (threshold * 1.08).powi(2);
-    let join_threshold_squared = (threshold * 0.92).powi(2);
 
     for seed in 0..count {
         if temporary_groups[seed] != u8::MAX {
@@ -61,11 +72,7 @@ pub fn assign_components(
                     continue;
                 }
                 let threshold_squared =
-                    if snapshot[current].component_id == snapshot[other].component_id {
-                        split_threshold_squared
-                    } else {
-                        join_threshold_squared
-                    };
+                    pair_link_distance_squared(&snapshot[current], &snapshot[other], threshold);
                 if snapshot[current]
                     .position
                     .distance_squared(snapshot[other].position)

@@ -162,9 +162,21 @@ impl LiquidInteractionProbe {
             || components.component_count > usize::from(tuning.maximum_detached_components) + 1
             || detached_mass_fraction > tuning.maximum_detached_mass_fraction + 1.0e-6;
         let maximum_strain = self.filtered_strain.max(0.0);
-        let neck_tension = ((maximum_strain - tuning.stretch_strain_min)
-            / tuning.boundary_strain.max(0.05))
-        .clamp(0.0, 1.0);
+        // A bond maximum is a strain diagnostic, not evidence of a neck.
+        // Resting fluid can redistribute against a wall with no localized
+        // tensile load. A held, partial, off-center material patch supplies
+        // the independent witness for the pointer-stretch neck proxy.
+        // Strong raw strain, pressure and detached mass remain independent
+        // inputs to interoception; none is hidden by this qualification.
+        let localized_tensile_contact = active
+            && grab.area_fraction <= 0.5
+            && grab.contact_center.distance(components.main_com) >= REFERENCE_BODY_RADIUS * 0.35;
+        let neck_tension = if localized_tensile_contact {
+            ((maximum_strain - tuning.stretch_strain_min) / tuning.boundary_strain.max(0.05))
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let neck_thickness = (1.0 - neck_tension).sqrt();
         let pressure_work = self.filtered_pressure
             * (grab.filtered_velocity - grab.material_velocity).length()
@@ -355,5 +367,94 @@ fn safe_divide(numerator: f32, denominator: f32) -> f32 {
         numerator / denominator
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod sensory_tests {
+    use super::*;
+    use lifecore::{BodyInteroceptionDirector, EmbodimentSourceFrame};
+
+    fn observed(strain: f32, grab: MaterialGrabReadback, detached: bool) -> EmbodiedInteractionFrame {
+        let (mut particles, count) = super::super::particles::initialize_particles(63);
+        // Explicit supported-fluid geometry fixture. This tests sensory
+        // semantics, not a claim that the PBF solver is stable in a real bed.
+        for (index, particle) in particles[..count].iter_mut().enumerate() {
+            particle.position *= Vec2::new(1.4, 1.0 / 1.4);
+            if detached && index >= count - 40 { particle.component_id = 1; }
+        }
+        let components = ComponentSummary {
+            component_count: if detached { 2 } else { 1 },
+            main_component: 0,
+            main_mass: (count - if detached { 40 } else { 0 }) as f32,
+            detached_mass: if detached { 40.0 } else { 0.0 },
+            ..Default::default()
+        };
+        let mut probe = LiquidInteractionProbe::default();
+        for _ in 0..120 {
+            probe.update(&particles, count, components, grab, Vec2::ZERO,
+                Vec2::splat(0.5), Vec2::new(18.0, -7.6), Vec2::ZERO,
+                strain, 0.03, InteractionTuning::default(), false, 1.0 / 120.0);
+        }
+        probe.latest
+    }
+
+    fn pain(frame: EmbodiedInteractionFrame) -> f32 {
+        let genome = lifecore::Genome::from_seed(63);
+        let mut source = EmbodimentSourceFrame {
+            frame_id: 1,
+            affect: Default::default(),
+            drives: lifecore::Drives::initial(&genome.temperament),
+            temperament: genome.temperament,
+            voice_seed: genome.voice.voice_seed,
+            vita: Default::default(), morph: Default::default(), body: Default::default(),
+            voice_feedback: Default::default(), gesture: Default::default(),
+            episode: Default::default(), perception: Default::default(),
+            soft_touch_pressure_max: 0.24,
+        };
+        source.body.shape.maximum_strain = frame.material.maximum_strain;
+        source.body.shape.neck_tension = frame.material.neck_tension;
+        source.body.contact.pressure = frame.contact.effective_pressure;
+        source.body.topology.detached_mass_fraction = frame.material.detached_mass_fraction;
+        let mut director = BodyInteroceptionDirector::default();
+        let mut result = 0.0;
+        for _ in 0..120 { result = director.tick(&source, 1.0 / 120.0).felt.pain_like; }
+        result
+    }
+
+    #[test]
+    fn supported_redistribution_is_not_a_neck_but_localized_external_stretch_is() {
+        let rest = observed(0.62, MaterialGrabReadback::default(), false);
+        assert!((rest.material.maximum_strain - 0.62).abs() < 1e-5);
+        assert_eq!(rest.material.neck_tension, 0.0);
+        let localized = MaterialGrabReadback {
+            active: true, held: true, area_fraction: 0.12,
+            contact_center: Vec2::new(0.28, 0.0),
+            ..Default::default()
+        };
+        let stretch = observed(0.62, localized, false);
+        assert!((stretch.material.maximum_strain - rest.material.maximum_strain).abs() < 1e-5);
+        assert!(stretch.material.neck_tension > 0.6);
+        assert!(pain(rest) < 0.24 && pain(stretch) > 0.24);
+        for bulk in [
+            MaterialGrabReadback { area_fraction: 0.8, ..localized },
+            MaterialGrabReadback { contact_center: Vec2::ZERO, ..localized },
+        ] {
+            assert_eq!(observed(0.62, bulk, false).material.neck_tension, 0.0);
+        }
+    }
+
+    #[test]
+    fn strong_raw_strain_pressure_and_detachment_still_reach_real_interoception() {
+        let strong = observed(0.95, MaterialGrabReadback::default(), false);
+        assert!(strong.material.maximum_strain > 0.94 && pain(strong) > 0.65);
+        let pressure = observed(0.1, MaterialGrabReadback {
+            active: true, held: true, area_fraction: 0.8, effective_pressure: 1.0,
+            ..Default::default()
+        }, false);
+        assert!(pressure.contact.effective_pressure > 0.99 && pain(pressure) > 0.65);
+        let detached = observed(0.1, MaterialGrabReadback::default(), true);
+        assert_eq!(detached.material.component_count, 2);
+        assert!(detached.material.detached_mass_fraction > 0.4 && pain(detached) > 0.65);
     }
 }

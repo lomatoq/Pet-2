@@ -581,6 +581,9 @@ pub struct SurfaceCandidate {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BehaviorContextFrame {
+    /// Previous presented frame's actual eye acquisition, never the commanded gaze.
+    #[serde(default)]
+    pub orientation: Option<OrientationEvidence>,
     #[serde(default)]
     pub orb_id: Option<u64>,
     #[serde(default = "default_body_diameter")]
@@ -631,6 +634,10 @@ pub struct BehaviorContextFrame {
     /// Physical cradle admission with settled motion, distinct from desktop floor contact.
     #[serde(default)]
     pub den_supported: bool,
+    /// Authoritative cushion plane from the host's physical cradle geometry.
+    /// Den anchor alone is a scene referent, not necessarily its support height.
+    #[serde(default)]
+    pub den_support_point: Option<Vec2>,
     pub surfaces: Vec<SurfaceCandidate>,
     pub den_anchor: Option<Vec2>,
     pub den_familiarity: f32,
@@ -655,6 +662,7 @@ pub struct BehaviorContextFrame {
 impl Default for BehaviorContextFrame {
     fn default() -> Self {
         Self {
+            orientation: None,
             orb_id: None,
             body_diameter: default_body_diameter(),
             preferred_touch_side: 0.0,
@@ -684,6 +692,7 @@ impl Default for BehaviorContextFrame {
             screen_edge_support_stable_seconds: 0.0,
             screen_edge_supported: false,
             den_supported: false,
+            den_support_point: None,
             surfaces: Vec::new(),
             den_anchor: None,
             den_familiarity: 0.0,
@@ -699,6 +708,15 @@ impl Default for BehaviorContextFrame {
             world_event: MotorWorldEvent::None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OrientationEvidence {
+    pub target_position: Vec2,
+    /// Error between presented semantic eye position and its final target.
+    pub gaze_error: f32,
+    /// Uninterrupted visible acquisition dwell, in real seconds.
+    pub acquired_seconds: f32,
 }
 
 fn default_screen_edge_gap_px() -> f32 {

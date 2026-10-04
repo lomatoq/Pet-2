@@ -391,14 +391,17 @@ pub(crate) fn apply(
                 } else {
                     -1.0
                 };
+                let load = goal.felt.physical_load.max(context.somatic.maximum_strain).clamp(0.0, 1.0);
+                let settling = (context.somatic.supported_seconds / 60.0).clamp(0.0, 1.0);
+                let amplitude = (0.015 + load * 0.055) * (1.0 - settling * 0.35);
                 push_field(
                     packet,
                     body_field(
                         SomaticFieldKind::Pulse,
                         Vec2::new(side * 0.24, -0.05),
-                        Vec2::new(side, 0.2),
+                        support_tangent * side + contact_axis * 0.2,
                         0.24,
-                        0.07 * pulse,
+                        amplitude * pulse,
                         progress,
                     ),
                 );

@@ -3,10 +3,10 @@ use std::{fmt, str::FromStr};
 use glam::Vec2;
 use lifecore::{
     ActionId, AppraisedEvent, BodyFeedback, BodyIntent, CompanionIntentFrame, EmbodiedGestureEvent,
-    EpisodeContextV1, FeedbackEvent, FeltStateV1, InteractionBodyActuation, InteractionGazeTarget,
-    InteractionResponsePlan, InteractionTurnRuntime, InteractionTurnState, LifeState,
-    LocomotionMode, PoseIntent, SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame, VitaState,
-    apply_emotion_to_expression,
+    EpisodeContextV1, FeedbackEvent, FeedbackProvenance, FeltStateV1, InteractionBodyActuation,
+    InteractionGazeTarget, InteractionResponsePlan, InteractionTurnRuntime, InteractionTurnState,
+    LifeState, LocomotionMode, PoseIntent, SensorFrame, VitaMind, VitaOutput, VitaPerceptFrame,
+    VitaState, apply_emotion_to_expression,
 };
 #[cfg(test)]
 use morph_brain::MORPH_COMMAND_COUNT;
@@ -290,6 +290,24 @@ impl VitaRuntime {
     pub fn integrate_felt_state(&mut self, felt: FeltStateV1, episode: EpisodeContextV1, dt: f32) {
         self.companion_last_felt = felt;
         self.mind.integrate_felt_state(felt, episode, dt);
+        if episode.closed && episode.episode_id > self.mind.state.last_closed_social_episode_id {
+            // Consume even an adverse/uncertain closure. Replaying it with
+            // later pleasant body state must not rewrite its social meaning.
+            self.mind.state.last_closed_social_episode_id = episode.episode_id;
+            let safe = episode.boundary_violation < 0.1
+                && felt.pain_like < 0.15
+                && felt.restraint < 0.2
+                && episode.user_absent < 0.5;
+            let quality = episode.safe_social_exchange.min(felt.contact_pleasantness);
+            if safe && quality.is_finite() && quality > 0.1 {
+                self.companion.record_outcome(CompanionOutcome {
+                    quality: quality.clamp(0.0, 1.0),
+                    duration: 1.0,
+                    clear_direct_user_cause: false,
+                });
+                self.mind.state.companion_social = self.companion.memory.clone();
+            }
+        }
     }
 
     pub fn set_embodied_gesture_tuning(&mut self, tuning: EmbodiedGestureClassifierTuning) {
@@ -752,6 +770,14 @@ impl VitaRuntime {
     }
 
     pub fn apply_feedback(&mut self, event: &FeedbackEvent) {
+        self.apply_feedback_with_provenance(event, FeedbackProvenance::Unattributed);
+    }
+
+    pub fn apply_feedback_with_provenance(
+        &mut self,
+        event: &FeedbackEvent,
+        provenance: FeedbackProvenance,
+    ) {
         if matches!(
             event,
             FeedbackEvent::FocusModeEnabled | FeedbackEvent::MuteOrHide
@@ -760,14 +786,30 @@ impl VitaRuntime {
             self.interaction_turn = InteractionTurnRuntime::default();
         }
         let quality = match event {
-            FeedbackEvent::PettingStarted => 0.90,
-            FeedbackEvent::PlayStarted => 0.78,
-            FeedbackEvent::RespondedAfterSound => 0.45,
-            FeedbackEvent::CursorApproached | FeedbackEvent::Observed => 0.25,
-            FeedbackEvent::Reward(value) if *value > 0.0 => value.clamp(0.0, 1.0),
+            // Starting a touch/game is an observation, not its felt outcome.
+            FeedbackEvent::PettingStarted | FeedbackEvent::PlayStarted => 0.0,
+            FeedbackEvent::RespondedAfterSound
+                if provenance == FeedbackProvenance::VoluntarySocial =>
+            {
+                0.45
+            }
+            FeedbackEvent::Observed if provenance == FeedbackProvenance::VoluntarySocial => 0.25,
+            FeedbackEvent::CursorApproached
+                if provenance == FeedbackProvenance::VoluntarySocial =>
+            {
+                0.25
+            }
+            FeedbackEvent::Reward(value)
+                if *value > 0.0 && provenance == FeedbackProvenance::VoluntarySocial =>
+            {
+                value.clamp(0.0, 1.0)
+            }
             _ => 0.0,
         };
-        if quality > 0.0 {
+        if quality > 0.0
+            && self.companion_last_felt.pain_like < 0.15
+            && self.companion_last_felt.restraint < 0.2
+        {
             self.companion.record_outcome(CompanionOutcome {
                 quality,
                 duration: 1.0,
@@ -775,7 +817,60 @@ impl VitaRuntime {
             });
             self.mind.state.companion_social = self.companion.memory.clone();
         }
-        self.mind.apply_feedback(event);
+        self.mind.apply_feedback_with_provenance(event, provenance);
+    }
+
+    /// Recall enriches the currently sensed affordance candidates before the
+    /// motor selector locks a target. No unavailable place can enter this list.
+    pub fn enrich_rest_surface_memory(
+        &self,
+        actual_action: ActionId,
+        sensors: &SensorFrame,
+        context: &mut pet_motor::BehaviorContextFrame,
+    ) {
+        if context.pet_dragged
+            || context.pet_touched
+            || !matches!(
+                actual_action,
+                ActionId::LandOnWindow | ActionId::IdleHover | ActionId::Sleep
+            )
+            || !matches!(
+                context.companion_intent,
+                lifecore::PrimaryIntent::Rest
+                    | lifecore::PrimaryIntent::IdleContent
+                    | lifecore::PrimaryIntent::QuietCompanionship
+                    | lifecore::PrimaryIntent::Sleep
+            )
+        {
+            return;
+        }
+        for surface in &mut context.surfaces {
+            if surface.velocity.length() > 0.02 {
+                continue;
+            }
+            if let Some(recall) = self.mind.recall_supported_place(
+                &surface.surface_id,
+                sensors.active_app_category.index(),
+                surface.minimum,
+                surface.maximum,
+            ) {
+                surface.familiarity =
+                    (surface.familiarity + 0.25 * recall.confidence).clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    /// The application supplies the actual execution owner after arbitration.
+    /// This updates the existing companion mind rather than creating a second
+    /// semantic authority inside the memory layer.
+    pub fn synchronize_execution_scene(
+        &mut self,
+        primary: lifecore::PrimaryIntent,
+        target: lifecore::IntentTarget,
+        expected: lifecore::ExpectedOutcome,
+    ) -> bool {
+        self.companion
+            .synchronize_execution(primary, target, expected)
     }
 
     pub fn note_metamorphosis(&mut self) {
@@ -1001,6 +1096,133 @@ mod tests {
     use lifecore::{ExpressionState, Genome, LifeCore, LocomotionMode, PoseIntent};
 
     use super::*;
+
+    #[test]
+    fn organism_rewards_do_not_create_social_attachment() {
+        let mut vita = VitaRuntime::new(7, None);
+        let before = vita.snapshot().companion_social;
+        for _ in 0..100 {
+            vita.apply_feedback(&FeedbackEvent::Reward(0.18));
+            vita.apply_feedback_with_provenance(
+                &FeedbackEvent::Reward(0.18),
+                FeedbackProvenance::OrganismOutcome,
+            );
+        }
+        assert_eq!(vita.snapshot().companion_social, before);
+        vita.apply_feedback(&FeedbackEvent::CursorApproached);
+        assert_eq!(vita.snapshot().companion_social, before);
+        vita.apply_feedback(&FeedbackEvent::PettingStarted);
+        vita.apply_feedback(&FeedbackEvent::PlayStarted);
+        assert_eq!(vita.snapshot().companion_social, before);
+        let episode = EpisodeContextV1 {
+            episode_id: 41,
+            closed: true,
+            safe_social_exchange: 0.8,
+            ..Default::default()
+        };
+        let felt = FeltStateV1 {
+            contact_pleasantness: 0.8,
+            ..Default::default()
+        };
+        vita.integrate_felt_state(felt, episode, 0.05);
+        assert!(vita.snapshot().companion_social.attachment > before.attachment);
+        let trained = vita.snapshot().companion_social;
+        vita.integrate_felt_state(felt, episode, 0.05);
+        assert_eq!(vita.snapshot().companion_social, trained);
+        let mut vita = VitaRuntime::new(7, Some(vita.snapshot()));
+        vita.integrate_felt_state(felt, episode, 0.05);
+        assert_eq!(vita.snapshot().companion_social, trained);
+        vita.integrate_felt_state(
+            FeltStateV1 {
+                pain_like: 0.8,
+                ..felt
+            },
+            EpisodeContextV1 {
+                episode_id: 42,
+                ..episode
+            },
+            0.05,
+        );
+        assert_eq!(vita.snapshot().companion_social, trained);
+        vita.integrate_felt_state(
+            felt,
+            EpisodeContextV1 {
+                episode_id: 42,
+                ..episode
+            },
+            0.05,
+        );
+        assert_eq!(vita.snapshot().companion_social, trained);
+        vita.apply_feedback(&FeedbackEvent::Ignored);
+        vita.apply_feedback(&FeedbackEvent::MuteOrHide);
+        assert_eq!(vita.snapshot().companion_social, trained);
+    }
+
+    #[test]
+    fn persisted_rest_memory_changes_current_surface_ranking_only() {
+        let mut vita = VitaRuntime::new(7, None);
+        let sensors = SensorFrame::default();
+        vita.mind
+            .state
+            .favorite_places
+            .push(lifecore::FavoritePlace {
+                relative_position: Vec2::new(0.5, 0.55),
+                app_category_index: sensors.active_app_category.index(),
+                edge_preference: 0.0,
+                hue: None,
+                comfort_value: 0.8,
+                play_value: 0.4,
+                safety_value: 0.9,
+                visits: 3,
+                observed_seconds: 60.0,
+                last_seen_seconds: 0.0,
+                support_surface: Some(lifecore::SurfaceId("window:known".into())),
+            });
+        let restored = vita.snapshot();
+        let vita = VitaRuntime::new(7, Some(restored));
+        let mut life = lifecore::LifeCore::new(lifecore::Genome::from_seed(7), 9).state;
+        life.current_action = ActionId::LandOnWindow;
+        let mut context = pet_motor::BehaviorContextFrame {
+            companion_intent: lifecore::PrimaryIntent::Rest,
+            ..Default::default()
+        };
+        context.body.motion.world_position = Vec2::new(0.5, 0.45);
+        context.surfaces = ["window:known", "window:other"]
+            .into_iter()
+            .map(|id| pet_motor::SurfaceCandidate {
+                surface_id: lifecore::SurfaceId(id.into()),
+                minimum: Vec2::new(0.2, 0.5),
+                maximum: Vec2::new(0.8, 0.6),
+                velocity: Vec2::ZERO,
+                familiarity: 0.5,
+                recent_failed_landings: 0,
+            })
+            .collect();
+        let unlearned = context.clone();
+        vita.enrich_rest_surface_memory(life.current_action, &sensors, &mut context);
+        assert_eq!(
+            pet_motor::rank_surface(&context, false, false)
+                .unwrap()
+                .surface_id
+                .0,
+            "window:known"
+        );
+        assert!(context.surfaces[0].familiarity > unlearned.surfaces[0].familiarity);
+        assert_eq!(
+            context.surfaces[1].familiarity,
+            unlearned.surfaces[1].familiarity
+        );
+        life.current_action = ActionId::SelfPlay;
+        let mut playing = unlearned.clone();
+        vita.enrich_rest_surface_memory(life.current_action, &sensors, &mut playing);
+        assert_eq!(playing.surfaces, unlearned.surfaces);
+        let mut absent = unlearned;
+        absent.surfaces.remove(0);
+        life.current_action = ActionId::LandOnWindow;
+        vita.enrich_rest_surface_memory(life.current_action, &sensors, &mut absent);
+        assert_eq!(absent.surfaces.len(), 1);
+        assert_eq!(absent.surfaces[0].familiarity, 0.5);
+    }
 
     #[test]
     fn merged_motor_context_receives_companion_intent_and_preserves_focus() {

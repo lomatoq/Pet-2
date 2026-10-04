@@ -28,12 +28,12 @@ pub struct ProgramDefinition {
 
 const ORIENT: [PhaseSpec; 4] = [
     PhaseSpec::new("freeze_30_120ms", 0.03, 0.12),
-    PhaseSpec::new("eyes_first", 0.04, 0.12),
-    PhaseSpec::new("front_axis_turn", 0.05, 0.16),
+    PhaseSpec::new("eyes_first", 0.04, 0.75),
+    PhaseSpec::new("front_axis_turn", 0.05, 0.35),
     PhaseSpec::new("decide", 0.02, 0.08),
 ];
 const TRAVEL: [PhaseSpec; 7] = [
-    PhaseSpec::new("orient", 0.08, 0.18),
+    PhaseSpec::new("orient", 0.08, 0.75),
     PhaseSpec::new("prepare", 0.07, 0.22),
     PhaseSpec::new("accelerate", 0.12, 0.40),
     PhaseSpec::new("coast", 0.10, 0.70),
@@ -173,8 +173,8 @@ const FAMILY_REST: [PhaseSpec; 5] = [
     PhaseSpec::new("recover", 0.16, 0.60),
 ];
 const FAMILY_MOVE: [PhaseSpec; 5] = [
-    PhaseSpec::new("orient", 0.06, 0.20),
-    PhaseSpec::new("prepare", 0.08, 0.26),
+    PhaseSpec::new("orient", 0.06, 0.75),
+    PhaseSpec::new("prepare", 0.08, 0.35),
     PhaseSpec::new("perform", 0.16, 1.2),
     PhaseSpec::new("punctuate", 0.10, 0.50),
     PhaseSpec::new("appraise", 0.12, 0.55),

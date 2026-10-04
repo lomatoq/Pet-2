@@ -46,10 +46,10 @@ pub fn step_compliant_grip(
     let damping = 1.35 * (stiffness * mass).sqrt();
     // Preload supports most of the toy's weight while leaving mass-dependent
     // sag. Without it, sag exceeds the shallow embedding depth and loses touch.
-    let grip_force =
-        ((target - position) * stiffness - (object.velocity - carrier_velocity) * damping
-            - Vec2::Y * ORB_SCREEN_GRAVITY * mass * 0.6)
-            .clamp_length_max(4.32);
+    let grip_force = ((target - position) * stiffness
+        - (object.velocity - carrier_velocity) * damping
+        - Vec2::Y * ORB_SCREEN_GRAVITY * mass * 0.6)
+        .clamp_length_max(4.32);
     let acceleration = (grip_force / mass + Vec2::Y * ORB_SCREEN_GRAVITY).clamp_length_max(6.0);
     object.velocity = (object.velocity + acceleration * dt).clamp_length_max(MAX_OBJECT_SPEED);
     position = (position + object.velocity * dt).clamp(minimum, maximum);

@@ -60,6 +60,7 @@ struct Globals {
     self_care: vec4<f32>,
     mood_tint: vec4<f32>,
     mood_trail: vec4<f32>,
+    optical_volume_bounds: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -71,6 +72,7 @@ struct Globals {
 @group(0) @binding(6) var material_flow_texture: texture_2d<f32>;
 @group(0) @binding(7) var studio_environment: texture_2d<f32>;
 @group(0) @binding(8) var studio_sampler: sampler;
+@group(0) @binding(9) var optical_volume_texture: texture_2d<f32>;
 
 // Compile the two material variants as separate, statically-specialized
 // pipelines. Keeping this as a pipeline override lets Naga and the native
@@ -447,6 +449,27 @@ fn pearl_emotion()->vec3<f32> {
 fn pearl_eye_center(side:f32)->vec2<f32> {
     return vec2<f32>(side*0.126,0.006)+globals.gaze_pupil.xy*vec2<f32>(0.052,0.038);
 }
+// The same fixed angular studio illuminates the body and corneal cap. Directions
+// live in 3D; projecting a reflected ray into each source frame avoids UV decals.
+fn pearl_light_card(ray:vec3<f32>, source:vec3<f32>, extent:vec2<f32>, roughness:f32)->f32 {
+    let u=normalize(cross(source,vec3<f32>(0.0,0.0,1.0)));
+    let v=cross(u,source);
+    let facing=dot(ray,source);
+    let p=vec2<f32>(dot(ray,u),dot(ray,v))/max(facing,0.08);
+    let width=extent+vec2<f32>(roughness*roughness*0.72);
+    let q=p/width;
+    // A finite diffused source with long microfacet tails, never a hard decal.
+    return pow(1.0+dot(q,q),-2.0)*smoothstep(0.02,0.20,facing);
+}
+fn pearl_studio(ray:vec3<f32>, roughness:f32)->vec3<f32> {
+    let key=pearl_light_card(ray,normalize(vec3<f32>(-0.48,0.62,0.64)),vec2<f32>(0.105,0.52),roughness);
+    let fill=pearl_light_card(ray,normalize(vec3<f32>(0.78,0.18,0.60)),vec2<f32>(0.09,0.30),roughness);
+    // A dark room separates the cards; no uniform emissive white rim.
+    let room=mix(vec3<f32>(0.13,0.10,0.22),vec3<f32>(0.32,0.36,0.48),saturate(ray.y*0.5+0.5));
+    let retained=1.0/(1.0+roughness*roughness*4.0);
+    return room+vec3<f32>(1.0,0.96,0.91)*key*52.0*retained
+        +vec3<f32>(0.64,0.78,1.0)*fill*11.0*retained;
+}
 fn pearl_eye_ink(point:vec2<f32>,side:f32)->vec3<f32> {
     // A continuous dark well, not a separate pupil. Its center leads the
     // whole-eye turn, leaving only a faint violet crescent on the opposite side.
@@ -455,7 +478,14 @@ fn pearl_eye_ink(point:vec2<f32>,side:f32)->vec3<f32> {
     let dark_center=clamp(gaze*vec2<f32>(0.95,0.72),vec2<f32>(-0.72),vec2<f32>(0.72));
     let delta=q-dark_center;
     let edge=1.0-exp(-0.65*dot(delta,delta));
-    return mix(vec3<f32>(0.008,0.003,0.018),vec3<f32>(0.160,0.020,0.320),edge);
+    let ink=mix(vec3<f32>(0.008,0.003,0.018),vec3<f32>(0.090,0.012,0.190),edge);
+    let cap_xy=clamp(q*0.72,vec2<f32>(-0.92),vec2<f32>(0.92));
+    let cap_normal=normalize(vec3<f32>(cap_xy,sqrt(max(0.08,1.0-dot(cap_xy,cap_xy)))));
+    let reflection=reflect(vec3<f32>(0.0,0.0,-1.0),cap_normal);
+    let blink=select(globals.lids_brows.x,globals.lids_brows.y,side>0.0);
+    let open=1.0-smoothstep(0.25,0.86,blink);
+    let fresnel=0.035+0.965*pow(1.0-cap_normal.z,5.0);
+    return ink*(1.0-fresnel*open)+pearl_studio(reflection,0.08)*fresnel*open*0.70;
 }
 fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     let index=select(1u,0u,side<0.0);
@@ -1363,40 +1393,60 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Local contrast backing suppresses internal pattern only behind the features.
     let face_region = 1.0 - smoothstep(0.22, 0.34, length(face_space(point)));
     color = mix(color, color * 0.76, face_region * globals.face_tuning.x);
-    // First Light pearl material, on the existing particle-derived surface normal.
-    // Broad pastel scattering and a soft coat preserve every simulated liquid edge.
-    // Broad continuous optical curvature is carried by the liquid particles.
-    // No axis-dependent boundary search and no face-centred sphere.
-    let optical_xy=macro_at(input.uv).ba;
-    let fluid_normal=normalize(vec3<f32>(optical_xy*0.16,1.0));
+    // The visible pearl material owns its own complete lighting response. The
+    // legacy jelly radiance above cannot supply highlights after palette mapping.
+    // Inflate the actual particle isocontour via Poisson, not a perimeter bevel.
+    // The exact disk solution is a hemisphere; normals turn across the full cap.
+    let volume_uv=(point-globals.optical_volume_bounds.xy)*globals.optical_volume_bounds.zw;
+    let optical_cap=textureSample(optical_volume_texture,density_sampler,volume_uv);
+    let volume_normal=optical_cap.xyz;
+    let fluid_normal=normalize(vec3<f32>(volume_normal.xy*sqrt(globals.material_e.w/1.3),max(volume_normal.z,0.0001)));
     // Only the deliberately spherical birth presentation uses a spherical normal.
     let birth_xy=point/0.38;
     let birth_normal=normalize(vec3<f32>(birth_xy,sqrt(max(0.025,1.0-dot(birth_xy,birth_xy)))));
     let pearl_normal=normalize(mix(fluid_normal,birth_normal,globals.cinematic_h.w));
-    let pearl_light = max(0.0, dot(pearl_normal, normalize(vec3<f32>(-0.45,0.58,0.85))));
-    color = mix(vec3<f32>(0.54,0.54,0.75), vec3<f32>(0.99,0.965,1.0), 0.26+0.73*pearl_light);
-    let reference_point = mix(material_coordinate*2.25,birth_xy*0.89,globals.cinematic_h.w);
-    let rose = exp(-dot(reference_point-vec2<f32>(0.23,-0.16),reference_point-vec2<f32>(0.23,-0.16))*3.2);
-    color = mix(color,vec3<f32>(0.91,0.74,0.90),rose*0.27);
-    let blue = exp(-dot(reference_point-vec2<f32>(-0.45,-0.10),reference_point-vec2<f32>(-0.45,-0.10))*6.0);
-    color += vec3<f32>(0.04,0.12,0.14)*blue;
-    color = mix(color,vec3<f32>(0.83,0.89,1.0),pow(1.0-pearl_normal.z,3.2)*0.7);
-    color = mix(color,vec3<f32>(1.0),pow(max(0.0,dot(pearl_normal,normalize(vec3<f32>(-0.35,0.48,1.0)))),19.0)*0.18);
-    // A broad material-space wash lets newly recruited color reach the core
-    // before the flanks. The delayed color catches up and the effect settles;
-    // there is no autonomous hue oscillator and no face-centred color patch.
-    let wash=0.20+0.70*exp(-dot(reference_point-vec2<f32>(-0.2,0.15),reference_point-vec2<f32>(-0.2,0.15))*1.6);
-    let mood=mix(globals.mood_trail.xyz,globals.mood_tint.xyz,wash);
-    let mood_amount=clamp(length(vec3<f32>(1.0)-mood)*2.0,0.0,0.38);
-    let pearl_gray=dot(color,vec3<f32>(0.2126,0.7152,0.0722));
-    color=mix(vec3<f32>(pearl_gray),color,1.0+mood_amount*0.35)*mood;
-    color+=vec3<f32>(0.025,0.016,0.008)*globals.mood_tint.w;
-    // Reference colors are display-referred. Invert the compositor tone curve
-    // so the original pearl palette survives the native linear HDR pipeline.
-    let pearl_linear=pow(color,vec3<f32>(2.2));
-    let pearl_luma=dot(pearl_linear,vec3<f32>(0.2126,0.7152,0.0722));
-    let pearl_hdr=8.0*(pearl_luma-1.0+sqrt(pow(1.0-pearl_luma,2.0)+pearl_luma*0.25));
-    color=pearl_linear*pearl_hdr/max(pearl_luma,0.001);
+    // Coated milky gel: dye lives in the reconstructed volume; illumination
+    // and both dielectric lobes are evaluated in linear HDR, not inverse-painted
+    // display colors. Thickness is from the same cap that supplies the normals.
+    let pearl_volume_height=optical_cap.w;
+    let pearl_depth=mix(pearl_volume_height*2.0,sqrt(max(0.0,0.38*0.38-dot(point,point)))*2.0,globals.cinematic_h.w)
+        *clamp(globals.material_a.z/0.9,0.3,3.0);
+    let reference_point=mix(material_coordinate*2.25,birth_xy*0.89,globals.cinematic_h.w);
+    let pearl_wash=0.20+0.70*exp(-dot(reference_point-vec2<f32>(-0.2,0.15),reference_point-vec2<f32>(-0.2,0.15))*1.6);
+    let pearl_mood=mix(globals.mood_trail.xyz,globals.mood_tint.xyz,pearl_wash);
+    let pearl_dye=exp(-vec3<f32>(0.25,0.47,0.08)*pearl_depth*globals.material_a.x*2.4);
+    let pearl_albedo=pow(vec3<f32>(0.87,0.82,0.98),vec3<f32>(2.2))*pearl_dye*pearl_mood;
+    let pearl_key=normalize(vec3<f32>(-0.48,0.62,0.64));
+    let pearl_fill=normalize(vec3<f32>(0.78,0.18,0.60));
+    let pearl_nl=dot(pearl_normal,pearl_key);
+    let pearl_wrap=clamp(globals.material_f.x*0.25,0.15,0.45);
+    let pearl_direct=saturate((pearl_nl+pearl_wrap)/(1.0+pearl_wrap));
+    let pearl_fill_irradiance=saturate(dot(pearl_normal,pearl_fill));
+    // Thin regions transmit a little warm backlight; dense regions remain dyed.
+    let pearl_transmission=exp(-pearl_depth*4.5)*pow(saturate(-pearl_nl),2.0);
+    let pearl_irradiance=vec3<f32>(0.82,0.75,1.00)*clamp(globals.material_f.y/0.9,0.25,1.5)
+        +vec3<f32>(1.0,0.93,0.89)*pearl_direct*2.95*clamp(globals.material_f.z/0.55,0.25,1.5)
+        +vec3<f32>(0.60,0.73,1.0)*pearl_fill_irradiance*0.48;
+    let pearl_substrate=pearl_albedo*pearl_irradiance+pearl_albedo*vec3<f32>(0.96,0.72,0.84)*pearl_transmission*0.32;
+    let pearl_ndotv=saturate(pearl_normal.z);
+    let pearl_f0=clamp(globals.material_d.w,0.018,0.08);
+    let pearl_fresnel=pearl_f0+(1.0-pearl_f0)*pow(1.0-pearl_ndotv,5.0);
+    let pearl_reflection=reflect(vec3<f32>(0.0,0.0,-1.0),pearl_normal);
+    let pearl_normal_variance=length(fwidth(pearl_normal));
+    let pearl_roughness=clamp(globals.cinematic_c.z*0.62+pearl_normal_variance*0.18,0.07,0.45);
+    let pearl_base_roughness=clamp(globals.cinematic_c.y,0.25,0.85);
+    let pearl_coat_light=pearl_studio(pearl_reflection,pearl_roughness);
+    let pearl_base_light=pearl_studio(pearl_reflection,pearl_base_roughness);
+    let pearl_reflection_strength=clamp(globals.cinematic_c.x/1.5,0.0,1.35);
+    let pearl_coat_fresnel=pearl_fresnel*pearl_reflection_strength;
+    // A coat attenuates underlying diffuse and rough reflection twice (incoming
+    // and outgoing). This approximation never adds a highlight onto full energy.
+    let pearl_coat_transmission=pow(1.0-min(pearl_coat_fresnel,0.96),2.0);
+    color=(pearl_substrate*(1.0-pearl_fresnel)+pearl_base_light*pearl_fresnel*0.32)
+        *pearl_coat_transmission+pearl_coat_light*pearl_coat_fresnel;
+    color+=vec3<f32>(0.040,0.022,0.010)*globals.mood_tint.w;
+    let pearl_key_reflection=pearl_light_card(pearl_reflection,pearl_key,vec2<f32>(0.105,0.52),pearl_roughness);
+    let pearl_fill_reflection=pearl_light_card(pearl_reflection,pearl_fill,vec2<f32>(0.09,0.30),pearl_roughness);
     let face_point = face_space(point);
     let left_eye = pearl_eye(face_point,-1.0);
     let right_eye = pearl_eye(face_point,1.0);
@@ -1500,19 +1550,14 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         } else if (debug_view < 6.5) {
             debug_color = mix(vec3<f32>(0.015, 0.018, 0.024), vec3<f32>(0.72, 1.0, 0.86), edge_gradient);
         } else if (debug_view < 7.5) {
-            debug_color = normal * 0.5 + vec3<f32>(0.5);
+            debug_color = pearl_normal * 0.5 + vec3<f32>(0.5);
         } else if (debug_view < 8.5) {
-            let debug_studio = studio_lobes(
-                normalize(reflect(-view, normal)),
-                globals.cinematic_c.y,
-                globals.cinematic_c.z,
-            );
-            // Red = gel/base lobe, green = wet-coat lobe, blue = ambient fill.
+            // Visible pearl coat: red = key, green = fill, blue = Fresnel.
             debug_color = vec3<f32>(
-                debug_studio.base_mask,
-                debug_studio.coat_mask,
-                luminance(debug_studio.fill) * 4.0,
-            ) * globals.cinematic_c.x;
+                pearl_key_reflection,
+                pearl_fill_reflection,
+                pearl_fresnel,
+            );
         } else {
             let debug_caustics = flowing_caustics(material_coordinate, material_velocity);
             debug_color = mix(vec3<f32>(0.01, 0.02, 0.05), glow_color, debug_caustics);

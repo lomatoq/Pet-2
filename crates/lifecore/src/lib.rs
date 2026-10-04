@@ -89,7 +89,7 @@ impl FeedbackEvent {
             Self::CursorApproached => 0.50,
             Self::RespondedAfterSound => 0.40,
             Self::Observed => 0.25,
-            Self::Ignored => -0.25,
+            Self::Ignored => 0.0,
             Self::PushedAway => -0.60,
             Self::MuteOrHide => -0.80,
             Self::FocusModeEnabled => 0.0,
@@ -122,6 +122,9 @@ pub struct LifeOutput {
 }
 
 pub struct LifeCore {
+    physiology_awake_seconds: f32,
+    pending_rest_quality: f32,
+    care_awake_seconds: f32,
     pub state: LifeState,
     brain: MicroBrain,
     habits: ContextualBandit,
@@ -131,9 +134,37 @@ pub struct LifeCore {
     rng_seed: [u8; 32],
     last_work_pressure: f32,
     last_context: ContextVector,
+    measured_outcomes: [u64; 32],
+    measured_outcome_cursor: usize,
 }
 
 impl LifeCore {
+    /// A real pending physiological task can wake sleep and briefly reserve
+    /// wakefulness. This gives no reward, need relief or user-response credit.
+    /// The host must refresh it only while execution is safe and still needed.
+    pub fn reserve_awake_for_physiology(&mut self) {
+        self.physiology_awake_seconds = 2.0;
+        if self.state.current_action == ActionId::Sleep {
+            self.state.current_action = ActionId::WakeUp;
+            self.state.action_elapsed_seconds = 0.0;
+        }
+    }
+    /// Confirmed consequence, never action-selection credit. A replayed event
+    /// cannot satisfy a need twice; source namespaces are encoded by the host.
+    pub fn apply_measured_relief(&mut self, event_id: u64, drive: DriveKind, amount: f32) -> bool {
+        if event_id == 0
+            || self.measured_outcomes.contains(&event_id)
+            || !amount.is_finite()
+            || amount <= 0.0
+        {
+            return false;
+        }
+        self.measured_outcomes[self.measured_outcome_cursor] = event_id;
+        self.measured_outcome_cursor =
+            (self.measured_outcome_cursor + 1) % self.measured_outcomes.len();
+        self.state.drives.relieve_measured(drive, amount);
+        true
+    }
     /// Applies the previous immutable body's felt-state evidence before the
     /// normal LifeCore tick. Renderers never receive mutable access to drives.
     pub fn integrate_felt_state(
@@ -142,6 +173,20 @@ impl LifeCore {
         episode: EpisodeContextV1,
         dt: f32,
     ) {
+        self.pending_rest_quality = episode.sleeping_or_deep_rest.clamp(0.0, 1.0);
+        // A real gentle contact can invite an awake turn. It cannot erase debt
+        // or turn pain into pleasure, and absence does not extend this lease.
+        if snapshot.felt.contact_pleasantness > 0.35
+            && snapshot.felt.restraint < 0.2
+            && snapshot.felt.pain_like < 0.15
+            && episode.safe_social_exchange > 0.2
+        {
+            self.care_awake_seconds = 12.0;
+            if self.state.current_action == ActionId::Sleep {
+                self.state.current_action = ActionId::WakeUp;
+                self.state.action_elapsed_seconds = 0.0;
+            }
+        }
         self.state
             .development
             .integrate_nervous_evidence(snapshot, episode, dt);
@@ -152,11 +197,24 @@ impl LifeCore {
     }
 
     /// Resolve excitement after the host reports actual play and motor ownership.
-    pub fn update_excitation(&mut self, mut input: ExcitationInput, dt: f32) -> ExcitationMotorFrame {
+    pub fn update_excitation(
+        &mut self,
+        mut input: ExcitationInput,
+        dt: f32,
+    ) -> ExcitationMotorFrame {
         input.blocked |= self.state.focus_mode
-            || matches!(self.state.current_action, ActionId::Sleep | ActionId::Metamorphosis);
-        self.state.excitation.tick(input, &self.state.genome.temperament,
-            &mut self.state.drives, self.state.affect, self.state.genome.identity_seed, dt)
+            || matches!(
+                self.state.current_action,
+                ActionId::Sleep | ActionId::Metamorphosis
+            );
+        self.state.excitation.tick(
+            input,
+            &self.state.genome.temperament,
+            &mut self.state.drives,
+            self.state.affect,
+            self.state.genome.identity_seed,
+            dt,
+        )
     }
 
     /// Tick once at the behavior rate after the host has resolved ecology and
@@ -168,8 +226,12 @@ impl LifeCore {
         busy: bool,
         dt: f32,
     ) -> SelfCareMotorFrame {
-        let busy = busy || self.state.focus_mode
-            || matches!(self.state.current_action, ActionId::Sleep | ActionId::Metamorphosis);
+        let busy = busy
+            || self.state.focus_mode
+            || matches!(
+                self.state.current_action,
+                ActionId::Sleep | ActionId::Metamorphosis
+            );
         self.state.self_care.tick(
             sensors,
             body,
@@ -202,6 +264,7 @@ impl LifeCore {
             .ticks_alive
             .saturating_add(logical_ticks);
         let seconds_f32 = seconds as f32;
+        self.physiology_awake_seconds = (self.physiology_awake_seconds - seconds_f32).max(0.0);
         self.state.action_elapsed_seconds = (self.state.action_elapsed_seconds + seconds_f32)
             .min(self.state.current_action.definition().maximum_duration);
         for cooldown in &mut self.state.action_cooldowns {
@@ -225,6 +288,9 @@ impl LifeCore {
         let habits = ContextualBandit::new(&genome.temperament);
         Self {
             state: LifeState::new(genome),
+            physiology_awake_seconds: 0.0,
+            pending_rest_quality: 0.0,
+            care_awake_seconds: 0.0,
             brain,
             habits,
             memories: MemorySystem::default(),
@@ -233,6 +299,8 @@ impl LifeCore {
             rng_seed,
             last_work_pressure: 0.0,
             last_context: [0.0; CONTEXT_SIZE],
+            measured_outcomes: [0; 32],
+            measured_outcome_cursor: 0,
         }
     }
 
@@ -252,6 +320,8 @@ impl LifeCore {
         transient_drives: Option<Drives>,
     ) -> LifeOutput {
         let dt = finite_dt(dt);
+        self.physiology_awake_seconds = (self.physiology_awake_seconds - dt).max(0.0);
+        self.care_awake_seconds = (self.care_awake_seconds - dt).max(0.0);
         self.learning.body.tick(dt);
         self.last_work_pressure = sensors.desktop_focus_pressure.clamp(0.0, 1.0);
         // Older snapshots could accumulate hundreds of implicit "ignores" because
@@ -277,11 +347,12 @@ impl LifeCore {
         self.resolve_expired_vocal_credit(dt);
 
         let previous_cost = self.state.drives.homeostatic_cost();
-        self.state.drives.update(
+        self.state.drives.update_with_rest_quality(
             &self.state.genome.temperament,
             sensors,
             self.state.current_action,
             dt,
+            std::mem::take(&mut self.pending_rest_quality),
         );
         let homeostatic_reward =
             (previous_cost - self.state.drives.homeostatic_cost()).clamp(-1.0, 1.0);
@@ -314,7 +385,10 @@ impl LifeCore {
         // decision boundary, then restore by assignment so clamp edges cannot
         // leak a temporary pulse into persistent homeostasis.
         self.state.drives = decision_drives;
-        let scores = self.score_actions(sensors, body, &context, &readouts.actions);
+        let mut scores = self.score_actions(sensors, body, &context, &readouts.actions);
+        if self.physiology_awake_seconds > 0.0 || self.care_awake_seconds > 0.0 {
+            scores[ActionId::Sleep.index()] = -100.0;
+        }
         self.last_context = context;
         let sleep_score = scores[ActionId::Sleep.index()];
         let urgent_sleep = decision_drives.sleep >= 0.72
@@ -337,11 +411,9 @@ impl LifeCore {
         self.state.drives = natural_drives;
         let expression = ExpressionState::from_readouts(readouts.expressions, self.state.affect);
         let mut body_intent = body_intent_for(self.state.current_action, sensors, body, expression);
-        self.state.exploration.observe(
-            body.world_position,
-            self.state.genome.identity_seed,
-            dt,
-        );
+        self.state
+            .exploration
+            .observe(body.world_position, self.state.genome.identity_seed, dt);
         if matches!(
             self.state.current_action,
             ActionId::ExploreScreen | ActionId::HideAndSeek | ActionId::SelfPlay
@@ -804,6 +876,9 @@ impl LifeCore {
         rng.set_word_pos(snapshot.rng.word_position);
         let mut restored = Self {
             state: snapshot.state,
+            physiology_awake_seconds: 0.0,
+            pending_rest_quality: 0.0,
+            care_awake_seconds: 0.0,
             brain: snapshot.brain,
             habits: snapshot.habits,
             memories: snapshot.memories,
@@ -812,6 +887,8 @@ impl LifeCore {
             rng_seed: snapshot.rng.seed,
             last_work_pressure: 0.0,
             last_context: [0.0; CONTEXT_SIZE],
+            measured_outcomes: [0; 32],
+            measured_outcome_cursor: 0,
         };
         if restored.state.interactions.pending_credit.take().is_some() {
             restored.state.interactions.interrupted_outcomes = restored
@@ -839,6 +916,11 @@ impl LifeCore {
     }
 
     pub fn reset_learning(&mut self) {
+        self.measured_outcomes = [0; 32];
+        self.measured_outcome_cursor = 0;
+        self.physiology_awake_seconds = 0.0;
+        self.pending_rest_quality = 0.0;
+        self.care_awake_seconds = 0.0;
         self.habits = ContextualBandit::new(&self.state.genome.temperament);
         self.memories = MemorySystem::default();
         self.learning = AdaptiveLearning::default();
@@ -1020,6 +1102,8 @@ impl LifeCore {
             }
             let expected_relief = self.state.drives.relief_value(definition.drive_relief) * 1.7;
             let learned = self.habits.prediction(action, context);
+            let recall = self.memories.recall(action, context, sensors.timestamp);
+            let remembered_outcome = 0.12 * recall.expected_reward * recall.confidence;
             let exploration = self.habits.exploration_bonus(action)
                 * (0.35 + self.state.genome.temperament.exploration_rate);
             let novelty = (1.0 - repetition_ratio(&self.state.recent_actions, action))
@@ -1058,6 +1142,7 @@ impl LifeCore {
                 )
                 + expected_relief
                 + learned
+                + remembered_outcome
                 + exploration
                 + novelty
                 + temperament_bias(action, &self.state)
@@ -1358,14 +1443,8 @@ impl LifeCore {
             return;
         }
         let pending = self.state.pending_attention.take().expect("pending exists");
-        self.habits.update(pending.action, &pending.context, -0.25);
-        self.brain.apply_reward(-0.25);
-        self.state.ignored_attempts = self
-            .state
-            .ignored_attempts
-            .saturating_add(1)
-            .min(MAX_IGNORED_ATTEMPTS);
-        self.state.recent_reward = -0.25;
+        // Silence supplies availability evidence, not an aversive relationship
+        // outcome. Back off this request without teaching distress or blame.
         self.state.action_cooldowns[pending.action.index()] += pending.action.definition().cooldown
             * (0.5 + self.state.ignored_attempts.min(5) as f32 * 0.25);
         self.memories.record(EventRecord {
@@ -1373,7 +1452,7 @@ impl LifeCore {
             context: pending.context,
             action: pending.action,
             outcome: Outcome::Ignored,
-            reward: -0.25,
+            reward: 0.0,
             salience: 0.35,
         });
     }
@@ -1386,14 +1465,11 @@ impl LifeCore {
         if pending.elapsed_seconds < pending.response_window_seconds {
             return;
         }
-        let expired = self
+        let _expired = self
             .state
             .pending_vocal_credit
             .take()
             .expect("pending vocal credit exists");
-        if expired.penalize_if_ignored {
-            self.update_vocal_motif_from_credit(&expired, -0.18);
-        }
     }
 
     fn apply_vocal_feedback(&mut self, reward: f32) {
@@ -2094,6 +2170,40 @@ fn smooth(current: f32, target: f32, speed: f32, dt: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physiological_wake_preserves_need_and_blocks_sleep_only_while_reserved() {
+        let mut core = LifeCore::new(Genome::from_seed(63), 63);
+        core.state.current_action = ActionId::Sleep;
+        core.state.drives.sleep = 0.95;
+        let drives = core.state.drives;
+        let reward = core.state.recent_reward;
+        core.reserve_awake_for_physiology();
+        assert_eq!(core.state.current_action, ActionId::WakeUp);
+        assert_eq!(core.state.drives, drives);
+        assert_eq!(core.state.recent_reward, reward);
+        for _ in 0..200 {
+            core.reserve_awake_for_physiology();
+            let output = core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.05);
+            assert_ne!(output.selected_action, ActionId::Sleep);
+        }
+        core.state.current_action = ActionId::Sleep;
+        core.physiology_awake_seconds = 0.0;
+        core.reserve_awake_for_physiology();
+        core.advance_calendar_only(4.0);
+        // A runtime lease is not a learned sleep preference or persistent save.
+        assert_eq!(core.state.drives.sleep, 1.0);
+        assert_eq!(core.physiology_awake_seconds, 0.0);
+    }
+
+    #[test]
+    fn refreshing_physiology_does_not_restart_an_awake_bout() {
+        let mut core = LifeCore::new(Genome::from_seed(64), 64);
+        core.state.current_action = ActionId::WakeUp;
+        core.state.action_elapsed_seconds = 0.8;
+        core.reserve_awake_for_physiology();
+        assert_eq!(core.state.action_elapsed_seconds, 0.8);
+    }
 
     #[test]
     fn unsolicited_feedback_uses_observed_clock_and_unknown_time_is_not_midnight() {
@@ -2845,7 +2955,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_attention_voice_gets_one_bounded_negative_update() {
+    fn silence_closes_voice_credit_without_training_refusal() {
         let mut core = LifeCore::new(Genome::from_seed(53), 93);
         let request = core
             .request_vocalization(
@@ -2869,9 +2979,23 @@ mod tests {
             .find(|motif| motif.id == request.motif_id)
             .map(|motif| motif.expected_reward)
             .unwrap();
-        assert!(after < before);
-        assert!(after >= -1.0);
+        assert_eq!(after, before);
         assert!(core.state.pending_vocal_credit.is_none());
+    }
+
+    #[test]
+    fn confirmed_relief_is_specific_bounded_and_consumed_once() {
+        let mut core = LifeCore::new(Genome::from_seed(17), 21);
+        core.state.drives.play = 0.8;
+        core.state.drives.social = 0.7;
+        assert!(!core.apply_measured_relief(0, DriveKind::Play, 0.2));
+        assert!(!core.apply_measured_relief(1, DriveKind::Play, f32::NAN));
+        assert!(core.apply_measured_relief(1, DriveKind::Play, 0.2));
+        assert!(!core.apply_measured_relief(1, DriveKind::Play, 0.2));
+        assert!((core.state.drives.play - 0.6).abs() < 0.0001);
+        assert_eq!(core.state.drives.social, 0.7);
+        assert!(core.apply_measured_relief(2, DriveKind::Play, 9.0));
+        assert!((core.state.drives.play - 0.36).abs() < 0.0001);
     }
 
     #[test]
@@ -3279,6 +3403,19 @@ mod tests {
                 DayPhase::Day
             };
             let output = core.tick(&sensors, &body, simulation_dt);
+            // This cognition-only fixture models an executed supported sleep
+            // bout explicitly; the production nervous system measures it from
+            // body velocity, contact and the executed locomotion owner.
+            if output.selected_action == ActionId::Sleep {
+                core.integrate_felt_state(
+                    InteroceptionSnapshot::default(),
+                    EpisodeContextV1 {
+                        sleeping_or_deep_rest: 1.0,
+                        ..Default::default()
+                    },
+                    simulation_dt,
+                );
+            }
             action_counts[output.selected_action.index()] += 1;
             saw_sleep |= output.selected_action == ActionId::Sleep;
             saw_wake |= previous == ActionId::Sleep && output.selected_action != ActionId::Sleep;
@@ -3311,5 +3448,41 @@ mod tests {
         assert!(!core.memories.short_term.is_empty());
         // Positive outcomes separated by failed attempts are not a successful sequence.
         assert!(!core.memories.episodic.is_empty());
+    }
+
+    #[test]
+    fn pleasant_care_wakes_with_debt_intact_and_silence_expires_the_turn() {
+        let mut core = LifeCore::new(Genome::from_seed(63), 64);
+        core.state.current_action = ActionId::Sleep;
+        core.state.drives.sleep = 0.99;
+        let pleasant = InteroceptionSnapshot { felt: FeltStateV1 { contact_pleasantness: 0.8, social_safety: 0.9, ..Default::default() }, ..Default::default() };
+        core.integrate_felt_state(pleasant, EpisodeContextV1 { safe_social_exchange: 0.8, ..Default::default() }, 0.1);
+        assert_eq!(core.state.current_action, ActionId::WakeUp);
+        assert!(core.state.drives.sleep >= 0.99);
+        for _ in 0..100 {
+            assert_ne!(core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1).selected_action, ActionId::Sleep);
+        }
+        let attachment = core.state.affect.attachment;
+        for _ in 0..30 {
+            core.integrate_felt_state(InteroceptionSnapshot::default(), EpisodeContextV1::default(), 0.1);
+            core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1);
+        }
+        assert_eq!(core.care_awake_seconds, 0.0);
+        assert!(core.state.affect.attachment >= attachment);
+    }
+
+    #[test]
+    fn quiet_rest_observation_is_consumed_once_not_persisted_as_free_sleep() {
+        let mut core = LifeCore::new(Genome::from_seed(3), 64);
+        core.state.drives.sleep = 0.99;
+        core.integrate_felt_state(InteroceptionSnapshot::default(), EpisodeContextV1 { sleeping_or_deep_rest: 1.0, ..Default::default() }, 0.1);
+        core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1);
+        let recovered = core.state.drives.sleep;
+        assert!(recovered < 0.99);
+        core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1);
+        assert!(core.state.drives.sleep > recovered);
+        let restored = LifeCore::restore(core.snapshot()).unwrap();
+        assert_eq!(restored.pending_rest_quality, 0.0);
+        assert_eq!(restored.care_awake_seconds, 0.0);
     }
 }

@@ -156,6 +156,10 @@ pub struct EmbodiedRuntime {
     previous_world_position: Option<Vec2>,
     runtime_face: FaceRuntimeActuation,
     runtime_visual: VisualPhysiologyActuation,
+    companion_body_style: crate::BodyStyleTarget,
+    companion_body_target: crate::BodyStyleTarget,
+    world_gaze_target: Option<Vec2>,
+    gaze_acquired_seconds: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +177,10 @@ impl EmbodiedRuntime {
     pub fn new(seed: u64, traits: &DerivedVisualTraits) -> Self {
         let seed_phase = (seed as u32 as f32 / u32::MAX as f32) * std::f32::consts::TAU;
         Self {
+            companion_body_style: crate::BodyStyleTarget::default(),
+            companion_body_target: crate::BodyStyleTarget::default(),
+            world_gaze_target: None,
+            gaze_acquired_seconds: 0.0,
             self_care_lean: 0.0,
             self_care_pulse: 0.0,
             pose: EmbodiedPose {
@@ -307,6 +315,31 @@ impl EmbodiedRuntime {
         self.gaze_target
     }
 
+    pub fn set_companion_body_style(&mut self, mut style: crate::BodyStyleTarget) {
+        let neutral = crate::BodyStyleTarget::default();
+        style.compactness = if style.compactness.is_finite() {
+            style.compactness.clamp(0.0, 1.0)
+        } else {
+            neutral.compactness
+        };
+        style.lean = if style.lean.is_finite() {
+            style.lean.clamp_length_max(1.0)
+        } else {
+            Vec2::ZERO
+        };
+        self.companion_body_target = style;
+    }
+
+    #[must_use]
+    pub fn orientation_evidence(&self) -> Option<pet_motor::OrientationEvidence> {
+        self.world_gaze_target
+            .map(|target_position| pet_motor::OrientationEvidence {
+                target_position,
+                gaze_error: self.pose.gaze.distance(self.gaze_target),
+                acquired_seconds: self.gaze_acquired_seconds,
+            })
+    }
+
     /// Elapsed and scheduled duration of the current semantic fixation.
     #[must_use]
     pub fn fixation_timing(&self) -> (f32, f32) {
@@ -323,6 +356,15 @@ impl EmbodiedRuntime {
         };
         self.present_gaze(dt);
         self.present_gaze_lids();
+        let visible_fixation = self.world_gaze_target.is_some()
+            && self.pose.gaze.distance(self.gaze_target) <= 0.08
+            && self.pose.eye_aperture > 0.35
+            && self.pose.blink_left.max(self.pose.blink_right) < 0.65;
+        self.gaze_acquired_seconds = if visible_fixation {
+            (self.gaze_acquired_seconds + dt).min(2.0)
+        } else {
+            0.0
+        };
         self.liquid.presentation_update(dt);
     }
 
@@ -358,6 +400,19 @@ impl EmbodiedRuntime {
         } else {
             gaze_mode(intent, affect)
         };
+        let world_target = if mode == GazeMode::TrackWorldTarget {
+            intent.gaze_target.filter(|target| target.is_finite())
+        } else {
+            None
+        };
+        if self
+            .world_gaze_target
+            .zip(world_target)
+            .is_none_or(|(old, new)| old.distance(new) > 0.02)
+        {
+            self.gaze_acquired_seconds = 0.0;
+        }
+        self.world_gaze_target = world_target;
         let desired_gaze = desired_gaze(
             mode,
             intent,
@@ -389,23 +444,24 @@ impl EmbodiedRuntime {
         // Sleep is an authoritative motor state, including supported Compact
         // sleep. Do not let an unrelated awake expression leave ghost ellipses.
         // A deliberate managed unilateral sleep-check remains the exception.
-        let sleeping = intent.locomotion == lifecore::LocomotionMode::Sleep
-            || mode == GazeMode::Sleep;
-        let checking = sleeping && self.managed_blink
+        let sleeping =
+            intent.locomotion == lifecore::LocomotionMode::Sleep || mode == GazeMode::Sleep;
+        let checking = sleeping
+            && self.managed_blink
             && expression.blink_left.max(expression.blink_right) >= 0.98
             && expression.blink_left.min(expression.blink_right) < 0.90;
-        let aperture_target = if sleeping && !checking {0.0}
-            else if checking {1.0} else {expression.eye_aperture.clamp(0.0,1.0)};
+        let aperture_target = if sleeping && !checking {
+            0.0
+        } else if checking {
+            1.0
+        } else {
+            expression.eye_aperture.clamp(0.0, 1.0)
+        };
         if sleeping && !checking {
             self.pose.blink_left = 1.0;
             self.pose.blink_right = 1.0;
         }
-        self.pose.eye_aperture = smooth(
-            self.pose.eye_aperture,
-            aperture_target,
-            16.0,
-            dt,
-        );
+        self.pose.eye_aperture = smooth(self.pose.eye_aperture, aperture_target, 16.0, dt);
         self.pose.eye_scale = smooth(
             self.pose.eye_scale,
             expression.eye_scale.clamp(0.88, 1.18),
@@ -414,11 +470,25 @@ impl EmbodiedRuntime {
         );
         // Emotion changes lid contours, never magnifies the eyeball/iris.
         self.pose.eye_scales = [Vec2::ONE; 2];
-        let aperture_closure = if checking {0.0} else {1.0 - self.pose.eye_aperture};
+        let aperture_closure = if checking {
+            0.0
+        } else {
+            1.0 - self.pose.eye_aperture
+        };
         self.pose.blink_left = self.pose.blink_left.max(aperture_closure);
         self.pose.blink_right = self.pose.blink_right.max(aperture_closure);
         self.update_pupil(mode, intent, sensors, mind, expression, face_tuning, dt);
         self.update_soft_body(genome, intent, feedback, affect, dt);
+        let style_alpha = 1.0 - (-8.0 * dt).exp();
+        self.companion_body_style.compactness += (self.companion_body_target.compactness
+            - self.companion_body_style.compactness)
+            * style_alpha;
+        self.companion_body_style.lean = self
+            .companion_body_style
+            .lean
+            .lerp(self.companion_body_target.lean, style_alpha);
+        self.liquid
+            .set_companion_body_style(self.companion_body_style);
 
         let voice_mouth = voice_mouth_target(voice);
         let shout_target = if voice.active && voice.shout.is_finite() {
@@ -1022,8 +1092,11 @@ impl EmbodiedRuntime {
             .as_ref()
             .map_or(0.0, |collision| collision.intensity)
             .clamp(0.0, 1.0);
-        let compression_target =
-            (pose_compression + impact * 0.35 + affect.stress * 0.08 + self.self_care_pulse * 0.075).clamp(-0.08, 0.48);
+        let compression_target = (pose_compression
+            + impact * 0.35
+            + affect.stress * 0.08
+            + self.self_care_pulse * 0.075)
+            .clamp(-0.08, 0.48);
         self.pose.compression = smooth(self.pose.compression, compression_target, 15.0, dt);
 
         let stretch =
@@ -1047,7 +1120,12 @@ impl EmbodiedRuntime {
             .max(((acceleration.length() - 0.18) / 0.85).clamp(0.0, 1.0));
         let tilt_target =
             ((-velocity.x * 0.20 - acceleration.x * 0.065).clamp(-0.18, 0.18)) * tilt_activity;
-        self.pose.tilt = smooth(self.pose.tilt, tilt_target + self.self_care_lean * 0.16, 8.0, dt);
+        self.pose.tilt = smooth(
+            self.pose.tilt,
+            tilt_target + self.self_care_lean * 0.16,
+            8.0,
+            dt,
+        );
         let head_target = Vec2::new(-acceleration.x, -acceleration.y) * (0.028 + softness * 0.035);
         spring_vec2(
             &mut self.pose.head_lag,
@@ -1093,10 +1171,13 @@ fn expressive_asymmetric_geometry(expression: lifecore::ExpressionState) -> life
     let knit = signed(expression.brow_tension).max(0.0);
     // Do not turn every small frown into worried inner brows. Effort and
     // alertness keep their own face; quiet disappointment can recruit worry.
-    let ease = |x: f32| { let t=x.clamp(0.0,1.0); t*t*(3.0-2.0*t) };
-    let concern = ease((-signed(expression.mouth_curve)-0.12)/0.43)
-        * (1.0-ease((knit-0.25)/0.35))
-        * (1.0-ease((signed(expression.brow_raise)-0.30)/0.35));
+    let ease = |x: f32| {
+        let t = x.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let concern = ease((-signed(expression.mouth_curve) - 0.12) / 0.43)
+        * (1.0 - ease((knit - 0.25) / 0.35))
+        * (1.0 - ease((signed(expression.brow_raise) - 0.30) / 0.35));
     for (index, side) in [1.0, -1.0].into_iter().enumerate() {
         // Local action correctives, not rotation of a rigid brow: inner worry
         // lift and corrugator-like knitting compete; an inquisitive side raises
@@ -1339,46 +1420,77 @@ mod tests {
 
     #[test]
     fn actual_sleep_closes_both_eyes_but_keeps_managed_checks_and_waking_blinks() {
-        let genome=Genome::from_seed(42);
-        let traits=DerivedVisualTraits::from_genome(&genome);
-        let mut runtime=EmbodiedRuntime::new(42,&traits);
-        runtime.managed_blink=true;
-        let mut display=intent();
-        display.locomotion=lifecore::LocomotionMode::Sleep;
-        display.pose=PoseIntent::Compact;
-        let update=|runtime:&mut EmbodiedRuntime,display:&BodyIntent,expression| {
-            runtime.update(&genome.body,&traits,VisualMindInput::default(),display,
-                &SensorFrame::default(),&BodyFeedback::default(),AffectState::default(),
-                expression,FaceTuning::default(),VoiceVisualState::default(),1.0/120.0);
+        let genome = Genome::from_seed(42);
+        let traits = DerivedVisualTraits::from_genome(&genome);
+        let mut runtime = EmbodiedRuntime::new(42, &traits);
+        runtime.managed_blink = true;
+        let mut display = intent();
+        display.locomotion = lifecore::LocomotionMode::Sleep;
+        display.pose = PoseIntent::Compact;
+        let update = |runtime: &mut EmbodiedRuntime, display: &BodyIntent, expression| {
+            runtime.update(
+                &genome.body,
+                &traits,
+                VisualMindInput::default(),
+                display,
+                &SensorFrame::default(),
+                &BodyFeedback::default(),
+                AffectState::default(),
+                expression,
+                FaceTuning::default(),
+                VoiceVisualState::default(),
+                1.0 / 120.0,
+            );
         };
-        let mut face=lifecore::ExpressionState::default();
-        face.blink_left=0.70;face.blink_right=0.70;
-        for _ in 0..120 {update(&mut runtime,&display,face);}
-        assert_eq!((runtime.pose.blink_left,runtime.pose.blink_right),(1.0,1.0));
-        face.blink_left=0.28;face.blink_right=1.0;
-        update(&mut runtime,&display,face);
-        assert_eq!((runtime.pose.blink_left,runtime.pose.blink_right),(0.28,1.0));
-        display.locomotion=lifecore::LocomotionMode::Hover;
-        display.pose=PoseIntent::Neutral;
-        face.blink_left=0.0;face.blink_right=0.0;
-        for _ in 0..120 {update(&mut runtime,&display,face);}
-        assert!(runtime.pose.blink_left<0.001 && runtime.pose.blink_right<0.001);
-        face.blink_left=0.42;face.blink_right=0.11;
-        update(&mut runtime,&display,face);
-        assert_eq!((runtime.pose.blink_left,runtime.pose.blink_right),(0.42,0.11));
+        let mut face = lifecore::ExpressionState {
+            blink_left: 0.70,
+            blink_right: 0.70,
+            ..Default::default()
+        };
+        for _ in 0..120 {
+            update(&mut runtime, &display, face);
+        }
+        assert_eq!(
+            (runtime.pose.blink_left, runtime.pose.blink_right),
+            (1.0, 1.0)
+        );
+        face.blink_left = 0.28;
+        face.blink_right = 1.0;
+        update(&mut runtime, &display, face);
+        assert_eq!(
+            (runtime.pose.blink_left, runtime.pose.blink_right),
+            (0.28, 1.0)
+        );
+        display.locomotion = lifecore::LocomotionMode::Hover;
+        display.pose = PoseIntent::Neutral;
+        face.blink_left = 0.0;
+        face.blink_right = 0.0;
+        for _ in 0..120 {
+            update(&mut runtime, &display, face);
+        }
+        assert!(runtime.pose.blink_left < 0.001 && runtime.pose.blink_right < 0.001);
+        face.blink_left = 0.42;
+        face.blink_right = 0.11;
+        update(&mut runtime, &display, face);
+        assert_eq!(
+            (runtime.pose.blink_left, runtime.pose.blink_right),
+            (0.42, 0.11)
+        );
     }
 
     #[test]
     fn worry_brows_require_disappointment_not_small_frowns_or_alarm() {
-        let mut e = lifecore::ExpressionState::default();
-        e.brow_asymmetry = 0.0;
-        e.brow_tension = 0.0;
-        e.brow_raise = 0.0;
+        let mut e = lifecore::ExpressionState {
+            brow_asymmetry: 0.0,
+            brow_tension: 0.0,
+            brow_raise: 0.0,
+            ..Default::default()
+        };
         let base = expressive_asymmetric_geometry(e);
         e.mouth_curve = -0.10;
         assert_eq!(expressive_asymmetric_geometry(e).brows, base.brows);
         e.mouth_curve = -0.70;
-        assert!(expressive_asymmetric_geometry(e).brows[0][0] > base.brows[0][0]+0.4);
+        assert!(expressive_asymmetric_geometry(e).brows[0][0] > base.brows[0][0] + 0.4);
         e.brow_raise = 0.75;
         assert_eq!(expressive_asymmetric_geometry(e).brows, base.brows);
         e.brow_raise = 0.0;
@@ -1420,6 +1532,167 @@ mod tests {
             expression: lifecore::ExpressionState::default(),
             interaction_target: None,
         }
+    }
+
+    #[test]
+    fn acquisition_evidence_requires_visible_presented_frames_not_simulation_ticks() {
+        let genome = Genome::from_seed(42);
+        let traits = DerivedVisualTraits::from_genome(&genome);
+        let mut runtime = EmbodiedRuntime::new(42, &traits);
+        runtime.managed_blink = true;
+        let mut display = intent();
+        let update = |runtime: &mut EmbodiedRuntime, display: &BodyIntent| {
+            runtime.update(
+                &genome.body,
+                &traits,
+                VisualMindInput::default(),
+                display,
+                &SensorFrame::default(),
+                &BodyFeedback::default(),
+                AffectState::default(),
+                display.expression,
+                FaceTuning::default(),
+                VoiceVisualState::default(),
+                1.0 / 120.0,
+            );
+        };
+        for _ in 0..120 {
+            update(&mut runtime, &display);
+        }
+        let before = runtime.orientation_evidence().unwrap();
+        assert_eq!(before.acquired_seconds, 0.0);
+        assert!(before.gaze_error > 0.08);
+        for _ in 0..30 {
+            update(&mut runtime, &display);
+            runtime.presentation_update(1.0 / 60.0);
+        }
+        let acquired = runtime.orientation_evidence().unwrap();
+        println!(
+            "presented gaze: error={:.7}, acquired dwell={:.5}s",
+            acquired.gaze_error, acquired.acquired_seconds
+        );
+        assert!(acquired.gaze_error <= 0.08 && acquired.acquired_seconds >= 0.04);
+        display.gaze_target = Some(Vec2::new(0.1, 0.8));
+        update(&mut runtime, &display);
+        assert_eq!(
+            runtime.orientation_evidence().unwrap().acquired_seconds,
+            0.0
+        );
+        display.expression.eye_aperture = 0.0;
+        for _ in 0..120 {
+            update(&mut runtime, &display);
+            runtime.presentation_update(1.0 / 60.0);
+        }
+        assert_eq!(
+            runtime.orientation_evidence().unwrap().acquired_seconds,
+            0.0
+        );
+    }
+
+    #[test]
+    fn distant_confirmed_world_fixation_passes_motor_gate_after_actual_presentation() {
+        use pet_motor::{
+            ActivePerformance, BehaviorContextFrame, BehaviorProgramId as P, PhaseAdvance,
+        };
+        let genome = Genome::from_seed(42);
+        let traits = DerivedVisualTraits::from_genome(&genome);
+        let mut runtime = EmbodiedRuntime::new(42, &traits);
+        runtime.managed_blink = true;
+        let feedback = BodyFeedback {
+            world_position: Vec2::splat(0.5),
+            ..BodyFeedback::default()
+        };
+        let mut world_gaze = crate::GazeController::default();
+        let mut display = intent();
+        let update = |runtime: &mut EmbodiedRuntime, display: &BodyIntent| {
+            runtime.update(
+                &genome.body,
+                &traits,
+                VisualMindInput::default(),
+                display,
+                &SensorFrame::default(),
+                &feedback,
+                AffectState::default(),
+                display.expression,
+                FaceTuning::default(),
+                VoiceVisualState::default(),
+                1.0 / 120.0,
+            );
+        };
+        for _ in 0..20 {
+            display.gaze_target = world_gaze
+                .tick(
+                    crate::GazePlan {
+                        primary_target: Some(Vec2::new(0.15, 0.85)),
+                        acquire_tau: 0.12,
+                        ..Default::default()
+                    },
+                    0.05,
+                )
+                .target;
+            for substep in 0..6 {
+                update(&mut runtime, &display);
+                if substep % 2 == 1 {
+                    runtime.presentation_update(1.0 / 60.0);
+                }
+            }
+        }
+        let target = Vec2::new(0.85, 0.15);
+        let mut active = ActivePerformance {
+            social_bid: None,
+            bout_id: 1,
+            program: P::MoveOrientReflex,
+            phase: pet_motor::PhaseId {
+                program: P::MoveOrientReflex,
+                index: 1,
+            },
+            phase_time: 0.0,
+            total_time: 0.0,
+            locked_target: Some(pet_motor::BehaviorTarget::Point(target)),
+            sampled_style: pet_motor::BoutStyle::default(),
+            minimum_readability_reached: false,
+            interruption_request: None,
+            source_action: lifecore::ActionId::IdleHover,
+            cause: pet_motor::MotorCause::BrainAction,
+        };
+        let mut acquired_at = None;
+        for tick in 1..=15 {
+            let context = BehaviorContextFrame {
+                orientation: runtime.orientation_evidence(),
+                ..Default::default()
+            };
+            match pet_motor::advance_phase(&mut active, &context, 0.05) {
+                PhaseAdvance::Hold => {}
+                PhaseAdvance::Advanced => {
+                    acquired_at = Some(tick as f32 * 0.05);
+                    break;
+                }
+                PhaseAdvance::Finished(reason) => {
+                    panic!("valid distant target failed acquisition: {reason:?}")
+                }
+            }
+            display.gaze_target = world_gaze
+                .tick(
+                    crate::GazePlan {
+                        primary_target: Some(target),
+                        acquire_tau: 0.12,
+                        ..Default::default()
+                    },
+                    0.05,
+                )
+                .target;
+            for substep in 0..6 {
+                update(&mut runtime, &display);
+                if substep % 2 == 1 {
+                    runtime.presentation_update(1.0 / 60.0);
+                }
+            }
+        }
+        let acquired_at = acquired_at.expect("bounded ordinary fixation acquired");
+        println!(
+            "distant actual gaze acquisition incl world confirmation/filter and pupil presentation: {acquired_at:.2}s"
+        );
+        assert!(acquired_at > 0.35 && acquired_at <= 0.75);
     }
 
     #[test]

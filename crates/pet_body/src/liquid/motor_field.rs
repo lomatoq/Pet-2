@@ -2,6 +2,89 @@ use glam::Vec2;
 
 use super::particles::{LiquidParticle, MAX_LIQUID_PARTICLES};
 
+/// Semantic style is a weak strain/redistribution field on the coherent body.
+/// The reciprocal affine scales preserve area; subtracting the mass-weighted
+/// acceleration preserves root momentum. Contact suppresses normal lean.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_companion_style_field(
+    particles: &mut [LiquidParticle; MAX_LIQUID_PARTICLES],
+    count: usize,
+    main_component: u8,
+    center: Vec2,
+    style: crate::BodyStyleTarget,
+    world_to_body: Vec2,
+    support_normal: Option<Vec2>,
+    gain: f32,
+) -> f32 {
+    let count = count.min(MAX_LIQUID_PARTICLES);
+    let compactness = if style.compactness.is_finite() {
+        (style.compactness.clamp(0.0, 1.0) - 0.5) * 2.0
+    } else {
+        0.0
+    };
+    let mut lean = if style.lean.is_finite() && world_to_body.is_finite() {
+        // Director lean is a direction and strength; anisotropic pixels only
+        // change direction, never amplify the authored effort.
+        (style.lean * world_to_body).normalize_or_zero() * style.lean.length().min(1.0)
+    } else {
+        Vec2::ZERO
+    };
+    if let Some(normal) = support_normal.filter(|normal| normal.is_finite()) {
+        lean -= normal * lean.dot(normal);
+    }
+    let gain = if gain.is_finite() {
+        gain.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let strain = (compactness * 0.09).exp();
+    let axis = lean.normalize_or_zero();
+    let mut forces = [Vec2::ZERO; MAX_LIQUID_PARTICLES];
+    let mut weighted = Vec2::ZERO;
+    let mut mass = 0.0;
+    for (i, particle) in particles[..count].iter().enumerate() {
+        if particle.component_id != main_component
+            || particle.inverse_mass <= 0.0
+            || !particle.inverse_mass.is_finite()
+        {
+            continue;
+        }
+        let q = particle.position - center;
+        let affine = Vec2::new(q.x * (strain - 1.0), q.y * (strain.recip() - 1.0));
+        let front = (q.dot(axis) / 0.43).clamp(0.0, 1.0);
+        let support = (1.0 - (q.length() - 0.45).max(0.0) / 0.25).clamp(0.0, 1.0);
+        forces[i] = (affine + lean * front * front * 0.065) * support * gain * 9.0;
+        let m = particle.inverse_mass.recip();
+        weighted += forces[i] * m;
+        mass += m;
+    }
+    if mass <= 0.0 {
+        return 0.0;
+    }
+    let mean = weighted / mass;
+    let largest = particles[..count]
+        .iter()
+        .zip(&forces[..count])
+        .filter(|(p, _)| {
+            p.component_id == main_component && p.inverse_mass > 0.0 && p.inverse_mass.is_finite()
+        })
+        .map(|(_, force)| (*force - mean).length())
+        .fold(0.0_f32, f32::max);
+    let bound = (0.65 / largest.max(0.65)).min(1.0);
+    let mut energy = 0.0;
+    for (particle, force) in particles[..count].iter_mut().zip(forces) {
+        if particle.component_id == main_component
+            && particle.inverse_mass > 0.0
+            && particle.inverse_mass.is_finite()
+        {
+            let acceleration = (force - mean) * bound;
+            particle.force += acceleration;
+            energy += acceleration.length_squared();
+        }
+    }
+    energy / count.max(1) as f32
+}
+
 /// Low-frequency deformation only. Particle masses, translation, contact and
 /// solver constraints remain authoritative; subtract the mass-weighted acceleration.
 pub fn apply_posture_field(
@@ -300,6 +383,63 @@ pub fn apply_character_field(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_style_has_direction_and_preserves_mass_weighted_momentum() {
+        let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+        for (i, particle) in particles[..8].iter_mut().enumerate() {
+            particle.position = Vec2::from_angle(i as f32 * std::f32::consts::TAU / 8.0) * 0.3;
+            particle.inverse_mass = 0.5 + i as f32 * 0.15;
+        }
+        particles[7].component_id = 1;
+        let initial = particles;
+        let mut guard = particles;
+        let mut style = crate::BodyStyleTarget {
+            lean: Vec2::X,
+            ..Default::default()
+        };
+        let energy = apply_companion_style_field(
+            &mut particles,
+            8,
+            0,
+            Vec2::ZERO,
+            style,
+            Vec2::ONE,
+            None,
+            1.0,
+        );
+        let net = particles[..7]
+            .iter()
+            .fold(Vec2::ZERO, |sum, p| sum + p.force / p.inverse_mass);
+        println!(
+            "semantic lean: field energy={energy:.7}, mass-weighted net force={:.9}",
+            net.length()
+        );
+        assert!(energy > 0.001);
+        assert!(net.length() < 1.0e-6);
+        assert!(particles[0].force.x > particles[4].force.x);
+        assert_eq!(particles[7], initial[7]);
+        assert!(particles[..7].iter().all(|p| p.force.length() <= 0.650001));
+        style.lean = Vec2::ZERO;
+        style.compactness = 1.0;
+        apply_companion_style_field(&mut guard, 8, 0, Vec2::ZERO, style, Vec2::ONE, None, 1.0);
+        assert!(guard[0].force.x > 0.0 && guard[2].force.y < 0.0);
+        let mut held = initial;
+        style.compactness = 0.5;
+        style.lean = Vec2::Y;
+        let energy = apply_companion_style_field(
+            &mut held,
+            8,
+            0,
+            Vec2::ZERO,
+            style,
+            Vec2::ONE,
+            Some(Vec2::Y),
+            1.0,
+        );
+        assert_eq!(energy, 0.0);
+    }
     #[test]
     fn core_strain_limit_preserves_center_area_and_rotation() {
         for angle in [0.0_f32, 0.7, 2.1] {
@@ -350,8 +490,6 @@ mod tests {
             assert!(super::comet_warp(p, glam::Vec2::ZERO, 0.0).0.distance(p) < 1.0e-6);
         }
     }
-
-    use super::*;
 
     #[test]
     fn all_postures_preserve_mass_and_have_zero_weighted_acceleration() {

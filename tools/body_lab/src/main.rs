@@ -1,10 +1,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod birth_capture;
-mod digestion_capture;
+mod bubble_material;
 mod companion_glass;
 mod companion_instance;
 mod companion_menu;
+mod digestion_capture;
 mod face_capture;
+mod menu_capture;
 use std::{
     collections::{BTreeSet, VecDeque},
     env,
@@ -77,13 +79,26 @@ const BACKGROUNDS: [ReviewBackground; 6] = [
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args().nth(1).as_deref() == Some("--digestion-captures") {
-        return digestion_capture::run(env::args().nth(2).unwrap_or_else(|| "digestion-captures".into()).into());
+        return digestion_capture::run(
+            env::args()
+                .nth(2)
+                .unwrap_or_else(|| "digestion-captures".into())
+                .into(),
+        );
     }
     if env::args().nth(1).as_deref() == Some("--birth-captures") {
         return birth_capture::run(
             env::args()
                 .nth(2)
                 .unwrap_or_else(|| "birth-captures".into())
+                .into(),
+        );
+    }
+    if env::args().nth(1).as_deref() == Some("--menu-captures") {
+        return menu_capture::run(
+            env::args()
+                .nth(2)
+                .unwrap_or_else(|| "menu-captures".into())
                 .into(),
         );
     }
@@ -98,16 +113,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut live_pet = false;
     let mut pet_menu = false;
     let mut menu_idle = false;
+    let mut menu_owner = None;
     let mut data_dir = None;
     let mut promote_report = None;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--live-pet" => live_pet = true,
-            "--pet-menu-idle" => { pet_menu = true; menu_idle = true; },
+            "--pet-menu-idle" => {
+                pet_menu = true;
+                menu_idle = true;
+            }
             "--pet-menu" => {
                 pet_menu = true;
                 live_pet = true;
+            }
+            "--menu-owner" => {
+                menu_owner = Some(arguments.next().ok_or("--menu-owner requires a launch token")?);
             }
             "--data-dir" => {
                 data_dir = Some(PathBuf::from(
@@ -137,17 +159,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = store.ok_or("Pet 2 data directory is unavailable")?;
         return promote_report_cli(&store, &report_path).map_err(Into::into);
     }
-    let _menu_owner = if pet_menu {
-        let root = &store.as_ref().ok_or("Pet data unavailable")?.paths.root;
-        match companion_instance::Guard::acquire(root)? {
-            Some(guard) => Some(guard),
-            None => { if !menu_idle { fs::write(root.join("companion-menu-open"), b"open")?; } return Ok(()); }
-        }
+    if menu_owner.is_some() && !pet_menu { return Err("--menu-owner requires a care menu".into()); }
+    let menu_channel = if pet_menu {
+        let root=&store.as_ref().ok_or("Pet data unavailable")?.paths.root;
+        Some(match menu_owner.as_deref() {
+            Some(owner) => desktop_host::CareMenuChannel::for_owner(root,owner)?,
+            None => desktop_host::CareMenuChannel::legacy(root),
+        })
     } else { None };
+    let _menu_guard = if pet_menu {
+        let root = &store.as_ref().ok_or("Pet data unavailable")?.paths.root;
+        let guard=if menu_owner.is_some() { companion_instance::Guard::acquire_scoped(root,menu_owner.as_deref())? }
+            else { companion_instance::Guard::acquire(root)? };
+        match guard {
+            Some(guard) => Some(guard),
+            None => {
+                if !menu_idle {
+                    menu_channel.as_ref().expect("care channel exists").request_open()?;
+                }
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     let event_loop = EventLoop::new()?;
     let mut app = BodyLab::new(SEED, store, live_pet);
     app.pet_menu = pet_menu;
     app.menu_idle = menu_idle;
+    app.menu_channel = menu_channel;
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -158,6 +198,7 @@ struct BodyLab {
     start_live: bool,
     pet_menu: bool,
     menu_idle: bool,
+    menu_channel: Option<desktop_host::CareMenuChannel>,
     runtime: Option<LabRuntime>,
 }
 
@@ -605,6 +646,7 @@ impl BodyLab {
             start_live,
             pet_menu: false,
             menu_idle: false,
+            menu_channel: None,
             runtime: None,
         }
     }
@@ -635,7 +677,7 @@ impl ApplicationHandler for BodyLab {
                         LogicalSize::new(880.0, 640.0)
                     })
                     .with_position(LogicalPosition::new(32.0, 48.0))
-                    .with_visible(!self.menu_idle)
+                    .with_visible(!self.pet_menu)
                     .with_resizable(!self.pet_menu)
                     .with_decorations(!self.pet_menu)
                     .with_transparent(self.pet_menu),
@@ -774,11 +816,14 @@ impl ApplicationHandler for BodyLab {
             window.theme(),
             None,
         );
-        let egui_renderer = EguiRenderer::new(
+        let mut egui_renderer = EguiRenderer::new(
             renderer.device(),
             renderer.surface_format(),
             RendererOptions::default(),
         );
+        if self.pet_menu {
+            bubble_material::register(&mut egui_renderer, renderer.device(), renderer.surface_format());
+        }
         let profile_path = store.as_ref().map_or_else(
             || "liquid-tuning.json".to_owned(),
             |store| store.paths.liquid_tuning.display().to_string(),
@@ -900,7 +945,9 @@ impl ApplicationHandler for BodyLab {
                 DevPanel::Character
             },
             live_monitor,
-            pet_menu: self.pet_menu.then(|| companion_menu::MenuState::new(self.menu_idle)),
+            pet_menu: self
+                .pet_menu
+                .then(|| companion_menu::MenuState::new(self.menu_idle)),
         });
     }
 
@@ -917,25 +964,34 @@ impl ApplicationHandler for BodyLab {
             if menu.glass.is_none() {
                 menu.glass = companion_glass::Glass::new(&runtime.window);
                 if let Some(store) = &self.store {
-                    companion_glass::position(&runtime.window, &store.paths.root);
+                    let channel = self.menu_channel.clone().unwrap_or_else(|| desktop_host::CareMenuChannel::legacy(&store.paths.root));
+                    menu.nest_x = companion_glass::position(&runtime.window, &channel.placement_path());
+                    runtime.renderer.resize(runtime.window.inner_size());
                 }
             }
             if let Some(store) = &self.store {
-                let request = store.paths.root.join("companion-menu-open");
-                if request.exists() {
-                    let _ = fs::remove_file(&request);
+                let channel = self.menu_channel.clone().unwrap_or_else(|| desktop_host::CareMenuChannel::legacy(&store.paths.root));
+                if channel.consume_open() {
                     if menu.reopen() {
-                        companion_glass::position(&runtime.window, &store.paths.root);
-                        runtime.window.set_visible(true);
-                        if let Some(monitor) = &mut runtime.live_monitor { monitor.connect(); }
+                        menu.nest_x = companion_glass::position(&runtime.window, &channel.placement_path());
+                    runtime.renderer.resize(runtime.window.inner_size());
+                        menu.pending_show = true;
+                        if let Some(monitor) = &mut runtime.live_monitor {
+                            monitor.connect();
+                        }
                     }
-                    runtime.window.focus_window();
+                    if !menu.pending_show { runtime.window.focus_window(); }
                 }
                 if menu.hidden {
                     let stopped = fs::read(store.paths.root.join("runtime-load-ack.json"))
                         .ok()
                         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                        .is_some_and(|v| v["status"] == "stopped" && v["updated_unix_ms"].as_u64().is_some_and(|t| t >= menu.created_unix_ms));
+                        .is_some_and(|v| {
+                            v["status"] == "stopped"
+                                && v["updated_unix_ms"]
+                                    .as_u64()
+                                    .is_some_and(|t| t >= menu.created_unix_ms)
+                        });
                     if stopped {
                         event_loop.exit();
                         return;
@@ -966,7 +1022,14 @@ impl ApplicationHandler for BodyLab {
             runtime.next_frame = now + Duration::from_micros(16_667);
         }
         if runtime.panel.is_live() || runtime.pet_menu.is_some() {
-            runtime.window.request_redraw();
+            if runtime.pet_menu.as_ref().is_some_and(|menu| menu.pending_show && !menu.hidden) {
+                // Hidden HWNDs do not receive WM_PAINT/RedrawRequested on Windows.
+                // Draw their first scene directly so the present-before-show gate
+                // can complete without making an empty/stale frame visible.
+                render_main(runtime, &self.genome, event_loop);
+            } else {
+                runtime.window.request_redraw();
+            }
             event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame));
             return;
         }
@@ -1151,13 +1214,23 @@ impl ApplicationHandler for BodyLab {
             return;
         };
         if window_id == runtime.window.id() {
+            if runtime.pet_menu.is_some()
+                && matches!(event, WindowEvent::MouseInput { .. } | WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. } | WindowEvent::KeyboardInput { .. } | WindowEvent::Focused(_))
+                && let Some(path) = std::env::var_os("PET2_MENU_DIAGNOSTICS")
+            {
+                use std::io::Write;
+                if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(std::path::PathBuf::from(path).with_extension("events")) {
+                    let _ = writeln!(file,"{:?}",event);
+                }
+            }
             let response = runtime
                 .egui_state
                 .on_window_event(runtime.window.as_ref(), &event);
             match event {
                 WindowEvent::Focused(false) if runtime.pet_menu.is_some() => {
                     if let Some(menu) = &mut runtime.pet_menu
-                        && menu.can_dismiss_on_focus_loss() {
+                        && menu.can_dismiss_on_focus_loss()
+                    {
                         menu.close = true;
                     }
                 }
@@ -1194,10 +1267,13 @@ impl ApplicationHandler for BodyLab {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         match code {
                             KeyCode::Escape => {
-                                if let Some(menu) = &mut runtime.pet_menu { menu.close = true; }
-                                else { event_loop.exit(); }
+                                if let Some(menu) = &mut runtime.pet_menu {
+                                    menu.close = true;
+                                } else {
+                                    event_loop.exit();
+                                }
                             }
-                            _ if runtime.pet_menu.is_some() => {} ,
+                            _ if runtime.pet_menu.is_some() => {}
                             KeyCode::F1 => runtime.panel = DevPanel::Character,
                             KeyCode::F2 => runtime.panel = DevPanel::Perception,
                             KeyCode::F3 => runtime.panel = DevPanel::Behavior,
@@ -1716,7 +1792,28 @@ fn preview_navigation_anchor(scenario: PreviewScenario, drag: PreviewDrag) -> f3
 
 fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEventLoop) {
     let diagnostics = runtime.body.embodiment.liquid.diagnostics();
-    let raw_input = runtime.egui_state.take_egui_input(runtime.window.as_ref());
+    let mut raw_input = runtime.egui_state.take_egui_input(runtime.window.as_ref());
+    // Isolated integration harness only: deliver a click to the actual widget
+    // without moving the user's OS cursor. This is explicitly not an OS mouse test.
+    if let Some(path) = std::env::var_os("PET2_MENU_DIAGNOSTICS")
+        && let Some(menu) = &runtime.pet_menu
+        && !menu.hidden && !menu.close
+        && runtime.live_monitor.as_ref().is_some_and(LivePetMonitor::can_send_control)
+        && let Some((region, _)) = menu.regions.first()
+    {
+        let trigger = std::path::PathBuf::from(path).with_extension("feed");
+        if let Ok(phase) = fs::read_to_string(&trigger) {
+            let pressed = phase.trim() == "press";
+            if pressed { let _ = fs::write(&trigger,"release"); }
+            else { let _ = fs::remove_file(&trigger); }
+            raw_input.focused = true;
+            raw_input.events.push(egui::Event::PointerMoved(region.center()));
+            raw_input.events.push(egui::Event::PointerButton {
+                pos: region.center(), button: egui::PointerButton::Primary,
+                pressed, modifiers: egui::Modifiers::NONE,
+            });
+        }
+    }
     let egui_context = runtime.egui_context.clone();
     let mut selected_panel = runtime.panel;
     let output = egui_context.run(raw_input, |context| {
@@ -1752,12 +1849,27 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
         menu.hidden = true;
         menu.waiting_for_feed = false;
         runtime.window.set_visible(false);
-        if let Some(monitor) = &mut runtime.live_monitor { monitor.disconnect(); }
+        if let Some(monitor) = &mut runtime.live_monitor {
+            monitor.disconnect();
+        }
     }
     if let Some(menu) = &mut runtime.pet_menu
-        && let Some(glass) = &mut menu.glass {
-            glass.set_regions(&runtime.window, &menu.regions);
-        }
+        && let Some(glass) = &mut menu.glass
+    {
+        glass.set_regions(&runtime.window, &menu.regions);
+    }
+    if let Some(path) = std::env::var_os("PET2_MENU_DIAGNOSTICS")
+        && let Some(menu) = &runtime.pet_menu
+    {
+        let pointer = egui_context.input(|input| input.pointer.interact_pos());
+        let status = serde_json::json!({"hidden":menu.hidden,"close":menu.close,"nest_x":menu.nest_x,
+            "regions":menu.regions.iter().map(|(r,_)| [r.min.x,r.min.y,r.max.x,r.max.y]).collect::<Vec<_>>(),
+            "pointer":pointer.map(|p|[p.x,p.y]),"focused":egui_context.input(|input|input.focused),"input_events":egui_context.input(|input|format!("{:?}",input.events)),"ready":runtime.live_monitor.as_ref().is_some_and(LivePetMonitor::can_send_control),
+            "connection":runtime.live_monitor.as_ref().map(|m|format!("{:?}",m.connection)),
+            "pending_command":runtime.live_monitor.as_ref().and_then(|m|m.pending_command_id),
+            "pixels_per_point":egui_context.pixels_per_point(),"waiting_for_feed":menu.waiting_for_feed});
+        let _ = fs::write(path,status.to_string());
+    }
     runtime.panel = selected_panel;
     if runtime.ui.section != LabSection::Nervous {
         // Switching sections must clear synthetic stimuli even while paused.
@@ -1897,6 +2009,16 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
     } else {
         renderer.render_with_overlay(parameters, overlay)
     };
+    if outcome == RenderOutcome::Presented
+        && let Some(menu) = &mut runtime.pet_menu
+        && menu.pending_show && !menu.hidden && !menu.regions.is_empty()
+    {
+        // Present the new transparent scene before exposing the native window.
+        // Otherwise DWM can briefly display the previous panel/connection card.
+        menu.pending_show = false;
+        runtime.window.set_visible(true);
+        runtime.window.focus_window();
+    }
     for id in &output.textures_delta.free {
         runtime.egui_renderer.free_texture(id);
     }
@@ -2191,8 +2313,16 @@ impl LivePetMonitor {
 
         let active_path = self.active_path().to_path_buf();
         let incremental_read = self.current_bootstrapped;
-        let events = match read_telemetry_file_bounded(&active_path, &mut self.offset, true,
-            if self.menu_only { 1024 * 1024 } else { LIVE_BOOTSTRAP_BYTES }) {
+        let events = match read_telemetry_file_bounded(
+            &active_path,
+            &mut self.offset,
+            true,
+            if self.menu_only {
+                1024 * 1024
+            } else {
+                LIVE_BOOTSTRAP_BYTES
+            },
+        ) {
             Ok(events) => events,
             Err(error) => {
                 self.status = error;
@@ -2256,7 +2386,7 @@ impl LivePetMonitor {
         }
         if self.menu_only {
             // Menu needs two small fields, not a cloned 240 KB diagnostic frame at 60 Hz.
-            let compact = serde_json::json!({"details": {"hearing": event["details"]["hearing"], "feeding": event["details"]["feeding"]}});
+            let compact = serde_json::json!({"details": {"hearing": event["details"]["hearing"], "feeding": event["details"]["feeding"], "cleanup": event["details"]["cleanup"]}});
             self.frames.clear();
             self.frames.push_back(compact);
             self.selected = 0;
@@ -3194,7 +3324,12 @@ fn read_telemetry_file(
 ) -> Result<Vec<Value>, String> {
     read_telemetry_file_bounded(path, offset, tail_on_first_read, LIVE_BOOTSTRAP_BYTES)
 }
-fn read_telemetry_file_bounded(path: &Path, offset: &mut u64, tail_on_first_read: bool, budget: u64) -> Result<Vec<Value>, String> {
+fn read_telemetry_file_bounded(
+    path: &Path,
+    offset: &mut u64,
+    tail_on_first_read: bool,
+    budget: u64,
+) -> Result<Vec<Value>, String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -8917,7 +9052,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.jsonl");
         let mut lines = String::new();
-        for sequence in 0..1000 { lines.push_str(&format!("{{\"sequence\":{sequence}}}\n")); }
+        for sequence in 0..1000 {
+            lines.push_str(&format!("{{\"sequence\":{sequence}}}\n"));
+        }
         std::fs::write(&path, &lines).unwrap();
         let mut offset = 0;
         let events = read_telemetry_file_bounded(&path, &mut offset, true, 256).unwrap();

@@ -5,6 +5,7 @@
 
 mod acoustic_cues;
 mod capabilities;
+mod care_menu_channel;
 mod contract;
 mod coordinates;
 mod evolution_control;
@@ -17,6 +18,7 @@ mod storage;
 
 pub use acoustic_cues::*;
 pub use capabilities::*;
+pub use care_menu_channel::*;
 pub use contract::*;
 pub use coordinates::*;
 pub use evolution_control::*;
@@ -31,5 +33,10 @@ pub use storage::*;
 
 /// The authored application icon, shared by the companion and its control window.
 pub fn application_icon() -> winit::window::Icon {
-    winit::window::Icon::from_rgba(include_bytes!("../../../assets/windows/app-icon.rgba").to_vec(), 64, 64).expect("embedded 64px RGBA icon")
+    winit::window::Icon::from_rgba(
+        include_bytes!("../../../assets/windows/app-icon.rgba").to_vec(),
+        64,
+        64,
+    )
+    .expect("embedded 64px RGBA icon")
 }

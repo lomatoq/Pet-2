@@ -825,6 +825,7 @@ dependencies = [
  "glam",
  "lifecore",
  "pet_ecology",
+ "pet_motor",
  "serde_json",
 ]
 
@@ -1672,6 +1673,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "half",
  "lifecore",
  "naga",
  "pet_audio",
