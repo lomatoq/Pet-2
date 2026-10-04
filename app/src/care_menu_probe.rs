@@ -35,6 +35,8 @@ pub(crate) fn run(store: StateStore) -> Result<(), Box<dyn Error>> {
         sequence: 0,
         right_clicks: 0,
         commands: vec![],
+        care_commands: vec![],
+        command_events: vec![],
         feeding_seconds: 0.0,
         cleanup_mode: false,
     };
@@ -57,13 +59,15 @@ struct Probe {
     sequence: u64,
     right_clicks: u64,
     commands: Vec<String>,
+    care_commands: Vec<String>,
+    command_events: Vec<serde_json::Value>,
     feeding_seconds: f32,
     cleanup_mode: bool,
 }
 impl Probe {
     fn report(&self) {
         let report = serde_json::json!({"pid":std::process::id(),"helper_pid":self.menu.child.as_ref().map(|c|c.id()),
-            "owner":self.menu.channel.owner(),"right_clicks":self.right_clicks,"commands":self.commands,
+            "owner":self.menu.channel.owner(),"right_clicks":self.right_clicks,"commands":self.commands,"care_commands":self.care_commands,"command_events":self.command_events,"care_ack":self.menu.control_ack(),
             "session_active":self.session.active(Instant::now()),"session_id":self.session.session_id,
             "feeding_enabled":self.feeding_seconds>0.0});
         let pending = self.store.paths.root.join("care-probe-report.next");
@@ -129,33 +133,52 @@ impl ApplicationHandler for Probe {
             loaded_genome_hash: 7,
             updated_unix_ms: wall,
         });
-        if let Ok(Some(envelope)) = self.store.load_lab_control()
-            && self.admission.admit_command(&envelope, wall) == LabCommandAdmission::Execute
-        {
-            let token = envelope.session_token.as_deref();
-            let changed = if let Some(changed) =
-                apply_lab_session_command(&mut self.session, &envelope.command, token, now)
-            {
-                changed
-            } else if let LabControlCommand::Feeding { enabled } = envelope.command
-                && self.session.accepts(token, now)
-            {
-                apply_feeding_mode(enabled, &mut self.feeding_seconds, &mut self.cleanup_mode);
-                true
-            } else {
-                false
-            };
-            self.admission.note_applied(changed);
-            self.commands
-                .push(super::lab_command_name(&envelope.command).to_owned());
-            self.report();
+        for (care, store) in [
+            (false, self.store.clone()),
+            (true, self.menu.control_store.clone()),
+        ] {
+            if let Ok(Some(envelope)) = store.load_lab_control() {
+                let ledger = if care {
+                    &mut self.menu.admission
+                } else {
+                    &mut self.admission
+                };
+                if ledger.admit_command(&envelope, wall) != LabCommandAdmission::Execute {
+                    continue;
+                }
+                let token = envelope.session_token.as_deref();
+                let changed = if let Some(changed) =
+                    apply_lab_session_command(&mut self.session, &envelope.command, token, now)
+                {
+                    changed
+                } else if let LabControlCommand::Feeding { enabled } = envelope.command
+                    && self.session.accepts(token, now)
+                {
+                    apply_feeding_mode(enabled, &mut self.feeding_seconds, &mut self.cleanup_mode);
+                    true
+                } else {
+                    false
+                };
+                ledger.note_applied(changed);
+                let name = super::lab_command_name(&envelope.command).to_owned();
+                self.command_events.push(
+                    serde_json::json!({"source":if care {"care"} else {"generic"},
+                    "command":name,"applied":changed,"command_id":envelope.command_id,
+                    "session_id":token.map(desktop_host::lab_session_id)}),
+                );
+                self.commands.push(name.clone());
+                if care {
+                    self.care_commands.push(name);
+                }
+                self.report();
+            }
         }
         self.session.expire(now);
         self.sequence += 1;
         if self.sequence.is_multiple_of(10) {
             let event = serde_json::json!({"kind":"debug_state","monotonic_seconds":self.start.elapsed().as_secs_f64(),"details":{
                 "runtime_session_id":1,"sequence":self.sequence,"lab_session":{"active":self.session.active(now),"session_id":self.session.session_id},
-                "lab_interventions":{"last_command_id":self.admission.last_seen_command_id},
+                "lab_interventions":{"last_command_id":self.admission.last_seen_command_id},"care_control":self.menu.control_ack(),
                 "hearing":{"master_gain":0.65,"enabled":true},"feeding":{"enabled":self.feeding_seconds>0.0},"cleanup":{"enabled":false}}});
             use std::io::Write;
             if let Ok(mut file) = std::fs::OpenOptions::new()

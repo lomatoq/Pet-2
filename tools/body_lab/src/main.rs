@@ -312,6 +312,7 @@ struct LivePetMonitor {
     motor_validation: CatalogValidationSummary,
     control_counter: u64,
     last_sent_command_id: u64,
+    care_owner: Option<String>,
     pending_command_id: Option<u64>,
     pending_command_sent_at: Option<Instant>,
     control_status: String,
@@ -847,13 +848,23 @@ impl ApplicationHandler for BodyLab {
             |engine| engine.device_name().to_owned(),
         );
         let live_monitor = store.as_ref().map(|store| {
-            let mut m = LivePetMonitor::new(store, self.start_live);
+            // Configure the scoped transport before any OpenSession write,
+            // including direct --pet-menu launches (the Pet normally uses idle).
+            let mut m = LivePetMonitor::new(store, false);
+            if let Some(channel) = &self.menu_channel
+                && let Some(owner) = channel.owner()
+            {
+                m.control_store = channel.control_store();
+                m.care_owner = Some(owner.to_owned());
+                m.last_sent_command_id = m.control_store.load_lab_control().ok().flatten().map_or(0,|c|c.command_id);
+            }
             m.menu_only = self.pet_menu;
             m.previous_loaded = self.pet_menu;
             if self.pet_menu {
                 m.offset = fs::metadata(m.active_path()).map_or(0, |m| m.len());
                 m.current_bootstrapped = true;
             }
+            if self.start_live { m.connect(); }
             m
         });
         let ui = LabUi {
@@ -1867,6 +1878,12 @@ fn render_main(runtime: &mut LabRuntime, genome: &Genome, event_loop: &ActiveEve
             "pointer":pointer.map(|p|[p.x,p.y]),"focused":egui_context.input(|input|input.focused),"input_events":egui_context.input(|input|format!("{:?}",input.events)),"ready":runtime.live_monitor.as_ref().is_some_and(LivePetMonitor::can_send_control),
             "connection":runtime.live_monitor.as_ref().map(|m|format!("{:?}",m.connection)),
             "pending_command":runtime.live_monitor.as_ref().and_then(|m|m.pending_command_id),
+            "control_status":runtime.live_monitor.as_ref().map(|m|&m.control_status),
+            "expected_session_id":runtime.live_monitor.as_ref().and_then(|m|m.expected_session_id),
+            "has_session_token":runtime.live_monitor.as_ref().is_some_and(|m|m.session_token.is_some()),
+            "last_sent_command_id":runtime.live_monitor.as_ref().map(|m|m.last_sent_command_id),
+            "connect_age":runtime.live_monitor.as_ref().and_then(|m|m.connect_started.map(|t|t.elapsed().as_secs_f32())),
+            "last_session_command_age":runtime.live_monitor.as_ref().and_then(|m|m.last_session_command.map(|t|t.elapsed().as_secs_f32())),
             "pixels_per_point":egui_context.pixels_per_point(),"waiting_for_feed":menu.waiting_for_feed});
         let _ = fs::write(path,status.to_string());
     }
@@ -2081,6 +2098,7 @@ impl LivePetMonitor {
                 .ok()
                 .flatten()
                 .map_or(0, |control| control.command_id),
+            care_owner: None,
             pending_command_id: None,
             pending_command_sent_at: None,
             control_status: "No intervention sent from this Dev Console session.".into(),
@@ -2612,8 +2630,13 @@ impl LivePetMonitor {
         let Some(pending) = self.pending_command_id else {
             return;
         };
-        let Some(observed) = event
-            .pointer("/details/lab_interventions/last_command_id")
+        let ledger = if let Some(owner) = &self.care_owner {
+            let ledger = &event["details"]["care_control"];
+            if ledger["owner"].as_str() != Some(owner.as_str()) { return; }
+            ledger
+        } else { &event["details"]["lab_interventions"] };
+        let Some(observed) = ledger
+            .get("last_command_id")
             .and_then(Value::as_u64)
         else {
             return;
@@ -2621,8 +2644,8 @@ impl LivePetMonitor {
         if observed < pending {
             return;
         }
-        let status = event
-            .pointer("/details/lab_interventions/last_command_status")
+        let status = ledger
+            .get("last_command_status")
             .and_then(Value::as_str)
             .unwrap_or("status_unavailable");
         self.control_status = if observed == pending {
@@ -9046,6 +9069,29 @@ fn preview_seeded_unit(mut value: u64) -> f32 {
 mod tests {
     use super::*;
     use lifecore::LifeCore;
+
+    #[test]
+    fn care_ack_ignores_general_console_and_other_owner_watermarks() {
+        let data = tempfile::tempdir().unwrap();
+        let store = StateStore::at(data.path());
+        let mut monitor = LivePetMonitor::new(&store,false);
+        monitor.care_owner = Some("current-pet".into());
+        monitor.pending_command_id = Some(2);
+        let mut event = serde_json::json!({"details":{
+            "lab_interventions":{"last_command_id":100,"last_command_status":"applied"},
+            "care_control":{"owner":"old-pet","last_command_id":2,"last_command_status":"applied"}
+        }});
+        monitor.observe_control_acknowledgement(&event);
+        assert_eq!(monitor.pending_command_id,Some(2));
+        event["details"]["care_control"]["owner"]="current-pet".into();
+        event["details"]["care_control"]["last_command_id"]=1.into();
+        monitor.observe_control_acknowledgement(&event);
+        assert_eq!(monitor.pending_command_id,Some(2));
+        event["details"]["care_control"]["last_command_id"]=2.into();
+        monitor.observe_control_acknowledgement(&event);
+        assert_eq!(monitor.pending_command_id,None);
+        assert!(monitor.control_status.contains("acknowledged command 2"));
+    }
 
     #[test]
     fn menu_tail_read_skips_backlog_but_preserves_latest_complete_record() {

@@ -3247,7 +3247,7 @@ impl PetApplication {
                 runtime.normalizer.monotonic_seconds(), body_dt, runtime.sensors.pet_dragged,
             ) {
                 let mut evidence = serde_json::json!({
-                    "build": "V65", "sample": observation.sample,
+                    "build": "V65.1", "sample": observation.sample,
                     "action": format!("{:?}", runtime.life.state.current_action),
                     "pose": format!("{:?}", runtime.intent.pose),
                     "program": runtime.body.somatic_actuation().program,
@@ -4763,6 +4763,7 @@ impl PetApplication {
                     "morph": morph_details,
                     "morph_diagnostics": morph_diagnostics,
                     "lab_interventions": lab_interventions,
+                    "care_control": runtime.companion_menu.control_ack(),
                     "body_interaction": body_interaction,
                     "nervous_system": {
                         "body_learning": runtime.life.learning.body.diagnostics,
@@ -6298,6 +6299,21 @@ fn poll_lab_control(
     wall_now: SystemTime,
     monotonic_now: Instant,
 ) {
+    // A legacy Console and the Pet-owned care helper are independent producers.
+    // Process each bounded slot with its own watermark; legacy renewals cannot
+    // overwrite or make a pending care command stale.
+    poll_lab_control_slot(store, runtime, wall_now, monotonic_now, false);
+    let care_store = runtime.companion_menu.control_store.clone();
+    poll_lab_control_slot(&care_store, runtime, wall_now, monotonic_now, true);
+}
+
+fn poll_lab_control_slot(
+    store: &StateStore,
+    runtime: &mut PetRuntime,
+    wall_now: SystemTime,
+    monotonic_now: Instant,
+    care: bool,
+) {
     let envelope = match store.load_lab_control() {
         Ok(Some(envelope)) => envelope,
         Ok(None) => return,
@@ -6305,13 +6321,13 @@ fn poll_lab_control(
             // The external slot is untrusted. Storage already enforces its
             // schema and byte cap; telemetry records only a categorical error
             // so paths or payload fragments never leak into the monitor.
-            runtime.lab_interventions.note_load_error();
+            if care { runtime.companion_menu.admission.note_load_error(); }
+            else { runtime.lab_interventions.note_load_error(); }
             return;
         }
     };
-    let admission = runtime
-        .lab_interventions
-        .admit_command(&envelope, unix_time_millis(wall_now));
+    let ledger = if care { &mut runtime.companion_menu.admission } else { &mut runtime.lab_interventions };
+    let admission = ledger.admit_command(&envelope, unix_time_millis(wall_now));
     if admission != LabCommandAdmission::Execute {
         return;
     }
@@ -6330,7 +6346,7 @@ fn poll_lab_control(
             | LabControlCommand::ShutdownForPromotion
     );
     if requires_active_session && !session_authorized {
-        runtime.lab_interventions.note_applied(false);
+        note_control_applied(runtime, care, false);
         return;
     }
     let changed = match envelope.command {
@@ -6499,7 +6515,12 @@ fn poll_lab_control(
             true
         }
     };
-    runtime.lab_interventions.note_applied(changed);
+    note_control_applied(runtime, care, changed);
+}
+
+fn note_control_applied(runtime: &mut PetRuntime, care: bool, changed: bool) {
+    if care { runtime.companion_menu.admission.note_applied(changed); }
+    else { runtime.lab_interventions.note_applied(changed); }
 }
 
 fn unix_time_millis(time: SystemTime) -> u64 {
@@ -9042,6 +9063,25 @@ fn feeding_escape_down() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn care_and_generic_control_admission_have_independent_replay_watermarks() {
+        let mut generic = LabInterventionState::new(1_000);
+        let mut care = LabInterventionState::new(1_000);
+        let envelope = |id| LabControlEnvelope {
+            schema_version:desktop_host::LAB_CONTROL_SCHEMA_VERSION,
+            command_id:id,issued_unix_ms:1_010,expires_after_ms:5_000,
+            session_token:Some("0123456789abcdef0123456789abcdef".into()),
+            command:LabControlCommand::CloseSession,
+        };
+        assert_eq!(generic.admit_command(&envelope(100),1_010),LabCommandAdmission::Execute);
+        assert_eq!(care.admit_command(&envelope(2),1_010),LabCommandAdmission::Execute);
+        assert_eq!(care.admit_command(&envelope(2),1_010),LabCommandAdmission::Stale);
+        assert_eq!(generic.admit_command(&envelope(99),1_010),LabCommandAdmission::Stale);
+        assert_eq!(care.admit_command(&envelope(3),1_010),LabCommandAdmission::Execute);
+        assert_eq!(generic.last_seen_command_id,Some(100));
+        assert_eq!(care.last_seen_command_id,Some(3));
+    }
+
     #[test]
     fn orb_navigation_survives_projection_but_yields_to_startle() {
         let mut authored = lifecore::BodyIntent {

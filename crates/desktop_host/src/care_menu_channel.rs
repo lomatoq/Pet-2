@@ -65,6 +65,15 @@ impl CareMenuChannel {
         self.path("placement.json")
     }
 
+    pub fn control_store(&self) -> crate::StateStore {
+        let mut store = crate::StateStore::at(self.root.clone());
+        if self.owner.is_some() {
+            store.paths.lab_control = self.path("control.json");
+            store.paths.lab_control_backup = self.path("control.bak.json");
+        }
+        store
+    }
+
     pub fn request_open(&self) -> io::Result<()> {
         std::fs::write(self.open_path(), b"open")
     }
@@ -124,6 +133,58 @@ mod tests {
             std::fs::read(legacy.placement_path()).unwrap(),
             b"{\"x\":10}"
         );
+    }
+    #[test]
+    fn legacy_renewal_cannot_replace_care_open_close_or_feeding() {
+        use crate::{LAB_CONTROL_SCHEMA_VERSION, LabControlCommand, LabControlEnvelope};
+        let data = tempfile::tempdir().unwrap();
+        let legacy = CareMenuChannel::legacy(data.path()).control_store();
+        let care = CareMenuChannel::for_owner(data.path(), "current-pet")
+            .unwrap()
+            .control_store();
+        let envelope = |id, command| LabControlEnvelope {
+            schema_version: LAB_CONTROL_SCHEMA_VERSION,
+            command_id: id,
+            issued_unix_ms: 1_791_116_000_000,
+            expires_after_ms: 5_000,
+            session_token: Some("0123456789abcdef0123456789abcdef".into()),
+            command,
+        };
+        for (id, command) in [
+            (
+                2,
+                LabControlCommand::OpenSession {
+                    protocol_version: crate::LAB_SESSION_PROTOCOL_VERSION,
+                    lease_seconds: 10,
+                },
+            ),
+            (4, LabControlCommand::CloseSession),
+            (6, LabControlCommand::Feeding { enabled: true }),
+        ] {
+            care.save_lab_control(&envelope(id, command)).unwrap();
+            legacy
+                .save_lab_control(&envelope(
+                    id + 1,
+                    LabControlCommand::RenewSession { lease_seconds: 10 },
+                ))
+                .unwrap();
+            assert_eq!(
+                care.load_lab_control().unwrap().unwrap().command_id,
+                id,
+                "legacy writer replaced care request"
+            );
+            assert_eq!(
+                legacy.load_lab_control().unwrap().unwrap().command_id,
+                id + 1
+            );
+        }
+        assert_ne!(care.paths.lab_control, legacy.paths.lab_control);
+        assert_ne!(
+            care.paths.lab_control_backup,
+            legacy.paths.lab_control_backup
+        );
+        assert_eq!(care.paths.telemetry, legacy.paths.telemetry);
+        assert_eq!(care.paths.state, legacy.paths.state);
     }
     #[test]
     fn owner_cannot_escape_directory_and_launches_are_distinct() {

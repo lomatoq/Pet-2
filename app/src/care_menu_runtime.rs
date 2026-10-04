@@ -1,5 +1,5 @@
 //! The native click route and its own native helper share one launch channel.
-use desktop_host::CareMenuChannel;
+use desktop_host::{CareMenuChannel, StateStore};
 use std::{
     io,
     path::Path,
@@ -9,18 +9,31 @@ use std::{
 pub(crate) struct CareMenuRuntime {
     pub(crate) channel: CareMenuChannel,
     pub(crate) child: Option<Child>,
+    pub(crate) control_store: StateStore,
+    pub(crate) admission: super::LabInterventionState,
 }
 
 impl CareMenuRuntime {
     pub(crate) fn new(root: &Path) -> Self {
+        let channel = CareMenuChannel::new_launch(root);
         let mut runtime = Self {
-            channel: CareMenuChannel::new_launch(root),
+            control_store: channel.control_store(),
+            admission: super::LabInterventionState::new(super::unix_time_millis(
+                std::time::SystemTime::now(),
+            )),
+            channel,
             child: None,
         };
         if let Err(error) = runtime.spawn(true) {
             eprintln!("care menu startup: {error}");
         }
         runtime
+    }
+
+    pub(crate) fn control_ack(&self) -> serde_json::Value {
+        serde_json::json!({"owner":self.channel.owner(),
+            "last_command_id":self.admission.last_seen_command_id,
+            "last_command_status":self.admission.last_command_status.as_str()})
     }
 
     fn spawn(&mut self, idle: bool) -> io::Result<()> {
