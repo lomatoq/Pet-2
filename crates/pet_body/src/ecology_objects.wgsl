@@ -631,22 +631,30 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let rgb = mix(input.color.rgb, vec3<f32>(1.0, 0.96, 0.72), core * 0.65) * (0.72 + pulse * 0.28);
         return encode_surface_output(vec4<f32>(rgb * alpha, alpha));
     }
-    // Generated nacre sprite: visual sphere and physical radius coincide.
-    let c = cos(input.material.z);
-    let s = sin(input.material.z);
-    let rotated = vec2<f32>(c * input.local.x - s * input.local.y, s * input.local.x + c * input.local.y);
-    let uv = rotated * vec2<f32>(0.414, -0.414) + vec2<f32>(0.5, 0.491);
-    let pearl = textureSampleLevel(pearl_sprite, desktop_background_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
-    let body = pearl.a * (1.0 - smoothstep(0.98, 1.03, radial_distance));
-    let pulse = 0.5 + 0.5 * sin(input.material.w * 1.15);
-    let halo = exp(-radial_distance * radial_distance * 2.0) * (1.0 - body) * (0.025 + pulse * 0.008);
-    let glint = pow(max(0.0, sin(input.material.w * 0.7)), 12.0)
-        * exp(-dot(input.local - vec2<f32>(-0.32, 0.4), input.local - vec2<f32>(-0.32, 0.4)) * 90.0);
-    let alpha = clamp(body + halo, 0.0, 1.0);
-    // Cushion occlusion belongs to the resting sphere, not its rotating texture.
-    // The curved, broad transition follows the lower hemisphere.
-    let lower_arc = smoothstep(-0.15, 0.95, -input.local.y + 0.30 * input.local.x * input.local.x);
-    let contact_shade = 1.0 - 0.16 * input.den_surface.x * lower_arc;
-    let rgb = pearl.rgb * body * contact_shade + vec3<f32>(0.8, 0.94, 1.0) * halo + vec3<f32>(glint * 0.18) * body;
-    return encode_surface_output(vec4<f32>(rgb, alpha));
+    // V66 illustrated living ink. Physical sphere radius and coverage
+    // coincide. All paint stays inside the silhouette; no additive halo/crust.
+    // Surface rotation moves the inset crescent, not the stationary lighting.
+    let aa=max(fwidth(radial_distance),0.008);
+    let alpha=(1.0-smoothstep(1.0-aa,1.0+aa,radial_distance))*input.color.a;
+    let z=sqrt(max(0.0,1.0-dot(input.local,input.local)));
+    let n=vec3<f32>(input.local,z);
+    let lighting=dot(n,normalize(vec3<f32>(-0.56,0.64,0.54)));
+    let terminator=smoothstep(-0.12,0.07,lighting);
+    let shoulder=smoothstep(0.60,0.77,lighting);
+    var paint=mix(vec3<f32>(0.008,0.010,0.030),vec3<f32>(0.038,0.052,0.105),terminator);
+    paint=mix(paint,vec3<f32>(0.12,0.25,0.25),shoulder*0.83);
+    let c=cos(input.material.z);let s=sin(input.material.z);
+    let q=vec2<f32>(c*input.local.x-s*input.local.y,s*input.local.x+c*input.local.y);
+    // Offset circular subtraction makes a quiet curved inlay which rotates
+    // with genuine orb roll and remains readable at the production small size.
+    let outer=length(q-vec2<f32>(-0.22,0.14));
+    let inner=length(q-vec2<f32>(-0.05,0.21));
+    let crescent=(1.0-smoothstep(0.50-aa,0.50+aa,outer))*smoothstep(0.47-aa,0.47+aa,inner);
+    let inlay_color=mix(vec3<f32>(0.15,0.20,0.34),vec3<f32>(0.48,0.68,0.61),terminator);
+    paint=mix(paint,inlay_color,crescent*0.48);
+    let glint=1.0-smoothstep(0.055,0.092,length((input.local-vec2<f32>(-0.31,0.48))*vec2<f32>(0.8,1.3)));
+    paint=mix(paint,vec3<f32>(0.87,0.92,0.87),glint*0.70);
+    let lower_arc=smoothstep(-0.15,0.95,-input.local.y+0.30*input.local.x*input.local.x);
+    paint*=1.0-0.16*input.den_surface.x*lower_arc;
+    return encode_surface_output(vec4<f32>(paint*alpha,alpha));
 }

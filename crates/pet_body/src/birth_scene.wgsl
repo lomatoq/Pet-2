@@ -1,6 +1,6 @@
 @group(0) @binding(0) var picture: texture_2d<f32>;
 @group(0) @binding(1) var picture_sampler: sampler;
-struct Out { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32>, @location(1) opacity:f32, @location(2) effect:vec4<f32>, @location(3) color:vec4<f32> }
+struct Out { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32>, @location(1) opacity:f32, @location(2) effect:vec4<f32>, @location(3) color:vec4<f32>, @location(5) sprite_area:f32 }
 @vertex fn vertex_main(@builtin(vertex_index) index:u32,@location(0) rect:vec4<f32>,@location(1) effect:vec4<f32>,@location(2) style:vec4<f32>,@location(3) color:vec4<f32>,@location(4) ribbon_edges:vec4<f32>)->Out {
     let corners=array<vec2<f32>,6>(vec2<f32>(-1,-1),vec2<f32>(1,-1),vec2<f32>(-1,1),vec2<f32>(-1,1),vec2<f32>(1,-1),vec2<f32>(1,1));
     let q=corners[index]*rect.zw;
@@ -9,7 +9,7 @@ struct Out { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32>, @
         let along=corners[index].y*0.5+0.5;
         p=mix(rect.xy,rect.zw,along)+corners[index].x*mix(ribbon_edges.xy,ribbon_edges.zw,along);
     }
-    var out:Out; out.position=vec4<f32>(p.x*style.z*2-1,1-p.y*style.w*2,0,1);out.uv=corners[index]*0.5+0.5;out.opacity=style.y;out.effect=effect;out.color=color;return out;
+    var out:Out; out.position=vec4<f32>(p.x*style.z*2-1,1-p.y*style.w*2,0,1);out.uv=corners[index]*0.5+0.5;out.opacity=style.y;out.effect=effect;out.color=color;out.sprite_area=4.0*rect.z*rect.w;return out;
 }
 // V29 authored near-rim trace. Central knots follow the visible cushion/shell
 // interface; the shoulders return to the real outer silhouette instead of
@@ -57,6 +57,37 @@ fn nest_front_rim_y(u: f32) -> f32 {
     return knots[20].y / 1024.0;
 }
 
+// V66 living ink: texture alpha owns all silhouettes and the exact layer
+// boundaries. Authored value only supplies bounded depth cues; broad analytic
+// paint replaces the baked gold, rainbow reflection and granular metal finish.
+// Same UV/function on the two nest layers avoids a new foreground paint seam.
+fn illustrated_prop(sample:vec3<f32>,uv:vec2<f32>,nest:bool)->vec3<f32> {
+    let value=dot(display_color(sample),vec3<f32>(0.2126,0.7152,0.0722));
+    if nest {
+        let mid_mask=smoothstep(0.22,0.40,value);
+        let light_mask=smoothstep(0.64,0.83,value);
+        var paint=mix(vec3<f32>(0.008,0.010,0.026),vec3<f32>(0.032,0.038,0.084),mid_mask);
+        paint=mix(paint,vec3<f32>(0.13,0.15,0.23),light_mask);
+        let cushion=smoothstep(0.72,0.87,value);
+        return mix(paint,vec3<f32>(0.095,0.18,0.17),cushion*0.70);
+    }
+    // Rounded, quiet ink planes belong to the capsule rather than the source
+    // image's metal reflections. Bounded value modulation preserves seams
+    // without amplifying tiny authored grain into mottled highlight patches.
+    let x=uv.x*2.0-1.0;
+    let rounded=sqrt(max(0.0,1.0-x*x));
+    let rise=1.0-smoothstep(0.12,0.83,uv.y);
+    let plane=rounded*(0.30+0.70*rise);
+    var paint=mix(vec3<f32>(0.012,0.016,0.036),vec3<f32>(0.068,0.096,0.14),plane);
+    paint*=0.76+0.24*value;
+    let shoulder=1.0-smoothstep(0.12,1.0,length((uv-vec2<f32>(0.27,0.24))*vec2<f32>(2.4,4.2)));
+    paint+=vec3<f32>(0.015,0.036,0.038)*shoulder;
+    // The existing bright central latch reads as one luminous insert. Do not
+    // recolor every bright texture edge into a glowing outer crust.
+    let latch=smoothstep(0.93,0.995,value)*(1.0-smoothstep(0.035,0.085,abs(uv.x-0.5)));
+    return mix(paint,vec3<f32>(0.45,0.64,0.58),latch*0.72);
+}
+
 @fragment fn fragment_main(input:Out)->@location(0) vec4<f32> {
     if input.effect.y < -0.5 {
         if input.effect.z > 0.0 && input.position.y > input.effect.z { discard; }
@@ -69,7 +100,7 @@ fn nest_front_rim_y(u: f32) -> f32 {
         let front_alpha = sample.a * coverage;
         let back_alpha = (sample.a - front_alpha) / max(1.0 - front_alpha, 0.000001);
         let alpha = select(front_alpha, back_alpha, input.effect.y < -1.5) * input.opacity;
-        return vec4<f32>(sample.rgb * alpha, alpha);
+        return vec4<f32>(illustrated_prop(sample.rgb,input.uv,true) * alpha, alpha);
     }
     if input.effect.y>5.5 {
         let p=(input.uv-0.5)*2.0;let radius=length(p);let a=(1.0-smoothstep(0.80,1.0,radius))*input.opacity;
@@ -78,7 +109,18 @@ fn nest_front_rim_y(u: f32) -> f32 {
         return vec4<f32>(mix(input.color.rgb*0.60,vec3<f32>(1.0),spec*0.75)*a,a);
     }
     if input.effect.y>4.5 {
-        let p=(input.uv-0.5)*2.0;let a=exp(-dot(p,p)*4.6)*(1.0-smoothstep(0.72,1.0,length(p)))*input.opacity;
+        let p=(input.uv-0.5)*2.0;
+        // Five overlapping large auras previously turned the opening aperture
+        // into an additive white veil. Bound broad haze by footprint, while
+        // leaving small particle glows and the original choreography intact.
+        let broad=smoothstep(48.0*48.0,130.0*130.0,input.sprite_area);
+        let channels=input.color.rgb;
+        let white_fraction=min(channels.x,min(channels.y,channels.z))/max(max(channels.x,max(channels.y,channels.z)),0.00001);
+        let neutral=smoothstep(0.72,0.90,white_fraction);
+        // Neutral mist is a faint accent, not an opaque white particle.
+        // Preserve its path/lifetime and keep colored motes unchanged.
+        let energy=mix(1.0,0.12,broad)*mix(1.0,0.06,neutral);
+        let a=exp(-dot(p,p)*4.6)*(1.0-smoothstep(0.72,1.0,length(p)))*input.opacity*energy;
         return vec4<f32>(input.color.rgb*a,a);
     }
     if input.effect.y>3.5 {
@@ -107,12 +149,11 @@ fn nest_front_rim_y(u: f32) -> f32 {
     if input.effect.y > 0.5 { return capsule_orb(input.uv,input.effect.x,input.opacity); }
     let sample=textureSample(picture,picture_sampler,input.uv);
     let alpha=sample.a*input.opacity;
-    return vec4<f32>(sample.rgb*alpha,alpha);
+    return vec4<f32>(illustrated_prop(sample.rgb,input.uv,false)*alpha,alpha);
 }
 
 
-// First Light v20 orb: the reference's moving volume, vortex, charge, glass
-// highlights, inner motes and dissolving membrane, in native WGSL.
+// First Light V66 seed: V20 moving geometry/charge/aperture with ink material.
 fn rotate2(p:vec2<f32>,a:f32)->vec2<f32> {
     return vec2<f32>(cos(a)*p.x+sin(a)*p.y,-sin(a)*p.x+cos(a)*p.y);
 }
@@ -135,96 +176,31 @@ fn capsule_orb(uv:vec2<f32>,time:f32,opacity:f32)->vec4<f32> {
     let radius=length(p);
     let alpha=1.0-smoothstep(0.994,1.006,radius);
     if alpha<0.0001 {return vec4<f32>(0.0);}
+    // Preserve V20 release deformation and aperture exactly; replace only the
+    // interior material. Calm ink, a broad cool plane and an orbiting inlay
+    // explain an energetic seed without raymarched candy clouds or neon crust.
     let normal_xy=p/max(1.0,radius);
     let z=sqrt(max(0.0,1.0-dot(normal_xy,normal_xy)));
-    let n=normalize(vec3<f32>(normal_xy.x,-normal_xy.y,max(z,0.001)));
-    let pre=smoothstep(0.56,0.992,charge)*(1.0-smoothstep(0.02,0.22,open));
-    let surge=0.5+0.5*sin(time*10.5+radius*11.0-polar*1.8);
-    let spin=(0.42*sin(time*0.52+0.62*radius)+0.09*sin(time*0.96+radius*2.7))*(1.0+pre*0.85);
-    var q=rotate2(p*(0.91+0.045*radius*radius),spin);
-    let swirl=q;let swlen=max(length(swirl),0.001);let swdir=swirl/swlen;
-    q+=vec2<f32>(-swirl.y,swirl.x)/swlen*(0.050*(1.0-radius*0.42))*sin(time*(1.10+0.95*pre)+swlen*(5.4+2.8*pre));
-    q+=0.022*(1.0+0.65*pre)*vec2<f32>(sin(q.y*(4.1+0.9*pre)+time*(1.05+0.85*pre)),cos(q.x*(3.9+0.7*pre)-time*(0.98+0.82*pre)));
-    q+=0.014*p*(sin(time*(0.86+0.75*pre)+radius*(3.6+2.8*pre))*0.5+0.5);
-    q+=swdir*(0.020+0.030*surge)*pre*(1.0-radius*0.24);
-    q+=0.060*sin(open*3.14159265)*vec2<f32>(sin(q.y*4.9+time*1.4),cos(q.x*4.7-time*1.3));
-    let colors=array<vec3<f32>,5>(vec3<f32>(1.0,0.055,0.48),vec3<f32>(0.025,0.78,1),vec3<f32>(0.40,0.075,1),vec3<f32>(1,0.73,0.035),vec3<f32>(0.025,0.94,0.48));
-    var inner=vec3<f32>(0.0);var trans=1.0;var emitted=vec3<f32>(0.0);
-    let zmax=sqrt(max(0.015,1.0-min(dot(q,q),0.985)));let step_len=2.0*zmax/6.0;
-    for(var slice=0;slice<6;slice++) {
-        let depth=zmax-(f32(slice)+0.5)*step_len;
-        var xy=rotate2(q,depth*0.28*sin(time*0.52));
-        xy+=0.062*vec2<f32>(sin(xy.y*3.1+time*0.81+depth),cos(xy.x*2.7-time*0.70+depth));
-        let pos=vec3<f32>(xy,depth);
-        var density=0.0;var weight=0.0;var sum=vec3<f32>(0.0);var emission=vec3<f32>(0.0);var hot=vec3<f32>(0.0);
-        for(var i=0;i<5;i++) {
-            let fi=f32(i);let angle=fi*2.399963+time*(0.48+0.09*f32(i%3))+0.21*sin(time*0.63+fi);
-            let orbit=0.53+0.095*sin(time*0.70+fi*1.37);
-            let center=vec3<f32>(orbit*cos(angle),orbit*sin(angle)*0.97,0.24*sin(time*0.69+fi*1.6));
-            let d=(pos-center)*vec3<f32>(0.96,0.91,0.8);let rad=0.78+0.075*sin(time*0.75+fi*1.7);
-            let w=exp(-2.4*dot(d,d)/(rad*rad));
-            let branch=d-vec3<f32>(0.14*cos(time*0.61+fi),0.18*sin(time*0.73+fi*1.4),0.05);
-            let child=exp(-6.4*dot(branch,branch)/(rad*rad));let soft=exp(-1.20*dot(d,d)/(rad*rad));
-            let energy=0.86+0.21*sin(time*0.82+fi*0.97)+0.09*sin(time*1.57+fi*2.2);
-            hot+=colors[i]*(2.40*(w*w*w*0.86+child*0.26)+0.025*soft)*energy;
-            density+=w;let cw=w*w*w*w;sum+=colors[i]*cw;weight+=cw;
-            emission+=colors[i]*(1.22*w*w+0.050*soft)*(0.94+0.06*sin(time*0.92+fi));
-        }
-        let hue=sum/max(weight,0.00001);emission=emission*0.24+hue*density*0.60;
-        let absorption=1.0-exp(-density*step_len*0.40);
-        inner+=trans*(hue*absorption*0.30+emission*step_len);emitted+=trans*hot*step_len;trans*=1.0-absorption*0.65;
-    }
-    inner+=mix(vec3<f32>(0.027,0.08,0.135),vec3<f32>(0.10,0.027,0.11),0.5+0.5*sin(time*0.42+q.y*1.6))*(0.38+0.60*zmax);
-    inner+=vec3<f32>(0.03,0.09,0.18)*(1.0-smoothstep(0.35,1.0,length(q)))*0.35;
-    let frost=vec3<f32>(0.16,0.19,0.23)+inner*0.34+vec3<f32>(0.05,0.07,0.10)*pow(1.0-z,1.7);
-    inner=mix(inner,frost,0.06);
-    let theta=atan2(p.y,p.x);inner*=0.98+0.08*sin(time*1.05+theta*2.0-z*3.1);
-    let fresnel=0.055+0.945*pow(1.0-z,4.6);
-    var reflection=reflect(vec3<f32>(0,0,-1),n);
-    let rxz=rotate2(reflection.xz,0.09*sin(time*0.31));reflection=vec3<f32>(rxz.x,reflection.y,rxz.y);
-    let key=max(0.0,dot(reflection,normalize(vec3<f32>(-0.68,0.66,0.15))));
-    let fill=max(0.0,dot(reflection,normalize(vec3<f32>(0.77,-0.10,-0.25))));
-    let back=max(0.0,dot(reflection,normalize(vec3<f32>(-0.26,-0.67,-0.45))));
-    let studio=vec3<f32>(0.07,0.10,0.15)*(0.40+0.60*max(0.0,reflection.y))+vec3<f32>(1,0.97,0.96)*(15.0*pow(key,105.0)+0.8*pow(key,22.0))+vec3<f32>(0.59,0.85,1)*(11.0*pow(fill,86.0)+0.55*pow(fill,18.0))+vec3<f32>(1,0.49,0.79)*6.0*pow(back,72.0);
-    var light=inner*(0.96-0.05*fresnel)+studio*(0.22+0.96*fresnel);
-    let edge=exp(-pow((radius-0.986)/0.009,2.0));let hue=0.73+0.25*cos(theta+vec3<f32>(0.0,1.8,3.8)+time*0.09);
-    light+=edge*hue*(0.46+0.24*pow(max(0.0,-p.x),2.0));
-    let sweep=max(0.0,dot(n,normalize(vec3<f32>(0.55*sin(time*0.42),0.22+0.10*cos(time*0.3),0.95))));
-    let sweep2=max(0.0,dot(n,normalize(vec3<f32>(-0.45*cos(time*0.33+0.8),-0.18,0.95))));
-    light+=vec3<f32>(1,0.99,0.97)*pow(sweep,44.0)*0.60+vec3<f32>(0.82,0.92,1)*pow(sweep2,28.0)*0.40;
-    let shell=exp(-pow((radius-0.974)/0.040,2.0));
-    light+=vec3<f32>(0.92,0.96,1)*shell*0.1356*pow(max(0.0,dot(n,normalize(vec3<f32>(-0.78,-0.18,0.60)))),2.8);
-    light+=vec3<f32>(1,0.96,0.93)*shell*0.0914*pow(max(0.0,dot(n,normalize(vec3<f32>(0.36,0.58,0.73)))),3.6);
-    light+=vec3<f32>(0.94,0.98,1)*shell*0.0696*pow(max(0.0,dot(n,normalize(vec3<f32>(-0.12,-0.92,0.38)))),5.5);
-    light+=exp(-pow((radius-0.962)/0.026,2.0))*(pow(max(0.0,cos(theta-2.65)),6.0)+0.65*pow(max(0.0,cos(theta+0.55)),8.0))*vec3<f32>(0.31,0.48,0.59);
-    light+=exp(-pow((radius-0.944)/0.034,2.0))*pow(max(0.0,dot(normalize(p+vec2<f32>(0.00001)),normalize(vec2<f32>(-0.63,-0.77)))),12.0)*vec3<f32>(0.71,0.87,1)*1.18;
-    light+=vec3<f32>(0.08,0.15,0.24)*release+vec3<f32>(0.10,0.18,0.28)*exp(-dot(q,q)*1.30)*(1.10+0.42*charge);
-    light+=vec3<f32>(0.08,0.16,0.30)*(0.5+0.5*sin(theta*2.0+radius*8.0-time*1.25))*(1.0-smoothstep(0.10,0.90,radius))*0.22;
-    light+=vec3<f32>(0.16,0.27,0.46)*pre*(0.55+0.45*sin(time*13.0-radius*13.0+theta*1.6))*(1.0-smoothstep(0.12,0.98,radius))*0.36;
-    let birth_pulse=0.5+0.5*sin(time*2.15-radius*3.6);let womb=smoothstep(0.18,0.96,charge)*(1.0-smoothstep(0.03,0.76,open));
-    let contraction=0.5+0.5*sin(time*3.05-radius*6.4-theta*0.55);
-    light+=vec3<f32>(0.14,0.22,0.38)*birth_pulse*womb*exp(-radius*radius*1.15)*0.55;
-    light+=vec3<f32>(1,0.61,0.76)*exp(-dot(q-vec2<f32>(0,0.03),q-vec2<f32>(0,0.03))*0.92)*womb*(0.12+0.16*birth_pulse);
-    light+=vec3<f32>(1,0.72,0.86)*exp(-pow(radius-0.34,2.0)/0.020)*womb*contraction*0.15;
-    light+=vec3<f32>(0.98,0.53,0.70)*(1.0-smoothstep(0.16,0.88,radius))*womb*pre*(0.10+0.12*contraction);
-    for(var i=0;i<16;i++) {
-        let fi=f32(i);let speed=0.12+0.035*f32(i%4);let angle=fi*2.399963+time*(speed+0.02*sin(fi));
-        let rr=0.16+0.58*fract(fi*0.6180339+0.17);
-        let at=rr*vec2<f32>(cos(angle),sin(angle*0.93+0.23))+vec2<f32>(0.10*sin(time*(0.55+0.03*fi)+fi),0.08*cos(time*(0.50+0.04*fi)+fi*1.7));
-        let d=q-at;let soft=0.060+0.042*fract(fi*0.712);
-        let mote=exp(-dot(d,d)/(soft*soft));let halo=exp(-dot(d,d)/pow(soft*2.9,2.0));let bloom=exp(-dot(d,d)/pow(soft*4.1,2.0));
-        let col=max(vec3<f32>(0.7+0.3*sin(fi*1.7),0.55+0.45*sin(fi*2.1+1.0),0.6+0.4*sin(fi*1.3+2.1)),vec3<f32>(0.0));
-        light+=col*(mote*0.08+halo*0.17+bloom*0.10)*(0.85+0.15*pow(sin(time*1.2+fi),2.0))*1.6;
-    }
-    let rgb=display_color(max(light,vec3<f32>(0))/(1.0+max(light,vec3<f32>(0))*0.72));
+    let n=vec3<f32>(normal_xy.x,-normal_xy.y,z);
+    let light=dot(n,normalize(vec3<f32>(-0.56,0.64,0.54)));
+    let plane=smoothstep(-0.12,0.10,light);
+    let shoulder=smoothstep(0.59,0.80,light);
+    var color=mix(vec3<f32>(0.004,0.006,0.017),vec3<f32>(0.025,0.033,0.069),plane);
+    color=mix(color,vec3<f32>(0.080,0.17,0.18),shoulder*0.65);
+    let q=rotate2(p,time*0.15+0.20*sin(time*0.32));
+    let orbit_outer=length(q-vec2<f32>(-0.25,-0.09));
+    let orbit_inner=length(q-vec2<f32>(-0.06,-0.02));
+    let ink_inlay=(1.0-smoothstep(0.52,0.545,orbit_outer))*smoothstep(0.495,0.52,orbit_inner);
+    let pulse=0.65+0.35*sin(time*2.15-radius*3.6);
+    color=mix(color,vec3<f32>(0.23,0.40,0.39),ink_inlay*(0.20+0.32*charge)*pulse);
+    let arc=exp(-pow((radius-0.958)/0.021,2.0));
+    let angular=smoothstep(0.14,0.88,dot(normal_xy,normalize(vec2<f32>(-0.64,-0.77))));
+    color+=vec3<f32>(0.28,0.36,0.37)*arc*angular*0.58;
+    let violet_side=smoothstep(0.40,0.94,normal_xy.x)*smoothstep(0.30,0.90,radius);
+    color+=vec3<f32>(0.039,0.017,0.075)*violet_side;
+    let theta=atan2(p.y,p.x);
     let hole=radius*0.5+release*0.034*(sin(theta*3.0-open*4.4)+0.45*sin(theta*5.0+open*3.2));
     let clear=mix(1.0,smoothstep(open*0.83-0.13,open*0.83+0.065,hole),smoothstep(0.02,0.27,open));
     let coverage=alpha*opacity*clear;
-    let ignition=1.0+0.34*charge+0.42*pre+select(0.0,0.30*exp(-pow((open-0.12)/0.15,2.0)),open>=0.001);
-    let radiance=clamp(rgb,vec3<f32>(0),vec3<f32>(1))*0.912*0.95+emitted*(0.32*1.6*ignition);
-    // The reference's hue-preserving shoulder, followed by the native sRGB conversion.
-    let peak=max(radiance.x,max(radiance.y,radiance.z));
-    let mapped=select(peak,0.93+0.07*(1.0-exp(-(peak-0.93)/0.07)),peak>0.93);
-    let color=linear_color(radiance*(mapped/max(peak,0.00001)));
     return vec4<f32>(color*coverage,coverage);
 }

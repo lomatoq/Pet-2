@@ -79,6 +79,9 @@ struct Globals {
 // backend discard the unused branch before compiling the large fragment
 // program instead of asking the driver to optimize both materials at once.
 override CINEMATIC: bool = true;
+// The ink path shares shape and facial geometry with the incumbent material.
+// A compile-time branch keeps the old diagnostic/reference path out of its cost.
+override LIVING_INK: bool = true;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -487,7 +490,7 @@ fn pearl_eye_ink(point:vec2<f32>,side:f32)->vec3<f32> {
     let fresnel=0.035+0.965*pow(1.0-cap_normal.z,5.0);
     return ink*(1.0-fresnel*open)+pearl_studio(reflection,0.08)*fresnel*open*0.70;
 }
-fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
+fn pearl_eye_distance(point:vec2<f32>,side:f32)->f32 {
     let index=select(1u,0u,side<0.0);
     let blink=select(globals.lids_brows.x,globals.lids_brows.y,side>0.0);
     let emotion=pearl_emotion();let angry=emotion.x;let sad=emotion.y;let surprise=emotion.z;
@@ -534,7 +537,10 @@ fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
     // Close geometry, not ink opacity: fading the fill exposed the bright pearl
     // underneath and made blinks look like pale flashes across the whole eye.
     let lid_distance=mix(open_distance,closed_distance,smoothstep(0.0,0.92,blink));
-    return 1.0-smoothstep(-0.0015,0.0015,lid_distance);
+    return lid_distance;
+}
+fn pearl_eye(point:vec2<f32>,side:f32)->f32 {
+    return 1.0-smoothstep(-0.0015,0.0015,pearl_eye_distance(point,side));
 }
 fn pearl_brow(point:vec2<f32>,side:f32)->f32 {
     let e=pearl_emotion();let shape=globals.face_brows[select(1u,0u,side<0.0)];
@@ -1115,8 +1121,144 @@ fn rounded_surface_highlights(
         * facing;
 }
 
+// Soft spectral ink. This is an authored light field, not a dielectric coat.
+// Pigment coordinates follow material; only slow chroma circulation uses time.
+fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
+    let field = density_at(input.uv);
+    let density = field.r;
+    let iso = globals.liquid_meta.z;
+    let aa = max(fwidth(density)*1.12,0.006);
+    let coverage = smoothstep(iso-aa,iso+aa,density);
+    if (density < iso*0.025) { return vec4<f32>(0.0); }
+    let texel=vec2<f32>(globals.liquid_meta.w,globals.render_mode.w);
+    let gradient=vec2<f32>(
+        density_at(input.uv+vec2<f32>(texel.x,0.0)).r-density_at(input.uv-vec2<f32>(texel.x,0.0)).r,
+        density_at(input.uv+vec2<f32>(0.0,texel.y)).r-density_at(input.uv-vec2<f32>(0.0,texel.y)).r)*0.5;
+    let native_scale=max(f32(textureDimensions(density_texture).x)/max(f32(textureDimensions(macro_texture).x)*2.0,1.0),1.0);
+    // Log-density distance avoids a clipped, constant-width fringe outside a
+    // Gaussian splat. Deep inside we use optical height, never this approximation.
+    let distance=log(max(density,0.00001)/iso)*density/max(length(gradient),0.00001)/native_scale;
+    let inward=normalize(gradient+vec2<f32>(0.000001,0.0));
+    let point=local_point(input.uv);
+    let material=material_flow_at(input.uv)/max(density,0.00001);
+    let cap=textureSample(optical_volume_texture,density_sampler,
+        (point-globals.optical_volume_bounds.xy)*globals.optical_volume_bounds.zw);
+    let fluid_normal=normalize(vec3<f32>(cap.xy*sqrt(globals.material_e.w/1.3),max(cap.z,0.0001)));
+    let birth_xy=point/0.38;
+    let birth_normal=normalize(vec3<f32>(birth_xy,sqrt(max(0.025,1.0-dot(birth_xy,birth_xy)))));
+    let normal=normalize(mix(fluid_normal,birth_normal,globals.cinematic_h.w));
+    let coord=mix(material.xy,birth_xy*0.38,globals.cinematic_h.w);
+    let time=globals.viewport_time.y;
+    // Two broad noncommensurate waves: no hash noise, no opacity flicker and no
+    // screen-locked texture sliding over a deforming body.
+    let drift=sin(coord.x*8.7+coord.y*6.1+time*0.61
+        +sin(coord.y*7.4-time*0.31)*0.62)*0.72
+        +sin(coord.y*11.3-coord.x*4.9-time*0.39)*0.36;
+    let pool=smoothstep(-0.85,0.90,drift);
+    let local_strain=saturate(length(material.zw-globals.liquid_motion.xy)*0.35);
+    let phase=dot(inward,vec2<f32>(0.61,-0.79))*0.65+drift*0.56;
+    let blue=vec3<f32>(0.085,0.43,1.20);
+    let orchid=vec3<f32>(0.79,0.12,0.72);
+    let mint=vec3<f32>(0.16,0.90,0.86);
+    let spectral=mix(mix(blue,orchid,smoothstep(-0.75,0.55,phase)),mint,
+        smoothstep(0.10,0.92,drift-inward.y*0.34)*0.72);
+    let arc=0.42+0.58*smoothstep(-0.6,0.8,drift+inward.x*0.36);
+    let inner=max(distance,0.0);
+    let shell_width=mix(1.8,6.8,pool)*(1.0+local_strain*0.20);
+    let shoulder=exp(-inner/mix(5.0,12.5,pool));
+    let luminous_core=exp(-pow((distance-shell_width*0.50)/shell_width,2.0));
+    let body_light=saturate(dot(normal,normalize(vec3<f32>(-0.50,0.60,0.62))));
+    // A quiet near-black volume stays readable without looking like chrome.
+    var color=vec3<f32>(0.0035,0.0030,0.0070)
+        +vec3<f32>(0.009,0.007,0.018)*pow(body_light,1.4);
+    color+=spectral*shoulder*arc*0.40;
+    color+=vec3<f32>(0.92,1.00,1.12)*luminous_core*arc*0.82;
+    let face_point=face_space(point);
+    let left_distance=pearl_eye_distance(face_point,-1.0);
+    let right_distance=pearl_eye_distance(face_point,1.0);
+    let eye_distance=min(left_distance,right_distance);
+    let eye_aa=max(fwidth(eye_distance)*0.75,0.0012);
+    let eyes=(1.0-smoothstep(-eye_aa,eye_aa,eye_distance))*globals.face_tuning.x;
+    let face_current=face_point.y*43.0+face_point.x*9.0-time*1.28
+        +sin(time*0.37+face_point.x*5.0)*0.45;
+    let eye_pool=0.5+0.5*sin(face_current);
+    let eye_glow=exp(-max(eye_distance,0.0)/0.014)*globals.face_tuning.x;
+    let eye_energy=mix(vec3<f32>(0.68,1.15,1.95),vec3<f32>(2.70,2.48,3.12),eye_pool);
+    color+=vec3<f32>(0.22,0.30,0.48)*eye_glow*(0.12+eye_pool*0.10);
+    color=mix(color,eye_energy,eyes);
+    let brows=max(pearl_brow(face_point,-1.0),pearl_brow(face_point,1.0))*globals.face_tuning.x;
+    color+=mix(vec3<f32>(0.44,0.70,1.10),vec3<f32>(1.02,0.91,1.30),eye_pool)*brows;
+    // Facial deformation and contact socket are identical to the production
+    // expression path. Light replaces ink; no second animation clock is added.
+    let face_gaze=globals.gaze_pupil.xy;
+    let mouth_center=vec2<f32>(0.0,-0.100)+globals.face_eye.zw;
+    let mouth_delta=face_point-mouth_center;
+    let mouth_local=vec2<f32>(mouth_delta.x/(1.0-0.19*abs(face_gaze.x)),
+        mouth_delta.y-mouth_delta.x*face_gaze.x*0.13);
+    let expression=pearl_emotion();
+    let smile_curve=clamp(globals.brow_mouth.w*1.15-expression.x*0.45,-1.0,1.0);
+    let opening=smoothstep(0.06,0.78,globals.brow_mouth.z);
+    let happiness=max(globals.brow_mouth.w,0.0)*(1.0-expression.z);
+    let width=mix(0.045,mix(0.039+0.015*happiness,0.025,expression.z),opening)
+        *clamp(globals.face_mouth.x,0.72,1.25);
+    let x=clamp(mouth_local.x,-width,width);
+    let profile=sqrt(max(0.0,1.0-pow(x/width,2.0)));
+    let corner_bias=mix(globals.face_mouth.y,globals.face_mouth.z,x/width*0.5+0.5)*0.010*pow(x/width,2.0);
+    let centerline=-0.030*smile_curve*(1.0-pow(x/width,2.0))*(1.0-opening*0.45)-opening*0.005+corner_bias;
+    let half_height=opening*(0.032+expression.z*0.014)*profile;
+    let mouth_distance=length(vec2<f32>(mouth_local.x-x,max(abs(mouth_local.y-centerline)-half_height,0.0)));
+    let mouth=(1.0-smoothstep(0.003,0.006,mouth_distance))*globals.face_tuning.x;
+    let mouth_glow=exp(-max(mouth_distance-0.004,0.0)/0.010)*globals.face_tuning.x;
+    let mouth_pool=0.5+0.5*sin(mouth_local.x*32.0+mouth_local.y*24.0-time*1.28+0.6);
+    color+=vec3<f32>(0.24,0.32,0.50)*mouth_glow*(0.10+mouth_pool*0.09);
+    color=mix(color,mix(vec3<f32>(0.50,0.87,1.42),vec3<f32>(1.80,1.61,2.18),mouth_pool),mouth);
+    let extension=globals.self_care.x;
+    let tongue_root=vec2<f32>(0.0,centerline-half_height*0.12);
+    let tongue_length=0.037*extension;
+    let tongue_width=0.025*sqrt(smoothstep(0.0,0.40,extension));
+    let tongue_height=tongue_length*0.58+0.009*extension;
+    let tongue_progress=clamp((tongue_root.y-mouth_local.y)/max(tongue_length,0.001),0.0,1.0);
+    let tongue_curl=globals.self_care.y*0.009*extension*tongue_progress*tongue_progress;
+    let tongue_local=vec2<f32>(mouth_local.x-tongue_curl,mouth_local.y-tongue_root.y+tongue_length*0.40);
+    let tongue_distance=(length(tongue_local/vec2<f32>(max(tongue_width,0.001),max(tongue_height,0.001)))-1.0)
+        *min(max(tongue_width,0.001),max(tongue_height,0.001));
+    let tongue=(1.0-smoothstep(-0.002,0.002,tongue_distance))*smoothstep(0.02,0.14,extension)
+        *globals.face_tuning.x*(1.0-smoothstep(tongue_root.y-0.001,tongue_root.y+0.004,mouth_local.y));
+    color=mix(color,vec3<f32>(0.95,0.45,0.83),tongue);
+    // Separated spectral envelopes blend continuously into the desktop. They
+    // never shift the opaque body or its features. Actual travel is handled by
+    // the exterior-only velocity wake in compose.wgsl.
+    let outer=max(-distance,0.0);
+    let separation=0.60+pool*1.4;
+    let fringe=vec3<f32>(
+        exp(-pow((outer-0.80-separation)/3.5,2.0)),
+        exp(-pow((outer-0.35)/2.7,2.0)),
+        exp(-pow((outer-1.20-separation)/4.4,2.0)));
+    let halo_color=(spectral*0.8+vec3<f32>(0.18,0.20,0.28))*fringe;
+    // Particle kernels have finite support. Fade by field support as well as
+    // contour distance, otherwise the broadest lobes end in a hard purple shell.
+    let support_fade=smoothstep(iso*0.025,iso*0.65,density);
+    let halo_alpha=exp(-outer*outer/mix(16.0,44.0,pool))*0.44*arc*(1.0-coverage)*support_fade;
+    let alpha=coverage+halo_alpha;
+    let premultiplied=color*coverage+halo_color*halo_alpha;
+    let debug=globals.face_tuning.y;
+    if (debug>0.5) {
+        var diagnostic=vec3<f32>(0.0);
+        if(debug<1.5) { diagnostic=vec3<f32>(saturate(density/(iso*3.0))); }
+        else if(debug<2.5) { diagnostic=vec3<f32>(alpha); }
+        else if(debug<3.5) { diagnostic=vec3<f32>(max(max(eyes,mouth),tongue),0.0,0.0); }
+        else if(debug<5.5) { diagnostic=vec3<f32>(cap.w); }
+        else if(debug<6.5) { diagnostic=vec3<f32>(shoulder); }
+        else if(debug<7.5) { diagnostic=normal*0.5+vec3<f32>(0.5); }
+        else { diagnostic=spectral*shoulder; }
+        return vec4<f32>(diagnostic*coverage,coverage);
+    }
+    return vec4<f32>(premultiplied,alpha);
+}
+
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if (LIVING_INK) { return living_ink_surface(input); }
     let field = density_at(input.uv);
     let density = field.r;
     let iso = globals.liquid_meta.z;

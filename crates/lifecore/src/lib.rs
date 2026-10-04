@@ -5,6 +5,7 @@
 //! graphics, audio devices, native windows, physical pixels, or operating systems.
 
 mod actions;
+mod activity;
 mod adaptive_learning;
 mod affect;
 mod bandit;
@@ -35,6 +36,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
 pub use actions::*;
+pub use activity::*;
 pub use adaptive_learning::*;
 pub use affect::*;
 pub use bandit::*;
@@ -124,6 +126,7 @@ pub struct LifeOutput {
 pub struct LifeCore {
     physiology_awake_seconds: f32,
     pending_rest_quality: f32,
+    pending_activity_evidence: Option<activity::ActivityEvidence>,
     care_awake_seconds: f32,
     pub state: LifeState,
     brain: MicroBrain,
@@ -174,6 +177,8 @@ impl LifeCore {
         dt: f32,
     ) {
         self.pending_rest_quality = episode.sleeping_or_deep_rest.clamp(0.0, 1.0);
+        self.pending_activity_evidence =
+            Some(activity::ActivityEvidence::measured(snapshot, episode));
         // A real gentle contact can invite an awake turn. It cannot erase debt
         // or turn pain into pleasure, and absence does not extend this lease.
         if snapshot.felt.contact_pleasantness > 0.35
@@ -264,6 +269,8 @@ impl LifeCore {
             .ticks_alive
             .saturating_add(logical_ticks);
         let seconds_f32 = seconds as f32;
+        self.state.activity.recover_unobserved(seconds_f32);
+        self.pending_activity_evidence = None;
         self.physiology_awake_seconds = (self.physiology_awake_seconds - seconds_f32).max(0.0);
         self.state.action_elapsed_seconds = (self.state.action_elapsed_seconds + seconds_f32)
             .min(self.state.current_action.definition().maximum_duration);
@@ -290,6 +297,7 @@ impl LifeCore {
             state: LifeState::new(genome),
             physiology_awake_seconds: 0.0,
             pending_rest_quality: 0.0,
+            pending_activity_evidence: None,
             care_awake_seconds: 0.0,
             brain,
             habits,
@@ -358,13 +366,19 @@ impl LifeCore {
             (previous_cost - self.state.drives.homeostatic_cost()).clamp(-1.0, 1.0);
         self.state.recent_reward = smooth(self.state.recent_reward, homeostatic_reward, 0.8, dt);
 
-        self.state.affect.update(
+        if let Some(evidence) = self.pending_activity_evidence.take() {
+            self.state.activity.tick(evidence, dt);
+        } else {
+            self.state.activity.elapse(dt);
+        }
+        self.state.affect.update_with_activity(
             &self.state.drives,
             sensors,
             body,
             &self.state.genome.temperament,
             self.state.recent_reward,
             self.state.ignored_attempts,
+            self.state.activity,
             dt,
         );
         self.update_lifetime_statistics(sensors, body, dt);
@@ -409,7 +423,15 @@ impl LifeCore {
         let switched = self.maybe_switch_action(sampled, &scores, sensors, body, &context);
         let (strongest_drive, strongest_drive_value) = decision_drives.strongest();
         self.state.drives = natural_drives;
-        let expression = ExpressionState::from_readouts(readouts.expressions, self.state.affect);
+        let mut expression =
+            ExpressionState::from_readouts(readouts.expressions, self.state.affect);
+        let safe = 1.0 - self.state.drives.safety;
+        expression.eye_aperture = (expression.eye_aperture
+            - 0.32 * self.state.activity.drowsiness(self.state.drives.sleep) * safe)
+            .clamp(0.35, 1.0);
+        expression.relief = expression
+            .relief
+            .max(self.state.activity.contact_warmth * safe * 0.45);
         let mut body_intent = body_intent_for(self.state.current_action, sensors, body, expression);
         self.state
             .exploration
@@ -878,6 +900,7 @@ impl LifeCore {
             state: snapshot.state,
             physiology_awake_seconds: 0.0,
             pending_rest_quality: 0.0,
+            pending_activity_evidence: None,
             care_awake_seconds: 0.0,
             brain: snapshot.brain,
             habits: snapshot.habits,
@@ -890,6 +913,7 @@ impl LifeCore {
             measured_outcomes: [0; 32],
             measured_outcome_cursor: 0,
         };
+        restored.state.activity.clear_observation();
         if restored.state.interactions.pending_credit.take().is_some() {
             restored.state.interactions.interrupted_outcomes = restored
                 .state
@@ -920,6 +944,7 @@ impl LifeCore {
         self.measured_outcome_cursor = 0;
         self.physiology_awake_seconds = 0.0;
         self.pending_rest_quality = 0.0;
+        self.pending_activity_evidence = None;
         self.care_awake_seconds = 0.0;
         self.habits = ContextualBandit::new(&self.state.genome.temperament);
         self.memories = MemorySystem::default();
@@ -1146,6 +1171,10 @@ impl LifeCore {
                 + exploration
                 + novelty
                 + temperament_bias(action, &self.state)
+                + self
+                    .state
+                    .activity
+                    .action_bias(action, self.state.drives.sleep)
                 + continuation
                 - cooldown_penalty
                 - repetition_penalty
@@ -3455,16 +3484,38 @@ mod tests {
         let mut core = LifeCore::new(Genome::from_seed(63), 64);
         core.state.current_action = ActionId::Sleep;
         core.state.drives.sleep = 0.99;
-        let pleasant = InteroceptionSnapshot { felt: FeltStateV1 { contact_pleasantness: 0.8, social_safety: 0.9, ..Default::default() }, ..Default::default() };
-        core.integrate_felt_state(pleasant, EpisodeContextV1 { safe_social_exchange: 0.8, ..Default::default() }, 0.1);
+        let pleasant = InteroceptionSnapshot {
+            felt: FeltStateV1 {
+                contact_pleasantness: 0.8,
+                social_safety: 0.9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        core.integrate_felt_state(
+            pleasant,
+            EpisodeContextV1 {
+                safe_social_exchange: 0.8,
+                ..Default::default()
+            },
+            0.1,
+        );
         assert_eq!(core.state.current_action, ActionId::WakeUp);
         assert!(core.state.drives.sleep >= 0.99);
         for _ in 0..100 {
-            assert_ne!(core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1).selected_action, ActionId::Sleep);
+            assert_ne!(
+                core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1)
+                    .selected_action,
+                ActionId::Sleep
+            );
         }
         let attachment = core.state.affect.attachment;
         for _ in 0..30 {
-            core.integrate_felt_state(InteroceptionSnapshot::default(), EpisodeContextV1::default(), 0.1);
+            core.integrate_felt_state(
+                InteroceptionSnapshot::default(),
+                EpisodeContextV1::default(),
+                0.1,
+            );
             core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1);
         }
         assert_eq!(core.care_awake_seconds, 0.0);
@@ -3472,10 +3523,83 @@ mod tests {
     }
 
     #[test]
+    fn activity_continuity_is_measured_once_and_old_saves_keep_identity() {
+        let mut core = LifeCore::new(Genome::from_seed(63), 64);
+        let genome = core.state.genome.clone();
+        let pleasant = InteroceptionSnapshot {
+            felt: FeltStateV1 {
+                contact_pleasantness: 0.8,
+                social_safety: 0.9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        core.integrate_felt_state(
+            pleasant,
+            EpisodeContextV1 {
+                safe_social_exchange: 0.8,
+                ..Default::default()
+            },
+            0.1,
+        );
+        core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1);
+        let warmth = core.state.activity.contact_warmth;
+        core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1);
+        assert!(
+            core.state.activity.contact_warmth < warmth,
+            "old evidence was replayed"
+        );
+        let snapshot = core.snapshot();
+        let rng = snapshot.rng.clone();
+        // Saved ChaCha word positions are u128: preserve their exact typed JSON
+        // representation rather than forcing it through serde_json::Value.
+        let field = format!(
+            "\"activity\":{},",
+            serde_json::to_string(&snapshot.state.activity).unwrap()
+        );
+        let old = serde_json::to_string(&snapshot)
+            .unwrap()
+            .replacen(&field, "", 1);
+        let restored = LifeCore::restore(serde_json::from_str(&old).unwrap()).unwrap();
+        assert_eq!(restored.state.activity, ActivityRegulationState::default());
+        assert_eq!(restored.state.genome, genome);
+        assert_eq!(restored.snapshot().rng, rng);
+    }
+
+    #[test]
+    fn tiredness_and_waking_shape_arousal_but_threat_remains_alert() {
+        let mut awake = LifeCore::new(Genome::from_seed(7), 7);
+        let mut tired = LifeCore::new(Genome::from_seed(7), 7);
+        awake.state.drives.sleep = 0.05;
+        tired.state.drives.sleep = 0.95;
+        let sensors = SensorFrame {
+            cursor_velocity: Vec2::new(0.8, 0.0),
+            ..Default::default()
+        };
+        for _ in 0..100 {
+            awake.tick(&sensors, &BodyFeedback::default(), 0.05);
+            tired.tick(&sensors, &BodyFeedback::default(), 0.05);
+        }
+        assert!(awake.state.affect.arousal > tired.state.affect.arousal + 0.07);
+        tired.state.drives.safety = 1.0;
+        for _ in 0..30 {
+            tired.tick(&sensors, &BodyFeedback::default(), 0.05);
+        }
+        assert!(tired.state.affect.arousal > 0.55);
+    }
+
+    #[test]
     fn quiet_rest_observation_is_consumed_once_not_persisted_as_free_sleep() {
         let mut core = LifeCore::new(Genome::from_seed(3), 64);
         core.state.drives.sleep = 0.99;
-        core.integrate_felt_state(InteroceptionSnapshot::default(), EpisodeContextV1 { sleeping_or_deep_rest: 1.0, ..Default::default() }, 0.1);
+        core.integrate_felt_state(
+            InteroceptionSnapshot::default(),
+            EpisodeContextV1 {
+                sleeping_or_deep_rest: 1.0,
+                ..Default::default()
+            },
+            0.1,
+        );
         core.tick(&SensorFrame::default(), &BodyFeedback::default(), 0.1);
         let recovered = core.state.drives.sleep;
         assert!(recovered < 0.99);

@@ -56,6 +56,11 @@ impl Capture {
         body.apply_tuning_profile(profile.clone())?;
         let mut renderer = pollster::block_on(Renderer::new(window.clone(), &body.mesh))?;
         renderer.set_review_background(ReviewBackground::Transparent);
+        eprintln!(
+            "birth capture format={:?} premultiplied_output={} linear source-over review",
+            renderer.surface_format(),
+            renderer.premultiplied_output(),
+        );
         let mut scene =
             pet_body::birth_scene::BirthScene::new(renderer.device(), renderer.surface_format());
         let mut ecology_renderer = pet_body::EcologyRenderer::new(
@@ -78,6 +83,9 @@ impl Capture {
             ("cradle-side-left", 640, 480, 15.0, FacePose::Awake),
             ("cradle-below", 640, 480, 15.0, FacePose::Awake),
             ("seated-large", 1280, 800, 15.0, FacePose::Awake),
+            ("seated-orb-free", 640, 480, 15.0, FacePose::Awake),
+            ("seated-orb-rolling", 640, 480, 15.0, FacePose::Awake),
+            ("seated-orb-large", 1280, 800, 15.0, FacePose::Awake),
             ("shouting", 640, 480, 15.0, FacePose::Awake),
             ("flattened", 640, 480, 15.0, FacePose::Awake),
             ("speaking", 640, 480, 15.0, FacePose::Awake),
@@ -105,6 +113,30 @@ impl Capture {
             ("sad", 640, 480, 12.0, FacePose::Awake),
             ("scared", 640, 480, 12.0, FacePose::Startled),
         ] {
+            if std::env::args().any(|arg| arg == "--opening-only")
+                && !matches!(name, "capsule-opening" | "capsule-burst")
+            {
+                continue;
+            }
+            if std::env::args().any(|arg| arg == "--props-only")
+                && !matches!(
+                    name,
+                    "capsule-arrival"
+                        | "capsule-opening"
+                        | "capsule-burst"
+                        | "seated"
+                        | "seated-large"
+                        | "seated-orb-free"
+                        | "seated-orb-rolling"
+                        | "seated-orb-large"
+                        | "cradle-side-left"
+                        | "cradle-below"
+                        | "portrait"
+                        | "small-screen"
+                )
+            {
+                continue;
+            }
             if std::env::args().any(|arg| arg == "--trails-only") && !name.starts_with("trails") {
                 continue;
             }
@@ -305,7 +337,7 @@ impl Capture {
             params.shadow_horizontal_offset = 0.0;
             params.shadow_vertical_offset = 0.0;
             params.render_scale = 1;
-            params.presentation_visibility = pet_body::birth_scene::smooth(7.96, 8.65, time);
+            params.presentation_visibility = pet_body::birth_scene::creature_visibility(time);
             let den = if name.starts_with("seated") || name.starts_with("cradle-") {
                 [0.5, 0.5]
             } else {
@@ -325,6 +357,23 @@ impl Capture {
                         / height as f32
                         - orb.radius_px_at_reference / 1080.0,
                 );
+            if name.starts_with("seated-orb") {
+                // Real production orb radius/lifecycle; expose it beside the
+                // den rather than behind its front rim in the seated fixture.
+                orb.lifecycle = pet_ecology::ObjectLifecycle::Free;
+                orb.position = Vec2::new(0.82, 0.54);
+            }
+            if name == "seated-orb-rolling" {
+                for step in 0..24 {
+                    ecology.objects[0].position.x = 0.72 + step as f32 / 240.0;
+                    ecology_renderer.prepare(
+                        renderer.queue(),
+                        &ecology,
+                        width as f32 / height as f32,
+                        14.60 + step as f32 / 60.0,
+                    );
+                }
+            }
             ecology_renderer.prepare(
                 renderer.queue(),
                 &ecology,

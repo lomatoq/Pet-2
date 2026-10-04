@@ -3247,7 +3247,7 @@ impl PetApplication {
                 runtime.normalizer.monotonic_seconds(), body_dt, runtime.sensors.pet_dragged,
             ) {
                 let mut evidence = serde_json::json!({
-                    "build": "V65.1", "sample": observation.sample,
+                    "build": "V66", "sample": observation.sample,
                     "action": format!("{:?}", runtime.life.state.current_action),
                     "pose": format!("{:?}", runtime.intent.pose),
                     "program": runtime.body.somatic_actuation().program,
@@ -4772,6 +4772,7 @@ impl PetApplication {
                         "body_feedback_v2": nervous_body_feedback,
                         "derived": nervous_snapshot.derived,
                         "felt_state_v1": nervous_snapshot.felt,
+                        "activity_regulation": runtime.life.state.activity,
                         "emotional_readouts": nervous_snapshot.emotions,
                         "morph_somatic_input": nervous_snapshot.morph_sensors,
                         "source_frame_id": nervous_snapshot.source_frame_id,
@@ -5772,7 +5773,7 @@ impl ApplicationHandler for PetApplication {
                 parameters.shadow_vertical_offset = 0.0;
                 parameters.exposure = 1.0;
                 parameters.presentation_visibility = birth_time.map_or(startup.pet_alpha, |t| {
-                    pet_body::birth_scene::smooth(7.96, 8.65, t)
+                    pet_body::birth_scene::creature_visibility(t)
                 });
                 let render_started = Instant::now();
                 let bounds = runtime.topology.virtual_physical_bounds;

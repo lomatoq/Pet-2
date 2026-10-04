@@ -37,6 +37,32 @@ impl AffectState {
         ignored_attempts: u32,
         dt: f32,
     ) {
+        self.update_with_activity(
+            drives,
+            sensors,
+            body,
+            temperament,
+            recent_reward,
+            ignored_attempts,
+            crate::ActivityRegulationState::default(),
+            dt,
+        );
+    }
+
+    /// One affect target combines sensed opportunities and physiological
+    /// capacity; no competing filter repeatedly attenuates the current value.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_with_activity(
+        &mut self,
+        drives: &Drives,
+        sensors: &SensorFrame,
+        body: &BodyFeedback,
+        temperament: &TemperamentGenome,
+        recent_reward: f32,
+        ignored_attempts: u32,
+        activity: crate::ActivityRegulationState,
+        dt: f32,
+    ) {
         let presence = sensors.user_presence.unwrap_or({
             if sensors.user_idle_seconds < 180.0 {
                 1.0
@@ -52,18 +78,26 @@ impl AffectState {
         // Appetitive interests can be high while the creature is comfortable.
         // Unexplored novelty and unused play opportunities are not suffering.
         let mean_need = (1.15 * drives.sleep.powi(2)
-            + 0.92 * drives.comfort.powi(2) + 1.35 * drives.safety.powi(2)) / 3.42;
+            + 0.92 * drives.comfort.powi(2)
+            + 1.35 * drives.safety.powi(2))
+            / 3.42;
         let ignored = (ignored_attempts as f32 / 5.0).clamp(0.0, 1.0);
         let pose_stress = body.pose_error.clamp(0.0, 1.0);
 
+        let calm = activity.contact_warmth * (1.0 - threat);
         let valence_target =
-            (0.35 + recent_reward * 0.55 - mean_need * 0.7 - threat * 0.35).clamp(-1.0, 1.0);
+            (0.35 + recent_reward * 0.55 + calm * 0.12 - mean_need * 0.7 - threat * 0.35)
+                .clamp(-1.0, 1.0);
         let arousal_target = (0.12
             + sensors.user_activity_rate * 0.32
             + sensors.cursor_velocity.length() * 0.12
             + drives.play * 0.25
             + threat * 0.42)
             .clamp(0.0, 1.0);
+        let arousal_target = (arousal_target
+            * (1.0 - 0.65 * activity.drowsiness(drives.sleep))
+            * (1.0 - 0.28 * calm))
+            .max(threat * 0.85);
         let stress_target = (threat * 0.72 + pose_stress * 0.25 + ignored * 0.24
             - temperament.boldness * 0.18)
             .clamp(0.0, 1.0);
@@ -93,7 +127,8 @@ impl AffectState {
             + 0.30 * felt.physical_load
             + 0.25 * (1.0 - felt.body_integrity))
             .clamp(0.0, 1.0);
-        let valence_evidence = (0.30 * felt.comfort + 0.35 * felt.relief
+        let valence_evidence = (0.30 * felt.comfort
+            + 0.35 * felt.relief
             + 0.60 * felt.contact_pleasantness * felt.social_safety
             - 0.55 * felt.pain_like
             - 0.35 * felt.restraint)
@@ -110,7 +145,8 @@ impl AffectState {
         // Positive contact accumulates bounded familiarity. A quiet interval
         // supplies no negative evidence and must not undo that familiarity.
         self.attachment = (self.attachment
-            + (1.0 - self.attachment) * attachment_evidence * 0.008 * dt).clamp(0.0, 1.0);
+            + (1.0 - self.attachment) * attachment_evidence * 0.008 * dt)
+            .clamp(0.0, 1.0);
     }
 
     #[must_use]

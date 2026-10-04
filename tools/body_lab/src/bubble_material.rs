@@ -1,7 +1,7 @@
-//! Analytic glass lenses for the six companion controls, in egui's existing pass.
+//! Authored luminous ink for the six companion controls, in egui's existing pass.
 //!
-//! Refraction bends a procedural studio environment, never captured desktop
-//! pixels. Icons are painted above this material by the caller. GPU objects are
+//! A deep quiet center and tapered colored light bow preserve glyph contrast.
+//! Icons are painted above this material by the caller. GPU objects are
 //! initialized once; each immutable slot receives one small uniform update.
 use egui::{Color32, PaintCallbackInfo, Painter, Rect};
 use egui_wgpu::{Callback, CallbackResources, CallbackTrait, ScreenDescriptor, wgpu};

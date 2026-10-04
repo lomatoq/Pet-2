@@ -265,20 +265,25 @@ impl BehaviorPerformanceRuntime {
         }
         self.previous_salience = context.selected_salience;
         self.previous_orb_user_held = context.orb_user_held;
-        if context.pet_touched
+        let gentle_contact = context.pet_touched
+            && context.body.contact.contact_count > 0
             && goal.felt.contact_pleasantness > 0.42
             && context.boundary_violation < 0.18
-        {
-            self.pleasant_touch_seconds += dt;
+            && goal.felt.restraint < 0.2
+            && goal.felt.pain_like < 0.15;
+        if gentle_contact {
+            self.pleasant_touch_seconds = (self.pleasant_touch_seconds + dt).min(3.0);
             let side = (context.cursor_position.x - context.body.motion.world_position.x).signum();
             if side != 0.0 {
                 self.contact_side = side;
             }
         }
-        let touch_stopped = self.previous_touch && !context.pet_touched;
         self.previous_touch = context.pet_touched;
-        if touch_stopped {
-            self.pleasant_touch_seconds = 0.0;
+        if !gentle_contact {
+            let unsafe_contact = context.boundary_violation >= 0.18
+                || goal.felt.restraint >= 0.2
+                || goal.felt.pain_like >= 0.15;
+            self.pleasant_touch_seconds *= (-dt / if unsafe_contact { 0.20 } else { 2.5 }).exp();
         }
 
         if (context.focus_mode || context.boundary_violation >= 0.18)
@@ -296,7 +301,10 @@ impl BehaviorPerformanceRuntime {
         // minimum readability must not keep the old sleep packet authoritative
         // after LifeCore has woken (e.g. for a conserved toileting need).
         if goal.action == lifecore::ActionId::WakeUp
-            && self.active.as_ref().is_some_and(|a| is_committed_rest(a.program))
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|a| is_committed_rest(a.program))
         {
             self.finish_active(CompletionReason::GracefulWithdrawal);
             self.rest_commit_seconds = 0.0;
@@ -528,10 +536,15 @@ impl BehaviorPerformanceRuntime {
             if goal.action != lifecore::ActionId::Sleep
                 && active.program.family() != crate::ProgramFamily::DefenseIntegrity
             {
-                for field in packet.fields.iter_mut().flatten().filter(|f|
+                for field in packet.fields.iter_mut().flatten().filter(|f| {
                     f.space == crate::FieldSpace::BodyLocal
-                    && matches!(f.kind, crate::SomaticFieldKind::MassShift | crate::SomaticFieldKind::Wave | crate::SomaticFieldKind::Pulse))
-                {
+                        && matches!(
+                            f.kind,
+                            crate::SomaticFieldKind::MassShift
+                                | crate::SomaticFieldKind::Wave
+                                | crate::SomaticFieldKind::Pulse
+                        )
+                }) {
                     field.strength *= gain;
                 }
             }
@@ -598,6 +611,32 @@ impl BehaviorPerformanceRuntime {
                 packet.expression.effort = 0.20;
             }
         }
+        // A relaxed contact leaves a short bodily aftereffect after release;
+        // it does not start another bid, move the root, or renew a touch cause.
+        // Sleep/support and protective performances retain their own expression.
+        let protective = packet
+            .program
+            .is_some_and(|p| p.family() == crate::ProgramFamily::DefenseIntegrity)
+            || goal.felt.startle > 0.35
+            || goal.felt.pain_like > 0.15
+            || context.boundary_violation >= 0.18
+            || goal.felt.restraint >= 0.2;
+        if !protective
+            && goal.action != lifecore::ActionId::Sleep
+            && !matches!(
+                packet.locomotion.pose,
+                crate::MotorPoseIntent::SupportedSleep | crate::MotorPoseIntent::SupportedRest
+            )
+        {
+            let warm = (self.pleasant_touch_seconds / 2.0).clamp(0.0, 1.0);
+            packet.expression.eye_aperture_delta -= 0.18 * warm;
+            packet.expression.squint_delta += 0.08 * warm;
+            packet.expression.relief = packet.expression.relief.max(0.45 * warm);
+            packet.internal.breath_speed_multiplier *= 1.0 - 0.14 * warm;
+            if gentle_contact {
+                packet.expression.gaze_target = Some(context.body.contact.point_world);
+            }
+        }
         packet.sanitize();
         let axis = packet
             .expression
@@ -646,7 +685,11 @@ impl BehaviorPerformanceRuntime {
         packet.shape = crate::ShapeIntent {
             mode,
             axis,
-            strength: if quiet_supported_sleep { 0.0 } else { 0.85 * rise },
+            strength: if quiet_supported_sleep {
+                0.0
+            } else {
+                0.85 * rise
+            },
         };
         self.last_packet = packet.clone();
         packet
@@ -690,26 +733,54 @@ impl BehaviorPerformanceRuntime {
             // The random bout style is only a small individual residual. Real
             // fatigue, sensed strain, target reach, arousal and preceding pose
             // determine what this body can attempt and how quickly it recovers.
-            let unit = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
-            let fatigue = unit(load.max(goal.derived.fatigue));
+            let unit = |v: f32| {
+                if v.is_finite() {
+                    v.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            };
+            let fatigue = unit(load.max(goal.derived.fatigue).max(goal.drives.sleep));
             let strain = unit(context.somatic.maximum_strain);
-            let arousal = unit(goal.derived.arousal.max(goal.affect.arousal));
-            let delta = target.as_ref().and_then(|t| t.world_position())
+            let arousal = unit(0.65 * goal.affect.arousal + 0.35 * goal.derived.arousal);
+            let delta = target
+                .as_ref()
+                .and_then(|t| t.world_position())
                 .map(|p| p - context.body.motion.world_position);
-            let reach = delta.map_or(0.0, |d| unit((d / context.body_diameter.max(glam::Vec2::splat(0.001))).length() / 3.0));
-            let recovering = f32::from(matches!(self.last_packet.locomotion.pose, crate::MotorPoseIntent::Recover | crate::MotorPoseIntent::SupportedRest));
-            let body_gain = (0.94 + arousal * 0.12 + reach * 0.06 - fatigue * 0.22 - strain * 0.10 - recovering * 0.03).clamp(0.72, 1.12);
-            let tempo = (0.95 + arousal * 0.15 - fatigue * 0.20 - strain * 0.08 - recovering * 0.03).clamp(0.75, 1.12);
-            self.active_expression_gain = (self.active_expression_gain * body_gain).clamp(0.72, 1.18);
+            let reach = delta.map_or(0.0, |d| {
+                unit((d / context.body_diameter.max(glam::Vec2::splat(0.001))).length() / 3.0)
+            });
+            let recovering = f32::from(matches!(
+                self.last_packet.locomotion.pose,
+                crate::MotorPoseIntent::Recover | crate::MotorPoseIntent::SupportedRest
+            ));
+            let body_gain = (0.94 + arousal * 0.12 + reach * 0.06
+                - fatigue * 0.22
+                - strain * 0.10
+                - recovering * 0.03)
+                .clamp(0.72, 1.12);
+            let tempo =
+                (0.95 + arousal * 0.15 - fatigue * 0.20 - strain * 0.08 - recovering * 0.03)
+                    .clamp(0.75, 1.12);
+            self.active_expression_gain =
+                (self.active_expression_gain * body_gain).clamp(0.72, 1.18);
             self.active_convention_tempo = (self.active_convention_tempo * tempo).clamp(0.72, 1.18);
             sampled_style.amplitude = (sampled_style.amplitude * body_gain).clamp(0.72, 1.18);
             sampled_style.tempo = self.active_convention_tempo;
             // Reach geometry wins over the anti-repeat arc coin. Without a
             // lateral target, retain the previous physical side or phenotype.
-            sampled_style.arc_sign = delta.filter(|d| d.x.abs() > context.body_diameter.x * 0.15)
+            sampled_style.arc_sign = delta
+                .filter(|d| d.x.abs() > context.body_diameter.x * 0.15)
                 .map(|d| d.x.signum())
-                .unwrap_or_else(|| if self.last_packet.shape.axis.x.abs() > 0.05 { self.last_packet.shape.axis.x.signum() }
-                    else if self.identity_seed.is_multiple_of(2) { 1.0 } else { -1.0 });
+                .unwrap_or_else(|| {
+                    if self.last_packet.shape.axis.x.abs() > 0.05 {
+                        self.last_packet.shape.axis.x.signum()
+                    } else if self.identity_seed.is_multiple_of(2) {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                });
         }
         if variable
             && cause == crate::MotorCause::UserGesture
@@ -1086,17 +1157,21 @@ mod tests {
     fn recorded_supported_sleep_quiets_global_reach_but_keeps_awake_and_wake_motion() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/v64_supported_sleep_shape.json"
-        )).unwrap();
-        let recorded: crate::ShapeIntent = serde_json::from_value(fixture["recorded_shape"].clone()).unwrap();
+        ))
+        .unwrap();
+        let recorded: crate::ShapeIntent =
+            serde_json::from_value(fixture["recorded_shape"].clone()).unwrap();
         assert_eq!(recorded.mode, crate::ShapeMode::Reach);
         assert_eq!(recorded.strength, 0.85);
         let target: Vec2 = serde_json::from_value(fixture["target_position"].clone()).unwrap();
-        let support: crate::SurfaceAttachmentCommand = serde_json::from_value(fixture["support"].clone()).unwrap();
+        let support: crate::SurfaceAttachmentCommand =
+            serde_json::from_value(fixture["support"].clone()).unwrap();
         let mut sleep = goal(ActionId::Sleep, target);
         sleep.body_intent.locomotion = LocomotionMode::Sleep;
         sleep.body_intent.desired_speed = 0.0;
         sleep.body_intent.pose = PoseIntent::Sleeping;
-        sleep.body_intent.gaze_target = serde_json::from_value(fixture["gaze_target"].clone()).unwrap();
+        sleep.body_intent.gaze_target =
+            serde_json::from_value(fixture["gaze_target"].clone()).unwrap();
         sleep.affect = serde_json::from_value(fixture["affect"].clone()).unwrap();
         sleep.drives = serde_json::from_value(fixture["drives"].clone()).unwrap();
         sleep.derived = serde_json::from_value(fixture["derived"].clone()).unwrap();
@@ -1116,11 +1191,20 @@ mod tests {
         for _ in 0..120 {
             let packet = runtime.tick(&sleep, &context, 1.0 / 120.0);
             assert_eq!(packet.program, Some(BehaviorProgramId::RestNremSleep));
-            assert_eq!(packet.locomotion.pose, crate::MotorPoseIntent::SupportedSleep);
+            assert_eq!(
+                packet.locomotion.pose,
+                crate::MotorPoseIntent::SupportedSleep
+            );
             assert_eq!(packet.support.as_ref().unwrap().surface_id.0, "den:cushion");
             assert_eq!(packet.shape.mode, crate::ShapeMode::Neutral);
             assert_eq!(packet.shape.strength, 0.0);
-            assert!(packet.fields.iter().flatten().any(|f| f.kind == crate::SomaticFieldKind::Flatten));
+            assert!(
+                packet
+                    .fields
+                    .iter()
+                    .flatten()
+                    .any(|f| f.kind == crate::SomaticFieldKind::Flatten)
+            );
             assert!(packet.internal.breath_amplitude_multiplier > 0.0);
         }
         // Same measured body and curiosity after real wake must retain its
@@ -1132,29 +1216,45 @@ mod tests {
         let mut awake_runtime = BehaviorPerformanceRuntime::new(seed);
         awake_runtime.begin_lab_fixture(BehaviorProgramId::MoveInspectPauseScan, &awake, &context);
         let mut awake_packet = awake_runtime.tick_lab_fixture(&awake, &context, 0.25);
-        for _ in 0..3 { awake_packet = awake_runtime.tick_lab_fixture(&awake, &context, 0.25); }
+        for _ in 0..3 {
+            awake_packet = awake_runtime.tick_lab_fixture(&awake, &context, 0.25);
+        }
         assert_eq!(awake_packet.shape.mode, crate::ShapeMode::Reach);
         assert!(awake_packet.shape.strength > 0.5);
         let mut wake = sleep;
         wake.action = ActionId::WakeUp;
         let packet = runtime.tick(&wake, &context, 0.05);
         assert_eq!(packet.program, Some(BehaviorProgramId::RestRemDreamWake));
-        assert_ne!(packet.locomotion.pose, crate::MotorPoseIntent::SupportedSleep);
+        assert_ne!(
+            packet.locomotion.pose,
+            crate::MotorPoseIntent::SupportedSleep
+        );
         assert_eq!(packet.shape.mode, crate::ShapeMode::Reach);
     }
 
     #[test]
     fn real_wake_interrupts_committed_nrem_and_performs_opening() {
         let mut runtime = BehaviorPerformanceRuntime::new(63);
-        let context = BehaviorContextFrame { den_supported: true, ..Default::default() };
+        let context = BehaviorContextFrame {
+            den_supported: true,
+            ..Default::default()
+        };
         let sleep = goal(ActionId::Sleep, Vec2::new(0.5, 0.9));
-        runtime.start(BehaviorProgramId::RestNremSleep, crate::MotorCause::BrainAction, &sleep, &context);
+        runtime.start(
+            BehaviorProgramId::RestNremSleep,
+            crate::MotorCause::BrainAction,
+            &sleep,
+            &context,
+        );
         runtime.active.as_mut().unwrap().phase.index = 1;
         runtime.active.as_mut().unwrap().minimum_readability_reached = false;
         let awake = runtime.tick(&goal(ActionId::WakeUp, Vec2::new(0.5, 0.9)), &context, 0.05);
         assert_eq!(awake.program, Some(BehaviorProgramId::RestRemDreamWake));
         assert_eq!(awake.phase_name, "wake_stretch_or_nrem");
-        assert_ne!(awake.locomotion.pose, crate::MotorPoseIntent::SupportedSleep);
+        assert_ne!(
+            awake.locomotion.pose,
+            crate::MotorPoseIntent::SupportedSleep
+        );
     }
 
     #[test]
@@ -1168,29 +1268,55 @@ mod tests {
             screen_edge_gap_px: 140.0,
             ..Default::default()
         };
-        context.surfaces.push(crate::SurfaceCandidate { surface_id: SurfaceId("screen:bottom_edge".into()),
-            minimum: Vec2::new(0.0, 1.0), maximum: Vec2::ONE, velocity: Vec2::ZERO,
-            familiarity: 1.0, recent_failed_landings: 0 });
+        context.surfaces.push(crate::SurfaceCandidate {
+            surface_id: SurfaceId("screen:bottom_edge".into()),
+            minimum: Vec2::new(0.0, 1.0),
+            maximum: Vec2::ONE,
+            velocity: Vec2::ZERO,
+            familiarity: 1.0,
+            recent_failed_landings: 0,
+        });
         let mut runtime = BehaviorPerformanceRuntime::new(63);
         let packet = runtime.tick(&sleep, &context, 0.05);
         assert_eq!(packet.program, Some(BehaviorProgramId::RestNremSleep));
-        assert_eq!(packet.locomotion.pose, crate::MotorPoseIntent::SupportedSleep);
+        assert_eq!(
+            packet.locomotion.pose,
+            crate::MotorPoseIntent::SupportedSleep
+        );
         assert_eq!(packet.locomotion.speed_multiplier, 0.0);
         assert_eq!(packet.support.as_ref().unwrap().surface_id.0, "den:cushion");
-        assert_eq!(packet.support.as_ref().unwrap().anchor_point, context.den_support_point.unwrap());
+        assert_eq!(
+            packet.support.as_ref().unwrap().anchor_point,
+            context.den_support_point.unwrap()
+        );
         for frame in 0..300 {
             context.frame_id = frame;
             let sleeping = runtime.tick(&sleep, &context, 0.05);
             assert_eq!(sleeping.program, Some(BehaviorProgramId::RestNremSleep));
-            assert_eq!(sleeping.support.as_ref().unwrap().surface_id.0, "den:cushion");
-            assert_eq!(sleeping.support.as_ref().unwrap().anchor_point, Vec2::new(0.5, 0.82));
+            assert_eq!(
+                sleeping.support.as_ref().unwrap().surface_id.0,
+                "den:cushion"
+            );
+            assert_eq!(
+                sleeping.support.as_ref().unwrap().anchor_point,
+                Vec2::new(0.5, 0.82)
+            );
             assert_eq!(sleeping.locomotion.speed_multiplier, 0.0);
-            assert!(sleeping.fields.iter().flatten().filter(|f| f.kind == crate::SomaticFieldKind::Flatten)
-                .all(|f| f.axis.dot(Vec2::Y) > 0.99));
+            assert!(
+                sleeping
+                    .fields
+                    .iter()
+                    .flatten()
+                    .filter(|f| f.kind == crate::SomaticFieldKind::Flatten)
+                    .all(|f| f.axis.dot(Vec2::Y) > 0.99)
+            );
         }
         context.den_supported = false;
         let mut airborne = BehaviorPerformanceRuntime::new(63);
-        assert_eq!(airborne.tick(&sleep, &context, 0.05).program, Some(BehaviorProgramId::RestSurfaceRoostSearch));
+        assert_eq!(
+            airborne.tick(&sleep, &context, 0.05).program,
+            Some(BehaviorProgramId::RestSurfaceRoostSearch)
+        );
     }
 
     #[test]
@@ -1212,11 +1338,15 @@ mod tests {
                 context.frame_id = frame;
                 let packet = runtime.tick(&awake, &context, 0.05);
                 assert_eq!(packet.program, Some(BehaviorProgramId::RestSitSettle));
-                if packet.phase_name == "rest_hold" { break; }
+                if packet.phase_name == "rest_hold" {
+                    break;
+                }
             }
             assert_eq!(runtime.last_packet().phase_name, "rest_hold");
             assert_eq!(runtime.active().unwrap().phase_time, 0.0);
-            for _ in 0..awake_hold_frames { let _ = runtime.tick(&awake, &context, 0.05); }
+            for _ in 0..awake_hold_frames {
+                let _ = runtime.tick(&awake, &context, 0.05);
+            }
             if awake_hold_frames > 0 {
                 let active = runtime.active().unwrap();
                 assert!(active.minimum_readability_reached);
@@ -1229,18 +1359,33 @@ mod tests {
                 let packet = runtime.tick(&sleep, &context, 0.05);
                 if packet.program == Some(BehaviorProgramId::RestNremSleep) {
                     first_sleep.get_or_insert(frame);
-                    assert_eq!(packet.locomotion.pose, crate::MotorPoseIntent::SupportedSleep);
+                    assert_eq!(
+                        packet.locomotion.pose,
+                        crate::MotorPoseIntent::SupportedSleep
+                    );
                 } else {
-                    assert!(first_sleep.is_none(), "sleep owner regressed to an awake hold");
+                    assert!(
+                        first_sleep.is_none(),
+                        "sleep owner regressed to an awake hold"
+                    );
                     assert_eq!(packet.program, Some(BehaviorProgramId::RestSitSettle));
                 }
                 assert_eq!(packet.support.as_ref().unwrap().surface_id.0, "den:cushion");
-                assert_eq!(packet.support.as_ref().unwrap().anchor_point, Vec2::new(0.5, 0.82));
+                assert_eq!(
+                    packet.support.as_ref().unwrap().anchor_point,
+                    Vec2::new(0.5, 0.82)
+                );
                 if awake_hold_frames == 0 && (frame + 1) as f32 * 0.05 < 0.45 - 1e-4 {
-                    assert!(first_sleep.is_none(), "actual supported settle minimum was skipped");
+                    assert!(
+                        first_sleep.is_none(),
+                        "actual supported settle minimum was skipped"
+                    );
                 }
             }
-            assert!(first_sleep.is_some_and(|frame| frame < 20), "held sit blocked sleep indefinitely");
+            assert!(
+                first_sleep.is_some_and(|frame| frame < 20),
+                "held sit blocked sleep indefinitely"
+            );
         }
     }
 
@@ -1256,8 +1401,17 @@ mod tests {
         tired.affect.arousal = 0.15;
         let start = |g: &BehaviorGoalFrame, c: &BehaviorContextFrame| {
             let mut r = BehaviorPerformanceRuntime::new(63);
-            r.start(BehaviorProgramId::MoveCuriosityArcApproach, crate::MotorCause::BrainAction, g, c);
-            (r.active_expression_gain, r.active_convention_tempo, r.active.unwrap().sampled_style.arc_sign)
+            r.start(
+                BehaviorProgramId::MoveCuriosityArcApproach,
+                crate::MotorCause::BrainAction,
+                g,
+                c,
+            );
+            (
+                r.active_expression_gain,
+                r.active_convention_tempo,
+                r.active.unwrap().sampled_style.arc_sign,
+            )
         };
         let brisk = start(&energetic, &context);
         let slow = start(&tired, &context);
@@ -1359,6 +1513,39 @@ mod tests {
             attachment: 0.2,
             recent_outcome: None,
         }
+    }
+
+    #[test]
+    fn gentle_contact_aftereffect_survives_release_without_a_new_force_or_bid() {
+        let mut g = goal(ActionId::ObserveUserActivity, Vec2::splat(0.5));
+        g.felt.contact_pleasantness = 0.8;
+        let mut c = BehaviorContextFrame {
+            pet_touched: true,
+            pointer_down: true,
+            ..Default::default()
+        };
+        c.body.contact.contact_count = 1;
+        c.body.contact.duration = 1.0;
+        let mut runtime = BehaviorPerformanceRuntime::new(7);
+        for _ in 0..60 {
+            let _ = runtime.tick(&g, &c, 0.05);
+        }
+        c.pet_touched = false;
+        c.pointer_down = false;
+        c.body.contact.contact_count = 0;
+        g.felt.contact_pleasantness = 0.0;
+        let packet = runtime.tick(&g, &c, 0.05);
+        assert!(packet.expression.relief >= 0.4);
+        assert!(!packet.program.is_some_and(|p| p.requests_user_attention()));
+        assert!(runtime.pleasant_touch_seconds > 2.8);
+        g.felt.pain_like = 0.6;
+        let guarded = runtime.tick(&g, &c, 0.05);
+        assert!(
+            guarded
+                .program
+                .is_some_and(|p| p.family() == crate::ProgramFamily::DefenseIntegrity)
+        );
+        assert!(guarded.expression.relief < 0.4);
     }
 
     #[test]
@@ -2104,14 +2291,13 @@ mod tests {
 
         let packet = runtime.tick(&goal, &context, 1.0 / 20.0);
 
-        assert_eq!(
-            packet.program,
-            Some(BehaviorProgramId::TouchStrokeFollow)
-        );
+        assert_eq!(packet.program, Some(BehaviorProgramId::TouchStrokeFollow));
         context.body.shape.neck_tension = 0.6;
         let mut loaded = BehaviorPerformanceRuntime::new(0xA012);
-        assert_eq!(loaded.tick(&goal, &context, 1.0 / 20.0).program,
-            Some(BehaviorProgramId::TouchPullReleaseRebound));
+        assert_eq!(
+            loaded.tick(&goal, &context, 1.0 / 20.0).program,
+            Some(BehaviorProgramId::TouchPullReleaseRebound)
+        );
     }
 
     #[test]

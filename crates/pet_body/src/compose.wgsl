@@ -186,7 +186,7 @@ fn spectral_rim(uv:vec2<f32>)->vec3<f32> {
         if(band==2u) {color=vec3<f32>(0.16,0.52,0.86);}
         spectrum+=color*field;
     }
-    return spectrum*exterior*speed*0.48*globals.post.w;
+    return spectrum*exterior*speed*1.10*globals.post.w;
 }
 
 @fragment

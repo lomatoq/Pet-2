@@ -337,12 +337,14 @@ fn derive_felt(
     let touch_present = bool_value(b.contact.contact_count > 0);
     let gentle_motion = 1.0 - smoothstep(0.18, 0.55, b.contact.tangential_speed);
     let pleasant = unit(
-        touch_present * soft_band(
-            b.contact.pressure,
-            0.03,
-            source.soft_touch_pressure_max.max(0.031),
-            0.10,
-        ) * (1.0 - pain_like)
+        touch_present
+            * soft_band(
+                b.contact.pressure,
+                0.03,
+                source.soft_touch_pressure_max.max(0.031),
+                0.10,
+            )
+            * (1.0 - pain_like)
             * (0.75 + 0.25 * d.social_warmth)
             * (0.75 + 0.25 * a.expectedness)
             * (0.65 + 0.35 * gentle_motion),
@@ -352,13 +354,25 @@ fn derive_felt(
     let intended_speed = intent.intended_velocity.length();
     let blocked_progress = if intended_speed > 0.01 {
         ((intent.intended_velocity - intent.actual_velocity)
-            .dot(intent.intended_velocity / intended_speed) / 0.25).clamp(0.0, 1.0)
-    } else { 0.0 };
-    let mechanical_load = smoothstep(0.30, 0.70,
-        b.contact.pressure.max(b.shape.maximum_strain).max(b.shape.neck_tension));
+            .dot(intent.intended_velocity / intended_speed)
+            / 0.25)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mechanical_load = smoothstep(
+        0.30,
+        0.70,
+        b.contact
+            .pressure
+            .max(b.shape.maximum_strain)
+            .max(b.shape.neck_tension),
+    );
     let restraint = unit(
-        touch_present * (b.contact.duration / 1.2).clamp(0.0, 1.0)
-            * blocked_progress * mechanical_load,
+        touch_present
+            * (b.contact.duration / 1.2).clamp(0.0, 1.0)
+            * blocked_progress
+            * mechanical_load,
     );
     let comfort = unit(
         0.35 * (1.0 - source.drives.comfort)
@@ -410,9 +424,16 @@ fn derive_felt(
     let external_witness = smoothstep(0.08, 0.25, b.environment.cursor_loom_rate)
         .max(smoothstep(0.08, 0.35, b.motion.collision_impulse))
         .max(smoothstep(0.20, 0.50, pain_like))
-        .max(smoothstep(0.12, 0.40, b.contact.user_force_estimate.length()));
-    let startle = unit(0.52 * threat_rise * external_witness
-        + 0.28 * b.motion.collision_impulse + 0.20 * loom_rise);
+        .max(smoothstep(
+            0.12,
+            0.40,
+            b.contact.user_force_estimate.length(),
+        ));
+    let startle = unit(
+        0.52 * threat_rise * external_witness
+            + 0.28 * b.motion.collision_impulse
+            + 0.20 * loom_rise,
+    );
     let relief = unit(
         0.45 * fall(d.stress, previous.previous_stress, dt)
             + 0.25 * fall(d.neural_threat, previous.previous_threat, dt)
@@ -425,13 +446,13 @@ fn derive_felt(
             * (1.0 - d.stress)
             * (0.35 + 0.65 * d.positive_valence)
             * (0.40 + 0.60 * activation),
-    );
+    ) * (1.0 - 0.85 * d.fatigue);
     let exploration_readiness = unit(
         d.curiosity
             * (0.45 + 0.55 * d.neural_novelty)
             * (1.0 - 0.65 * d.stress)
             * (0.45 + 0.55 * motor_efficacy),
-    );
+    ) * (1.0 - 0.65 * d.fatigue);
     let sleep_pressure =
         unit(0.55 * source.drives.sleep + 0.35 * source.vita.mood.fatigue + 0.10 * d.neural_rest);
     let boredom = unit(
@@ -687,6 +708,29 @@ mod tests {
     }
 
     #[test]
+    fn same_appetite_has_less_play_and_exploration_capacity_when_tired() {
+        let s = source();
+        let awake_axes = DerivedNervousState {
+            positive_valence: 0.7,
+            arousal: 0.7,
+            curiosity: 0.7,
+            neural_novelty: 0.6,
+            ..Default::default()
+        };
+        let tired_axes = DerivedNervousState {
+            fatigue: 0.9,
+            ..awake_axes
+        };
+        let previous = BodyInteroceptionDirector::default();
+        let awake = derive_felt(&s, awake_axes, &previous, 0.05);
+        let tired = derive_felt(&s, tired_axes, &previous, 0.05);
+        assert!(tired.play_readiness < awake.play_readiness * 0.3);
+        assert!(tired.exploration_readiness < awake.exploration_readiness * 0.5);
+        assert_eq!(tired.pain_like, awake.pain_like);
+        assert_eq!(tired.body_integrity, awake.body_integrity);
+    }
+
+    #[test]
     fn object_load_is_effort_not_user_touch_or_an_impact() {
         let neutral = source();
         let mut carried = neutral.clone();
@@ -774,20 +818,35 @@ mod tests {
     fn care_requires_actual_contact_and_distinguishes_transfer_from_loaded_restraint() {
         let mut absent = source();
         absent.body.contact.pressure = 0.18; // stale pressure is not a new touch
-        let absent_felt = derive_felt(&absent, DerivedNervousState::default(), &BodyInteroceptionDirector::default(), 0.05);
+        let absent_felt = derive_felt(
+            &absent,
+            DerivedNervousState::default(),
+            &BodyInteroceptionDirector::default(),
+            0.05,
+        );
         assert_eq!(absent_felt.contact_pleasantness, 0.0);
         let mut carried = absent.clone();
         carried.body.contact.contact_count = 1;
         carried.body.contact.duration = 2.0;
         carried.body.efference_copy.actual_velocity = glam::Vec2::new(0.6, 0.0);
-        let carried_felt = derive_felt(&carried, DerivedNervousState::default(), &BodyInteroceptionDirector::default(), 0.05);
+        let carried_felt = derive_felt(
+            &carried,
+            DerivedNervousState::default(),
+            &BodyInteroceptionDirector::default(),
+            0.05,
+        );
         assert!(carried_felt.contact_pleasantness > 0.45);
         assert_eq!(carried_felt.restraint, 0.0);
         let mut loaded = carried.clone();
         loaded.body.contact.pressure = 0.85;
         loaded.body.shape.neck_tension = 0.8;
         loaded.body.efference_copy.intended_velocity = glam::Vec2::new(-0.5, 0.0);
-        let loaded_felt = derive_felt(&loaded, DerivedNervousState::default(), &BodyInteroceptionDirector::default(), 0.05);
+        let loaded_felt = derive_felt(
+            &loaded,
+            DerivedNervousState::default(),
+            &BodyInteroceptionDirector::default(),
+            0.05,
+        );
         assert!(loaded_felt.restraint > 0.9);
         assert!(loaded_felt.pain_like > 0.4);
         assert!(loaded_felt.contact_pleasantness < carried_felt.contact_pleasantness * 0.2);
@@ -797,7 +856,10 @@ mod tests {
     fn endogenous_threat_oscillation_is_not_an_external_startle_but_real_loom_is() {
         let quiet = source();
         let previous = BodyInteroceptionDirector::default();
-        let threat = DerivedNervousState { neural_threat: 0.2, ..Default::default() };
+        let threat = DerivedNervousState {
+            neural_threat: 0.2,
+            ..Default::default()
+        };
         let resting = derive_felt(&quiet, threat, &previous, 0.05);
         assert_eq!(resting.startle, 0.0);
         let mut loom = quiet.clone();
@@ -810,21 +872,29 @@ mod tests {
 
     #[test]
     fn recorded_v63_nrem_to_startle_incident_requires_an_external_witness() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/v63_sleep_startle_incident.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/v63_sleep_startle_incident.json"
+        ))
+        .unwrap();
         let mut previous = BodyInteroceptionDirector::default();
         for row in fixture["rows"].as_array().unwrap() {
             let mut recorded = source();
             recorded.body = serde_json::from_value(row["body"].clone()).unwrap();
             recorded.drives = serde_json::from_value(row["drives"].clone()).unwrap();
             recorded.affect = serde_json::from_value(row["affect"].clone()).unwrap();
-            let derived: DerivedNervousState = serde_json::from_value(row["derived"].clone()).unwrap();
+            let derived: DerivedNervousState =
+                serde_json::from_value(row["derived"].clone()).unwrap();
             let old: FeltStateV1 = serde_json::from_value(row["recorded_felt"].clone()).unwrap();
             assert_eq!(recorded.body.contact.contact_count, 0);
             assert_eq!(recorded.body.environment.cursor_loom_rate, 0.0);
             assert!(recorded.body.motion.collision_impulse < 1e-8);
             assert!(old.startle > 0.35);
             let target = derive_felt(&recorded, derived, &previous, 0.05);
-            assert!(target.startle < 1e-8, "t={} regenerated a startle from quiet recorded input", row["monotonic_seconds"]);
+            assert!(
+                target.startle < 1e-8,
+                "t={} regenerated a startle from quiet recorded input",
+                row["monotonic_seconds"]
+            );
             previous.previous_threat = derived.neural_threat;
         }
         let row = &fixture["rows"][0];
@@ -832,8 +902,17 @@ mod tests {
         control.body = serde_json::from_value(row["body"].clone()).unwrap();
         control.body.environment.cursor_loom_rate = 0.8;
         let derived: DerivedNervousState = serde_json::from_value(row["derived"].clone()).unwrap();
-        assert!(derive_felt(&control, derived, &BodyInteroceptionDirector::default(), 0.05).startle > 0.6,
-            "the same recorded body with genuine loom must retain its reflex");
+        assert!(
+            derive_felt(
+                &control,
+                derived,
+                &BodyInteroceptionDirector::default(),
+                0.05
+            )
+            .startle
+                > 0.6,
+            "the same recorded body with genuine loom must retain its reflex"
+        );
         // Even a previously latched legacy startle must dissipate when replay
         // presents no sensed event; no direct clearing of its filter is needed.
         let mut recovery = BodyInteroceptionDirector {

@@ -39,7 +39,12 @@ impl ApplicationHandler for Capture {
 impl Capture {
     fn capture(&self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn std::error::Error>> {
         // Optional pixel-density fixture; never changes the live OS DPI setting.
-        let capture_scale = if std::env::var_os("PET2_MENU_CAPTURE_SCALE").is_some_and(|v| v == "2") { 2_u32 } else { 1_u32 };
+        let capture_scale = if std::env::var_os("PET2_MENU_CAPTURE_SCALE").is_some_and(|v| v == "2")
+        {
+            2_u32
+        } else {
+            1_u32
+        };
         let wide = std::env::var_os("PET2_MENU_CAPTURE_WIDE").is_some_and(|v| v == "1");
         let logical_width = if wide { 1280 } else { 420 };
         let width = logical_width * capture_scale;
@@ -93,19 +98,53 @@ impl Capture {
             "close-0.04",
             "close-0.10",
             "close-0.20",
-        ].into_iter().map(str::to_owned).collect();
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         fixtures.extend((0..48).map(|i| format!("open-{:.6}", i as f32 / 60.0)));
         fixtures.extend((0..12).map(|i| format!("drift-{:.6}", i as f32 / 60.0)));
         fixtures.extend((0..14).map(|i| format!("close-{:.6}", i as f32 / 60.0)));
         if capture_scale > 1 || wide {
-            fixtures.retain(|name| matches!(name.as_str(), "controls" | "learn" | "voice" | "open-0.300000" | "drift-0.000000" | "drift-0.016667" | "drift-0.033333"));
+            fixtures.retain(|name| {
+                matches!(
+                    name.as_str(),
+                    "controls"
+                        | "learn"
+                        | "voice"
+                        | "open-0.300000"
+                        | "drift-0.000000"
+                        | "drift-0.016667"
+                        | "drift-0.033333"
+                )
+            });
         }
+        if std::env::var_os("PET2_MENU_MATERIAL_MATRIX").is_some() {
+            fixtures = vec![
+                "material-grid-light".into(),
+                "material-grid-dark".into(),
+                "material-grid-checker".into(),
+                "controls".into(),
+                "hover".into(),
+                "pressed".into(),
+                "feeding".into(),
+                "close-0.100000".into(),
+                "drift-0.000000".into(),
+                "drift-0.016667".into(),
+                "drift-0.033333".into(),
+            ];
+        }
+        let started = std::time::Instant::now();
+        let count = fixtures.len();
         for name in fixtures {
             let mut output = None;
             // Let egui resolve Area sizes before accepting a snapshot.
             for frame in 0..60 {
                 let raw = RawInput {
-                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(logical_width as f32, 580.0))),
+                    screen_rect: Some(Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(logical_width as f32, 580.0),
+                    )),
                     time: Some(frame as f64 / 60.0),
                     ..Default::default()
                 };
@@ -150,6 +189,7 @@ impl Capture {
             bytes.extend(frame.rgba8);
             fs::write(self.output.join(format!("{name}.rgba")), bytes)?;
         }
+        fs::write(self.output.join("capture-timing.json"),serde_json::json!({"frames":count,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"method":"native full renderer+readback+egui 60 settle passes; not live FPS or isolated shader timing"}).to_string())?;
         Ok(())
     }
 }

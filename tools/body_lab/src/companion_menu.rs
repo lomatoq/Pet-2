@@ -103,12 +103,12 @@ fn action_label(index: usize, latest: &Value) -> &'static str {
 
 fn accent(index: usize) -> Color32 {
     match index {
-        0 => Color32::from_rgb(62, 122, 109),
-        1 => Color32::from_rgb(102, 85, 160),
-        2 => Color32::from_rgb(130, 99, 145),
-        3 => Color32::from_rgb(62, 113, 157),
-        5 => Color32::from_rgb(155, 90, 123),
-        _ => Color32::from_rgb(89, 98, 125),
+        0 => Color32::from_rgb(107, 199, 196),
+        1 => Color32::from_rgb(161, 137, 216),
+        2 => Color32::from_rgb(185, 140, 208),
+        3 => Color32::from_rgb(115, 175, 223),
+        5 => Color32::from_rgb(211, 145, 184),
+        _ => Color32::from_rgb(151, 163, 204),
     }
 }
 
@@ -223,14 +223,6 @@ pub(super) fn configure(ctx: &egui::Context) {
     } else {
         egui::FontFamily::Proportional
     };
-    fonts.font_data.insert(
-        "phosphor".into(),
-        egui::FontData::from_static(include_bytes!("../assets/phosphor/Pet2-Phosphor.ttf")).into(),
-    );
-    fonts.families.insert(
-        egui::FontFamily::Name("phosphor".into()),
-        vec!["phosphor".into()],
-    );
     ctx.set_fonts(fonts);
     ctx.tessellation_options_mut(|o| o.round_text_to_pixels = false);
     ctx.set_visuals(egui::Visuals::light());
@@ -273,7 +265,6 @@ pub(super) fn configure(ctx: &egui::Context) {
             .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
     });
 }
-// Original Phosphor regular glyphs, embedded so they never depend on installed fonts.
 struct BubbleMotion {
     center: egui::Pos2,
     alpha: f32,
@@ -297,10 +288,27 @@ fn bubble_motion(
     dismissal: f32,
     reduced: bool,
 ) -> BubbleMotion {
-    bubble_motion_at(screen, screen.center().x, index, elapsed, dismissal, reduced)
+    bubble_motion_at(
+        screen,
+        screen.center().x,
+        index,
+        elapsed,
+        dismissal,
+        reduced,
+    )
 }
-fn bubble_motion_at(screen: Rect, nest_x: f32, index: usize, elapsed: f32, dismissal: f32, reduced: bool) -> BubbleMotion {
-    let layout = Rect::from_center_size(pos2(nest_x, screen.center().y), vec2(420.0_f32.min(screen.width()), screen.height()));
+fn bubble_motion_at(
+    screen: Rect,
+    nest_x: f32,
+    index: usize,
+    elapsed: f32,
+    dismissal: f32,
+    reduced: bool,
+) -> BubbleMotion {
+    let layout = Rect::from_center_size(
+        pos2(nest_x, screen.center().y),
+        vec2(420.0_f32.min(screen.width()), screen.height()),
+    );
     let end = bubble_target(layout, index);
     if reduced {
         return BubbleMotion {
@@ -334,20 +342,112 @@ fn bubble_motion_at(screen: Rect, nest_x: f32, index: usize, elapsed: f32, dismi
     }
 }
 
+// Rounded vector symbols avoid a small font-atlas glyph and its dark shadow.
+// The pale fringe is only 0.35 points per side; shape AA remains egui's own.
 fn icon(p: &egui::Painter, c: egui::Pos2, index: usize, color: Color32) {
-    let glyphs = [
-        "\u{e6ca}", "\u{e62c}", "\u{e478}", "\u{e326}", "\u{e434}", "\u{e6a2}",
-    ];
-    let font = egui::FontId::new(26.0, egui::FontFamily::Name("phosphor".into()));
-    // Small lower shadow seats the crisp symbol in the lens, without outlining it.
-    p.text(
-        c + vec2(0.0, 0.7),
-        egui::Align2::CENTER_CENTER,
-        glyphs[index],
-        font.clone(),
-        Color32::from_black_alpha((color.a() as f32 * 0.24) as u8),
-    );
-    p.text(c, egui::Align2::CENTER_CENTER, glyphs[index], font, color);
+    let path = |points: Vec<egui::Pos2>, closed: bool| {
+        for (width, ink) in [(2.4, color.gamma_multiply(0.10)), (1.7, color)] {
+            p.add(egui::epaint::PathShape {
+                points: points.clone(),
+                closed,
+                fill: Color32::TRANSPARENT,
+                stroke: Stroke::new(width, ink).into(),
+            });
+            if !closed {
+                for point in [points.first(), points.last()].into_iter().flatten() {
+                    p.circle_filled(*point, width * 0.5, ink);
+                }
+            }
+        }
+    };
+    let pts = |points: &[[f32; 2]]| points.iter().map(|v| c + vec2(v[0], v[1])).collect();
+    let arc = |center: [f32; 2], radius: f32, start: f32, end: f32| {
+        (0..=32)
+            .map(|i| {
+                let a = start + (end - start) * i as f32 / 32.0;
+                c + vec2(center[0] + radius * a.cos(), center[1] + radius * a.sin())
+            })
+            .collect::<Vec<_>>()
+    };
+    match index {
+        0 => {
+            let mut outline = arc([0.0, 0.0], 9.6, -0.07, std::f32::consts::TAU - 1.18);
+            outline.extend(pts(&[[1.2, -5.6], [2.7, -2.5], [6.0, -2.1], [6.7, 0.0]]));
+            path(outline, true);
+            for d in [[-3.8, -3.2], [-4.0, 3.6], [2.5, 4.3]] {
+                p.circle_filled(c + vec2(d[0], d[1]), 1.2, color);
+            }
+        }
+        1 => {
+            path(
+                pts(&[[-11.0, -3.4], [0.0, -8.3], [11.0, -3.4], [0.0, 1.5]]),
+                true,
+            );
+            path(
+                pts(&[
+                    [-7.0, -1.4],
+                    [-7.0, 4.2],
+                    [-3.5, 6.5],
+                    [0.0, 7.3],
+                    [3.5, 6.5],
+                    [7.0, 4.2],
+                    [7.0, -1.4],
+                ]),
+                false,
+            );
+            path(pts(&[[10.5, -3.0], [10.5, 5.2]]), false);
+        }
+        2 => {
+            path(
+                pts(&[
+                    [-9.0, -9.0],
+                    [-1.5, -9.0],
+                    [9.7, 2.2],
+                    [2.2, 9.7],
+                    [-9.0, -1.5],
+                ]),
+                true,
+            );
+            p.circle_stroke(c + vec2(-4.8, -4.8), 1.4, Stroke::new(1.5, color));
+        }
+        3 => {
+            let mut capsule = arc(
+                [0.0, -5.5],
+                3.4,
+                std::f32::consts::PI,
+                std::f32::consts::TAU,
+            );
+            capsule.extend(arc([0.0, 0.3], 3.4, 0.0, std::f32::consts::PI));
+            path(capsule, true);
+            path(arc([0.0, 0.0], 6.7, 0.0, std::f32::consts::PI), false);
+            path(pts(&[[0.0, 6.7], [0.0, 10.0]]), false);
+            path(pts(&[[-3.5, 10.0], [3.5, 10.0]]), false);
+        }
+        4 => {
+            for (y, x) in [(-6.8, -3.8), (0.0, 4.0), (6.8, -1.2)] {
+                path(pts(&[[-10.0, y], [x - 2.2, y]]), false);
+                path(pts(&[[x + 2.2, y], [10.0, y]]), false);
+                path(arc([x, y], 2.2, 0.0, std::f32::consts::TAU), true);
+            }
+        }
+        _ => {
+            path(
+                pts(&[
+                    [0.0, -10.0],
+                    [2.7, -2.7],
+                    [10.0, 0.0],
+                    [2.7, 2.7],
+                    [0.0, 10.0],
+                    [-2.7, 2.7],
+                    [-10.0, 0.0],
+                    [-2.7, -2.7],
+                ]),
+                true,
+            );
+            path(pts(&[[8.0, -10.0], [8.0, -5.6]]), false);
+            path(pts(&[[5.8, -7.8], [10.2, -7.8]]), false);
+        }
+    }
 }
 pub(super) fn show(
     ctx: &egui::Context,
@@ -374,7 +474,11 @@ fn show_frame(
     ready: bool,
 ) -> Option<LabControlCommand> {
     let elapsed = state.capture_elapsed.unwrap_or_else(|| {
-        state.opened.get_or_insert_with(Instant::now).elapsed().as_secs_f32()
+        state
+            .opened
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_secs_f32()
     });
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         state.close = true;
@@ -422,10 +526,17 @@ fn show_frame(
         state.dismissal = 0.0;
     }
     let nest_x = state.nest_x.unwrap_or(screen.center().x);
-    let layout = Rect::from_center_size(pos2(nest_x, screen.center().y), vec2(420.0_f32.min(screen.width()), screen.height()));
+    let layout = Rect::from_center_size(
+        pos2(nest_x, screen.center().y),
+        vec2(420.0_f32.min(screen.width()), screen.height()),
+    );
     let base = pos2(nest_x, screen.max.y - 165.0);
     for (index, accessible_label) in LABELS.iter().enumerate() {
-        let motion = if state.nest_x.is_some() { bubble_motion_at(screen, nest_x, index, elapsed, state.dismissal, reduced) } else { bubble_motion(screen, index, elapsed, state.dismissal, reduced) };
+        let motion = if state.nest_x.is_some() {
+            bubble_motion_at(screen, nest_x, index, elapsed, state.dismissal, reduced)
+        } else {
+            bubble_motion(screen, index, elapsed, state.dismissal, reduced)
+        };
         let alpha = motion.alpha;
         let scale = 1.0 + 0.012 * state.hover[index] - state.press[index];
         let rect = Rect::from_center_size(motion.center, vec2(56.0, 56.0));
@@ -673,10 +784,91 @@ if ui.button("Close menu").clicked(){state.close=true;}}
 }
 
 pub(super) fn capture_frame(ctx: &egui::Context, fixture: &str) {
+    if fixture.starts_with("material-grid-") {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let row = match fixture {
+            "material-grid-light" => 0,
+            "material-grid-dark" => 1,
+            _ => 2,
+        };
+        {
+            let top = 20.0;
+            let bg = Rect::from_min_size(pos2(0.0, top), vec2(420.0, 160.0));
+            painter.rect_filled(
+                bg,
+                0,
+                if row == 0 {
+                    Color32::from_rgb(246, 243, 249)
+                } else {
+                    Color32::from_rgb(31, 29, 39)
+                },
+            );
+            if row == 2 {
+                for y in 0..8 {
+                    for x in 0..21 {
+                        if (x + y) % 2 == 0 {
+                            painter.rect_filled(
+                                Rect::from_min_size(
+                                    pos2(x as f32 * 20.0, top + y as f32 * 20.0),
+                                    vec2(20.0, 20.0),
+                                ),
+                                0,
+                                Color32::from_rgb(111, 112, 127),
+                            );
+                        }
+                    }
+                }
+            }
+            painter.text(
+                pos2(12.0, top + 12.0),
+                egui::Align2::LEFT_TOP,
+                "idle        hover       active       pressed      fade 50%",
+                egui::FontId::proportional(11.0),
+                if row == 0 {
+                    Color32::from_rgb(64, 60, 78)
+                } else {
+                    Color32::from_rgb(225, 222, 239)
+                },
+            );
+            for slot in 0..5 {
+                let rect = Rect::from_center_size(
+                    pos2(45.0 + slot as f32 * 79.0, top + 80.0),
+                    vec2(56.0, 56.0) * if slot == 3 { 0.965 } else { 1.0 },
+                );
+                let alpha = if slot == 4 { 0.5 } else { 1.0 };
+                let tint = accent(if slot == 2 { 1 } else { 0 });
+                super::bubble_material::paint(
+                    &painter,
+                    rect,
+                    tint,
+                    alpha,
+                    if slot == 1 {
+                        0.55
+                    } else if slot == 2 {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                    slot,
+                );
+                icon(
+                    &painter,
+                    rect.center(),
+                    if slot == 2 { 1 } else { 0 },
+                    Color32::from_rgb(248, 249, 255).gamma_multiply(alpha),
+                );
+            }
+        }
+        return;
+    }
+
     let mut state = MenuState::new(false);
     state.opened = Some(Instant::now() - std::time::Duration::from_secs(2));
     state.capture_elapsed = Some(2.0);
-    if ctx.content_rect().width() > 421.0 { state.nest_x = Some(210.0); }
+    if ctx.content_rect().width() > 421.0 {
+        state.nest_x = Some(210.0);
+    }
     state.page = match fixture {
         "learn" => Some(1),
         "name" => Some(2),
@@ -921,5 +1113,4 @@ mod tests {
             assert!(end.center.distance(super::bubble_target(layout, index)) < 0.001);
         }
     }
-
 }

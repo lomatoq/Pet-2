@@ -1,4 +1,4 @@
-// V62 smoky glass lens: analytic optics and studio lights, no desktop sampling.
+// V66 authored luminous ink. No texture samples or time-varying shading.
 struct Uniforms {
     tint_alpha: vec4<f32>, // linear absorption tint, independent menu fade
     shape: vec4<f32>,      // logical viewport width/height, emphasis, periodic phase
@@ -24,25 +24,39 @@ fn gamma_encode(rgb:vec3<f32>)->vec3<f32> {
     let c=max(rgb,vec3<f32>(0.0));
     return select(1.055*pow(c,vec3<f32>(1.0/2.4))-0.055,c*12.92,c<=vec3<f32>(0.0031308));
 }
-fn environment(direction:vec3<f32>)->vec3<f32> {
-    let sky=smoothstep(-0.32,0.62,direction.y);
-    let horizon=1.0-smoothstep(0.06,0.24,abs(direction.y+0.15));
-    return mix(vec3<f32>(0.035,0.050,0.075),vec3<f32>(0.32,0.40,0.46),sky)
-        +vec3<f32>(0.10,0.08,0.12)*horizon;
+// Artist-authored shading, not desktop refraction or a photoreal BSDF.
+fn gaussian2(p:vec2<f32>, center:vec2<f32>, scale:vec2<f32>)->f32 {
+    let d=(p-center)/scale;
+    return exp(-dot(d,d));
 }
-fn softbox(ray:vec3<f32>,phase:f32)->f32 {
-    // Angular area light behind the sphere: grazing reflections have negative
-    // ray.z. Planar front-only projection incorrectly reduces these to eyebrows.
-    let light=normalize(vec3<f32>(-0.60+0.025*sin(phase),0.65+0.02*cos(phase),-0.42));
-    return smoothstep(0.74,0.975,dot(ray,light));
-}
-fn secondary_softbox(ray:vec3<f32>,phase:f32)->f32 {
-    let light=normalize(vec3<f32>(0.65+0.02*cos(phase),-0.60+0.025*sin(phase),-0.48));
-    let across=dot(ray,normalize(vec3<f32>(0.60,0.65,0.0)));
-    return smoothstep(0.77,0.975,dot(ray,light)-across*across*0.38);
-}
-fn band(radius:f32,center:f32,width:f32,aa:f32)->f32 {
-    return 1.0-smoothstep(width,width+aa,abs(radius-center));
+fn ink_material(q:vec2<f32>,z:f32,tint:vec3<f32>,emphasis:f32)->vec3<f32> {
+    let saturated=tint/max(max(tint.r,tint.g),max(tint.b,0.001));
+    let radius=length(q);
+    // Airy colored ink: a quiet pool leaves space for the rounded white symbol.
+    let depth=vec3<f32>(0.035,0.042,0.066)+saturated*0.16;
+    let shoulder=smoothstep(0.40,0.96,radius);
+    let upper=exp(-pow((q.x+0.56)/0.50,2.0)-pow((q.y+0.34)/0.57,2.0));
+    let lower=gaussian2(q,vec2<f32>(0.33,0.55),vec2<f32>(0.50,0.27));
+    var c=depth+saturated*(shoulder*0.048+upper*0.088+lower*0.069);
+    // Two scales of one authored bowed wash. Narrow crest and wide halo are
+    // separated so the surface reads as luminous depth at native 56px.
+    let curve=-0.65+0.24*q.x+0.34*q.x*q.x;
+    let taper=exp(-pow((q.x+0.24)/0.62,4.0));
+    let d=q.y-curve;
+    let halo=exp(-pow(d/0.15,2.0))*taper;
+    let crest=exp(-pow(d/0.035,2.0))*taper;
+    let cyan=vec3<f32>(0.20,0.61,0.76);
+    let violet=vec3<f32>(0.38,0.23,0.72);
+    let radiance=mix(cyan,violet,smoothstep(-0.55,0.54,q.x));
+    c+=mix(saturated,radiance,0.55)*halo*0.24;
+    c+=radiance*crest*(0.50+0.10*emphasis);
+    // An asymmetric colored shoulder glances along one side only. No closed
+    // contour, radial ring, white crust, pseudo-metal or temporal iridescence.
+    let facing=normalize(q+vec2<f32>(0.00001));
+    let left=max(dot(facing,normalize(vec2<f32>(-0.91,-0.42))),0.0);
+    c+=mix(saturated,cyan,0.35)*pow(1.0-z,2.0)*pow(left,4.0)*0.20;
+    c+=mix(saturated,violet,0.45)*lower*0.055;
+    return c*(1.0+0.16*emphasis);
 }
 @fragment
 fn fragment_main(input:VertexOutput)->@location(0) vec4<f32> {
@@ -51,63 +65,14 @@ fn fragment_main(input:VertexOutput)->@location(0) vec4<f32> {
     let radius=length(p);
     let aa=max(fwidth(radius),0.001);
     let coverage=1.0-smoothstep(0.925-aa*0.5,0.925+aa*0.5,radius);
-    if(coverage<=0.0) { return vec4<f32>(0.0); }
+    if(coverage<=0.0) {return vec4<f32>(0.0);}
     let q=p/0.925;
-    let r2=min(dot(q,q),0.9999);
-    let z=sqrt(max(1.0-r2,0.0001));
-    let point=normalize(vec3<f32>(q.x,-q.y,z));
-    let normal=point;
-    let view=vec3<f32>(0.0,0.0,1.0);
-    let reflection=reflect(-view,normal);
-    // Two analytic Snell interfaces through a sphere. Only the procedural
-    // studio is sampled: this is an environment approximation, not live glass.
-    let inside=refract(-view,normal,1.0/1.42);
-    let chord=max(-2.0*dot(point,inside),0.0);
-    let exit_point=normalize(point+inside*chord);
-    let transmitted=refract(inside,-exit_point,1.42);
-    let refracted_environment=environment(transmitted);
-    let fresnel=0.030+0.970*pow(1.0-z,5.0);
-    let phase=globals.shape.w;
-    let emphasis=globals.shape.z;
-    let facing=p/max(radius,0.001);
-    let upper=max(dot(facing,normalize(vec2<f32>(-0.62,-0.78))),0.0);
-    let lower=max(dot(facing,normalize(vec2<f32>(0.46,0.89))),0.0);
-    // Tinted transmission replaces the V61 pale diffuse sphere. No matte paint
-    // lobe: a calm absorptive center supports white glyphs across desktops.
-    let tint=globals.tint_alpha.rgb;
-    let absorption=tint*(0.084+0.012*z)+vec3<f32>(0.001,0.002,0.003);
-    // Quiet dark center, colored refractive depth only on the clear shoulder.
-    var color=absorption+refracted_environment*smoothstep(0.45,0.80,radius)*0.12;
-    let inner_light=0.030*smoothstep(0.35,0.85,radius)*lower;
-    color+=mix(tint,vec3<f32>(0.22,0.34,0.39),0.40)*inner_light;
-    color=mix(color,environment(reflection),fresnel*(0.38+0.25*upper));
-    // Broad colored environment transmission through the shoulder volume,
-    // bounded away from the calm glyph center. No colored contour stroke.
-    let volume=smoothstep(0.32,0.78,radius)*(1.0-smoothstep(0.86,0.925,radius));
-    color+=volume*(vec3<f32>(0.024,0.035,0.080)*upper+vec3<f32>(0.070,0.030,0.012)*lower);
-    // Curved broad window reflection on the shoulder, leaving glyph centers
-    // clear. Different surface depths distinguish glass from a flat stroke.
-    let window=softbox(reflection,phase)*smoothstep(0.40,0.58,radius);
-    color=mix(color,vec3<f32>(0.90,0.97,1.0),window*(0.92+0.04*emphasis));
-    let secondary=secondary_softbox(reflection,phase)*smoothstep(0.43,0.64,radius);
-    color=mix(color,vec3<f32>(0.95,0.90,0.84),secondary*0.82);
-    let meniscus=band(radius,0.865,0.015,aa*0.70);
-    color*=1.0-meniscus*(0.31+0.12*lower);
-    let caustic=band(radius,0.815,0.015,aa*1.2)*pow(lower,1.5);
-    let refracted_tint=mix(tint,vec3<f32>(0.43,0.64,0.70),0.38);
-    color+=refracted_tint*caustic*(0.32+0.08*emphasis);
-    let rim=band(radius,0.908,0.004,aa*0.65);
-    let optical_phase=(1.0-z)*11.0+q.x*1.1+q.y*0.6+0.18*sin(phase);
-    let film=0.5+0.5*cos(vec3<f32>(optical_phase,optical_phase*1.17+2.1,optical_phase*1.38+4.2));
-    let rim_color=mix(vec3<f32>(0.78,0.94,1.0),film,0.10);
-    // Interrupted grazing highlight; no continuous white coin outline.
-    color=mix(color,rim_color,rim*0.83*pow(upper,3.0));
-    let catch_direction=max(dot(facing,normalize(vec2<f32>(-0.70,0.71))),0.0);
-    let catchlight=band(radius,0.894,0.007,aa*0.8)*pow(catch_direction,9.0);
-    color=mix(color,vec3<f32>(0.92,0.98,1.0),catchlight*0.26);
-    let material_alpha=clamp(0.90-0.11*r2+0.11*fresnel,0.79,0.94);
+    let z=sqrt(max(1.0-dot(q,q),0.0001));
+    var color=ink_material(q,z,globals.tint_alpha.rgb,globals.shape.z);
+    // High center opacity anchors glyph contrast; a soft translucent shoulder.
+    let material_alpha=0.992-0.035*pow(1.0-z,2.0);
     let alpha=coverage*material_alpha*globals.tint_alpha.w;
     color=clamp(color,vec3<f32>(0.0),vec3<f32>(1.0));
-    if(globals.output.x>0.5) { color=gamma_encode(color); }
+    if(globals.output.x>0.5) {color=gamma_encode(color);}
     return vec4<f32>(color*alpha,alpha);
 }

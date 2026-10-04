@@ -107,6 +107,48 @@ impl Capture {
                 )?;
             }
         }
+        // A fixed physical pose at nearby and widely spaced times separates
+        // smooth optical evolution from movement or a new random pose.
+        let temporal = self.output.join("temporal");
+        std::fs::create_dir_all(&temporal)?;
+        body = ProceduralBody::generate(&genome)?;
+        body.apply_tuning_profile(profile.clone())?;
+        renderer.set_review_background(ReviewBackground::Black);
+        for (name, time) in [
+            ("t0", 0.0),
+            ("t1-frame", 1.0 / 60.0),
+            ("t2-seconds", 2.0),
+            ("t8-seconds", 8.0),
+        ] {
+            let mut params = body.render_parameters(&genome, time);
+            params.time = time;
+            params.render_mode = BodyRenderMode::ParticlePbf;
+            params.presentation_visibility = 1.0;
+            renderer.reset_perceptual_capture_state();
+            let frame = renderer.render_capture(params)?;
+            let mut bytes = Vec::with_capacity(frame.rgba8.len() + 8);
+            bytes.extend(frame.width.to_le_bytes());
+            bytes.extend(frame.height.to_le_bytes());
+            bytes.extend(frame.rgba8);
+            std::fs::write(temporal.join(format!("{name}.rgba")), bytes)?;
+        }
+        if std::env::args().any(|arg| arg == "--motion-preview") {
+            let sequence = self.output.join("sequence");
+            std::fs::create_dir_all(&sequence)?;
+            for index in 0..120 {
+                let mut params = body.render_parameters(&genome, 0.0);
+                params.time = index as f32 / 30.0;
+                params.render_mode = BodyRenderMode::ParticlePbf;
+                params.presentation_visibility = 1.0;
+                renderer.reset_perceptual_capture_state();
+                let frame = renderer.render_capture(params)?;
+                let mut bytes = Vec::with_capacity(frame.rgba8.len() + 8);
+                bytes.extend(frame.width.to_le_bytes());
+                bytes.extend(frame.height.to_le_bytes());
+                bytes.extend(frame.rgba8);
+                std::fs::write(sequence.join(format!("{index:03}.rgba")), bytes)?;
+            }
+        }
         let probes = self.output.join("probes");
         std::fs::create_dir_all(&probes)?;
         renderer.set_review_background(ReviewBackground::Black);
@@ -119,13 +161,15 @@ impl Capture {
             for probe in [
                 "normal",
                 "reflection",
-                "no-coat",
+                "face-off",
                 "high-curvature",
                 "small",
                 "motion",
                 "gaze",
                 "half-blink",
                 "frown",
+                "joy",
+                "surprise",
             ] {
                 let mut params = body.render_parameters(&genome, 0.3);
                 params.render_mode = BodyRenderMode::ParticlePbf;
@@ -138,7 +182,7 @@ impl Capture {
                 match probe {
                     "normal" => params.debug_view = pet_body::DebugView::MacroNormal,
                     "reflection" => params.debug_view = pet_body::DebugView::StudioReflection,
-                    "no-coat" => params.material_studio_intensity = 0.0,
+                    "face-off" => params.face_visible = false,
                     "high-curvature" => params.material_normal_scale = 4.0,
                     "small" => params.presentation_scale = 1.40,
                     "motion" => {
@@ -154,6 +198,18 @@ impl Capture {
                         // Material stress probe, not a full affect/motor replay.
                         params.brow_tension = 0.80;
                         params.mouth_curve = -0.65;
+                    }
+                    "joy" => {
+                        params.mouth_curve = 0.7;
+                        params.mouth_open = 0.25;
+                        params.blink_left = 0.0;
+                        params.blink_right = 0.0;
+                    }
+                    "surprise" => {
+                        params.mouth_open = 0.9;
+                        params.brow_raise = 0.8;
+                        params.blink_left = 0.0;
+                        params.blink_right = 0.0;
                     }
                     _ => unreachable!(),
                 }
@@ -171,6 +227,7 @@ impl Capture {
         let moving = self.output.join("velocity-motion");
         std::fs::create_dir_all(&moving)?;
         std::fs::create_dir_all(moving.join("wake-off"))?;
+        std::fs::create_dir_all(moving.join("body-mask"))?;
         body = ProceduralBody::generate(&genome)?;
         body.apply_tuning_profile(profile.clone())?;
         let desktop = glam::Vec2::new(3440.0, 1440.0);
@@ -230,6 +287,21 @@ impl Capture {
             bytes.extend(frame.height.to_le_bytes());
             bytes.extend(frame.rgba8);
             std::fs::write(moving.join("wake-off").join(format!("{name}.rgba")), bytes)?;
+            // Independent geometric alpha oracle: no material-color threshold
+            // that accidentally stops working when the creature becomes black.
+            let mut mask = wake_off;
+            mask.debug_view = pet_body::DebugView::Alpha;
+            mask.material_bloom_strength = 0.0;
+            mask.shadow_opacity = 0.0;
+            mask.joy_aura = 0.0;
+            renderer.set_review_background(ReviewBackground::Transparent);
+            renderer.reset_perceptual_capture_state();
+            let frame = renderer.render_capture(mask)?;
+            let mut bytes = Vec::with_capacity(frame.rgba8.len() + 8);
+            bytes.extend(frame.width.to_le_bytes());
+            bytes.extend(frame.height.to_le_bytes());
+            bytes.extend(frame.rgba8);
+            std::fs::write(moving.join("body-mask").join(format!("{name}.rgba")), bytes)?;
             motion_log.push(serde_json::json!({"case":name,
                 "physical_px_per_second":pixels_per_second.to_array(),
                 "normalized_feedback":velocity.to_array(),

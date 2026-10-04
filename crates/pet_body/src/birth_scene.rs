@@ -410,6 +410,13 @@ fn den_sprite(viewport: [u32; 2], den: [f32; 2], scale: f32, front: bool) -> Spr
         ribbon_edges: [0.0; 4],
     }
 }
+/// The opaque creature is prepared under the seed while its aperture opens.
+/// A second, later fade exposed the desktop through the already-open aperture
+/// and made the dark material look like a white/grey veil on light desktops.
+pub fn creature_visibility(time: f32) -> f32 {
+    smooth(7.79, 8.08, time)
+}
+
 pub fn smooth(a: f32, b: f32, t: f32) -> f32 {
     let x = ((t - a) / (b - a)).clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
