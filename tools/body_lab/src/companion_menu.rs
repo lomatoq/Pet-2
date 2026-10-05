@@ -29,6 +29,8 @@ pub(super) struct MenuState {
     // Only isolated GPU fixtures supply a deterministic logical clock.
     capture_elapsed: Option<f32>,
     closing: Option<Instant>,
+    last_hidden_unix_ms: Option<u64>,
+    focus_dismissal_armed: bool,
     pub glass: Option<Glass>,
     pub regions: Vec<(Rect, f32)>,
     volume: Option<u8>,
@@ -51,18 +53,75 @@ impl MenuState {
     }
 
     pub fn can_dismiss_on_focus_loss(&self) -> bool {
-        !self.hidden && self.opened.is_some_and(|t| t.elapsed().as_secs_f32() > 0.7)
+        !self.hidden && self.focus_dismissal_armed
+    }
+
+    fn dismiss(&mut self) {
+        if !self.hidden {
+            self.close = true;
+            self.pending_show = false;
+        }
+    }
+
+    pub fn on_native_mouse_button(
+        &mut self,
+        button: winit::event::MouseButton,
+        state: winit::event::ElementState,
+    ) {
+        // egui-winit drops button events until it has a pointer position (and
+        // after CursorLeft). Cancellation needs neither a target nor a position.
+        if button == winit::event::MouseButton::Right
+            && state == winit::event::ElementState::Pressed
+        {
+            self.dismiss();
+        }
+    }
+
+    fn observe_presented_focus(&mut self, focused: bool) {
+        // pending_show is cleared only after a successful native present. The
+        // first focused frame after that acknowledges startup; no time-based
+        // grace period should swallow the user's first outside click.
+        self.focus_dismissal_armed |= !self.hidden && !self.pending_show && focused;
     }
     pub fn hide_ready(&mut self) -> bool {
         // Hide only after the rendered tail has finished. A separate wall
         // clock can expire while a delayed frame is still visibly fading.
-        self.close && self.dismissal >= 1.0 && self.panel_presence <= 0.012
+        let ready = self.close && self.dismissal >= 1.0 && self.panel_presence <= 0.012;
+        if ready {
+            self.last_hidden_unix_ms = Some(super::unix_time_ms());
+        }
+        ready
+    }
+
+    /// A native secondary press toggles the visible menu. Unlike an explicit
+    /// reopen, it must keep a dismissal already initiated by native focus loss.
+    pub fn consume_desktop_toggle(&mut self, channel: &desktop_host::CareMenuChannel) -> bool {
+        if !channel.consume_open() {
+            return false;
+        }
+        let requested_unix_ms = std::fs::read(channel.placement_path()).ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|placement| placement["secondary_press_unix_ms"].as_u64());
+        self.toggle_from_desktop(requested_unix_ms)
+    }
+
+    fn toggle_from_desktop(&mut self, requested_unix_ms: Option<u64>) -> bool {
+        if !self.hidden {
+            self.dismiss();
+            return false;
+        }
+        if requested_unix_ms.zip(self.last_hidden_unix_ms)
+            .is_some_and(|(requested, hidden)| requested <= hidden)
+        {
+            return false;
+        }
+        self.reopen()
     }
 
     pub fn reopen(&mut self) -> bool {
         if !self.hidden {
-            // A right click on the nest can first transfer native focus away.
-            // Cancel that pending dismissal without resetting the visible UI.
+            // Explicit reversal retains the current animation/panel. Native
+            // secondary-click toggles use the separate dismissal path above.
             self.close = false;
             self.closing = None;
             return false;
@@ -73,6 +132,7 @@ impl MenuState {
         self.closing = None;
         self.waiting_for_feed = false;
         self.waiting_for_cleanup = false;
+        self.focus_dismissal_armed = false;
         self.opened = Some(Instant::now());
         self.page = None;
         self.desired_page = None;
@@ -537,8 +597,10 @@ fn show_frame(
             .elapsed()
             .as_secs_f32()
     });
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        state.close = true;
+    state.observe_presented_focus(ctx.input(|i| i.focused));
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)
+        || i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+        state.dismiss();
     }
     let screen = ctx.content_rect();
     let hearing = &latest["details"]["hearing"];
@@ -1159,6 +1221,161 @@ mod tests {
         state.opened = Some(Instant::now() - std::time::Duration::from_secs(1));
         assert!(click(&ctx, &mut state, false, pos2(50.0, 520.0)).is_none());
         assert!(!state.waiting_for_feed && !state.close);
+    }
+
+    #[test]
+    fn native_secondary_without_a_pointer_position_dismisses_without_an_action() {
+        use winit::event::{ElementState, MouseButton};
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut state = MenuState::new(false);
+        state.opened = Some(Instant::now() - std::time::Duration::from_secs(2));
+        assert!(ui_tick(&ctx, &mut state, true, vec![]).is_none());
+        assert!(ctx.input(|i| i.pointer.latest_pos()).is_none());
+        for (button, phase) in [
+            (MouseButton::Left, ElementState::Pressed),
+            (MouseButton::Middle, ElementState::Pressed),
+            (MouseButton::Right, ElementState::Released),
+        ] {
+            state.on_native_mouse_button(button, phase);
+            assert!(!state.close);
+        }
+        // Same production path as WindowEvent::MouseInput; no egui pointer
+        // event, coordinate, focus acknowledgement, or action is required.
+        state.on_native_mouse_button(MouseButton::Right, ElementState::Pressed);
+        assert!(state.close && !state.pending_show);
+        assert!(!state.hide_ready(), "native cancellation retains the fade");
+        for _ in 0..90 {
+            assert!(ui_tick(&ctx, &mut state, false, vec![]).is_none());
+        }
+        assert!(state.hide_ready());
+        assert!(!state.waiting_for_feed && !state.waiting_for_cleanup);
+        state.hidden = true;
+        state.close = false;
+        state.on_native_mouse_button(MouseButton::Right, ElementState::Pressed);
+        assert!(!state.close && state.hidden, "late hidden input must not reopen or rearm");
+    }
+
+    #[test]
+    fn secondary_press_closes_bubbles_and_panels_without_dispatching_an_action() {
+        for reduced in [false, true] {
+            for page in [None, Some(3)] {
+                let ctx = egui::Context::default();
+                configure(&ctx);
+                ctx.style_mut(|style| style.animation_time = if reduced { 0.0 } else { 0.2 });
+                let mut state = MenuState::new(false);
+                state.opened = Some(Instant::now() - std::time::Duration::from_secs(2));
+                state.select_panel(page);
+                for _ in 0..3 {
+                    assert!(ui_tick(&ctx, &mut state, true, vec![]).is_none());
+                }
+                let position = state.regions[0].0.center();
+                let pointer = |button, pressed| egui::Event::PointerButton {
+                    pos: position, button, pressed, modifiers: Default::default(),
+                };
+                // Cancel even an already armed primary action. Secondary must
+                // take priority over its release in the same native input batch.
+                assert!(ui_tick(&ctx, &mut state, true, vec![
+                    egui::Event::PointerMoved(position),
+                    pointer(egui::PointerButton::Primary, true),
+                ]).is_none());
+                assert!(ui_tick(&ctx, &mut state, true, vec![
+                    pointer(egui::PointerButton::Secondary, true),
+                    pointer(egui::PointerButton::Primary, false),
+                ]).is_none());
+                assert!(state.close);
+                assert!(!state.waiting_for_feed && !state.waiting_for_cleanup);
+                assert!(!state.hide_ready(), "secondary press must retain the exit fade");
+                assert!(ui_tick(&ctx, &mut state, false,
+                    vec![pointer(egui::PointerButton::Secondary, false)]).is_none());
+                for _ in 0..90 {
+                    assert!(ui_tick(&ctx, &mut state, false, vec![]).is_none());
+                }
+                assert!(state.hide_ready(), "closing must finish, including reduced motion");
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_toggle_keeps_focus_loss_dismissal_instead_of_reopening() {
+        let data = tempfile::tempdir().unwrap();
+        let channel = desktop_host::CareMenuChannel::for_owner(data.path(), "toggle-test").unwrap();
+        let mut state = MenuState::new(true);
+        channel.request_open().unwrap(); // Legacy placement without a timestamp still works.
+        assert!(state.consume_desktop_toggle(&channel));
+        assert!(!state.hidden);
+        assert!(!state.consume_desktop_toggle(&channel));
+        state.pending_show = false;
+        state.observe_presented_focus(true);
+        assert!(state.can_dismiss_on_focus_loss());
+        state.close = true; // Native focus transfer arrives before the IPC request.
+        state.update_dismissal(0.08);
+        let leaving = state.dismissal;
+        channel.request_open().unwrap();
+        assert!(!state.consume_desktop_toggle(&channel));
+        assert!(state.close && !state.hidden && !state.pending_show);
+        assert_eq!(state.dismissal, leaving, "do not restart or reverse the fade");
+        state.update_dismissal(0.05);
+        assert!(state.dismissal > leaving);
+    }
+
+    #[test]
+    fn delayed_secondary_request_cannot_reopen_a_completed_focus_loss_fade() {
+        let data = tempfile::tempdir().unwrap();
+        let channel = desktop_host::CareMenuChannel::for_owner(data.path(), "delayed-test").unwrap();
+        let mut state = MenuState::new(false);
+        let requested = super::super::unix_time_ms();
+        channel.write_placement(&serde_json::json!({"x":42,
+            "secondary_press_unix_ms":requested})).unwrap();
+        channel.request_open().unwrap();
+        // Helper scheduling may delay consumption until focus loss has already
+        // completed its fade and the native window has become hidden.
+        state.close = true;
+        state.update_dismissal(MENU_FADE_SECONDS);
+        assert!(state.hide_ready());
+        state.hidden = true;
+        state.close = false;
+        assert!(!state.consume_desktop_toggle(&channel));
+        assert!(state.hidden && !state.close);
+        // A genuinely new press after dismissal still opens normally.
+        channel.write_placement(&serde_json::json!({"x":42,
+            "secondary_press_unix_ms":state.last_hidden_unix_ms.unwrap()+1})).unwrap();
+        channel.request_open().unwrap();
+        assert!(state.consume_desktop_toggle(&channel));
+        assert!(!state.hidden && !state.close && state.pending_show);
+    }
+
+    #[test]
+    fn focus_loss_arms_after_presented_focus_without_a_time_grace_period() {
+        let mut state = MenuState::new(true);
+        state.observe_presented_focus(false);
+        assert!(!state.can_dismiss_on_focus_loss());
+        assert!(state.reopen());
+        // Initial Focused(false), or early focus before the first presented
+        // frame, must not dismiss an opening window.
+        state.observe_presented_focus(false);
+        assert!(!state.can_dismiss_on_focus_loss());
+        state.observe_presented_focus(true);
+        assert!(!state.can_dismiss_on_focus_loss());
+        state.pending_show = false; // Production clears this only on Presented.
+        state.observe_presented_focus(false);
+        assert!(!state.can_dismiss_on_focus_loss());
+        state.observe_presented_focus(true);
+        assert!(state.can_dismiss_on_focus_loss(), "first outside click is now valid");
+        state.observe_presented_focus(false);
+        assert!(state.can_dismiss_on_focus_loss());
+        state.close = true;
+        state.update_dismissal(MENU_FADE_SECONDS);
+        assert!(state.hide_ready());
+        state.hidden = true;
+        state.close = false;
+        let hidden_at = state.last_hidden_unix_ms;
+        for _ in 0..10 {
+            assert!(!state.hide_ready());
+        }
+        assert_eq!(state.last_hidden_unix_ms, hidden_at, "idle must not extend the timestamp guard");
+        assert!(state.reopen());
+        assert!(!state.can_dismiss_on_focus_loss(), "new opening requires its own presented focus");
     }
 
     #[test]

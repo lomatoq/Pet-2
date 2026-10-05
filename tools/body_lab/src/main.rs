@@ -982,16 +982,13 @@ impl ApplicationHandler for BodyLab {
             }
             if let Some(store) = &self.store {
                 let channel = self.menu_channel.clone().unwrap_or_else(|| desktop_host::CareMenuChannel::legacy(&store.paths.root));
-                if channel.consume_open() {
-                    if menu.reopen() {
-                        menu.nest_x = companion_glass::position(&runtime.window, &channel.placement_path());
+                if menu.consume_desktop_toggle(&channel) {
+                    menu.nest_x = companion_glass::position(&runtime.window, &channel.placement_path());
                     runtime.renderer.resize(runtime.window.inner_size());
-                        menu.pending_show = true;
-                        if let Some(monitor) = &mut runtime.live_monitor {
-                            monitor.connect();
-                        }
+                    menu.pending_show = true;
+                    if let Some(monitor) = &mut runtime.live_monitor {
+                        monitor.connect();
                     }
-                    if !menu.pending_show { runtime.window.focus_window(); }
                 }
                 if menu.hidden {
                     let stopped = fs::read(store.paths.root.join("runtime-load-ack.json"))
@@ -1238,6 +1235,11 @@ impl ApplicationHandler for BodyLab {
                 .egui_state
                 .on_window_event(runtime.window.as_ref(), &event);
             match event {
+                WindowEvent::MouseInput { button, state, .. } if runtime.pet_menu.is_some() => {
+                    if let Some(menu) = &mut runtime.pet_menu {
+                        menu.on_native_mouse_button(button, state);
+                    }
+                }
                 WindowEvent::Focused(false) if runtime.pet_menu.is_some() => {
                     if let Some(menu) = &mut runtime.pet_menu
                         && menu.can_dismiss_on_focus_loss()

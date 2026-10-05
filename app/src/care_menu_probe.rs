@@ -3,7 +3,7 @@
 //! clicks, and runs the same storage/admission/session transitions as production.
 use super::{
     LabCommandAdmission, LabInterventionState, LabSessionState, apply_feeding_mode,
-    apply_lab_session_command, unix_time_millis,
+    apply_lab_session_command, cancel_care_placement, unix_time_millis,
 };
 use crate::care_menu_runtime::CareMenuRuntime;
 use desktop_host::{
@@ -105,7 +105,9 @@ impl ApplicationHandler for Probe {
                 ..
             } => {
                 self.right_clicks += 1;
-                self.menu.open(&serde_json::json!({"x":800,"y":900,"left":0,"top":0,"right":1920,"bottom":1080})).expect("native right-click care request");
+                if !cancel_care_placement(&mut self.feeding_seconds, &mut self.cleanup_mode) {
+                    self.menu.open(&serde_json::json!({"x":800,"y":900,"left":0,"top":0,"right":1920,"bottom":1080})).expect("native right-click care request");
+                }
                 self.report();
             }
             WindowEvent::CloseRequested => event_loop.exit(),

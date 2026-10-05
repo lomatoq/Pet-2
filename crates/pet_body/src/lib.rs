@@ -210,6 +210,7 @@ pub struct ProceduralBody {
     ecology_visual_effect: EcologyVisualEffect,
     feeding_mouth_offset: Vec2,
     feeding_mouth_activity: f32,
+    feeding_face_roll: f32,
     feeding_expression_active: bool,
     self_care_motor: lifecore::SelfCareMotorFrame,
     base_somatic_actuation: SomaticActuationPacket,
@@ -255,6 +256,7 @@ impl ProceduralBody {
             ecology_visual_effect: EcologyVisualEffect::default(),
             feeding_mouth_offset: Vec2::ZERO,
             feeding_mouth_activity: 0.0,
+            feeding_face_roll: 0.0,
             feeding_expression_active: false,
             self_care_motor: Default::default(),
             base_somatic_actuation: Default::default(),
@@ -380,16 +382,25 @@ impl ProceduralBody {
     }
 
     pub fn set_feeding_mouth(&mut self, surface_pixels: Option<Vec2>, height: f32, dt: f32) {
+        let surface_pixels=surface_pixels.filter(|p|p.is_finite());
+        let roll_target = surface_pixels.filter(|p|p.is_finite() && p.y>0.0).map_or(0.0,|p| {
+            let hull=self.main_liquid_contact_bounds_pixels(height);
+            let midpoint=(hull.minimum.x+hull.maximum.x)*0.5;
+            ((p.x-midpoint)/((hull.maximum.x-hull.minimum.x)*0.20).max(1.0)*0.70).clamp(-0.70,0.70)
+        });
+        let roll_step=(roll_target-self.feeding_face_roll)*(1.0-(-dt.max(0.0)/0.25).exp());
+        self.feeding_face_roll+=(roll_step).clamp(-2.0*dt.max(0.0),2.0*dt.max(0.0));
         let target = surface_pixels.map_or(Vec2::ZERO, |p| {
             let local =
                 p * Vec2::new(1.0, -1.0) * (2.0 * self.projection_scale() / height.max(1.0));
-            let frame = self.embodiment.liquid.render_state().face_frame;
+            let mut frame = self.embodiment.liquid.render_state().face_frame;
+            (frame.axis_x,frame.axis_y)=self.feeding_face_axes(frame.axis_x,frame.axis_y);
             let delta = local - frame.origin;
             (Vec2::new(delta.dot(frame.axis_x), delta.dot(frame.axis_y))
                 / frame.scale.max(Vec2::splat(0.01))
                 - Vec2::new(0.0, -0.135))
             // This is a whole-face goal, never an independent mouth target.
-            .clamp(Vec2::new(0.0, -1.8), Vec2::new(0.0, 0.0))
+            .clamp(Vec2::new(-1.4, -1.8), Vec2::new(1.4, 0.0))
         });
         let alpha = 1.0 - (-12.0 * dt.max(0.0)).exp();
         self.feeding_mouth_offset = self.feeding_mouth_offset.lerp(target, alpha);
@@ -404,8 +415,15 @@ impl ProceduralBody {
         Vec2::ZERO
     }
 
+    fn feeding_face_axes(&self, axis_x: Vec2, axis_y: Vec2) -> (Vec2,Vec2) {
+        // Contact, containment and drawing share the complete face transform.
+        let turn=glam::Mat2::from_angle(self.excitement_roll+self.feeding_face_roll);
+        (turn*axis_x,turn*axis_y)
+    }
+
     pub fn feeding_mouth_rest_pixels(&self, height: f32) -> Vec2 {
-        let frame = self.embodiment.liquid.render_state().face_frame;
+        let mut frame = self.embodiment.liquid.render_state().face_frame;
+        (frame.axis_x,frame.axis_y)=self.feeding_face_axes(frame.axis_x,frame.axis_y);
         let offset = self.feeding_mouth_render_offset();
         let local = self.contained_face.origin.unwrap_or(frame.origin)
             + frame.axis_x * offset.x * frame.scale.x
@@ -414,7 +432,8 @@ impl ProceduralBody {
     }
 
     pub fn feeding_mouth_tip_pixels(&self, height: f32) -> Vec2 {
-        let frame = self.embodiment.liquid.render_state().face_frame;
+        let mut frame = self.embodiment.liquid.render_state().face_frame;
+        (frame.axis_x,frame.axis_y)=self.feeding_face_axes(frame.axis_x,frame.axis_y);
         let offset = self.feeding_mouth_render_offset();
         let local = self.contained_face.origin.unwrap_or(frame.origin)
             + frame.axis_x * offset.x * frame.scale.x
@@ -807,7 +826,9 @@ impl ProceduralBody {
     pub fn presentation_update(&mut self, dt: f32) {
         self.embodiment.presentation_update(dt);
         let liquid = self.embodiment.liquid.render_state();
-        let frame = liquid.face_frame;
+        let mut frame = liquid.face_frame;
+        (frame.axis_x,frame.axis_y)=self.feeding_face_axes(frame.axis_x,frame.axis_y);
+        let presented_origin = self.contained_face.origin.unwrap_or(frame.origin);
         let particles = &liquid.particles[..liquid.particle_count];
         let mut sum = Vec2::ZERO;
         let mut mass = 0.0;
@@ -874,6 +895,13 @@ impl ProceduralBody {
                     (0.65 + 0.75 * self.feeding_mouth_activity) * dt.clamp(0.0, 0.05),
                 ),
         );
+        if self.feeding_mouth_activity > 0.05 {
+            // Bound material advection and mask pursuit together, so switching
+            // sides of a meal cannot spend two independent motion budgets.
+            let origin=self.contained_face.origin.unwrap();
+            self.contained_face.origin=Some(presented_origin+(origin-presented_origin)
+                .clamp_length_max(0.65*dt.clamp(0.0,0.05)));
+        }
     }
 
     #[must_use]
@@ -1529,7 +1557,7 @@ impl ProceduralBody {
                 let mut liquid = self.embodiment.liquid.render_state();
                 // One transform for eyes, brows and mouth; ordinary attention keeps
                 // its existing limits while a playful roll can turn the whole face.
-                let turn = glam::Mat2::from_angle(self.excitement_roll);
+                let turn = glam::Mat2::from_angle(self.excitement_roll+self.feeding_face_roll);
                 liquid.face_frame.axis_x = turn * liquid.face_frame.axis_x;
                 liquid.face_frame.axis_y = turn * liquid.face_frame.axis_y;
                 let desired = liquid.face_frame.origin;
@@ -1896,6 +1924,38 @@ mod tests {
         let restored = body.render_parameters(&genome, 0.3);
         assert!(restored.feeding_mouth_offset.length() < 0.001);
         assert!(restored.liquid.face_frame.origin.distance(before) < 0.06);
+    }
+
+    #[test]
+    fn feeding_tilt_contact_matches_drawing_with_roll_and_releases_smoothly() {
+        let genome=Genome::from_seed(5784121873664838231);
+        let mut body=ProceduralBody::generate(&genome).unwrap();
+        body.set_presentation_scale(2.0);
+        body.excitement_roll=0.2;
+        body.presentation_update(1.0/120.0);
+        for side in [-1.0,1.0] {
+            for _ in 0..120 {
+                body.set_feeding_mouth(Some(Vec2::new(side*32.0,80.0)),1440.0,1.0/120.0);
+                body.presentation_update(1.0/120.0);
+                let params=body.render_parameters(&genome,0.0);
+                let f=params.liquid.face_frame;
+                let lip=(f.origin-f.axis_y*f.scale.y*0.135)*Vec2::new(1.0,-1.0)
+                    *(1440.0/(2.0*body.projection_scale()));
+                assert!(lip.distance(body.feeding_mouth_tip_pixels(1440.0))<0.0001);
+                assert_eq!(params.feeding_mouth_offset,Vec2::ZERO);
+            }
+            assert_eq!(body.feeding_face_roll.signum(),side);
+        }
+        let mut previous=body.feeding_mouth_tip_pixels(1440.0);
+        for _ in 0..360 {
+            body.set_feeding_mouth(None,1440.0,1.0/120.0);
+            body.presentation_update(1.0/120.0);
+            let tip=body.feeding_mouth_tip_pixels(1440.0);
+            assert!(tip.distance(previous)<3.5,"cancelled feeding face jumped");
+            previous=tip;
+        }
+        assert!(body.feeding_face_roll.abs()<0.001);
+        assert!(body.feeding_mouth_offset.length()<0.001);
     }
 
     #[test]

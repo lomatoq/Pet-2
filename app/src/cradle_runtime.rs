@@ -23,6 +23,13 @@ impl CradleGeometry {
             && target.y > self.anchor.y - 85.0
             && target.y < self.floor + 30.0
     }
+
+    /// The meal is inside the bowl even when the body's feeding root is above
+    /// its lip. Admission follows the food; the motor still keeps its actual
+    /// root goal, constrained by the physical cushion and side walls.
+    pub fn food_scene_target(self, root_target: Vec2, food: Option<Vec2>) -> Vec2 {
+        if food.is_some_and(|p| self.contains_target(p)) { self.anchor } else { root_target }
+    }
 }
 
 #[derive(Default)]
@@ -156,6 +163,19 @@ mod tests {
     use super::*;
     fn geometry() -> CradleGeometry {
         CradleGeometry::new(Vec2::new(300.0, 300.0), [1920, 1080], 1.0)
+    }
+    #[test]
+    fn meal_inside_cradle_owns_admission_even_when_feeding_root_is_above_lip() {
+        let g = geometry();
+        let root = Vec2::new(g.anchor.x+28.0,g.anchor.y-120.0);
+        let meal = Vec2::new(g.anchor.x+40.0,g.floor-3.0);
+        assert!(!g.contains_target(root));
+        let scene = g.food_scene_target(root,Some(meal));
+        assert!(g.contains_target(scene));
+        let mut seat = CradleSeat { inside: true, ..Default::default() };
+        assert!(seat.navigation(g,root,Vec2::splat(-65.0),Vec2::splat(65.0),scene).is_none());
+        let outside=Vec2::new(g.anchor.x+g.half_width+20.0,g.floor);
+        assert_eq!(g.food_scene_target(root,Some(outside)),root);
     }
     #[test]
     fn cushion_collision_precedes_admission_and_rejects_underneath() {

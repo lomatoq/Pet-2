@@ -56,6 +56,9 @@ impl Capture {
         body.apply_tuning_profile(profile.clone())?;
         let mut renderer = pollster::block_on(Renderer::new(window.clone(), &body.mesh))?;
         renderer.set_review_background(ReviewBackground::Transparent);
+        if std::env::args().any(|arg| arg == "--waste-material-only") {
+            return self.render_waste_material(&mut renderer, &body, &genome);
+        }
         if std::env::args().any(|arg| arg == "--orb-regression-only") {
             return self.render_orb_regression(&mut renderer, &body, &genome);
         }
@@ -473,6 +476,63 @@ impl Capture {
             bytes.extend(frame.height.to_le_bytes());
             bytes.extend(frame.rgba8);
             std::fs::write(self.output.join(format!("{name}.rgba")), bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Isolated native optical fixture. Geometry and floor stay fixed while
+    /// the production instance clock advances; never reads the user's save.
+    fn render_waste_material(
+        &self,
+        renderer: &mut Renderer,
+        body: &ProceduralBody,
+        genome: &Genome,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use pet_ecology::{WasteChain, WasteNode};
+        const SIZE: u32 = 256;
+        renderer.resize(PhysicalSize::new(SIZE, SIZE));
+        let mut params = body.render_parameters(genome, 0.0);
+        params.presentation_visibility = 0.0;
+        params.shadow_opacity = 0.0;
+        params.joy_aura = 0.0;
+        params.material_bloom_strength = 0.0;
+        let mut objects = pet_body::EcologyRenderer::new(
+            renderer.device(), renderer.surface_format(), renderer.premultiplied_output(),
+        );
+        for (scale_name, radius) in [("native", 3.5 / SIZE as f32), ("detail", 14.0 / SIZE as f32)] {
+            for (shape, count, hardness) in [("soft", 8, 0.15), ("firm", 12, 0.85), ("single", 1, 0.5)] {
+                let mut ecology = pet_ecology::EcologyState::new(42);
+                ecology.objects.clear();
+                let nodes = (0..count).map(|i| {
+                    let t = i as f32 / (count - 1).max(1) as f32;
+                    let p = if count == 1 { Vec2::ZERO } else {
+                        Vec2::new((t - 0.5) * 5.0, (t * std::f32::consts::TAU).sin() * 0.7)
+                    };
+                    WasteNode { position: Vec2::splat(0.5) + p * radius,
+                        velocity: Vec2::ZERO, radius }
+                }).collect();
+                ecology.waste.chains.push(WasteChain {
+                    nodes, hardness, rest_length: radius, rest_turn: 0.0,
+                    rest_turns: Vec::new(), remaining: 0.0, next_segment: 0.0,
+                    mass: 0.1, floor: 0.5 + radius * 1.15,
+                    resting_seconds: 0.0, suction: None,
+                });
+                for frame_index in 0..=30 {
+                    let time = frame_index as f32 / 30.0;
+                    objects.prepare(renderer.queue(), &ecology, 1.0, time);
+                    renderer.reset_perceptual_capture_state();
+                    let frame = renderer.render_capture_with_layers(
+                        params, |_, _, _, _| {},
+                        |_, _, encoder, view| objects.render_prepared_objects(encoder, view),
+                    )?;
+                    assert!(frame.rgba8.chunks_exact(4).any(|p| p[3] > 128), "empty waste fixture");
+                    let mut bytes = Vec::with_capacity(frame.rgba8.len() + 8);
+                    bytes.extend(frame.width.to_le_bytes());
+                    bytes.extend(frame.height.to_le_bytes());
+                    bytes.extend(frame.rgba8);
+                    std::fs::write(self.output.join(format!("{scale_name}-{shape}-{frame_index:02}.rgba")), bytes)?;
+                }
+            }
         }
         Ok(())
     }

@@ -223,9 +223,35 @@ fn desktop_button_action(button: MouseButton, state: ElementState) -> DesktopBut
     }
 }
 
+fn cancel_care_placement(feeding_seconds: &mut f32, cleanup_mode: &mut bool) -> bool {
+    let cancelled = *feeding_seconds > 0.0 || *cleanup_mode;
+    *feeding_seconds = 0.0;
+    *cleanup_mode = false;
+    cancelled
+}
+
+#[cfg(test)]
+mod care_secondary_routing_tests {
+    use super::*;
+
+    #[test]
+    fn secondary_press_cancels_placement_before_it_can_toggle_menu() {
+        for (mut feeding, mut cleanup) in [(90.0, false), (0.0, true), (90.0, true)] {
+            assert_eq!(desktop_button_action(MouseButton::Right, ElementState::Pressed), DesktopButtonAction::CareMenu);
+            assert!(cancel_care_placement(&mut feeding, &mut cleanup));
+            assert_eq!(feeding, 0.0);
+            assert!(!cleanup);
+            // Release does nothing. Only a distinct later press may open care.
+            assert_eq!(desktop_button_action(MouseButton::Right, ElementState::Released), DesktopButtonAction::Ignore);
+            assert!(!cancel_care_placement(&mut feeding, &mut cleanup));
+        }
+    }
+}
+
 fn request_companion_care_menu(runtime: &mut PetRuntime, _store: &StateStore) {
-    runtime.feeding_seconds = 0.0;
-    runtime.cleanup_mode = false;
+    if cancel_care_placement(&mut runtime.feeding_seconds, &mut runtime.cleanup_mode) {
+        return;
+    }
     let nest =
         virtual_normalized_to_physical(&runtime.topology, runtime.ecology.state().den.anchor);
     let bounds = runtime
@@ -242,7 +268,7 @@ fn request_companion_care_menu(runtime: &mut PetRuntime, _store: &StateStore) {
         .map_or(runtime.topology.virtual_physical_bounds, |m| m.working_area);
     let placement = serde_json::json!({"x":nest.x,"y":nest.y,"left":bounds.minimum.x,"top":bounds.minimum.y,"right":bounds.maximum.x,"bottom":bounds.maximum.y});
     if let Err(error) = runtime.companion_menu.open(&placement) {
-        eprintln!("care menu open: {error}");
+        eprintln!("care menu toggle: {error}");
     }
 }
 
@@ -3037,7 +3063,15 @@ impl PetApplication {
                 virtual_normalized_to_physical(&runtime.topology, runtime.intent.target_position),
                 sleep_scene_owns_navigation,
             );
+            let original_target = cradle_geometry.food_scene_target(original_target,
+                (!runtime.sensors.pet_dragged && !sleep_scene_owns_navigation)
+                    .then(||runtime.ecology.feeding_food_position()
+                        .map(|p|virtual_normalized_to_physical(&runtime.topology,p))).flatten());
             let wants_cradle = cradle_geometry.contains_target(original_target);
+            runtime.ecology.set_food_entry_waypoint(!runtime.sensors.pet_dragged
+                && !runtime.cradle_seat.inside
+                && runtime.ecology.feeding_food_position().is_some_and(|p|
+                    cradle_geometry.contains_target(virtual_normalized_to_physical(&runtime.topology,p))));
             let cognitive_navigation = (
                 runtime.intent.target_position,
                 runtime.intent.locomotion,

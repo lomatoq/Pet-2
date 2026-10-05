@@ -387,6 +387,9 @@ impl EpisodeMemory {
 
 #[derive(Clone, Debug)]
 pub struct EpisodeDirector {
+    food_reach: Option<FoodReachAttempt>,
+    food_reach_cooldowns: Vec<(ObjectId, Vec2, f32)>,
+    stalled_food: Option<ObjectId>,
     activations: [f32; crate::EPISODE_GOAL_COUNT],
     adaptation: EpisodeAdaptation,
     prediction_observer: crate::orb_experience::OrbPredictionObserver,
@@ -402,9 +405,20 @@ pub struct EpisodeDirector {
     endogenous_play_cooldown: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FoodReachAttempt {
+    object_id: ObjectId,
+    position: Vec2,
+    best_distance_px: f32,
+    stalled_seconds: f32,
+}
+
 impl Default for EpisodeDirector {
     fn default() -> Self {
         Self {
+            food_reach: None,
+            food_reach_cooldowns: Vec::new(),
+            stalled_food: None,
             activations: [0.0; crate::EPISODE_GOAL_COUNT],
             adaptation: EpisodeAdaptation::default(),
             prediction_observer: Default::default(),
@@ -423,6 +437,37 @@ impl Default for EpisodeDirector {
 }
 
 impl EpisodeDirector {
+    /// A reach failure is motor evidence, never a change of taste. Progress and
+    /// moved food rearm the attempt; long entry/travel routes retain a grace period.
+    pub fn observe_food_reach(&mut self, state: &EcologyState, object_id: ObjectId,
+        mouth_distance_px: f32, contact: bool, entry_waypoint: bool, dt: f32) {
+        let Some(active) = self.active.filter(|a| a.object_id == Some(object_id)
+            && matches!(a.goal, EpisodeGoal::InspectMorsel | EpisodeGoal::EatMorsel)
+            && a.phase != EpisodePhase::Recover) else { self.food_reach = None; return; };
+        let Some(food) = state.objects.iter().find(|o|o.id == object_id && matches!(o.lifecycle,
+            ObjectLifecycle::Free | ObjectLifecycle::Sleeping)) else { self.food_reach = None; return; };
+        // Climbing over a real lip temporarily increases mouth distance. The
+        // host owns that detour; it is bounded and does not fabricate progress.
+        if entry_waypoint && active.elapsed_seconds < 20.0 { self.food_reach = None; return; }
+        if contact || !mouth_distance_px.is_finite() { self.food_reach = None; return; }
+        let moved = self.food_reach.is_some_and(|a|a.object_id != object_id || a.position.distance(food.position)>0.005);
+        if self.food_reach.is_none() || moved {
+            self.food_reach = Some(FoodReachAttempt{object_id,position:food.position,best_distance_px:mouth_distance_px,stalled_seconds:0.0});
+        }
+        let attempt = self.food_reach.as_mut().unwrap();
+        if mouth_distance_px < attempt.best_distance_px - 3.0 {
+            attempt.best_distance_px = mouth_distance_px;
+            attempt.stalled_seconds = 0.0;
+        } else { attempt.stalled_seconds += dt.clamp(0.0,0.25); }
+        let grace = if mouth_distance_px <= 220.0 { 6.0 } else { 20.0 };
+        if active.elapsed_seconds > grace && attempt.stalled_seconds >= 4.0 {
+            self.stalled_food = Some(object_id);
+            self.food_reach_cooldowns.retain(|(id,_,_)|*id != object_id);
+            self.food_reach_cooldowns.push((object_id,food.position,12.0));
+            self.food_reach = None;
+        }
+    }
+
     pub fn from_memory(memory: &EpisodeMemory) -> Self {
         if !memory.is_valid() {
             return Self::default();
@@ -727,6 +772,15 @@ impl EpisodeDirector {
             && ((self.endogenous_idle_seconds >= 3.5 && endogenous_need >= 0.14)
                 || self.endogenous_idle_seconds >= 8.0);
         let mut output = empty_output(brain_intent);
+        for (_,_,seconds) in &mut self.food_reach_cooldowns { *seconds -= dt; }
+        self.food_reach_cooldowns.retain(|(id,position,seconds)| *seconds > 0.0
+            && state.objects.iter().any(|o|o.id == *id && o.position.distance(*position) <= 0.005));
+        if let Some(id) = self.stalled_food.take()
+            && self.active.is_some_and(|a|a.object_id == Some(id))
+            && let Some(aborted) = self.active.take() {
+            state.episode_stats.aborted[aborted.goal.index()] += 1;
+            push_outcome(&mut output, EcologyOutcome::EpisodeAborted(aborted.goal,EpisodeReason::TimedOut));
+        }
         output.debug.tick = self.tick;
         output.debug.focus_mode_filtered = frame.focus_mode;
 
@@ -1188,6 +1242,7 @@ impl EpisodeDirector {
             // travel cost. Select the best real morsel rather than vector order.
             for morsel in state.objects.iter().filter(|o| {
                 o.kind == ObjectKind::Morsel
+                    && !self.food_reach_cooldowns.iter().any(|(id,_,_)|*id == o.id)
                     && (state.metabolism.satiation < 0.88 || o.radius_px_at_reference > 3.0)
                     && matches!(
                         o.lifecycle,
@@ -4188,6 +4243,9 @@ mod tests {
         let mut state = EcologyState::new(93);
         let orb_id = state.objects[0].id;
         let mut director = EpisodeDirector {
+            food_reach: None,
+            food_reach_cooldowns: Vec::new(),
+            stalled_food: None,
             activations: [0.0; crate::EPISODE_GOAL_COUNT],
             adaptation: EpisodeAdaptation::default(),
             prediction_observer: Default::default(),
@@ -4460,6 +4518,57 @@ mod tests {
             cohesion_bias: 0.68,
             novelty: 0.84,
         }
+    }
+
+    #[test]
+    fn stalled_food_yields_to_new_crumbs_without_changing_taste_and_rearms_when_moved() {
+        let mut state = EcologyState::new(672);
+        state.metabolism.satiation = 0.1;
+        let id = state.spawn_morsel(Vec2::splat(0.5), test_morsel(0.2), 0.0).unwrap();
+        let taste = state.taste.clone();
+        let preference = state.objects.iter().find(|o|o.id==id).unwrap().preference;
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.food_physical = Some(PhysicalGrabFrame {contact:false, socket_position:frame.pet_position,..Default::default()});
+        for i in 0..30 {
+            frame.timestamp = i as f64 * 0.25;
+            director.observe_food_reach(&state,id,60.0,false,false,0.25);
+            let _ = director.tick(&mut state,frame,representative_intent(),0.25);
+        }
+        assert!(director.food_reach_cooldowns.iter().any(|(blocked,_,_)|*blocked==id));
+        let new_id = state.spawn_morsel(Vec2::new(0.51,0.5), test_morsel(0.2),frame.timestamp).unwrap();
+        let _ = director.tick(&mut state,frame,representative_intent(),0.25);
+        assert_eq!(director.active.unwrap().object_id,Some(new_id));
+        assert_eq!(state.taste,taste);
+        assert_eq!(state.objects.iter().find(|o|o.id==id).unwrap().preference,preference);
+        assert_eq!(state.objects.iter().find(|o|o.id==id).unwrap().lifecycle,ObjectLifecycle::Free);
+        state.objects.retain(|o|o.id!=new_id);
+        state.objects.iter_mut().find(|o|o.id==id).unwrap().position.x+=0.01;
+        director.interrupt_for_shutdown();
+        let _ = director.tick(&mut state,frame,representative_intent(),0.25);
+        assert!(director.food_reach_cooldowns.is_empty());
+        assert_eq!(director.active.unwrap().object_id,Some(id));
+    }
+
+    #[test]
+    fn food_reach_progress_and_long_entry_keep_the_attempt_and_cooldown_expires() {
+        let mut state = EcologyState::new(673);
+        let id = state.spawn_morsel(Vec2::splat(0.5),test_morsel(0.2),0.0).unwrap();
+        let mut director = EpisodeDirector::default();
+        let mut frame = behavior_frame(ActionId::IdleHover);
+        frame.food_physical=Some(PhysicalGrabFrame{contact:false,socket_position:frame.pet_position,..Default::default()});
+        for i in 0..100 {
+            director.observe_food_reach(&state,id,800.0-i as f32*4.0,false,false,0.25);
+            let _ = director.tick(&mut state,frame,representative_intent(),0.25);
+        }
+        assert!(director.food_reach_cooldowns.is_empty(),"ongoing distant travel must not be classified as blocked");
+        assert_eq!(director.active.unwrap().object_id,Some(id));
+        director.food_reach_cooldowns.push((id,Vec2::splat(0.5),0.1));
+        director.interrupt_for_shutdown();
+        frame.timestamp+=0.25;
+        let _ = director.tick(&mut state,frame,representative_intent(),0.25);
+        assert!(director.food_reach_cooldowns.is_empty());
+        assert_eq!(director.active.unwrap().object_id,Some(id));
     }
 
     #[test]

@@ -65,7 +65,13 @@ impl CareMenuRuntime {
     }
 
     pub(crate) fn open(&mut self, placement: &serde_json::Value) -> io::Result<()> {
-        self.channel.write_placement(placement)?;
+        let mut placement = placement.clone();
+        // Keep the input time across native focus loss and helper scheduling.
+        // A close request issued while visible must not reopen a completed fade.
+        placement["secondary_press_unix_ms"] = serde_json::json!(super::unix_time_millis(
+            std::time::SystemTime::now(),
+        ));
+        self.channel.write_placement(&placement)?;
         let running = match self.child.as_mut() {
             Some(child) => child.try_wait()?.is_none(),
             None => false,

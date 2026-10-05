@@ -618,9 +618,22 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let spec=pow(max(0.0,dot(normal,normalize(vec3<f32>(-0.3,0.45,1.5)))),24.0)*0.10;
         let aa=max(fwidth(d),0.00004);
         let floor_mask=1.0-smoothstep(input.waste3.z-0.0006,input.waste3.z,input.screen_uv.y);
-        let alpha=(1.0-smoothstep(-aa,aa,d))*input.color.a*floor_mask;
-        let rgb=input.color.rgb*lighting+vec3<f32>(1.0,0.85,0.93)*spec;
-        return encode_surface_output(vec4<f32>(rgb*alpha,alpha));
+        let coverage=1.0-smoothstep(-aa,aa,d);
+        // Keep the original soft pink material. A faint continuous shoulder
+        // and exterior bloom share its spline, rather than outlining each node.
+        let depth=clamp(-d/radius,0.0,1.0);
+        let shoulder=exp(-depth/0.14);
+        let rim=exp(-pow((depth-0.16)/0.17,2.0));
+        let paint=input.color.rgb*lighting*(1.0-0.06*shoulder)
+            +vec3<f32>(1.0,0.85,0.93)*spec
+            +vec3<f32>(0.82,0.64,0.88)*rim*0.025;
+        // Fade to zero inside the existing padded quad even for subpixel traces.
+        let bloom=exp(-pow(max(d,0.0)/max(radius*0.14,aa*1.15),2.0))*0.10*(1.0-coverage)
+            *(1.0-smoothstep(radius*0.20,radius*0.38,d));
+        let opacity=input.color.a*floor_mask;
+        let alpha=(coverage+bloom)*opacity;
+        let rgb=(paint*coverage+input.color.rgb*bloom*0.72)*opacity;
+        return encode_surface_output(vec4<f32>(rgb,alpha));
     }
     if input.material.x > 1.5 {
         let pulse = 0.62 + 0.38 * sin(input.material.w * 1.65);
