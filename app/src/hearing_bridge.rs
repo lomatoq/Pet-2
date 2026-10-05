@@ -26,6 +26,23 @@ struct OutputReferenceCadence {
     was_active: bool,
 }
 
+#[derive(Default)]
+struct TrainingInputHealth {
+    silent_seconds: f32,
+}
+
+impl TrainingInputHealth {
+    fn observe(&mut self, dt: f32, training: bool, listening: bool, rms: f32) {
+        // This diagnoses an empty/muted input; it never changes VAD or accepts
+        // silent examples. Device startup and ordinary pauses are not failures.
+        if !training || !listening || (rms.is_finite() && rms > 0.00001) {
+            self.silent_seconds = 0.0;
+        } else if dt.is_finite() {
+            self.silent_seconds = (self.silent_seconds + dt.clamp(0.0, 0.25)).min(60.0);
+        }
+    }
+}
+
 impl OutputReferenceCadence {
     fn due(&mut self, dt: f32, active: bool) -> bool {
         self.elapsed += dt;
@@ -63,6 +80,7 @@ pub struct HearingBridge {
     elapsed_since_save: f32,
     dirty: bool,
     reference_cadence: OutputReferenceCadence,
+    training_input_health: TrainingInputHealth,
 }
 
 impl Drop for HearingBridge {
@@ -137,6 +155,7 @@ impl HearingBridge {
             elapsed_since_save: 0.0,
             dirty: enable,
             reference_cadence: OutputReferenceCadence::default(),
+            training_input_health: TrainingInputHealth::default(),
         }
     }
 
@@ -151,7 +170,10 @@ impl HearingBridge {
                 if index != 0 && device.is_none() {
                     return;
                 }
+                self.training_input_health = TrainingInputHealth::default();
+                let was_training = self.training();
                 self.message = match self.input.select_device(device.clone()) {
+                    Ok(()) if was_training => "Микрофон переключён. Сохранённые примеры остались; проверь индикатор и снова начни запись.".into(),
                     Ok(()) => "Микрофон переключён. Проверь индикатор голоса.".into(),
                     Err(error) => format!("Не удалось переключить микрофон: {error}"),
                 };
@@ -180,6 +202,7 @@ impl HearingBridge {
             | HearingAction::TrainQuiet
             | HearingAction::TrainOther
             | HearingAction::TrainCommand { .. } => {
+                self.training_input_health = TrainingInputHealth::default();
                 if !self.enabled {
                     self.control(HearingAction::Enable);
                 }
@@ -374,6 +397,13 @@ impl HearingBridge {
         if self.input.take_dirty_model_snapshot().is_some() {
             self.dirty = true;
         }
+        let status = self.input.status();
+        self.training_input_health.observe(
+            dt,
+            status.training.is_some(),
+            status.state == AudioInputState::Listening,
+            status.rms,
+        );
         if self.elapsed_since_save > 1.0 {
             self.save_if_dirty();
         }
@@ -420,6 +450,7 @@ impl HearingBridge {
         serde_json::json!({"enabled":self.enabled,"device":status.device_name,"input_devices":self.input_devices,"input_device":self.input_device,
             "message":status.last_error.as_ref().unwrap_or(&self.message),"input_level":status.rms,
             "status":status,"last_cue":self.last_cue,"master_gain":self.master_gain,
+            "training_input_silent_seconds":self.training_input_health.silent_seconds,
             "quiet_seconds":self.quiet_seconds,"test_seconds":self.test_seconds,
             "completed_trainings":self.completed_trainings,"accepted":self.accepted,"rejected":self.rejected,"training":self.input.training_progress(),
             "name_examples":model.name.as_ref().map_or(0, |c| c.examples.len()),
@@ -460,6 +491,21 @@ impl HearingBridge {
             Err(error) => self.message = format!("Hearing settings could not be saved: {error}"),
         }
     }
+}
+
+#[test]
+fn training_input_health_reports_empty_stream_but_recovers_on_audio_and_device_startup() {
+    let mut health = TrainingInputHealth::default();
+    for _ in 0..20 { health.observe(0.25, true, true, 0.0); }
+    assert!(health.silent_seconds >= 4.0);
+    health.observe(0.05, true, true, 0.0001);
+    assert_eq!(health.silent_seconds, 0.0, "Quiet real audio clears the empty-stream warning");
+    for _ in 0..20 { health.observe(0.25, true, false, 0.0); }
+    assert_eq!(health.silent_seconds, 0.0, "Opening/disconnected input is not classified as mute");
+    health.observe(10.0, true, true, 0.0);
+    assert_eq!(health.silent_seconds, 0.25, "Long stalls cannot immediately diagnose silence");
+    health.observe(0.05, false, true, 0.0);
+    assert_eq!(health.silent_seconds, 0.0, "Normal quiet listening is not failed teaching");
 }
 
 #[test]

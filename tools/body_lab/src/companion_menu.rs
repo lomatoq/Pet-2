@@ -538,6 +538,61 @@ fn advance_press(value: &mut f32, velocity: &mut f32, held: bool, dt: f32, reduc
     *velocity = (*value - previous) / dt.max(0.001);
 }
 
+fn microphone_label(hearing: &Value) -> String {
+    if let Some(selected) = hearing["input_device"].as_str() {
+        selected.to_owned()
+    } else if let Some(active) = hearing["device"].as_str() {
+        format!("System: {active}")
+    } else {
+        "System microphone".to_owned()
+    }
+}
+
+fn microphone_notice(hearing: &Value) -> Option<&str> {
+    if let Some(error) = hearing["status"]["last_error"].as_str() {
+        Some(error)
+    } else if !hearing["enabled"].as_bool().unwrap_or(false) {
+        Some("Microphone is off. Recording will turn it on.")
+    } else if hearing["training_input_silent_seconds"].as_f64().unwrap_or(0.0) >= 4.0 {
+        Some("No sound from this microphone. Choose your headset above and check mute.")
+    } else {
+        None
+    }
+}
+
+fn microphone_controls(ui: &mut egui::Ui, hearing: &Value, page: usize) -> Option<H> {
+    let mut action = None;
+    ui.small("Microphone");
+    egui::ComboBox::from_id_salt(("care-input", page))
+        .width(ui.available_width())
+        .truncate()
+        .selected_text(microphone_label(hearing))
+        .show_ui(ui, |ui| {
+            let default_label = hearing["device"].as_str()
+                .filter(|_| hearing["input_device"].is_null())
+                .map_or_else(|| "System microphone".to_owned(), |name| format!("System: {name}"));
+            if ui.selectable_label(hearing["input_device"].is_null(), default_label).clicked() {
+                action = Some(H::SelectInput { index: 0 });
+            }
+            if let Some(devices) = hearing["input_devices"].as_array() {
+                for (i, device) in devices.iter().enumerate() {
+                    if let Some(name) = device.as_str()
+                        && ui.selectable_label(hearing["input_device"].as_str() == Some(name), name).clicked()
+                    {
+                        action = Some(H::SelectInput { index: i as u16 + 1 });
+                    }
+                }
+            }
+        }).response.on_hover_text(microphone_label(hearing));
+    let rms = hearing["input_level"].as_f64().unwrap_or(0.0) as f32;
+    ui.add(egui::ProgressBar::new((rms.sqrt() * 2.2).clamp(0.0, 1.0))
+        .desired_height(4.0).fill(ACCENT));
+    if let Some(notice) = microphone_notice(hearing) {
+        ui.label(RichText::new(notice).size(12.0).color(Color32::from_rgb(235, 187, 187)));
+    }
+    action
+}
+
 fn panel_surface(p: &egui::Painter, rect: Rect) {
     p.add(
         egui::epaint::RectShape::filled(
@@ -796,11 +851,11 @@ fn show_frame(
     }
     if let Some(page) = state.page {
         let height = match page {
-            1 => 374.0,
-            2 => 294.0,
-            3 => 304.0,
+            1 => 492.0_f32,
+            2 => 462.0,
+            3 => 344.0,
             _ => 256.0,
-        };
+        }.min((base.y - screen.min.y - 30.0).max(120.0));
         let rect = Rect::from_min_size(
             pos2(nest_x - 160.0, base.y - height - 18.0),
             vec2(320.0, height),
@@ -836,17 +891,19 @@ fn show_frame(
             ui.label(RichText::new(match page {1=>"A familiar sound. A shared little ritual.",2=>"Your voice makes it familiar.",3=>"Keep it comfortable for both of you.",_=>"Small moments, whenever you like."}).size(13.0).color(MUTED));
             ui.add_space(8.0);
 
-            ui.add_enabled_ui(ready,|ui|match page{
+            egui::ScrollArea::vertical().max_height((rect.height()-92.0).max(64.0)).show(ui,|ui|{ui.add_enabled_ui(ready,|ui|match page{
                 1|2=>{
                     if page==1 {egui::ComboBox::from_id_salt("care-cue").width(ui.available_width()).selected_text(CUES[state.selected]).show_ui(ui,|ui|{for (i,label) in CUES.iter().enumerate().skip(1){ui.selectable_value(&mut state.selected,i,*label);}});}
                     else{ui.label(RichText::new("Bender / Benny").size(18.0).strong());ui.small("Teach him the sound of his name.");}
+                    if let Some(action)=microphone_controls(ui,hearing,page){command=Some(LabControlCommand::Hearing{action});}
                     let index=if page==2{0}else{state.selected};let cue=CueKind::ALL[index];
                     let record=hearing["cues"].as_array().and_then(|a|a.get(index));let count=record.and_then(|r|r["examples"].as_u64()).unwrap_or(0);
                     let training=hearing["training"].is_object();let accepted=hearing["training"]["accepted"].as_u64().unwrap_or(0);
+                    if primary(ui,if training{"Stop recording"}else{"Record 5 examples"}){command=Some(LabControlCommand::Hearing{action:if training{H::CancelTraining}else{H::TrainCommand{cue}}});}
                     ui.small(format!("{count} / 40 examples · {}",if record.is_some_and(|r|r["ready"]==true){"ready to listen"}else{"learning together"}));
                     ui.horizontal(|ui|{let segment_width=(ui.available_width()-32.0)/5.0;for i in 0..5{let (r,_)=ui.allocate_exact_size(vec2(segment_width,5.0),Sense::hover());ui.painter().rect_filled(r,3,if training&&(i as u64)<accepted {ACCENT}else{Color32::from_rgb(61,77,86)});}});
                     ui.label(RichText::new(if training{ "Listening… leave a short pause between phrases." }else{"Say it five times, with a short pause. Existing examples stay saved."}).size(13.0).color(MUTED));
-                    if primary(ui,if training{"Stop recording"}else{"Record 5 examples"}){command=Some(LabControlCommand::Hearing{action:if training{H::CancelTraining}else{H::TrainCommand{cue}}});}
+                    if training && let Some(message)=hearing["message"].as_str(){ui.label(RichText::new(message).size(12.0).color(MUTED));}
                     if page==1 {ui.horizontal(|ui|{if ui.button("Show me").clicked(){command=Some(LabControlCommand::Hearing{action:H::Perform{cue}});}
 if ui.button("Try my voice").clicked(){command=Some(LabControlCommand::Hearing{action:H::Test});}});if ui.small_button("Record other words").on_hover_text("Helps distinguish a command from everyday speech").clicked(){command=Some(LabControlCommand::Hearing{action:H::TrainOther});}}
                 },
@@ -855,12 +912,10 @@ if ui.button("Try my voice").clicked(){command=Some(LabControlCommand::Hearing{a
                     ui.horizontal(|ui|{if ui.small_button(if volume==0{"Unmute"}else{"Mute"}).clicked(){if volume>0{state.restore_volume=volume;volume=0;}else{volume=state.restore_volume.max(30);}}ui.add(egui::Slider::new(&mut volume,0..=100).show_value(false));});
                     if Some(volume)!=state.volume{state.volume=Some(volume);state.last_volume_edit=Some(Instant::now());command=Some(LabControlCommand::Hearing{action:H::SetVolume{percent:volume}});}
                     ui.add_space(5.0);let mut enabled=hearing["enabled"].as_bool().unwrap_or(false);if ui.checkbox(&mut enabled,"Listen to my voice").changed(){command=Some(LabControlCommand::Hearing{action:if enabled{H::Enable}else{H::Disable}});}
-                    egui::ComboBox::from_id_salt("care-input").width(ui.available_width()).selected_text(hearing["input_device"].as_str().unwrap_or("System microphone")).show_ui(ui,|ui|{if ui.selectable_label(hearing["input_device"].is_null(),"System microphone").clicked(){command=Some(LabControlCommand::Hearing{action:H::SelectInput{index:0}});}
-if let Some(devices)=hearing["input_devices"].as_array(){for(i,d)in devices.iter().enumerate(){if let Some(name)=d.as_str()&& ui.selectable_label(hearing["input_device"].as_str()==Some(name),name).clicked(){command=Some(LabControlCommand::Hearing{action:H::SelectInput{index:i as u16+1}});}}}});
-                    let rms=hearing["input_level"].as_f64().unwrap_or(0.0) as f32;ui.add(egui::ProgressBar::new((rms.sqrt()*2.2).clamp(0.0,1.0)).desired_height(4.0).fill(ACCENT));ui.small("Learning stays on this computer.");},
+                    if let Some(action)=microphone_controls(ui,hearing,page){command=Some(LabControlCommand::Hearing{action});}ui.small("Learning stays on this computer.");},
                 _=>{if primary(ui,"Replay birth"){command=Some(LabControlCommand::ReplayBirth);state.close=true;}ui.label(RichText::new("His age and memories stay the same.").small().color(MUTED));if ui.button("Dash to my cursor").clicked(){command=Some(LabControlCommand::Hearing{action:H::Perform{cue:CueKind::Dash}});state.close=true;}
 if ui.button("Close menu").clicked(){state.close=true;}}
-            });
+            });});
         });
     }
     if !reduced && closing.is_none() {
@@ -980,7 +1035,7 @@ pub(super) fn capture_frame(ctx: &egui::Context, fixture: &str) {
     }
     state.page = match fixture {
         "learn" => Some(1),
-        "name" => Some(2),
+        "name" | "name-no-input" => Some(2),
         "voice" | "panel-exit" => Some(3),
         "settings" => Some(4),
         _ => None,
@@ -997,6 +1052,15 @@ pub(super) fn capture_frame(ctx: &egui::Context, fixture: &str) {
             state.action_started = Some(Instant::now());
         }
         "failure" => state.action_error = true,
+        "name-no-input" => {
+            frame["details"]["hearing"] = serde_json::json!({
+                "enabled":true,"device":"Headset Microphone (Oculus Virtual Audio Device)",
+                "input_device":null,"input_devices":["Headset Microphone (Oculus Virtual Audio Device)","Headset (Nothing Headphone (a))"],
+                "input_level":0.0,"training_input_silent_seconds":5.0,
+                "training":{"accepted":0,"required":5},
+                "message":"Имя: 0 из 5. Сделай паузу, затем повтори."
+            });
+        }
         "hover" => state.hover[0] = 1.0,
         "pressed" => {
             state.press[0] = 0.04;
@@ -1103,6 +1167,36 @@ fn primary(ui: &mut egui::Ui, label: &str) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_microphone_name_does_not_expand_the_training_panel() {
+        let ctx=egui::Context::default();
+        let hearing=serde_json::json!({"enabled":true,"input_device":null,
+            "device":"Headset Microphone (Oculus Virtual Audio Device)",
+            "training_input_silent_seconds":5.0});
+        let _=ctx.run(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,egui::vec2(280.0,240.0))),..Default::default()},|ctx|{
+            egui::CentralPanel::default().show(ctx,|ui|{
+                let available=ui.available_width();
+                let _=super::microphone_controls(ui,&hearing,2);
+                assert!(ui.min_rect().width()<=available+0.1);
+            });
+        });
+    }
+
+    #[test]
+    fn microphone_feedback_identifies_silent_default_and_explicit_headset() {
+        let mut hearing=serde_json::json!({"enabled":true,"input_device":null,
+            "device":"Oculus Virtual Audio Device","training_input_silent_seconds":5.0});
+        assert_eq!(super::microphone_label(&hearing),"System: Oculus Virtual Audio Device");
+        assert!(super::microphone_notice(&hearing).unwrap().contains("No sound"));
+        hearing["input_device"]="Headset (Nothing Headphone (a))".into();
+        hearing["training_input_silent_seconds"]=0.0.into();
+        assert_eq!(super::microphone_label(&hearing),"Headset (Nothing Headphone (a))");
+        assert!(super::microphone_notice(&hearing).is_none());
+        hearing["status"]["last_error"]="Microphone unavailable".into();
+        assert_eq!(super::microphone_notice(&hearing),Some("Microphone unavailable"));
+    }
+
     use super::*;
 
     fn ui_tick(
