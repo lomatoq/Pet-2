@@ -4,6 +4,7 @@
 )]
 #![recursion_limit = "1024"]
 
+mod vision_bridge;
 mod activity_glance;
 mod birth_runtime;
 mod care_menu_runtime;
@@ -374,6 +375,7 @@ struct Arguments {
     seed: Option<u64>,
     headless: bool,
     care_menu_probe: bool,
+    local_vision: bool,
     headless_smoke_seconds: Option<f32>,
     simulate_hours: Option<f32>,
     pointer_replay: Option<PathBuf>,
@@ -409,6 +411,7 @@ impl Arguments {
             match argument.as_str() {
                 "--seed" => parsed.seed = Some(value("--seed", &mut arguments)?.parse()?),
                 "--headless" => parsed.headless = true,
+                "--local-vision" => parsed.local_vision = true,
                 "--care-menu-probe" => parsed.care_menu_probe = true,
                 "--headless-smoke" => {
                     parsed.headless_smoke_seconds =
@@ -2180,6 +2183,7 @@ impl LabInterventionState {
 }
 
 struct PetRuntime {
+    vision: vision_bridge::VisionBridge,
     window: Arc<Window>,
     renderer: Renderer,
     ecology_renderer: EcologyRenderer,
@@ -2761,6 +2765,23 @@ impl PetApplication {
                 local_time_01(),
             );
             runtime.sensors.embodied_interaction = runtime.body.embodied_interaction_frame();
+            let mask_rect = |center: Vec2, half: Vec2| RectI {
+                minimum: PhysicalDesktopPoint { x: (center.x-half.x).floor() as i32, y: (center.y-half.y).floor() as i32 },
+                maximum: PhysicalDesktopPoint { x: (center.x+half.x).ceil() as i32, y: (center.y+half.y).ceil() as i32 },
+            };
+            let pet_mask_half = runtime.screen_collision_half_extent_px * 1.8
+                + runtime.screen_velocity_px.abs() * 0.8 + Vec2::splat(32.0);
+            let den_center = virtual_normalized_to_physical(&runtime.topology, runtime.ecology.state().den.anchor);
+            runtime.vision.tick(&snapshot,
+                runtime.was_sleeping || runtime.life.state.focus_mode || runtime.pointer.pet_dragged
+                    || runtime.birth.started.is_some(),
+                [mask_rect(runtime.screen_body_center, pet_mask_half),
+                    mask_rect(den_center, Vec2::splat(190.0 * runtime.ecology.state().den.size_scale))]);
+            // Fill unknown native context only. Existing contextual learners keep ownership.
+            if runtime.sensors.active_app_category == lifecore::AppCategory::Unknown
+                && let Some(category) = runtime.vision.category() {
+                runtime.sensors.active_app_category = category;
+            }
             // A dev fixture is an alternate pointer observation, not a
             // post-physics visual effect. Install it into the canonical sensor
             // frame before Vita observes it so body physics, gesture
@@ -2832,6 +2853,14 @@ impl PetApplication {
                 structure: visual_cell.map_or(0.0, |cell| cell.edge_density),
                 surprise: visual_cell.map_or(0.0, |cell| cell.sudden_change.max(cell.motion)),
             });
+            if !visual_target.is_some_and(|target| target.explicit)
+                && let Some(semantic) = runtime.vision.attention() {
+                runtime.ecology.set_visual_attention(VisualAttentionSample {
+                    target: Some(semantic.position), hue: visual_hue, strength: 0.62,
+                    explicit: false, colorfulness: visual_cell.map_or(0.0, |c| c.colorfulness),
+                    structure: 0.4, surprise: semantic.novelty,
+                });
+            }
             if let Some(signature) = runtime
                 .teach
                 .observe(runtime.sensors.cursor_position, runtime.sensors.timestamp)
@@ -5354,6 +5383,8 @@ impl ApplicationHandler for PetApplication {
         let loaded_genome_hash = prepared.life.state.genome.stable_hash();
         let identity_seed = prepared.life.state.genome.identity_seed;
         self.runtime = Some(PetRuntime {
+            vision: vision_bridge::VisionBridge::new(self.arguments.local_vision,
+                self.store.paths.root.clone(), Arc::clone(&window)),
             window,
             renderer,
             ecology_renderer,
@@ -5658,6 +5689,7 @@ impl ApplicationHandler for PetApplication {
                             );
                             runtime.save_accumulator = 30.0;
                         }
+                        PhysicalKey::Code(KeyCode::KeyV) => { runtime.vision.toggle(); }
                         PhysicalKey::Code(KeyCode::KeyL) => {
                             runtime
                                 .vita

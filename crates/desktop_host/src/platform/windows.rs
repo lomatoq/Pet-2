@@ -207,7 +207,7 @@ impl PlatformBackend for WindowsBackend {
         region: DesktopBackgroundCaptureRegion,
     ) -> Option<DesktopBackgroundFrame> {
         self.background_worker
-            .as_mut()?
+            .get_or_insert_with(|| GdiBackgroundWorker::new(self.started))
             .submit_and_poll(window, region)
     }
 

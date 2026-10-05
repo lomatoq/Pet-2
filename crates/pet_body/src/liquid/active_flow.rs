@@ -11,7 +11,7 @@ pub fn apply_active_flow(
     count: usize,
     body_origin: Vec2,
     seed_phase: f32,
-    _elapsed: f32,
+    elapsed: f32,
     mind: VisualMindInput,
     activity: f32,
     strength_multiplier: f32,
@@ -28,12 +28,23 @@ pub fn apply_active_flow(
         InternalFlowPhase::Outcome => 0.88,
         InternalFlowPhase::Recover => 0.42,
     };
-    let strength = (mind.curiosity * 0.34 + mind.arousal * 0.26 + mind.stress * 0.10
-        - mind.fatigue * 0.22)
-        .max(0.0)
-        * activity.clamp(0.0, 2.0)
-        * strength_multiplier.clamp(0.0, 2.0)
-        * phase_gain;
+    if count == 0 || count > MAX_LIQUID_PARTICLES || !body_origin.is_finite()
+        || !elapsed.is_finite() || !seed_phase.is_finite()
+        || !activity.is_finite() || !strength_multiplier.is_finite() || !damping.is_finite()
+    {
+        return;
+    }
+    let mut mind = mind;
+    mind.sanitize();
+    // Basal internal motion is distinct from locomotion. It remains small in
+    // quiet wakefulness, declines with fatigue and preserves the user's off knob.
+    let basal = 0.075 * (1.0 - mind.fatigue * 0.85) * (1.0 - mind.stress * 0.5);
+    let motivated = (mind.curiosity * 0.34 + mind.arousal * 0.26 + mind.stress * 0.10
+        - mind.fatigue * 0.22).max(0.0) * activity.clamp(0.0, 2.0);
+    let strength = (basal + motivated)
+        * strength_multiplier.clamp(0.0, 2.0) * phase_gain;
+    let basal_phase = elapsed * 0.82 + seed_phase;
+
     if strength <= 0.005 {
         return;
     }
@@ -76,7 +87,16 @@ pub fn apply_active_flow(
             InternalFlowPhase::Recover => -0.12 * (1.0 - p),
             InternalFlowPhase::Ambient => 0.0,
         };
-        proposed[particle_index] += radial * radial_gain * causal_radial * strength;
+        // Two broad counter-deforming lobes, not isotropic pumping. Their
+        // positive/negative radial components approximately balance area; the
+        // existing pressure/contact solver enforces the real body constraints.
+        let theta = body_delta.y.atan2(body_delta.x);
+        let quiet_lobes = 0.085 * (1.0 - mind.fatigue * 0.8)
+            * ((2.0 * theta - basal_phase).sin()
+                + 0.35 * (3.0 * theta + basal_phase * 0.63).sin());
+        proposed[particle_index] += radial * radial_gain
+            * (causal_radial * strength + quiet_lobes * basal
+                * strength_multiplier.clamp(0.0, 2.0));
         proposed[particle_index] -= particle.velocity * damping.clamp(0.0, 1.0) * 0.08;
     }
     if weight_sum <= 1.0e-5 {
@@ -107,6 +127,28 @@ pub fn apply_active_flow(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v68_quiet_flow_is_live_conservative_bounded_and_can_be_disabled() {
+        let mut signatures = Vec::new();
+        for time in [0.0, 1.25, 3.7] {
+            let (mut particles, count) = initialize_particles(42);
+            apply_active_flow(&mut particles, count, Vec2::ZERO, 0.37, time,
+                VisualMindInput { arousal: 0.0, curiosity: 0.0, fatigue: 0.0,
+                    ..VisualMindInput::default() },
+                0.0, 1.0, 0.0, InternalFlowPhase::Ambient, 0.0);
+            let force = particles[..count].iter().map(|p|p.force).sum::<Vec2>();
+            let torque = particles[..count].iter().map(|p|p.position.perp_dot(p.force)).sum::<f32>();
+            let energy = particles[..count].iter().map(|p|p.force.length_squared()).sum::<f32>();
+            assert!(force.length() < 1e-4 && torque.abs() < 1e-4);
+            assert!(energy > 1e-8 && energy < 0.02, "{energy}");
+            signatures.push(particles[0].force);
+        }
+        assert!(signatures[0].distance(signatures[1]) > 1e-6);
+        let (mut p,n)=initialize_particles(42);
+        apply_active_flow(&mut p,n,Vec2::ZERO,0.2,1.0,VisualMindInput::default(),
+            1.0,0.0,0.0,InternalFlowPhase::Ambient,0.0);
+        assert!(p[..n].iter().all(|p|p.force == Vec2::ZERO));
+    }
     use super::*;
     use crate::liquid::particles::initialize_particles;
 

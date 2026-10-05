@@ -12,6 +12,7 @@ living-language = []
 legacy-expression-fallback = []
 
 [dependencies]
+tempfile.workspace = true
 desktop_host = { path = "../crates/desktop_host" }
 glam.workspace = true
 lifecore = { path = "../crates/lifecore" }
@@ -21,6 +22,7 @@ pet_body = { path = "../crates/pet_body" }
 pet_ecology = { path = "../crates/pet_ecology" }
 pet_motor = { path = "../crates/pet_motor" }
 pet_perception = { path = "../crates/pet_perception" }
+pet_vision = { path = "../crates/pet_vision" }
 pollster.workspace = true
 serde.workspace = true
 serde_json.workspace = true

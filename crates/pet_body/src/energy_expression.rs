@@ -116,7 +116,10 @@ impl EnergyExpression {
             self.agitation_drive += (agitation - self.agitation_drive) * a;
             self.appearance.dynamics.z += (self.intensity_drive - self.appearance.dynamics.z) * b;
             self.appearance.dynamics.w += (self.agitation_drive - self.appearance.dynamics.w) * b;
-            let rate = 0.10 + self.appearance.dynamics.z * 0.78;
+            // Continuous speed follows the filtered amplitude, not an action
+            // label. Quiet broad pools remain visibly advected at desktop size.
+            let wake = ((self.appearance.dynamics.z - 0.07) / 0.23).clamp(0.0, 1.0);
+            let rate = 0.10 + wake * 0.16 + self.appearance.dynamics.z * 0.62;
             self.appearance.dynamics.x =
                 (self.appearance.dynamics.x + h * rate).rem_euclid(std::f32::consts::TAU);
             self.appearance.dynamics.y =

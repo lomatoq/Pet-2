@@ -22,3 +22,4 @@ winit.workspace = true
 [dev-dependencies]
 naga.workspace = true
 serde_json.workspace = true
+pollster.workspace = true

@@ -756,7 +756,11 @@ impl EpisodeDirector {
                 | ActionId::LandOnWindow
                 | ActionId::ClingToWindowSide
                 | ActionId::PeekFromEdge
-        );
+        ) && Vec2::new(frame.pet_velocity.x * frame.desktop_aspect, frame.pet_velocity.y)
+            .length_squared() > 0.004_f32.powi(2);
+        // A requested traversal is not evidence of an executed movement.
+        // Active inspection/contact/rest episodes retain their own ownership;
+        // this fallback only observes an otherwise unowned stationary body.
         if self.active.is_none() && !brain_is_traversing && !frame.sleeping && !frame.focus_mode {
             self.endogenous_idle_seconds = (self.endogenous_idle_seconds + dt).min(30.0);
         } else if self.active.is_none() {
@@ -1113,6 +1117,15 @@ impl EpisodeDirector {
                 }
             }
             EpisodeStep::Abort(reason) => {
+                if active.goal == EpisodeGoal::CarryOrbHome && reason == EpisodeReason::TimedOut {
+                    self.endogenous_play_cooldown = self.endogenous_play_cooldown.max(12.0);
+                    self.orb_bid_cooldown = self.orb_bid_cooldown.max(20.0);
+                    if let Some(id)=active.object_id
+                        && state.objects.iter().any(|o|o.id==id && o.lifecycle==ObjectLifecycle::CarriedByPet) {
+                        push_command(&mut output,ObjectCommand::Release {object_id:id,
+                            velocity:frame.pet_velocity.clamp_length_max(0.1)});
+                    }
+                }
                 if active.goal == EpisodeGoal::OfferOrb && reason == EpisodeReason::TimedOut {
                     self.orb_bid_cooldown = self.orb_bid_cooldown.max(20.0);
                 }
@@ -1290,7 +1303,15 @@ impl EpisodeDirector {
                     + frame.play_state.playfulness * 0.16
                     + orb.novelty * 0.18
                     + orb.preference * orb.familiarity * 0.20;
-                let play = capacity * (0.26 + appeal) - distance * 0.10;
+                // A short quiet manipulation costs less than a desktop chase.
+                // Interpolate by actual travel distance; sleep/pressure/focus
+                // remain hard filters above, not learned or weakened constraints.
+                let nearby_capacity = (1.0 - fatigue).powf(1.15)
+                    * state.metabolism.reserve * (1.0 - stress * 0.7);
+                let nearby_weight = (1.0 - distance / 0.30).clamp(0.0, 1.0)
+                    * (1.0 - frame.play_drive * 0.65);
+                let play_capacity = capacity + (nearby_capacity - capacity) * nearby_weight;
+                let play = play_capacity * (0.26 + appeal) - distance * 0.10;
                 let free = matches!(
                     orb.lifecycle,
                     ObjectLifecycle::Free
@@ -1341,8 +1362,12 @@ impl EpisodeDirector {
                         Some(orb.id),
                     );
                 }
-                let solo_ready =
-                    frame.autonomous_play_ready && (orb.novelty > 0.04 || orb.preference > 0.1);
+                // Familiarity is value, not an eligibility gate. A known neutral
+                // toy can still support practice; an explicitly disliked toy or
+                // repeatedly declined game must not trigger an unsolicited bid.
+                let solo_ready = frame.autonomous_play_ready
+                    && orb.preference >= -0.10
+                    && self.adaptation.game[1] > -3.0;
                 if (free || stored)
                     && (solo_ready || self_prior > 0.0)
                     && self.endogenous_play_cooldown <= 0.0
@@ -2164,6 +2189,12 @@ fn drive_episode(
                 state.den.visits = state.den.visits.saturating_add(1);
                 state.den.familiarity = (state.den.familiarity + 0.012).clamp(0.0, 1.0);
                 return EpisodeStep::Complete;
+            }
+            // Lost grip is a failed physical attempt, not an endless protected
+            // home-delivery scene. Permit a short measured reacquisition first.
+            if orb_lifecycle != ObjectLifecycle::CarriedByPet
+                && active.elapsed_seconds > if frame.orb_physical.contact { 2.5 } else { 0.75 } {
+                return EpisodeStep::Abort(EpisodeReason::TimedOut);
             }
             let target = if orb_lifecycle == ObjectLifecycle::CarriedByPet {
                 // Bring the grip socket to the bowl, not the body's centre.
@@ -3256,6 +3287,61 @@ fn push_outcome(output: &mut EcologyOutput, outcome: EcologyOutcome) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v68_carrying_without_ownership_yields_and_does_not_change_taste() {
+        let mut state=EcologyState::new(71);
+        let mut frame=behavior_frame(ActionId::IdleHover);
+        frame.pet_position=state.den.anchor;
+        state.objects[0].lifecycle=ObjectLifecycle::CarriedByPet;
+        state.objects[0].position=Vec2::splat(0.5);
+        let preference=state.objects[0].preference;
+        let mut director=EpisodeDirector::default();
+        let _=director.tick(&mut state,frame,representative_intent(),0.05);
+        assert_eq!(director.active_episode().map(|e|e.goal),Some(EpisodeGoal::CarryOrbHome));
+        state.objects[0].lifecycle=ObjectLifecycle::Free;
+        for _ in 0..24 { let _=director.tick(&mut state,frame,representative_intent(),0.05); }
+        assert!(state.episode_stats.aborted[EpisodeGoal::CarryOrbHome.index()]>0);
+        assert_ne!(director.active_episode().map(|e|e.goal),Some(EpisodeGoal::CarryOrbHome));
+        assert_eq!(state.objects[0].preference,preference);
+    }
+    #[test]
+    fn v68_familiar_neutral_toy_is_not_locked_out_by_selected_but_unexecuted_explore() {
+        for action in [ActionId::IdleHover, ActionId::ExploreScreen] {
+            let mut state = EcologyState::new(9101);
+            state.objects[0].novelty = 0.0;
+            state.objects[0].preference = 0.05;
+            state.objects[0].familiarity = 1.0;
+            let mut director = EpisodeDirector::default();
+            let mut frame = behavior_frame(action);
+            frame.play_drive = 0.45;
+            frame.curiosity_drive = 0.5;
+            frame.pet_velocity = Vec2::ZERO;
+            for _ in 0..85 {
+                let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+                frame.timestamp += 0.05;
+            }
+            assert!(state.episode_stats.started[EpisodeGoal::SoloOrbPlay.index()] > 0,
+                "stationary {action:?} cannot starve endogenous initiative");
+        }
+    }
+
+    #[test]
+    fn v68_real_traversal_and_explicitly_disliked_toy_do_not_trigger_idle_fallback() {
+        for moving in [false, true] {
+            let mut state = EcologyState::new(9101);
+            state.objects[0].novelty = 0.0;
+            state.objects[0].preference = if moving { 0.0 } else { -0.8 };
+            let mut director = EpisodeDirector::default();
+            let mut frame = behavior_frame(ActionId::ExploreScreen);
+            frame.play_drive = 0.5;
+            frame.pet_velocity = if moving { Vec2::new(0.03, 0.0) } else { Vec2::ZERO };
+            for _ in 0..220 {
+                let _ = director.tick(&mut state, frame, representative_intent(), 0.05);
+                frame.timestamp += 0.05;
+            }
+            assert_eq!(state.episode_stats.started[EpisodeGoal::SoloOrbPlay.index()], 0);
+        }
+    }
     use lifecore::{
         BodyIntent, ExpressionState, InteractionTarget, LocomotionMode, PoseIntent, SurfaceId,
     };

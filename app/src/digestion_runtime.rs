@@ -86,6 +86,9 @@ pub fn update(runtime: &mut PetRuntime, dt: f32) {
     let execution = runtime.ecology.prepare_toileting(pet_ecology::ToiletingEvidence {
         needed: wants,
         allowed,
+        distance_to_site: runtime.digestion_site.map(|site|
+            Vec2::new((feedback.world_position.x-site.x)*aspect,
+                feedback.world_position.y+bottom.y/extent.y-site.y).length()),
         sleeping,
         waking,
         at_site: runtime.digestion_site.is_some_and(|site|

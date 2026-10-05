@@ -1,0 +1,50 @@
+{
+  "model": "LiquidAI/LFM2.5-VL-450M-ONNX",
+  "revision": "95c283d4497a56477a83177079fa6b7121abb1b1",
+  "files": {
+    "config.json": {
+      "size": 2540,
+      "sha256": "0827f68c3099103cc2c49235508e38fb4ce1f0fe1aa97f45ed19f7dbb9e30dfa"
+    },
+    "preprocessor_config.json": {
+      "size": 732,
+      "sha256": "5af96934bef15c4fdb69752c9b5de3918e237d5e50ca5d9191f1cf01706c57ca"
+    },
+    "tokenizer.json": {
+      "size": 4733040,
+      "sha256": "f3910942aa907c48b0cc20ec426ee38bfa8dcda8feecf035ced981918cb30f14"
+    },
+    "tokenizer_config.json": {
+      "size": 4816,
+      "sha256": "3013ff2da8f0fd18c053bf9fcc5411ee11607921e094781daf4ce109f217fd26"
+    },
+    "README.md": {
+      "size": 12628,
+      "sha256": "d97f3a93ddcd6aaa50fb900da5950364c2e4b0502d865883ec53d8c1b27407b3"
+    },
+    "onnx/embed_tokens_fp16.onnx": {
+      "size": 573,
+      "sha256": "291d72b491d3187f3cafbb0ec35c5f889360a044d7db815510eff0fabb2af371"
+    },
+    "onnx/embed_tokens_fp16.onnx_data": {
+      "size": 134217728,
+      "sha256": "6936dd14d4e0fa29f4046159dfa5738363f020216ed39a2ed14d276d8d473aa6"
+    },
+    "onnx/vision_encoder_q8.onnx": {
+      "size": 157887,
+      "sha256": "e50f8ea32b40f8aea16b37d2cdcd17a3838c38de8d63c0053061023355b68dad"
+    },
+    "onnx/vision_encoder_q8.onnx_data": {
+      "size": 109874176,
+      "sha256": "b1f664b195ba188ba5d2c8a5103338465a728050e11c6f7fffea079bfc65b2ef"
+    },
+    "onnx/decoder_model_merged_q4.onnx": {
+      "size": 171898,
+      "sha256": "26600302bd9db0ef26d1a98fba0aae22dac99468e2195ce6d9b9bc7308c18f68"
+    },
+    "onnx/decoder_model_merged_q4.onnx_data": {
+      "size": 481030144,
+      "sha256": "b930a8ec51f6326c1b5e09e38fd0162fc69840b2f9b926025948a58a4e962c7d"
+    }
+  }
+}

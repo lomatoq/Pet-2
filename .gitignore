@@ -11,3 +11,9 @@ __pycache__/
 *.pyc
 
 .superdesign/tmp/
+
+# Local V68 runtime weights, validation artifacts and one-off development scripts.
+/.runtime-python/
+/models/
+/reports/v68/
+/scripts/v68_*.py
