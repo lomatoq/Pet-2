@@ -35,7 +35,10 @@ foreach ($entry in $before) {
 # same project's versioned builds, after their old owner has already exited.
 $buildRoot=Split-Path -Parent $Previous
 $helpers=Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -ieq 'Pet2 Dev Console.exe' -and $_.ExecutablePath.StartsWith($buildRoot,[StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -match '--pet-menu-idle'
+    $_.Name -ieq 'Pet2 Dev Console.exe' -and $_.ExecutablePath -and $_.CommandLine -and
+    $_.ExecutablePath.StartsWith($buildRoot,[StringComparison]::OrdinalIgnoreCase) -and
+    $_.CommandLine -match '--pet-menu-idle' -and
+    $_.CommandLine.IndexOf($Data,[StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 foreach ($entry in $helpers) {
     $process=Get-Process -Id $entry.ProcessId -ErrorAction SilentlyContinue
@@ -52,6 +55,6 @@ if ($new.HasExited) {
     Start-Process -FilePath (Join-Path $Previous 'Pet2.exe') -ArgumentList ('--data-dir "'+$Data+'"') -WorkingDirectory $Previous
     throw "New Pet2 exited with code $($new.ExitCode); previous build relaunched."
 }
-$result=@{version='V68';package=$Package;source_commit=$manifest.source_commit;pid=$new.Id;backup=$backup;files_verified=$manifest.files.PSObject.Properties.Count;launched_local_vision=$true;state_reset=$false}
+$result=@{version='V68';package=$Package;source_commit=$manifest.source_commit;pid=$new.Id;backup=$backup;files_verified=@($manifest.files.PSObject.Properties).Count;launched_local_vision=$true;state_reset=$false}
 $result | ConvertTo-Json | Set-Content (Join-Path $backup 'deployment.json') -Encoding UTF8
 $result | ConvertTo-Json
