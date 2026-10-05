@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "companion-menu": {
+      "targetKind": "existing-ui",
+      "projectId": "43c336c8-3648-4bea-8c96-3496a6fd9f84",
+      "baselineDraftId": "635a0758-d643-41e0-8fc6-6b36a2003d10",
+      "activeDraftId": "2c1112a1-1396-4f5e-88bc-f4367873efec",
+      "designSystemPath": ".superdesign/design-system.md",
+      "referenceIds": [
+        "c805a751-d2eb-4df0-9d25-58828ea0be6d",
+        "ca9ddde7-d9c1-46b0-9437-cc22477cd4e7"
+      ],
+      "contextFiles": [
+        ".superdesign/design-system.md",
+        ".superdesign/init/theme.md",
+        "tools/body_lab/src/companion_menu.rs"
+      ],
+      "fingerprints": {
+        ".superdesign/design-system.md": "d24aba7b1c8f9638c7a55812cbcd1c38b4f1c6c3c5e35e3403c91f41ae5aa841",
+        ".superdesign/init/theme.md": "4b9f08c3bee7596e87ca2cb7dbddd7167cb7e37c9fadd06066a0b1c0e2bd92da",
+        "tools/body_lab/src/companion_menu.rs": "4bcffd82e6fe016a4ee430e9477be492f9cc6b2d0bccb15ff193a2c9f60da0b9"
+      },
+      "drafts": {
+        "635a0758-d643-41e0-8fc6-6b36a2003d10": {
+          "title": "Baseline Care Menu",
+          "visualDirection": "Current opaque native popup",
+          "currentVersion": 1
+        },
+        "2c1112a1-1396-4f5e-88bc-f4367873efec": {
+          "title": "Floating Pearl Care Menu - English",
+          "visualDirection": "Opaque English pearl controls; bottom-up scale/fade entrance, top-down scale/fade exit, soft held press",
+          "parentDraftId": "635a0758-d643-41e0-8fc6-6b36a2003d10",
+          "currentVersion": 6
+        }
+      },
+      "updatedAt": "2026-09-23T19:37:54.439353+00:00"
+    }
+  }
+}

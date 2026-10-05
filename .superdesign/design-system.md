@@ -1,0 +1,13 @@
+# Pet 2 floating care menu
+Native Windows desktop pet. User speaks Russian. Tiny companion with soft pearl body, deep purple eyes and padded dark lavender cradle. Existing menu is a dense developer-like rectangle; replace with genuinely separate floating controls above the cradle, anchored and clamped to monitor work area.
+## Target visual tokens
+Segoe UI / system sans only. Labels 13px medium, titles16px semibold, helper11px. Text #302B42, secondary #716B85. Pearl surface #F7F4FF at .96 opacity, secondary #ECE6FA, subtle lavender accent #9F86D5, active #7252A5, sage #A5C3B1, muted pink #D6ADBE. Soft outer shadow 0 6px 22px #21172E26; fine white highlight border. No saturated neon, no black panels, no orange dev accents. Round bubbles 48-56px high, 14-18px gaps; popovers radius24 with soft shadow. Per-control backgrounds only; absolutely no enclosing rectangle behind the main bubbles, no top bar/sidebar.
+## Interactions
+Right-click den toggles a small arc/cluster of four labeled bubbles: Еда, Обучение, Имя, Голос. A tiny gear provides birth replay and secondary controls. Close on Escape or outside click. Native taskbar remains visible. Menu follows den and shifts inward at screen edges. Max cluster width350px, panel width300px, do not occupy full screen.
+Animation: stagger40ms, 300ms scale .72 to1.045 to1, opacity0 to1, pivot toward den, translateY10px to0. No continuous bouncing. Hover scale1.035, press .96. Reduced motion opacity-only. Panel transition160ms.
+## Panels
+Еда: show real existing option Светящиеся крошки, start and stop feeding. Do not invent supported food types. If decorative secondary options appear mark unavailable, preferably omit.
+Обучение: selectable actual commands; 5 sample batch, progress, record/stop, show action, test voice. Preserve existing 40 example indicator but keep explanation short and progressive. Name learning is separate contextual card with Бендер / Бенни, record5 examples and count. Do not imply a working rename feature before backend support.
+Голос: volume slider with readable percentage, mute, microphone toggle and selectable input device, live small level meter. Settings: Replay birth preserving age/memory. Prototype should have clickable main bubbles and demonstrable close, slider, training and food states. Do not claim prototype records actual microphone.
+## Draft constraints
+Use actual supplied nest and pet artwork without repainting. Desktop backdrop is only a demonstration: soft neutral solid with a tiny taskbar; actual popup surface outside controls is transparent. No marketing title, cards of statistics, explanatory webpage or huge headings. No logo slot needed. Entire focus is the actual compact interaction.

@@ -1,0 +1,10 @@
+# Companion care popup dependency tree
+- tools/body_lab/src/companion_menu.rs (entire rendered UI; no local subcomponents)
+  - tools/body_lab/src/main.rs (window, egui rendering, LivePetMonitor and LabControlCommand import)
+  - crates/desktop_host/src/lab_control.rs (HearingAction, command contracts)
+  - crates/pet_audio/src/hearing.rs (CueKind labels via desktop_host; behavioral data only)
+  - egui (external widget library)
+  - serde_json (telemetry values, no styling)
+- app/src/main.rs (right-click opener)
+- assets/nest/nest-pearl-v28.png (actual den)
+- assets/windows/app.png (actual pet)
