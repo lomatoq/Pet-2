@@ -41,6 +41,13 @@ impl ApplicationHandler for Probe {
                     .unwrap(),
             },
         };
+        let dock = overlay_geometry::docked_den_anchor(
+            glam::Vec2::ZERO,
+            self.bounds,
+            pet_ecology::DenEdge::Right,
+            310.0,
+        );
+        assert_eq!(dock.x, self.bounds.maximum.x as f32 - 170.0);
         self.window = Some(
             event_loop
                 .create_window(

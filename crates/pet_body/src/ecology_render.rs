@@ -650,7 +650,7 @@ impl EcologyRenderer {
             self.previous_orb_position = Some(orb.position);
         }
         let mut ordered: Vec<_> = state.objects.iter().collect();
-        ordered.sort_by_key(|o| object_in_front(o.kind, o.lifecycle));
+        ordered.sort_by_key(|o| object_draw_order(o.kind, o.lifecycle));
         let mut foreground_start = None;
         for object in ordered {
             if count >= MAX_ECOLOGY_INSTANCES || object.lifecycle == ObjectLifecycle::Consumed {
@@ -876,6 +876,30 @@ fn object_in_front(kind: ObjectKind, state: ObjectLifecycle) -> bool {
     // held in a mouth or manipulated by the user owns the foreground layer.
     state == ObjectLifecycle::GrabbedByUser
         || (kind == ObjectKind::Morsel && state == ObjectLifecycle::CarriedByPet)
+}
+
+fn object_draw_order(kind: ObjectKind, state: ObjectLifecycle) -> (bool, bool) {
+    // In either physical layer the toy covers crumbs, regardless of which was
+    // inserted most recently. Dropping food must not paint it over the orb.
+    (object_in_front(kind, state), kind == ObjectKind::Orb)
+}
+
+#[test]
+fn overlapping_food_is_drawn_before_the_orb_in_both_scene_layers() {
+    for state in [
+        ObjectLifecycle::Free,
+        ObjectLifecycle::Sleeping,
+        ObjectLifecycle::StoredInDen,
+        ObjectLifecycle::GrabbedByUser,
+    ] {
+        for mut kinds in [
+            [ObjectKind::Orb, ObjectKind::Morsel],
+            [ObjectKind::Morsel, ObjectKind::Orb],
+        ] {
+            kinds.sort_by_key(|kind| object_draw_order(*kind, state));
+            assert_eq!(kinds, [ObjectKind::Morsel, ObjectKind::Orb]);
+        }
+    }
 }
 
 #[test]

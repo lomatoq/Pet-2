@@ -17,6 +17,9 @@ pub const BODY_ACTION_TEMPO: f32 = 2.0;
 #[must_use]
 pub fn phase_clock_scale(program: BehaviorProgramId, phase_name: &str) -> f32 {
     use BehaviorProgramId as P;
+    if program == P::MovePunctuatedTravel {
+        return 1.0;
+    }
     if ordinary_orientation_phase(program, phase_name)
         || program == P::DefenseStartleOrientFreeze
         || program == P::MoveInspectPauseScan
@@ -64,6 +67,76 @@ pub fn advance_phase(
     } else {
         0.0
     };
+    if active.program == BehaviorProgramId::MovePunctuatedTravel {
+        // Elapsed time is telemetry only. The same physical state must produce
+        // the same transition at 30, 60 or 144 Hz, or after an arbitrarily long
+        // obstruction. Goal changes/integrity reflexes can still interrupt it.
+        active.total_time += dt;
+        let Some(target) = active
+            .locked_target
+            .as_ref()
+            .and_then(crate::BehaviorTarget::world_position)
+            .filter(|target| target.is_finite())
+        else {
+            return PhaseAdvance::Finished(CompletionReason::Invalidated);
+        };
+        let diameter = context.body_diameter.max(glam::Vec2::splat(0.001));
+        let distance = ((target - context.body.motion.world_position) / diameter).length();
+        let speed = (context.body.motion.velocity / diameter).length();
+        let requested = (context.body.efference_copy.intended_velocity / diameter).length();
+        let strain = context
+            .somatic
+            .maximum_strain
+            .max(context.body.shape.maximum_strain);
+        let acquired = context.orientation.is_none_or(|eye| {
+            eye.target_position.distance(target) <= 0.035 && eye.gaze_error <= 0.08
+        });
+        let velocity_fraction = if requested > 0.01 {
+            (speed / requested).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let (progress, ready) = match spec.name {
+            "orient" => (
+                if acquired { 1.0 } else { 0.0 },
+                acquired || !orientation_acquisition_required(active.program, spec.name, context),
+            ),
+            "prepare" => (
+                (1.0 - strain).clamp(0.0, 1.0),
+                strain < 0.65 && !context.body.topology.recovery_active,
+            ),
+            "accelerate" => (
+                velocity_fraction,
+                velocity_fraction >= 0.70 || distance <= 0.75,
+            ),
+            "coast" => (1.0 / (1.0 + distance), distance <= 0.75),
+            "brake" => (
+                (1.0 - speed / 0.8).clamp(0.0, 1.0),
+                speed <= 0.12 && distance <= 0.75,
+            ),
+            "arrival_pause" => (
+                (1.0 - context.body.fluid.settle_error).clamp(0.0, 1.0),
+                context.body.fluid.settle_error < 0.15
+                    && context.body.fluid.slosh_energy < 0.20
+                    && strain < 0.30,
+            ),
+            "appraise" => (if acquired { 1.0 } else { 0.0 }, acquired),
+            _ => return PhaseAdvance::Finished(CompletionReason::Invalidated),
+        };
+        // Keep the existing packet/trace format; progress now describes physical
+        // completion instead of elapsed / authored duration.
+        active.phase_time = progress * spec.maximum_seconds;
+        active.minimum_readability_reached = true;
+        if !ready {
+            return PhaseAdvance::Hold;
+        }
+        if usize::from(active.phase.index) + 1 >= definition.phases.len() {
+            return PhaseAdvance::Finished(super::completion_from_context(active.program, context));
+        }
+        active.phase.index += 1;
+        active.phase_time = 0.0;
+        return PhaseAdvance::Advanced;
+    }
     let waiting = response_phase(spec.name);
     if waiting {
         let bid = active.social_bid.get_or_insert_with(|| crate::SocialBid {
@@ -217,16 +290,7 @@ fn phase_evidence_complete(
         return !context.pointer_down || context.gesture_ended;
     }
     match (program, phase_name) {
-        (P::MovePunctuatedTravel, "coast") => {
-            context
-                .somatic
-                .motor_error
-                .min(context.body.efference_copy.intended_velocity.length())
-                < 0.08
-        }
-        (P::MovePunctuatedTravel | P::MoveBrakeSquashRecover, "brake" | "stillness") => {
-            context.body.motion.velocity.length() < 0.045
-        }
+        (P::MoveBrakeSquashRecover, "stillness") => context.body.motion.velocity.length() < 0.045,
         (P::RestSurfaceRoostSearch, "approach_commit") => {
             if bottom_screen_edge(active) {
                 context.screen_edge_gap_px <= 8.0
@@ -348,6 +412,63 @@ mod tests {
             source_action: lifecore::ActionId::IdleHover,
             cause: crate::MotorCause::BrainAction,
         }
+    }
+
+    #[test]
+    fn travel_coasts_until_measured_arrival_regardless_of_elapsed_time() {
+        let mut active = orient_performance();
+        active.program = BehaviorProgramId::MovePunctuatedTravel;
+        active.phase = crate::PhaseId {
+            program: active.program,
+            index: 3,
+        };
+        let mut context = BehaviorContextFrame::default();
+        context.body.motion.world_position = Vec2::new(0.1, 0.3);
+        // Both zero motor error and zero intended velocity used to trigger
+        // an arrival far from the target. Neither is spatial evidence.
+        for _ in 0..25 {
+            assert_eq!(
+                advance_phase(&mut active, &context, 0.1),
+                PhaseAdvance::Hold
+            );
+        }
+        let mut blocked = active.clone();
+        blocked.phase_time = 20_000.0;
+        blocked.total_time = 20_000.0;
+        assert_eq!(
+            advance_phase(&mut blocked, &context, 0.01),
+            PhaseAdvance::Hold
+        );
+        context.body.motion.world_position = Vec2::new(0.8, 0.3);
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.01),
+            PhaseAdvance::Advanced
+        );
+        assert_eq!(
+            crate::phase_name(active.program, active.phase.index),
+            "brake"
+        );
+        context.body.motion.velocity = Vec2::new(0.4, 0.0);
+        active.phase_time = 20_000.0;
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.25),
+            PhaseAdvance::Hold
+        );
+        context.body.motion.velocity = Vec2::ZERO;
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.001),
+            PhaseAdvance::Advanced
+        );
+        context.body.fluid.settle_error = 0.5;
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.25),
+            PhaseAdvance::Hold
+        );
+        context.body.fluid.settle_error = 0.0;
+        assert_eq!(
+            advance_phase(&mut active, &context, 0.001),
+            PhaseAdvance::Advanced
+        );
     }
 
     #[test]

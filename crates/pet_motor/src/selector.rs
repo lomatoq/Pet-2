@@ -472,7 +472,9 @@ pub(crate) fn choose_program_with_rest_commitment(
         .body_intent
         .target_position
         .distance(context.body.motion.world_position);
-    let locomoting = goal.body_intent.desired_speed > 0.025 && target_distance > 0.022;
+    let target_body_distance = ((goal.body_intent.target_position - context.body.motion.world_position)
+        / context.body_diameter.max(glam::Vec2::splat(0.001))).length();
+    let locomoting = goal.body_intent.desired_speed > 0.025 && target_body_distance > 0.75;
     if locomoting && eligible(P::MovePunctuatedTravel) {
         return Some(ProgramDecision {
             program: P::MovePunctuatedTravel,

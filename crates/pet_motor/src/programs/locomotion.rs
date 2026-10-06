@@ -7,7 +7,7 @@ use crate::{
     body_field, push_field,
 };
 
-use super::{smooth, target_axis};
+use super::target_axis;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
@@ -75,10 +75,20 @@ pub(crate) fn apply(
                 active.sampled_style.arc_sign * 0.08 * active.sampled_style.asymmetry;
             packet.locomotion.gaze_lead = 0.90;
             match phase {
-                "orient" => packet.locomotion.speed_multiplier = 0.0,
+                "orient" => {
+                    // Looking at the next waypoint must not discard existing
+                    // momentum. The body owns smooth changes in propulsion.
+                    packet.locomotion.speed_multiplier =
+                        if context.body.motion.velocity.length() > 0.01 {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                }
                 "prepare" => {
-                    packet.locomotion.speed_multiplier = 0.05;
-                    packet.locomotion.acceleration_limit = 0.25;
+                    packet.locomotion.speed_multiplier = 1.0;
+                    packet.locomotion.acceleration_limit =
+                        (1.0 - context.somatic.maximum_strain * 0.5).clamp(0.5, 1.0);
                     push_field(
                         packet,
                         body_field(
@@ -92,8 +102,8 @@ pub(crate) fn apply(
                     );
                 }
                 "accelerate" => {
-                    packet.locomotion.speed_multiplier = 0.25 + smooth(progress) * 0.85;
-                    packet.locomotion.acceleration_limit = 0.45 + smooth(progress) * 0.55;
+                    packet.locomotion.speed_multiplier = 1.0;
+                    packet.locomotion.acceleration_limit = 1.0;
                     packet.material.flight_stretch_multiplier = 1.0 + 0.18 * contrast;
                     push_field(
                         packet,
@@ -114,8 +124,10 @@ pub(crate) fn apply(
                 }
                 "brake" => {
                     packet.locomotion.pose = MotorPoseIntent::Brake;
-                    packet.locomotion.speed_multiplier = 1.0 - smooth(progress);
-                    packet.locomotion.braking = smooth(progress);
+                    // Close the remaining spatial error at low effort; actual
+                    // velocity, not a duration curve, ends the brake phase.
+                    packet.locomotion.speed_multiplier = 0.25;
+                    packet.locomotion.braking = 0.45;
                     packet.material.flight_damping_multiplier = 1.0 + 0.28 * contrast;
                     push_field(
                         packet,
@@ -138,7 +150,6 @@ pub(crate) fn apply(
                 "appraise" => {
                     packet.locomotion.speed_multiplier = 0.0;
                     packet.locomotion.arrival_pause = 0.8;
-                    packet.expression.blink = if progress > 0.55 { 0.30 } else { 0.0 };
                 }
                 _ => {}
             }

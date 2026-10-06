@@ -5358,22 +5358,15 @@ impl ApplicationHandler for PetApplication {
                 y: old_nest.y as i32,
             })
             .map_or(birth_monitor, |m| m.working_area);
-        let inset_x = 170.0_f32.min(nest_monitor.width() as f32 * 0.25);
-        let inset_y = 105.0_f32.min(nest_monitor.height() as f32 * 0.25);
-        let mut nest = old_nest.clamp(
-            Vec2::new(
-                nest_monitor.minimum.x as f32 + inset_x,
-                nest_monitor.minimum.y as f32 + inset_y,
-            ),
-            Vec2::new(
-                nest_monitor.maximum.x as f32 - inset_x,
-                nest_monitor.maximum.y as f32 - inset_y,
-            ),
-        );
         let den_width = (310.0 * prepared.ecology.state().den.size_scale)
             .min(window.inner_size().width as f32 * 0.8)
             .min(window.inner_size().height as f32 * 0.65);
-        nest.y = nest_monitor.maximum.y as f32 - den_width * 0.292;
+        let nest = overlay_geometry::docked_den_anchor(
+            old_nest,
+            nest_monitor,
+            prepared.ecology.state().den.edge,
+            den_width,
+        );
         prepared
             .ecology
             .set_den_anchor(physical_to_virtual_normalized(&topology, nest));

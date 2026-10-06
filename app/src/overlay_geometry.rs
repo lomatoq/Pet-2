@@ -4,6 +4,27 @@ use desktop_host::RectI;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::window::Window;
 
+/// Restore the authored side in physical working-area coordinates. Keeping a
+/// valid but old normalized x left the den floating away from its saved edge.
+pub(crate) fn docked_den_anchor(
+    old: glam::Vec2,
+    working_area: RectI,
+    edge: pet_ecology::DenEdge,
+    den_width: f32,
+) -> glam::Vec2 {
+    let inset_x = (den_width * 0.5 + 15.0)
+        .max(170.0)
+        .min(working_area.width() as f32 * 0.5);
+    let left = working_area.minimum.x as f32 + inset_x;
+    let right = working_area.maximum.x as f32 - inset_x;
+    let x = match edge {
+        pet_ecology::DenEdge::Left => left,
+        pet_ecology::DenEdge::Right => right,
+        _ => old.x.clamp(left, right),
+    };
+    glam::Vec2::new(x, working_area.maximum.y as f32 - den_width * 0.292)
+}
+
 pub(crate) fn window_matches(window: &Window, desktop: RectI) -> bool {
     window.is_minimized() != Some(true)
         && window
@@ -47,6 +68,23 @@ mod tests {
             minimum: PhysicalDesktopPoint { x: -1920, y: -900 },
             maximum: PhysicalDesktopPoint { x: 3440, y: 1440 },
         }
+    }
+
+    #[test]
+    fn den_returns_to_its_saved_side_and_keeps_the_floor_contact() {
+        let area = desktop();
+        let old = glam::Vec2::new(2869.0, 1200.0);
+        let right = docked_den_anchor(old, area, pet_ecology::DenEdge::Right, 310.0);
+        let left = docked_den_anchor(old, area, pet_ecology::DenEdge::Left, 310.0);
+        assert_eq!(right.x, 3270.0);
+        assert_eq!(left.x, -1750.0);
+        assert!((right.y - (1440.0 - 310.0 * 0.292)).abs() < 0.001);
+        assert_eq!(left.y, right.y);
+        let scaled = docked_den_anchor(old, area, pet_ecology::DenEdge::Right, 558.0);
+        assert_eq!(scaled.x, 3146.0);
+        assert!(scaled.x + 558.0 * 0.5 < area.maximum.x as f32);
+        let bottom = docked_den_anchor(old, area, pet_ecology::DenEdge::Bottom, 310.0);
+        assert_eq!(bottom.x, old.x);
     }
 
     #[test]

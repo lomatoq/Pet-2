@@ -259,13 +259,12 @@ impl GroundedMemory {
         }
         s.last_episode = x.episode_id;
         s.last_practiced = self.clock;
-        if success && x.family == GameFamily::Roll {
-            if let Some(push) = x.steps.iter().find(|p| p.primitive == Primitive::Push) {
+        if success && x.family == GameFamily::Roll
+            && let Some(push) = x.steps.iter().find(|p| p.primitive == Primitive::Push) {
                 let nominal = 0.14 + f32::from(x.level) * 0.035;
                 let measured = (push.speed / nominal).clamp(0.7, 2.5);
                 s.calibration[x.level as usize] +=
                     (measured - s.calibration[x.level as usize]) * 0.35;
-            }
         }
         let t = &mut s.trials[usize::from(x.level)];
         t.attempts = t.attempts.saturating_add(1);
@@ -295,6 +294,7 @@ impl GroundedMemory {
             self.stats.plan_failures = self.stats.plan_failures.saturating_add(1)
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn curriculum(
         &self,
         episode: u64,
@@ -305,23 +305,20 @@ impl GroundedMemory {
         contact: bool,
         velocity: Vec2,
     ) -> Exercise {
-        if let Some(recalled) = self.recall_program(episode, object, origin, aspect) {
-            return recalled;
-        }
+        let previous_family = self.skills.iter().max_by_key(|s| s.last_episode).map(|s| s.family);
         let family = GameFamily::ALL
             .into_iter()
             .max_by(|a, b| {
                 let score = |family: GameFamily| {
                     let s = self.skills.iter().find(|s| s.family == family);
-                    let (n, value, last) = s
+                    let (n, value) = s
                         .map(|s| {
                             (
                                 s.trials[s.level as usize].attempts,
                                 s.trials[s.level as usize].lower_bound(),
-                                s.last_practiced,
                             )
                         })
-                        .unwrap_or((0, 0.0, -100.0));
+                        .unwrap_or((0, 0.0));
                     let fit = match family {
                         GameFamily::Stop => {
                             if velocity.length() > 0.12 {
@@ -349,8 +346,11 @@ impl GroundedMemory {
                     };
                     0.4 / (1.0 + n as f32).sqrt()
                         + value * 0.12
-                        + ((self.clock - last) / 90.0).clamp(0.0, 1.0) as f32 * 0.25
                         + fit
+                        // Novelty comes from confirmed experience, not waiting
+                        // for a clock. Avoid an immediate identical practice
+                        // when another feasible skill still has uncertainty.
+                        - if previous_family == Some(family) { 0.18 } else { 0.0 }
                 };
                 score(*a).total_cmp(&score(*b))
             })
@@ -375,8 +375,9 @@ impl GroundedMemory {
                 }
             }
         }
-        plan
+        self.recall_program(plan.clone()).unwrap_or(plan)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_exercise(
         episode: u64,
         object: ObjectId,

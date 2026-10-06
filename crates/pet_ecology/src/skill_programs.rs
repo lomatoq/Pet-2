@@ -114,21 +114,19 @@ impl GroundedMemory {
             last_used: self.clock,
         });
     }
-    pub(crate) fn recall_program(
-        &self,
-        episode: u64,
-        object: u64,
-        origin: Vec2,
-        aspect: f32,
-    ) -> Option<Exercise> {
+    pub(crate) fn recall_program(&self, mut plan: Exercise) -> Option<Exercise> {
         let p = self
             .programs
             .iter()
-            .filter(|p| p.successes >= 2 && self.clock - p.last_used > 90.0)
-            .max_by(|a, b| (self.clock - a.last_used).total_cmp(&(self.clock - b.last_used)))?;
-        let mut plan = Self::compile_exercise(
-            episode, object, p.family, p.level, origin, origin, aspect, self.clock,
-        );
+            .filter(|p| p.successes >= 2 && p.family == plan.family && p.level == plan.level)
+            .max_by_key(|p| p.successes)?;
+        let origin = plan.reference_origin;
+        let aspect = plan.reference_aspect;
+        let home = plan
+            .steps
+            .iter()
+            .find(|s| s.primitive == Primitive::Carry)
+            .map(|s| s.target);
         plan.steps = p
             .steps
             .iter()
@@ -139,6 +137,16 @@ impl GroundedMemory {
                     Primitive::Inspect | Primitive::Approach | Primitive::Grip | Primitive::Brake
                 ) {
                     origin
+                } else if plan.family == GameFamily::Fetch
+                    && matches!(
+                        s.primitive,
+                        Primitive::Carry | Primitive::Release | Primitive::WaitStill
+                    )
+                    && let Some(home) = home
+                {
+                    // Fetch means the current den, not a memorized offset that
+                    // changes destination when the toy or den has moved.
+                    home
                 } else {
                     (origin
                         + (s.target - p.origin) * crate::grounded_memory::metric(p.aspect)
@@ -178,10 +186,111 @@ mod tests {
         x.episode_id = 2;
         m.remember_program(&x);
         m.clock = 100.0;
-        let p = m.recall_program(3, 2, Vec2::splat(0.3), 1.0).unwrap();
+        let candidate = GroundedMemory::compile_exercise(
+            3,
+            2,
+            GameFamily::Shuttle,
+            0,
+            Vec2::splat(0.3),
+            Vec2::splat(0.8),
+            1.0,
+            m.clock,
+        );
+        let p = m.recall_program(candidate).unwrap();
         assert!(p.valid());
         assert_eq!(p.steps[0].target, Vec2::splat(0.3));
         assert_eq!(p.executed_steps, 0);
         assert!(m.valid());
+    }
+
+    #[test]
+    fn familiar_program_does_not_preempt_an_unlearned_family_or_depend_on_waiting() {
+        let mut m = GroundedMemory::default();
+        let mut x = GroundedMemory::compile_exercise(
+            1,
+            2,
+            GameFamily::Roll,
+            0,
+            Vec2::splat(0.5),
+            Vec2::splat(0.9),
+            2.4,
+            0.0,
+        );
+        x.index = x.steps.len();
+        x.executed_steps = 3;
+        m.remember_program(&x);
+        x.episode_id = 2;
+        m.remember_program(&x);
+        let mut trials = [crate::TrialEstimate::default(); 5];
+        trials[0] = crate::TrialEstimate {
+            successes: 2,
+            attempts: 2,
+            error_ema: 0.0,
+        };
+        m.skills.push(crate::SkillRecord {
+            family: GameFamily::Roll,
+            level: 0,
+            trials,
+            calibration: [1.0; 5],
+            last_practiced: 0.0,
+            last_episode: 2,
+        });
+        let choose = |m: &GroundedMemory| {
+            m.curriculum(
+                3,
+                2,
+                Vec2::splat(0.5),
+                Vec2::splat(0.9),
+                2.4,
+                false,
+                Vec2::ZERO,
+            )
+        };
+        let first = choose(&m);
+        assert_ne!(first.family, GameFamily::Roll);
+        m.clock = 1_000_000.0;
+        assert_eq!(first.family, choose(&m).family);
+        assert_eq!(m.stats.plan_successes, 0);
+    }
+
+    #[test]
+    fn recalled_fetch_targets_current_home_after_den_and_orb_relocation() {
+        let mut m = GroundedMemory::default();
+        let mut x = GroundedMemory::compile_exercise(
+            1,
+            2,
+            GameFamily::Fetch,
+            0,
+            Vec2::new(0.4, 0.5),
+            Vec2::new(0.8, 0.8),
+            1.5,
+            0.0,
+        );
+        x.index = x.steps.len();
+        x.executed_steps = 4;
+        m.remember_program(&x);
+        x.episode_id = 2;
+        m.remember_program(&x);
+        let home = Vec2::new(0.95, 0.9);
+        let candidate = GroundedMemory::compile_exercise(
+            3,
+            2,
+            GameFamily::Fetch,
+            0,
+            Vec2::new(0.2, 0.3),
+            home,
+            2.4,
+            0.0,
+        );
+        let recalled = m.recall_program(candidate).unwrap();
+        for step in &recalled.steps {
+            if matches!(
+                step.primitive,
+                Primitive::Carry | Primitive::Release | Primitive::WaitStill
+            ) {
+                assert_eq!(step.target, home);
+            }
+        }
+        assert!(recalled.valid());
     }
 }

@@ -1917,7 +1917,9 @@ mod tests {
                 &base_goal,
                 &context,
             );
-            let packet = runtime.tick(&base_goal, &context, 0.01);
+            // Test the explicitly forced program's packet, not replacement by
+            // the unrelated IdleHover goal. Selector reachability is separate.
+            let packet = runtime.tick_internal(&base_goal, &context, 0.01, false);
             assert_eq!(packet.program, Some(program), "{}", program.wire_name());
             assert!(packet.phase.is_some(), "{}", program.wire_name());
             assert!(packet.field_count() <= crate::LOCAL_FIELD_BUDGET);
@@ -1966,6 +1968,10 @@ mod tests {
         });
 
         for program in BehaviorProgramId::ALL {
+            let mut context = context.clone();
+            if program == BehaviorProgramId::MovePunctuatedTravel {
+                context.body.motion.world_position = base_goal.body_intent.target_position;
+            }
             let mut runtime = BehaviorPerformanceRuntime::new(0x6400 + program.index() as u64);
             runtime.start(
                 program,
@@ -2017,6 +2023,12 @@ mod tests {
         });
 
         for program in BehaviorProgramId::ALL {
+            let mut context = context.clone();
+            if program == BehaviorProgramId::MovePunctuatedTravel {
+                // Grammar fixture supplies real arrival evidence; a clock no
+                // longer pretends that a stationary, distant body has arrived.
+                context.body.motion.world_position = base_goal.body_intent.target_position;
+            }
             let mut runtime = BehaviorPerformanceRuntime::new(0x1AB0 + program.index() as u64);
             runtime.begin_lab_fixture(program, &base_goal, &context);
             let first = runtime.tick_lab_fixture(&base_goal, &context, 0.01);

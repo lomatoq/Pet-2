@@ -1,6 +1,6 @@
 //! Explicit, expiring exercise requests and bounded causal telemetry.
 //! Files carry data only; no generated code or OS commands can be executed.
-use pet_ecology::{EcologyState, Exercise, GameFamily, GroundedMemory, ObjectKind};
+use pet_ecology::{EcologyState, GameFamily, GroundedMemory, ObjectKind};
 use serde::Deserialize;
 use std::{
     fs,
@@ -55,18 +55,17 @@ impl LearningControls {
             .ok()
             .filter(|v| v.len() <= 32768)
             .and_then(|v| serde_json::from_slice::<Request>(&v).ok())
+            && r.id > self.last_id
         {
-            if r.id > self.last_id {
-                self.last_id = r.id;
-                let result = self.apply(&r, state, aspect);
-                self.message = result
-                    .as_ref()
-                    .map_or_else(|e| format!("Not applied: {e}"), |s| s.clone());
-                let _ = super::vision_bridge::atomic_json(
-                    &self.root.join("grounded-control-ack.json"),
-                    &serde_json::json!({"id":r.id,"applied":result.is_ok(),"message":self.message}),
-                );
-            }
+            self.last_id = r.id;
+            let result = self.apply(&r, state, aspect);
+            self.message = result
+                .as_ref()
+                .map_or_else(|e| format!("Not applied: {e}"), |s| s.clone());
+            let _ = super::vision_bridge::atomic_json(
+                &self.root.join("grounded-control-ack.json"),
+                &serde_json::json!({"id":r.id,"applied":result.is_ok(),"message":self.message}),
+            );
         }
         let m = &state.grounded;
         let status = serde_json::json!({"schema_version":1,"instance":self.instance,"updated_unix_ms":now(),"message":self.message,"stats":m.stats,"skills":m.skills,"learned_programs":m.programs,"exercise":m.exercise,"suspended":m.suspended.len(),"cooldown_seconds":m.cooldown,

@@ -211,7 +211,17 @@ impl BodySimulation {
                 | LocomotionMode::Landing
                 | LocomotionMode::EdgeCling => 0.080 + purposeful_effort * 0.070,
                 LocomotionMode::Orbit => 0.095 + purposeful_effort * 0.165,
+                LocomotionMode::Arrive
+                    if intent.interaction_target.is_none() && intent.target_surface.is_none() =>
+                {
+                    0.055 + 0.25 * ((intent.desired_speed - 0.04) / 0.24).clamp(0.0, 1.0)
+                }
                 LocomotionMode::Arrive => 0.090 + purposeful_effort * 0.100,
+                // Ordinary exploration is authored around 0.08–0.16 effort.
+                // A flat hover cap used to erase almost all of that variation.
+                LocomotionMode::Wander => {
+                    0.045 + 0.20 * ((intent.desired_speed - 0.035) / 0.20).clamp(0.0, 1.0)
+                }
                 _ => 0.085,
             };
         // The expression comes from the authoritative affect/brain pipeline.
@@ -265,12 +275,7 @@ impl BodySimulation {
                 // ignored it and drove a perpetual screen-wide oscillator that bounced
                 // off the desktop bounds. Arrive gives each bout a readable destination
                 // and naturally settles there before LifeCore chooses another one.
-                desired_velocity = arrive(
-                    position,
-                    target,
-                    desired_speed.max(BODY_MOVEMENT_TEMPO * 0.05 * reference_span),
-                    0.18 * reference_span,
-                );
+                desired_velocity = arrive(position, target, desired_speed, 0.18 * reference_span);
             }
             LocomotionMode::SurfaceApproach
             | LocomotionMode::Landing
@@ -313,6 +318,13 @@ impl BodySimulation {
         );
         let requested_response = if purposeful_mode {
             purposeful_effort
+        } else if matches!(
+            intent.locomotion,
+            LocomotionMode::Wander | LocomotionMode::Arrive
+        ) {
+            // More propulsion on a long journey, with the same continuous
+            // acceleration state and jerk bounds as quiet motion.
+            ((cruise - 1.0) / 1.2).clamp(0.0, 1.0) * 0.65
         } else {
             0.0
         };
@@ -502,19 +514,20 @@ fn direction(from: Vec2, to: Vec2) -> Vec2 {
 }
 
 fn distance_cruise(intent: &BodyIntent, distance_in_spans: f32) -> f32 {
-    // Only unencumbered purposeful flight. Low-speed precision/grip approaches,
-    // support, orbit, sleep and escape keep their existing control envelopes.
+    // Distance and effort blend continuously: ordinary exploration can cruise,
+    // while quiet drifting and object/surface approaches keep their envelopes.
     if !matches!(
         intent.locomotion,
-        LocomotionMode::Seek | LocomotionMode::Wander
+        LocomotionMode::Seek | LocomotionMode::Wander | LocomotionMode::Arrive
     ) || intent.interaction_target.is_some()
-        || intent.desired_speed < 0.20
+        || intent.target_surface.is_some()
         || !distance_in_spans.is_finite()
     {
         return 1.0;
     }
     let t = ((distance_in_spans - 0.20) / 0.50).clamp(0.0, 1.0);
-    1.0 + 1.2 * t * t * (3.0 - 2.0 * t)
+    let effort = ((intent.desired_speed - 0.045) / 0.105).clamp(0.0, 1.0);
+    1.0 + 1.2 * t * t * (3.0 - 2.0 * t) * effort * effort * (3.0 - 2.0 * effort)
 }
 
 #[test]
@@ -532,7 +545,7 @@ fn distance_cruise_preserves_precision_and_support() {
     };
     assert_eq!(distance_cruise(&intent, 0.1), 1.0);
     assert!((distance_cruise(&intent, 1.0) - 2.2).abs() < 0.001);
-    intent.desired_speed = 0.1;
+    intent.desired_speed = 0.04;
     assert_eq!(distance_cruise(&intent, 1.0), 1.0);
     intent.desired_speed = 0.7;
     for mode in [
@@ -911,7 +924,9 @@ mod tests {
             gaze_target: None,
             pose: PoseIntent::Curious,
             expression: ExpressionState::default(),
-            interaction_target: None,
+            // Precision approaches keep a fixed envelope; unconstrained
+            // distance-dependent cruise is covered by the fast-flight test.
+            interaction_target: Some(lifecore::InteractionTarget::ProceduralOrb),
         };
         let mut regular = BodySimulation::new(91);
         let mut ultrawide = BodySimulation::new(91);
@@ -1015,7 +1030,8 @@ mod tests {
                 pupil_size: 0.20,
                 ..ExpressionState::default()
             },
-            interaction_target: None,
+            // Isolate affect within the preserved object-approach envelope.
+            interaction_target: Some(lifecore::InteractionTarget::ProceduralOrb),
         };
         let mut energized = base.clone();
         energized.expression.body_glow = 1.0;
@@ -1087,6 +1103,155 @@ mod tests {
             (900.0..=1250.0).contains(&purposeful_speed),
             "2x purposeful seek speed={purposeful_speed} px/s"
         );
+    }
+
+    #[test]
+    fn feedback_driven_motor_crosses_the_desktop_without_midflight_arrival_pauses() {
+        use pet_motor::{
+            BehaviorContextFrame, BehaviorPerformanceRuntime, BehaviorProgramId,
+            SomaticActuationBus,
+        };
+        let genome = Genome::from_seed(0xFA57);
+        let scale = Vec2::new(3440.0, 1440.0);
+        let mut simulation = BodySimulation::new(0xFA57);
+        simulation.set_motion_space_pixels(scale);
+        simulation.feedback.world_position = Vec2::new(0.05, 0.5);
+        let intent = BodyIntent {
+            locomotion: LocomotionMode::Wander,
+            target_position: Vec2::new(0.9, 0.5),
+            target_surface: None,
+            desired_speed: 0.12,
+            facing_direction: 1.0,
+            gaze_target: Some(Vec2::new(0.9, 0.5)),
+            pose: PoseIntent::Curious,
+            expression: ExpressionState::default(),
+            interaction_target: None,
+        };
+        let goal = lifecore::BehaviorGoalFrame {
+            action: lifecore::ActionId::ExploreScreen,
+            body_intent: intent.clone(),
+            affect: Default::default(),
+            drives: lifecore::Drives::initial(&genome.temperament),
+            felt: Default::default(),
+            derived: Default::default(),
+            attachment: 0.2,
+            recent_outcome: None,
+        };
+        let mut context = BehaviorContextFrame {
+            body_diameter: Vec2::splat(180.0) / scale,
+            ..Default::default()
+        };
+        context.body.motion.world_position = simulation.feedback.world_position;
+        let mut runtime = BehaviorPerformanceRuntime::new(0xFA57);
+        runtime.begin_lab_fixture(BehaviorProgramId::MovePunctuatedTravel, &goal, &context);
+        let mut peak = 0.0_f32;
+        let mut finished = false;
+        for step in 0..2400 {
+            context.frame_id = step;
+            context.timestamp_seconds = step as f64 / 120.0;
+            context.body.motion.world_position = simulation.feedback.world_position;
+            context.body.motion.velocity = simulation.feedback.velocity;
+            context.body.efference_copy.intended_velocity = simulation.motor_velocity;
+            let packet = runtime.tick_lab_fixture(&goal, &context, 1.0 / 120.0);
+            if runtime.active().is_none() {
+                finished = true;
+                break;
+            }
+            let distance = ((intent.target_position - simulation.feedback.world_position)
+                / context.body_diameter)
+                .length();
+            if distance > 2.0 {
+                assert!(!matches!(
+                    packet.phase_name.as_str(),
+                    "brake" | "arrival_pause" | "appraise"
+                ));
+                if step > 120 {
+                    assert!(
+                        simulation.feedback.velocity.x * scale.x > 100.0,
+                        "uncommanded midflight stop at step {step}"
+                    );
+                }
+            }
+            let mut embodied = intent.clone();
+            SomaticActuationBus::apply_to_intent(&packet, &context, &mut embodied);
+            simulation.fixed_update(
+                &genome.body,
+                &embodied,
+                &SensorFrame::default(),
+                1.0 / 120.0,
+            );
+            peak = peak.max(simulation.feedback.velocity.x * scale.x);
+            assert!(simulation.diagnostics.jerk_px_s3.length() <= 6.01 * 1152.0);
+        }
+        println!(
+            "feedback flight peak={peak} px/s, finished={finished}, position={:?}, velocity={:?}",
+            simulation.feedback.world_position,
+            simulation.feedback.velocity * scale
+        );
+        assert!(finished, "physical arrival did not complete");
+        assert!(peak > 350.0 && peak < 750.0);
+        assert!(
+            ((intent.target_position - simulation.feedback.world_position) / context.body_diameter)
+                .length()
+                <= 0.75
+        );
+        assert!((simulation.feedback.velocity * scale).length() < 25.0);
+    }
+
+    #[test]
+    fn ordinary_flight_has_distinct_drift_cruise_and_fast_bands_without_speed_steps() {
+        let genome = Genome::from_seed(0xFA57);
+        let scale = Vec2::new(3440.0, 1440.0);
+        let mut peaks = Vec::new();
+        for effort in [0.025, 0.12, 0.24] {
+            let mut simulation = BodySimulation::new(0xFA57);
+            simulation.set_motion_space_pixels(scale);
+            simulation.feedback.world_position = Vec2::new(0.05, 0.50);
+            let mut intent = BodyIntent {
+                locomotion: LocomotionMode::Wander,
+                target_position: Vec2::new(0.95, 0.50),
+                target_surface: None,
+                desired_speed: effort,
+                facing_direction: 1.0,
+                gaze_target: None,
+                pose: PoseIntent::Curious,
+                expression: ExpressionState::default(),
+                interaction_target: None,
+            };
+            let mut peak = 0.0_f32;
+            for _ in 0..180 {
+                let before = simulation.feedback.world_position * scale;
+                simulation.fixed_update(
+                    &genome.body,
+                    &intent,
+                    &SensorFrame::default(),
+                    1.0 / 120.0,
+                );
+                peak = peak.max(simulation.feedback.velocity.x * scale.x);
+                assert!(simulation.diagnostics.jerk_px_s3.length() <= 6.01 * 1152.0);
+                assert!((simulation.feedback.world_position * scale).distance(before) < 15.0);
+                assert!(simulation.feedback.velocity.is_finite());
+            }
+            // An intentional stop must not be turned back into a minimum-speed
+            // wander by the actuator. Braking remains continuous.
+            intent.desired_speed = 0.0;
+            for _ in 0..480 {
+                simulation.fixed_update(
+                    &genome.body,
+                    &intent,
+                    &SensorFrame::default(),
+                    1.0 / 120.0,
+                );
+                assert!(simulation.diagnostics.jerk_px_s3.length() <= 6.01 * 1152.0);
+            }
+            assert!((simulation.feedback.velocity.x * scale.x).abs() < 1.0);
+            peaks.push(peak);
+        }
+        println!("ordinary flight drift/cruise/fast peaks (px/s): {peaks:?}");
+        assert!((30.0..100.0).contains(&peaks[0]), "{peaks:?}");
+        assert!((350.0..750.0).contains(&peaks[1]), "{peaks:?}");
+        assert!((750.0..1450.0).contains(&peaks[2]), "{peaks:?}");
+        assert!(peaks[2] > peaks[1] * 1.5 && peaks[2] > peaks[0] * 10.0);
     }
 
     #[test]

@@ -392,11 +392,11 @@ impl GroundedMemory {
         self.next_event = self.next_event.saturating_add(1);
         if applied {
             for p in &self.pending {
-                if p.object == id {
-                    if let Some(e) = self.episodes.iter_mut().find(|e| e.id == p.event) {
-                        e.outcome = CausalOutcome::Confounded;
-                        self.stats.confounded = self.stats.confounded.saturating_add(1);
-                    }
+                if p.object == id
+                    && let Some(e) = self.episodes.iter_mut().find(|e| e.id == p.event)
+                {
+                    e.outcome = CausalOutcome::Confounded;
+                    self.stats.confounded = self.stats.confounded.saturating_add(1);
                 }
             }
             self.pending.retain(|p| p.object != id);
@@ -458,8 +458,8 @@ impl GroundedMemory {
             && action == Intervention::Push
             && input.length() > 0.003
             && v.length() < MAX_OBJECT_SPEED - 0.001
+            && let Some(b) = self.beliefs.iter_mut().find(|b| b.id == id)
         {
-            if let Some(b) = self.beliefs.iter_mut().find(|b| b.id == id) {
                 let error = v - before.velocity - b.effect(input);
                 let rate = 0.22 / (0.002 + input.length_squared());
                 b.impulse_columns[0] = (b.impulse_columns[0] + error * input.x * rate)
@@ -469,16 +469,14 @@ impl GroundedMemory {
                 b.effect_error += (error.length().min(1.0) - b.effect_error) * 0.15;
                 b.impulse_samples = b.impulse_samples.saturating_add(1);
                 self.stats.learning_updates = self.stats.learning_updates.saturating_add(1);
-            }
         }
-        if let Some(x) = &mut self.exercise {
-            if x.object_id == id && x.awaiting_command {
+        if let Some(x) = &mut self.exercise
+            && x.object_id == id && x.awaiting_command {
                 if applied && (action != Intervention::Push || input.length() > 0.003) {
                     x.confirmed_interventions = x.confirmed_interventions.saturating_add(1);
                 }
                 x.last_receipt = Some((event, applied));
                 x.awaiting_command = false;
-            }
         }
         Some(event)
     }

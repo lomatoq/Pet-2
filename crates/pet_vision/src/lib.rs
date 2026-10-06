@@ -307,7 +307,7 @@ impl VisionEngine {
         let mut embeddings = {
             let out = self.embedding.run_with_options(
                 ort::inputs! { "input_ids" => Tensor::from_array(([1, count], ids.clone()))? },
-                &options,
+                options,
             )?;
             out["inputs_embeds"].try_extract_tensor::<f32>()?.1.to_vec()
         };
@@ -350,7 +350,7 @@ impl VisionEngine {
                 );
             }
         }
-        let out = self.decoder.run_with_options(feeds, &options)?;
+        let out = self.decoder.run_with_options(feeds, options)?;
         let (_, logits) = out["logits"].try_extract_tensor::<f32>()?;
         if logits.len() < 65536 {
             return Err("Unexpected decoder output".into());

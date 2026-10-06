@@ -71,7 +71,9 @@ pub fn validate_catalog(seed: u64) -> CatalogValidationSummary {
         let activation_cause = decision.map(|decision| decision.cause);
         let mut runtime = BehaviorPerformanceRuntime::new(seed ^ program.index() as u64);
         runtime.start(program, MotorCause::BrainAction, &goal, &context);
-        let packet = runtime.tick(&goal, &context, 0.01);
+        // Selection was checked above. Review this forced program's actuation
+        // without replacing it with the unrelated grammar fixture's idle goal.
+        let packet = runtime.tick_lab_fixture(&goal, &context, 0.01);
         let non_cosmetic = packet.locomotion.pose != MotorPoseIntent::Neutral
             || packet.locomotion.speed_multiplier != 1.0
             || packet.material != BoundedMaterialActuation::default()
@@ -87,8 +89,21 @@ pub fn validate_catalog(seed: u64) -> CatalogValidationSummary {
         let mut active = runtime.active().expect("validation program starts").clone();
         let mut completion_reason = CompletionReason::None;
         let mut phase_grammar_finished = false;
+        let mut completion_context = context.clone();
         for _ in 0..4_096 {
-            if let PhaseAdvance::Finished(reason) = advance_phase(&mut active, &context, 0.25) {
+            // This sweep checks phase grammar, not a physical route replay.
+            // Supply explicit spatial arrival for the travel completion case;
+            // separate motor/body tests cover far, blocked and moving routes.
+            if program == BehaviorProgramId::MovePunctuatedTravel
+                && crate::phase_name(program, active.phase.index) == "coast"
+                && let Some(target) = active.locked_target.as_ref()
+                    .and_then(crate::BehaviorTarget::world_position)
+            {
+                completion_context.body.motion.world_position = target;
+            }
+            if let PhaseAdvance::Finished(reason) =
+                advance_phase(&mut active, &completion_context, 0.25)
+            {
                 completion_reason = reason;
                 phase_grammar_finished = true;
                 break;

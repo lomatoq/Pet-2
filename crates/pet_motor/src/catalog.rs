@@ -36,6 +36,8 @@ const TRAVEL: [PhaseSpec; 7] = [
     PhaseSpec::new("orient", 0.08, 0.75),
     PhaseSpec::new("prepare", 0.07, 0.22),
     PhaseSpec::new("accelerate", 0.12, 0.40),
+    // These legacy duration fields are presentation normalization only for
+    // travel: its runtime advances from measured body feedback, not a clock.
     PhaseSpec::new("coast", 0.10, 0.70),
     PhaseSpec::new("brake", 0.12, 0.35),
     PhaseSpec::new("arrival_pause", 0.25, 0.90),
@@ -241,7 +243,7 @@ pub const fn definition(id: BehaviorProgramId) -> ProgramDefinition {
         ),
         P::MovePunctuatedTravel => (
             TRAVEL.as_slice(),
-            0.25,
+            0.0,
             MotorPriority::Voluntary,
             InterruptPolicy::FinishReadablePhase,
         ),
