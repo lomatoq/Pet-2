@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+tempfile.workspace = true
 desktop_host = { path = "../../crates/desktop_host" }
 egui.workspace = true
 egui-wgpu.workspace = true

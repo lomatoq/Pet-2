@@ -5,6 +5,8 @@
 #![recursion_limit = "1024"]
 
 mod vision_bridge;
+mod vision_teaching;
+mod learning_controls;
 mod activity_glance;
 mod birth_runtime;
 mod care_menu_runtime;
@@ -4756,6 +4758,8 @@ impl PetApplication {
                     "successful_interactions": runtime.life.state.successful_interactions,
                     "ignored_attempts": runtime.life.state.ignored_attempts,
                     "focus_mode": runtime.life.state.focus_mode,
+                    "grounded_learning": runtime.ecology.state().grounded.stats,
+                    "grounded_exercise": runtime.ecology.state().grounded.exercise,
                     "locomotion": format!("{:?}", runtime.intent.locomotion),
                     "body_render_mode": format!("{:?}", runtime.body.tuning_profile().render_mode),
                     "material_variant": format!("{:?}", runtime.body.tuning_profile().material.variant),
@@ -4836,7 +4840,9 @@ impl PetApplication {
                         "acceleration_limited": locomotion_diagnostics.acceleration_limited,
                         "jerk_limited": locomotion_diagnostics.jerk_limited,
                         "collision_impulse_count": runtime.collision_impulse_count,
-                        "locomotion": format!("{:?}", runtime.intent.locomotion),
+                        "grounded_learning": runtime.ecology.state().grounded.stats,
+                    "grounded_exercise": runtime.ecology.state().grounded.exercise,
+                    "locomotion": format!("{:?}", runtime.intent.locomotion),
                         "desired_speed": runtime.intent.desired_speed,
                         "pose": format!("{:?}", runtime.intent.pose),
                         "expression": runtime.intent.expression,

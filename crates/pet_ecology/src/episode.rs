@@ -670,6 +670,7 @@ impl EpisodeDirector {
             return false;
         };
         self.active = None;
+        state.grounded.suspend_exercise(true);
         self.orb_bid_cooldown = 45.0;
         self.endogenous_play_cooldown = self.endogenous_play_cooldown.max(45.0);
         self.endogenous_idle_seconds = 0.0;
@@ -1365,7 +1366,8 @@ impl EpisodeDirector {
                 // Familiarity is value, not an eligibility gate. A known neutral
                 // toy can still support practice; an explicitly disliked toy or
                 // repeatedly declined game must not trigger an unsolicited bid.
-                let solo_ready = frame.autonomous_play_ready
+                let queued_practice = state.grounded.suspended.iter().any(|x|x.object_id==orb.id && x.expires_at>state.grounded.clock);
+                let solo_ready = (frame.autonomous_play_ready || queued_practice)
                     && orb.preference >= -0.10
                     && self.adaptation.game[1] > -3.0;
                 if (free || stored)
@@ -1378,7 +1380,7 @@ impl EpisodeDirector {
                         } else {
                             EpisodeGoal::SoloOrbPlay
                         },
-                        play + self_prior + self.adaptation.game[1].clamp(-3.0, 6.0) * 0.035,
+                        play + self_prior + f32::from(queued_practice)*0.25 + self.adaptation.game[1].clamp(-3.0, 6.0) * 0.035,
                         EpisodeReason::AutonomousPlay,
                         Some(orb.id),
                     );
@@ -1785,6 +1787,30 @@ fn drive_episode(
             }
         }
         EpisodeGoal::ChaseOrb | EpisodeGoal::SoloOrbPlay => {
+            // Quiet familiar-object carrying remains an authored low-energy
+            // activity. New practice enters at active play readiness or via an
+            // explicit/recalled task; it does not replace every old interaction.
+            if active.goal == EpisodeGoal::SoloOrbPlay && active.reason_code == EpisodeReason::AutonomousPlay
+                && (frame.play_drive >= 0.32 || state.grounded.exercise.is_some() || !state.grounded.suspended.is_empty())
+                && let Some(orb) = state.objects.iter().find(|o| Some(o.id) == active.object_id).cloned()
+                && let Some(task) = state.grounded.run_exercise(frame, active.id, &orb, state.den.anchor, output.body_intent.clone(), dt)
+            {
+                output.body_intent = task.intent;
+                if let Some(command) = task.command { push_command(output, command); }
+                active.prediction_confidence = state.grounded.beliefs.iter().find(|b|b.id==orb.id).map_or(0.0,|b|b.confidence());
+                active.phase = if task.command.is_some() { EpisodePhase::Execute } else {
+                    match state.grounded.exercise.as_ref().and_then(|x|x.steps.get(x.index)).map(|s|s.primitive) {
+                        Some(crate::Primitive::Approach|crate::Primitive::Carry|crate::Primitive::Visit)=>EpisodePhase::Approach,
+                        Some(crate::Primitive::ObserveMotion|crate::Primitive::ObserveRebound|crate::Primitive::WaitStill)=>EpisodePhase::Evaluate,
+                        _=>EpisodePhase::Inspect,
+                    }
+                };
+                return match task.status {
+                    crate::ExerciseStatus::Running => EpisodeStep::Continue,
+                    crate::ExerciseStatus::Succeeded => { output.vocal_trigger = Some(EcologyVocalTrigger::SkillMastered); EpisodeStep::Complete },
+                    crate::ExerciseStatus::Failed => EpisodeStep::Abort(EpisodeReason::TimedOut),
+                };
+            }
             let Some(orb) = active
                 .object_id
                 .and_then(|id| state.objects.iter().find(|object| object.id == id))

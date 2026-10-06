@@ -101,6 +101,8 @@ impl SavedEcologyRng {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EcologyState {
     #[serde(default)]
+    pub grounded: crate::GroundedMemory,
+    #[serde(default)]
     pub orb_experience: crate::OrbExperience,
     #[serde(default)]
     pub episode_memory: crate::EpisodeMemory,
@@ -143,6 +145,7 @@ impl EcologyState {
             next_object_id = orb.id.wrapping_add(1).max(1);
         }
         Self {
+            grounded: crate::GroundedMemory::default(),
             episode_memory: crate::EpisodeMemory::default(),
             orb_experience: crate::OrbExperience::default(),
             waste: crate::WasteWorld::default(),
@@ -209,12 +212,14 @@ impl EcologyState {
                 object.velocity = glam::Vec2::ZERO;
             }
         }
+        snapshot.grounded.after_native_restart();
         snapshot.ensure_canonical_orb();
         snapshot.validate()?;
         Ok(snapshot)
     }
 
     pub fn validate(&self) -> Result<(), EcologyError> {
+        if !self.grounded.valid() { return Err(EcologyError::InvalidObjectMemory); }
         if !self.orb_experience.valid() {
             return Err(EcologyError::InvalidEpisodeMemory);
         }

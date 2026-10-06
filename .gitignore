@@ -22,3 +22,8 @@ __pycache__/
 /scripts/patch_v681.py
 /scripts/patch_vision_permission.py
 /scripts/patch_v681_followup.py
+
+# V69 local state, private features, model and evidence stay out of source control.
+/reports/v69/
+/.training-runtime/
+/models/

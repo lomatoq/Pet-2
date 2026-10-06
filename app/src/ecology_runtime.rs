@@ -31,6 +31,7 @@ fn food_touches_mouth(body: &ProceduralBody, food: Vec2, radius: f32, height: f3
 /// Application integration boundary for the portable habitat. Native input,
 /// rendering and body physics stay in their existing owners.
 pub struct EcologyRuntime {
+    learning_controls: super::learning_controls::LearningControls,
     toileting: pet_ecology::ToiletingCoordinator,
     feeding_evidence: FeedingEvidence,
     adaptation_sequence: u64,
@@ -282,6 +283,7 @@ impl EcologyRuntime {
     /// metabolism and object/episode identity sequences.
     pub fn reset_learning(&mut self) {
         let fresh = EcologyState::new(self.state.identity_seed);
+        self.state.grounded = fresh.grounded;
         self.state.episode_memory = fresh.episode_memory;
         self.state.orb_experience = fresh.orb_experience;
         self.state.touch_preference = fresh.touch_preference;
@@ -317,6 +319,7 @@ impl EcologyRuntime {
         let director = EpisodeDirector::from_memory(&state.episode_memory);
         let adaptation_sequence = director.placement_event_sequence();
         Ok(Self {
+            learning_controls: super::learning_controls::LearningControls::new(&store.paths.root),
             toileting: Default::default(),
             feeding_evidence: Default::default(),
             pet_grips: Vec::new(),
@@ -389,6 +392,7 @@ impl EcologyRuntime {
             dt,
             orb_physical,
         } = frame;
+        self.learning_controls.poll(&mut self.state, self.desktop_aspect);
         self.last_body_position = body.world_position;
         self.last_orb_physical = orb_physical;
         if let Some(id) = self.feeding_evidence.object_id {
@@ -454,8 +458,11 @@ impl EcologyRuntime {
             click_rhythm: self.click_rhythm,
             timestamp: sensors.timestamp,
         };
+        self.state.grounded.observe(&self.state.objects, body.world_position, self.desktop_aspect, dt,
+            frame.sleeping || frame.focus_mode || frame.window_pressure >= 0.22);
         let started = Instant::now();
         let output = self.director.tick(&mut self.state, frame, brain_intent, dt);
+        if output.debug.active_goal != Some(EpisodeGoal::SoloOrbPlay) { self.state.grounded.suspend_exercise(false); }
         self.episode_tick_microseconds = started.elapsed().as_secs_f64() * 1_000_000.0;
         self.last_visual_context = output.visual_context;
         self.last_debug = output.debug.clone();
@@ -1671,6 +1678,9 @@ impl EcologyRuntime {
             .copied()
             .take(output.object_command_count)
         {
+            let descriptor = pet_ecology::Intervention::from_command(command);
+            let before = descriptor.and_then(|(_, id, _)| self.state.objects.iter().find(|o| o.id == id).cloned());
+            (|| {
             let commanded_object = match command {
                 ObjectCommand::ApplyImpulse { object_id, .. }
                 | ObjectCommand::MoveToward { object_id, .. }
@@ -1684,13 +1694,13 @@ impl EcologyRuntime {
                     .iter()
                     .any(|o| o.id == id && o.lifecycle == ObjectLifecycle::GrabbedByUser)
             }) {
-                continue;
+                return;
             }
             match command {
                 ObjectCommand::None => {}
                 ObjectCommand::ApplyImpulse { object_id, impulse } => {
                     if !impulse.is_finite() {
-                        continue;
+                        return;
                     }
                     self.pet_grips.retain(|grip| grip.object_id != object_id);
                     self.release_grace.retain(|(id, _)| *id != object_id);
@@ -1725,7 +1735,7 @@ impl EcologyRuntime {
                                 && !self.last_orb_physical.contact
                         })
                     {
-                        continue;
+                        return;
                     }
                     self.clear_den_slot_references(object_id);
                     if let Some(object) = self
@@ -1735,7 +1745,7 @@ impl EcologyRuntime {
                         .find(|object| object.id == object_id)
                     {
                         if object.lifecycle == ObjectLifecycle::GrabbedByUser {
-                            continue;
+                            return;
                         }
                         if let Some(grip) = self
                             .pet_grips
@@ -1745,7 +1755,7 @@ impl EcologyRuntime {
                             grip.strength = speed;
                             // Keep the attachment in body space. A new command
                             // sustains the grasp; it is not another pickup.
-                            continue;
+                            return;
                         }
                         self.pet_grips.push(PetObjectGrip {
                             object_id,
@@ -1766,7 +1776,7 @@ impl EcologyRuntime {
                     velocity,
                 } => {
                     if !velocity.is_finite() {
-                        continue;
+                        return;
                     }
                     self.pet_grips.retain(|grip| grip.object_id != object_id);
                     self.release_grace.retain(|(id, _)| *id != object_id);
@@ -1795,7 +1805,7 @@ impl EcologyRuntime {
                         .iter()
                         .position(|object| object.id == object_id)
                     else {
-                        continue;
+                        return;
                     };
                     let object = &self.state.objects[object_index];
                     let config = ObjectPhysicsConfig {
@@ -1805,7 +1815,7 @@ impl EcologyRuntime {
                     if object.lifecycle != ObjectLifecycle::CarriedByPet
                         || !orb_is_inside_den_latch(object, self.state.den.anchor, config)
                     {
-                        continue;
+                        return;
                     }
                     self.clear_den_slot_references(object_id);
                     let object = &mut self.state.objects[object_index];
@@ -1826,10 +1836,10 @@ impl EcologyRuntime {
                     if self.state.objects.iter().any(|object| {
                         object.id == object_id && object.lifecycle == ObjectLifecycle::GrabbedByUser
                     }) {
-                        continue;
+                        return;
                     }
                     if !self.last_orb_physical.contact {
-                        continue;
+                        return;
                     }
                     self.clear_den_slot_references(object_id);
                     if let Some(object) = self
@@ -1839,7 +1849,7 @@ impl EcologyRuntime {
                         .find(|object| object.id == object_id)
                     {
                         if object.kind == ObjectKind::Orb && !self.last_orb_physical.contact {
-                            continue;
+                            return;
                         }
                         // Backward-compatible command semantics: take the
                         // object into the pet's carry state at its current
@@ -1873,6 +1883,22 @@ impl EcologyRuntime {
                     }
                 }
                 ObjectCommand::Store { .. } => {}
+            }
+            })();
+            if let Some((kind, id, input)) = descriptor {
+                let after = self.state.objects.iter().find(|o| o.id == id).cloned();
+                let applied = before.as_ref().is_some_and(|old| {
+                    if old.lifecycle == ObjectLifecycle::GrabbedByUser || !input.is_finite() { return false; }
+                    match kind {
+                        pet_ecology::Intervention::Push => after.as_ref().is_some_and(|new|new.lifecycle==ObjectLifecycle::Free && (new.velocity!=old.velocity || input.length_squared()==0.0)),
+                        pet_ecology::Intervention::Grip | pet_ecology::Intervention::Retrieve => after.as_ref().is_some_and(|new|new.lifecycle==ObjectLifecycle::CarriedByPet),
+                        pet_ecology::Intervention::Release => after.as_ref().is_some_and(|new|new.lifecycle==ObjectLifecycle::Free),
+                        pet_ecology::Intervention::Store => after.as_ref().is_some_and(|new|new.home_slot.is_some() && old.lifecycle==ObjectLifecycle::CarriedByPet && new.lifecycle==ObjectLifecycle::Free),
+                        pet_ecology::Intervention::Consume => after.is_none() && old.kind==ObjectKind::Morsel,
+                    }
+                });
+                let episode = self.director.active_episode().map_or(0, |a| a.id);
+                self.state.grounded.receipt(command, before.as_ref(), after.as_ref(), episode, self.desktop_aspect, applied);
             }
         }
     }

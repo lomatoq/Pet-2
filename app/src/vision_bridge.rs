@@ -85,18 +85,22 @@ struct Observation {
     id: u64,
     context: u64,
     prediction: ScenePrediction,
+    training: Option<pet_vision::TrainingFeatures>,
     position: Vec2,
     submitted: Instant,
     permission: u64,
 }
 enum Event {
     Ready,
+    AdapterStatus(String),
     Observation(Observation),
     Skipped(u64),
     Failed(u64, String),
 }
 
 pub struct VisionBridge {
+    teacher: super::vision_teaching::VisionTeacher,
+    adapter_status: String,
     root: PathBuf,
     window: Arc<Window>,
     settings: Settings,
@@ -131,7 +135,7 @@ pub struct VisionBridge {
     last_latency_ms: f32,
 }
 
-fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path
         .parent()
@@ -161,11 +165,14 @@ impl VisionBridge {
             .and_then(|b| serde_json::from_slice::<SceneMemory>(&b).ok())
             .filter(|m| m.entries.len() <= 64)
             .unwrap_or_default();
+        let teacher = super::vision_teaching::VisionTeacher::new(&root);
         let old = Instant::now() - Duration::from_secs(120);
         Self {
             root,
             window,
             settings,
+            teacher,
+            adapter_status: "not loaded".into(),
             enabled: Arc::new(AtomicBool::new(false)),
             permission: Arc::new(AtomicU64::new(0)),
             tx: None,
@@ -228,6 +235,7 @@ impl VisionBridge {
             self.stable = 0;
             self.busy = false;
             self.state = "disabled".into();
+            self.teacher.clear();
         }
     }
     fn ensure_worker(&mut self) {
@@ -259,6 +267,8 @@ impl VisionBridge {
                     "runtime/libonnxruntime.dylib"
                 })
             });
+        let profile_root=self.root.clone();
+        let packaged_adapter=package.join("models/vision-adapter.json");
         let (tx, requests) = mpsc::sync_channel::<Job>(1);
         let (events, rx) = mpsc::sync_channel::<Event>(4);
         let window = Arc::clone(&self.window);
@@ -277,6 +287,19 @@ impl VisionBridge {
                         return;
                     }
                 };
+                let reload_adapter = |engine: &mut VisionEngine| -> String {
+                    if profile_root.join("vision-adapter-disabled").exists() {
+                        let _=engine.set_adapter(None);return "disabled by user".into();
+                    }
+                    let custom=profile_root.join("vision-adapter.json");
+                    let path=if custom.exists(){&custom}else{&packaged_adapter};
+                    if !path.exists(){let _=engine.set_adapter(None);return "base weights; no promoted adapter".into();}
+                    match pet_vision::ConnectorAdapter::load(path).and_then(|a|engine.set_adapter(Some(a))) {
+                        Ok(())=>"validated connector adapter active".into(),
+                        Err(e)=>{let _=engine.set_adapter(None);format!("adapter rejected; base retained: {e}")},
+                    }
+                };
+                let _=events.send(Event::AdapterStatus(reload_adapter(&mut engine)));
                 let mut capture = desktop_host::create_platform_backend();
                 let _ = events.send(Event::Ready);
                 while let Ok(job) = requests.recv() {
@@ -289,6 +312,7 @@ impl VisionBridge {
                         let _ = events.send(Event::Skipped(job.id));
                         continue;
                     }
+                    let _=events.try_send(Event::AdapterStatus(reload_adapter(&mut engine)));
                     // Dedicated instance of the EXISTING capture adapter. It never
                     // changes overlay styles, capture affinity or user input state.
                     let old_sequence = capture
@@ -337,6 +361,7 @@ impl VisionBridge {
                                 id: job.id,
                                 context: job.context,
                                 prediction,
+                                training: engine.take_training_features(),
                                 position: job.position,
                                 submitted: job.submitted,
                                 permission: job.permission,
@@ -411,6 +436,7 @@ impl VisionBridge {
             .unwrap_or_default();
         for event in events {
             match event {
+                Event::AdapterStatus(status) => { self.adapter_status=status; }
                 Event::Ready => {
                     self.state = "ready".into();
                     self.last_submit = now - Duration::from_secs(120);
@@ -449,6 +475,7 @@ impl VisionBridge {
                         self.skipped += 1;
                         continue;
                     }
+                    self.teacher.offer(obs.id,obs.context,obs.training);
                     if !obs.prediction.trustworthy() {
                         self.ambiguous += 1;
                         self.state = "uncertain".into();
@@ -495,6 +522,7 @@ impl VisionBridge {
                 }
             }
         }
+        self.teacher.poll(&self.root,self.settings.enabled);
         let fast_confirmation = self.last_sampled_context != Some(context)
             || (self.stable == 1 && self.proposed.is_some_and(|(c, _)| c == context));
         let interval = if fast_confirmation {
@@ -545,6 +573,7 @@ impl VisionBridge {
                 &self.root.join("vision-status.json"),
                 &serde_json::json!({
                 "schema_version":1,"enabled":self.settings.enabled,"state":self.state,"paused":paused,"inference_busy":self.busy,
+                "teaching":self.teacher.status(),"adapter":self.adapter_status,
                 "model":"LFM2.5-VL-450M-ONNX","provider":"CPU, 2 threads","scope":"active window, local only",
                 "completed":self.completed,"accepted":self.accepted,"ambiguous":self.ambiguous,"skipped":self.skipped,
                 "query_budget_tokens":self.query_tokens,"confirmation_interval_seconds":2,"context_debounce_ms":650,

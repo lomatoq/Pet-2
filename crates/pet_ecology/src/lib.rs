@@ -4,6 +4,16 @@
 //! arbitration and object physics. It deliberately has no native-window,
 //! renderer, audio-device or operating-system dependencies.
 
+pub mod grounded_memory;
+pub mod exercise;
+pub mod skill_programs;
+pub mod program_spec;
+pub use skill_programs::*;
+pub use program_spec::*;
+pub mod goal_planner;
+pub use goal_planner::*;
+pub use grounded_memory::*;
+pub use exercise::*;
 mod affordance;
 mod debug;
 mod den;

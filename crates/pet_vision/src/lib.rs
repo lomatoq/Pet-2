@@ -1,4 +1,6 @@
 //! Bounded, in-process visual-language sensing. No network, tools or text memory.
+pub mod adapter;
+pub use adapter::{ConnectorAdapter, TrainingFeatures};
 use ort::{
     session::{RunOptions, Session},
     value::{DynValue, Tensor},
@@ -77,6 +79,8 @@ impl ScenePrediction {
 
 /// One owner thread, bounded CPU concurrency, no global Python or inference server.
 pub struct VisionEngine {
+    adapter: Option<ConnectorAdapter>,
+    last_training_features: Option<TrainingFeatures>,
     embedding: Session,
     encoder: Session,
     decoder: Session,
@@ -163,6 +167,8 @@ impl VisionEngine {
             }
         }
         Ok(Self {
+            adapter: None,
+            last_training_features: None,
             embedding: session("embed_tokens_fp16")?,
             encoder: session("vision_encoder_q8")?,
             decoder: session("decoder_model_merged_q4")?,
@@ -170,6 +176,12 @@ impl VisionEngine {
             label_ids,
         })
     }
+
+    pub fn set_adapter(&mut self, adapter: Option<ConnectorAdapter>) -> Result<()> {
+        if adapter.as_ref().is_some_and(|a| !a.valid()) { return Err("Unvalidated adapter".into()); }
+        self.adapter = adapter; Ok(())
+    }
+    pub fn take_training_features(&mut self) -> Option<TrainingFeatures> { self.last_training_features.take() }
 
     pub fn classify(
         &mut self,
@@ -204,6 +216,7 @@ impl VisionEngine {
         {
             return Err("Invalid or oversized vision input".into());
         }
+        self.last_training_features = None;
         let started = Instant::now();
         let signature = image_signature(width, height, &rgb);
         let image = image::RgbImage::from_raw(width, height, rgb).ok_or("Invalid RGB buffer")?;
@@ -247,7 +260,7 @@ impl VisionEngine {
             }
         });
         let _completion = Completion(done);
-        let features = {
+        let mut features = {
             let out = self.encoder.run_with_options(
                 ort::inputs! {
                     "pixel_values" => Tensor::from_array(([1, n*n, 768], patches))?,
@@ -263,6 +276,24 @@ impl VisionEngine {
             }
             data.to_vec()
         };
+        self.last_training_features = Some(TrainingFeatures { schema_version: 1, model_revision: MODEL_REVISION.into(), image_tokens, features: features.clone() });
+        if let Some(adapter) = &self.adapter { adapter.apply(&mut features)?; }
+        self.decode_features(features,image_tokens,signature,started,&options)
+    }
+
+    /// Evaluate explicitly supplied private feature examples without a screenshot
+    /// or another visual encoder. Used for held-out native adapter validation.
+    pub fn classify_features(&mut self, sample: &TrainingFeatures) -> Result<ScenePrediction> {
+        if !sample.valid() { return Err("invalid or incompatible visual features".into()); }
+        let started=Instant::now();let options=Arc::new(RunOptions::new()?);
+        let (done,wait)=mpsc::channel::<()>();let cancel=Arc::clone(&options);
+        std::thread::spawn(move||{if matches!(wait.recv_timeout(Duration::from_secs(8)),Err(mpsc::RecvTimeoutError::Timeout)){let _=cancel.terminate();}});
+        let _completion=Completion(done);
+        let mut features=sample.features.clone();
+        if let Some(adapter)=&self.adapter {adapter.apply(&mut features)?;}
+        self.decode_features(features,sample.image_tokens,0,started,&options)
+    }
+    fn decode_features(&mut self, features:Vec<f32>, image_tokens:usize, signature:u64, started:Instant, options:&RunOptions) -> Result<ScenePrediction> {
         let prompt = format!(
             "<|startoftext|><|im_start|>user\n<|image_start|>{}<|image_end|>{QUESTION}<|im_end|>\n<|im_start|>assistant\n",
             "<image>".repeat(image_tokens)

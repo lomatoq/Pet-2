@@ -1,4 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+mod learning_panel;
 mod birth_capture;
 mod bubble_material;
 mod companion_glass;
@@ -3544,6 +3545,8 @@ fn show_live_panel(context: &Context, monitor: &mut LivePetMonitor, panel: DevPa
                         live_drives(ui, &latest);
                     }
                     DevPanel::Behavior => {
+                        learning_panel::draw(ui, &monitor.control_store.paths.root);
+                        ui.separator();
                         ui.columns(2, |columns| {
                             live_drives(&mut columns[0], &latest);
                             live_perception_and_decision(&mut columns[1], &latest);
