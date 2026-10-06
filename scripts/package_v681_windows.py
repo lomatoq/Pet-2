@@ -1,6 +1,7 @@
 """Package one validated standalone release without replacing a previous version."""
 from __future__ import annotations
 import argparse, datetime, hashlib, json, os, pathlib, shutil, subprocess
+from release_provenance import ARTIFACTS, verify_artifacts
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 REPORT=pathlib.Path(os.environ.get('PET2_VALIDATION_DIR',str(ROOT/'reports/v681')))
 def digest(p):
@@ -14,10 +15,11 @@ def main():
  ap.add_argument('--destination',type=pathlib.Path,required=True)
  ap.add_argument('--target',type=pathlib.Path,default=pathlib.Path(os.environ.get('CARGO_TARGET_DIR',str(ROOT/'target'))))
  args=ap.parse_args(); dest=args.destination.resolve()
+ provenance=verify_artifacts()
  if dest.exists() or dest==ROOT or dest==args.previous.resolve(): raise RuntimeError('Use a new release directory')
  # A saved pet may legitimately sleep. Check play on a fresh reference fixture,
  # and check identity/load/save separately on the unchanged saved profile.
- for name in ['workspace','build','gpu-build','contact','native','native-cancel','gpu','fresh-behavior','persistence']:
+ for name in ['workspace','build','gpu-build','clippy','geometry','care-native','contact','native','native-cancel','gpu','fresh-behavior','persistence']:
   if (REPORT/(name+'-exit.txt')).read_text(encoding='utf-8-sig').strip()!='0':
    raise RuntimeError('Required validation failed or missing: '+name)
  git=['git','-c','safe.directory='+ROOT.as_posix(),'-C',str(ROOT)]
@@ -51,7 +53,7 @@ def main():
   shutil.copy2(ROOT/'LICENSE',stage/'licenses/Pet2-MIT.txt')
   shutil.copy2(args.previous/'app.ico',stage/'app.ico')
   for old,new in [('pet2.exe','Pet2.exe'),('body_lab.exe','Pet2 Dev Console.exe'),('vision_probe.exe','vision_probe.exe')]:
-   shutil.copy2(args.target/'release'/old,stage/new)
+   shutil.copy2(ARTIFACTS/old,stage/new)
   (stage/'runtime').mkdir()
   for name in ['onnxruntime.dll','onnxruntime_providers_shared.dll']:
    shutil.copy2(ROOT/'.runtime-python/onnxruntime/capi'/name,stage/'runtime'/name)
@@ -62,6 +64,7 @@ def main():
    target=(target_model/name); target.parent.mkdir(parents=True,exist_ok=True)
    shutil.copy2(model/name,target)
   shutil.copy2(ROOT/'V68_1_LIVING_AGENCY.md',stage/'ПРОЧИТАЙ.md')
+  shutil.copy2(ROOT/'V68_1_1_DESKTOP_RECOVERY.md',stage/'V68.1.1-Изменения.md')
   control=r'''param([ValidateSet('Enable','Disable','Status')][string]$Action='Status')
 $ErrorActionPreference='Stop'
 $root=Join-Path $env:LOCALAPPDATA 'lomatoq\Pet 2\data'
@@ -83,13 +86,14 @@ if (Test-Path -LiteralPath $status) { Get-Content -LiteralPath $status }
   for filename,args_ in [('Start Pet2.cmd',''),('Start with Local Vision.cmd',' --local-vision')]:
    (stage/filename).write_text('@echo off\r\nstart "" "%~dp0Pet2.exe"'+args_+'\r\n',encoding='ascii')
   validation=stage/'validation'; validation.mkdir()
-  for name in ['workspace-result.json','build-result.json','gpu-build-result.json','contact-result.json','native-result.json','native-cancel-result.json','gpu-result.json','fresh-behavior-result.json','persistence-result.json','test-summary.json','VALIDATION.md','workspace.log','native.log','native-cancel.log','contact.log','gpu.log','fresh-behavior.log','persistence.log','source-digest.json']:
+  for name in ['workspace-result.json','build-result.json','gpu-build-result.json','clippy-result.json','geometry-result.json','geometry.log','care-native-result.json','build-provenance.json','contact-result.json','native-result.json','native-cancel-result.json','gpu-result.json','fresh-behavior-result.json','persistence-result.json','test-summary.json','VALIDATION.md','workspace.log','native.log','native-cancel.log','contact.log','gpu.log','fresh-behavior.log','persistence.log','source-digest.json']:
    shutil.copy2(REPORT/name,validation/name)
   for name in ['material-review.png','pixel-delta.json','physics.json']:
    shutil.copy2(REPORT/'gpu-review'/name,validation/name)
-  manifest={'schema':'pet2.release_manifest.v1','release_label':'Pet2 V68.1 Living Agency + Local Vision',
+  manifest={'schema':'pet2.release_manifest.v1','release_label':'Pet2 V68.1.1 Living Agency + Local Vision + Desktop Canvas Recovery',
    'built_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source_commit':commit,'source_worktree':str(ROOT),
    'production_source_sha256':source_digest,
+   'cargo_sha256':provenance['cargo_sha256'],'lock_sha256':provenance['lock_sha256'],
    'compatible_pair':True,'lab_control_protocol':2,'lab_control_schema':4,'model_revision':spec['revision'],
    'files':{p.relative_to(stage).as_posix():digest(p) for p in sorted(stage.rglob('*')) if p.is_file()}}
   (stage/'release-manifest.json').write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding='utf-8')

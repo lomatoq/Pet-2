@@ -22,6 +22,7 @@ mod motor_context;
 mod nearby_gaze;
 mod nervous_system_runtime;
 mod orb_cradle;
+mod overlay_geometry;
 mod organic_runtime;
 mod pointer_replay_runner;
 mod repertoire_bridge;
@@ -2241,6 +2242,8 @@ struct PetRuntime {
     cursor_hittest_latch: CursorHitTestLatch,
     acknowledged_window_origin: PhysicalPosition<i32>,
     window_origin_changes: u64,
+    canvas_repair_pending: bool,
+    next_canvas_repair: Instant,
     screen_body_center: Vec2,
     screen_velocity_px: Vec2,
     screen_collision_half_extent_px: Vec2,
@@ -2539,6 +2542,26 @@ impl PetApplication {
         };
         let now = Instant::now();
         if now < runtime.next_frame_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame_deadline));
+            return;
+        }
+        // Sleep/unlock, OS placement and asynchronous resizes can move or
+        // shrink a borderless window without a DPI event. Body-only offset
+        // compensation does not fix ecology drawing or its native hit targets.
+        if !restore_overlay_canvas(runtime, &self.store) {
+            // Geometry recovery must keep permission polling alive and revoke
+            // any queued/running capture even while the organism is paused.
+            runtime.vision.tick(
+                &desktop_host::DesktopSnapshot::unavailable(
+                    runtime.normalizer.monotonic_seconds(), runtime.topology.revision,
+                ),
+                true,
+                [RectI::default(); 2],
+            );
+            // Never feed a temporary viewport into contact or render scale,
+            // and never catch up this unavailable interval as a physics impulse.
+            runtime.last_update = now;
+            runtime.next_frame_deadline = now + ACTIVE_FRAME;
             event_loop.set_control_flow(ControlFlow::WaitUntil(runtime.next_frame_deadline));
             return;
         }
@@ -5466,6 +5489,8 @@ impl ApplicationHandler for PetApplication {
             cursor_hittest_latch: CursorHitTestLatch::default(),
             acknowledged_window_origin,
             window_origin_changes: 0,
+            canvas_repair_pending: false,
+            next_canvas_repair: runtime_started,
             screen_body_center: initial_center,
             screen_velocity_px: Vec2::ZERO,
             screen_collision_half_extent_px: Vec2::ZERO,
@@ -5570,6 +5595,11 @@ impl ApplicationHandler for PetApplication {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                // A temporary OS viewport must not change the organism's
+                // presentation scale or contact reference frame.
+                if !overlay_canvas_matches(runtime) {
+                    return;
+                }
                 runtime.renderer.resize(size);
                 runtime
                     .body
@@ -5789,6 +5819,9 @@ impl ApplicationHandler for PetApplication {
                 }
             }
             WindowEvent::RedrawRequested => {
+                if runtime.canvas_repair_pending || !overlay_canvas_matches(runtime) {
+                    return;
+                }
                 let present_now = Instant::now();
                 let present_dt = (present_now - runtime.last_present)
                     .as_secs_f32()
@@ -8538,6 +8571,65 @@ fn desktop_host_geometry(bounds: RectI) -> (PhysicalPosition<i32>, PhysicalSize<
         PhysicalPosition::new(bounds.minimum.x, bounds.minimum.y),
         PhysicalSize::new(bounds.width().max(1) as u32, bounds.height().max(1) as u32),
     )
+}
+
+fn overlay_canvas_matches(runtime: &PetRuntime) -> bool {
+    overlay_geometry::window_matches(&runtime.window, runtime.topology.virtual_physical_bounds)
+}
+
+fn restore_overlay_canvas(runtime: &mut PetRuntime, store: &StateStore) -> bool {
+    if overlay_canvas_matches(runtime) {
+        if runtime.canvas_repair_pending {
+            let size = runtime.window.inner_size();
+            let (origin, _) = desktop_host_geometry(runtime.topology.virtual_physical_bounds);
+            runtime.acknowledged_window_origin = origin;
+            runtime.renderer.resize(size);
+            runtime
+                .body
+                .set_presentation_scale(production_presentation_scale(size.height));
+            configure_visual_motion_space(&mut runtime.body, &runtime.topology, size);
+            synchronize_presentation_offset(
+                &runtime.window,
+                &runtime.topology,
+                runtime.body.simulation.feedback.world_position,
+                &mut runtime.body,
+                origin,
+            );
+            let _ = store.append_telemetry(&EventLogEntry {
+                monotonic_seconds: runtime.normalizer.monotonic_seconds(),
+                kind: "desktop_canvas_restored".into(),
+                details: serde_json::json!({"origin":[origin.x,origin.y],"size":[size.width,size.height]}),
+            });
+            runtime.canvas_repair_pending = false;
+        }
+        return true;
+    }
+    if !runtime.canvas_repair_pending {
+        let origin = runtime.window.outer_position().ok();
+        let size = runtime.window.inner_size();
+        let bounds = runtime.topology.virtual_physical_bounds;
+        let _ = store.append_telemetry(&EventLogEntry {
+            monotonic_seconds: runtime.normalizer.monotonic_seconds(),
+            kind: "desktop_canvas_mismatch".into(),
+            details: serde_json::json!({
+                "actual_origin":origin.map(|p|[p.x,p.y]),"actual_size":[size.width,size.height],
+                "expected_origin":[bounds.minimum.x,bounds.minimum.y],
+                "expected_size":[bounds.width(),bounds.height()],
+            }),
+        });
+        runtime.canvas_repair_pending = true;
+    }
+    let now = Instant::now();
+    if now >= runtime.next_canvas_repair {
+        overlay_geometry::request_restore(
+            &runtime.window,
+            runtime.topology.virtual_physical_bounds,
+        );
+        runtime.next_canvas_repair = now + Duration::from_millis(250);
+    }
+    // A resize can be asynchronous. Wait for the acknowledged native geometry
+    // before simulation or drawing resumes, including when the OS minimizes us.
+    false
 }
 
 fn production_presentation_scale(host_height: u32) -> f32 {
