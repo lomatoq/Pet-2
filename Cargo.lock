@@ -2093,6 +2093,7 @@ dependencies = [
  "pet_audio",
  "pet_ecology",
  "pet_motor",
+ "pet_perception",
  "pollster",
  "serde",
  "serde_json",

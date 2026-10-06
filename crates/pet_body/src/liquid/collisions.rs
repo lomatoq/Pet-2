@@ -3,7 +3,7 @@ use lifecore::{BodyFeedback, SensorFrame};
 use pet_ecology::EmbodiedEnvironmentFrame;
 
 use super::{
-    kernels::{wendland_c2_gradient, wendland_c2_kernel},
+    kernels::wendland_c2_kernel,
     particles::{KERNEL_RADIUS, LiquidParticle, MAX_LIQUID_PARTICLES},
 };
 
@@ -16,6 +16,12 @@ pub struct MaterialGrab {
     filtered_velocity: Vec2,
     previous_filtered_velocity: Vec2,
     filtered_acceleration: Vec2,
+    onset_center: Vec2,
+    reference_origin: Vec2,
+    onset_positions: [Vec2; MAX_LIQUID_PARTICLES],
+    onset_weights: [f32; MAX_LIQUID_PARTICLES],
+    captured_count: usize,
+    patch_initialized: bool,
     amplitude: f32,
     field_axis: Vec2,
     differential_forces: [Vec2; MAX_LIQUID_PARTICLES],
@@ -38,6 +44,12 @@ impl Default for MaterialGrab {
             filtered_velocity: Vec2::ZERO,
             previous_filtered_velocity: Vec2::ZERO,
             filtered_acceleration: Vec2::ZERO,
+            onset_center: Vec2::ZERO,
+            reference_origin: Vec2::ZERO,
+            onset_positions: [Vec2::ZERO; MAX_LIQUID_PARTICLES],
+            onset_weights: [0.0; MAX_LIQUID_PARTICLES],
+            captured_count: 0,
+            patch_initialized: false,
             amplitude: 0.0,
             field_axis: Vec2::ZERO,
             differential_forces: [Vec2::ZERO; MAX_LIQUID_PARTICLES],
@@ -76,9 +88,9 @@ pub(super) struct MaterialStressFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GrabParameters {
-    /// Compact support of the pointer potential in body-local units.
+    /// Compact support of the captured material patch in body-local units.
     pub support_radius: f32,
-    /// Maximum acceleration anywhere in the Wendland gradient.
+    /// Maximum acceleration applied by the compliant material grasp.
     pub peak_acceleration: f32,
     pub response_hz: f32,
     pub max_speed_radii_per_second: f32,
@@ -266,12 +278,28 @@ impl MaterialGrab {
         dt: f32,
     ) {
         let dt = dt.clamp(0.0, 0.10);
+        // The captured material patch lives in the same local frame as the
+        // filtered cursor, including a translated carrier origin.
+        if self.initialized {
+            let shift = body_origin - self.reference_origin;
+            self.onset_center += shift;
+            self.filtered_center += shift;
+            self.target_center += shift;
+            if self.patch_initialized {
+                for position in &mut self.onset_positions[..self.captured_count] {
+                    *position += shift;
+                }
+            }
+        }
+        self.reference_origin = body_origin;
         if held {
             // A new press begins exactly at the hit-tested visible material. Only
             // subsequent cursor samples need filtering; this avoids sweeping a
             // stale field through the body when a new gesture begins.
-            if !self.initialized || (!self.held && self.amplitude <= 1.0e-4) {
+            if !self.initialized || !self.held {
                 self.filtered_center = target_center;
+                self.onset_center = target_center;
+                self.patch_initialized = false;
                 self.filtered_velocity = Vec2::ZERO;
                 self.previous_filtered_velocity = Vec2::ZERO;
                 self.filtered_acceleration = Vec2::ZERO;
@@ -347,27 +375,70 @@ impl MaterialGrab {
 
         let support = parameters.support_radius.max(1.0e-4);
         let peak_acceleration = parameters.peak_acceleration.max(0.0);
-        let mut weighted_center = Vec2::ZERO;
-        let mut weighted_material_velocity = Vec2::ZERO;
+        if !self.patch_initialized || self.captured_count != count {
+            // Indices are material identities while the locked solver count is
+            // stable. A reconstruction/count change starts a fresh observation
+            // rather than applying old offsets to different material.
+            self.onset_center = self.filtered_center;
+            self.captured_count = count;
+            for (index, particle) in particles[..count].iter().enumerate() {
+                self.onset_positions[index] = particle.position;
+                self.onset_weights[index] =
+                    wendland_c2_kernel(particle.position - self.onset_center, support);
+            }
+            self.patch_initialized = true;
+        }
+        let displacement = self.filtered_center - self.onset_center;
+        // Recruitment follows actual pull distance, not holding time. A plain
+        // press does not damp breathing or drive particles toward one point.
+        let load = (displacement.length() / (support * 0.15)).clamp(0.0, 1.0);
+        let recruitment = load * load * (3.0 - 2.0 * load);
+        let stiffness = peak_acceleration / support;
+        let mut captured_center = Vec2::ZERO;
+        let mut captured_weight = 0.0;
+        for (particle, weight) in particles[..count].iter().zip(&self.onset_weights) {
+            captured_center += particle.position * *weight;
+            captured_weight += *weight;
+        }
+        let patch_center = if captured_weight > 1.0e-5 {
+            captured_center / captured_weight
+        } else {
+            self.onset_center
+        };
         let mut weight_sum = 0.0;
+        let mut support_center = Vec2::ZERO;
+        let mut support_velocity = Vec2::ZERO;
         let mut support_weight_sum = 0.0;
         let mut support_weight_squared_sum = 0.0;
         for (index, particle) in particles[..count].iter_mut().enumerate() {
-            let distance = self.filtered_center.distance(particle.position);
-            let support_weight = (1.0 - distance / support).clamp(0.0, 1.0).powi(2);
+            // A captured grasp remains attached to this material neighborhood
+            // while the virtual cursor runs ahead. Dropping locality around a
+            // distant cursor would release it before a neck could form. No new
+            // distant material can enter the onset-selected patch.
+            let distance = patch_center.distance(particle.position);
+            let edge = ((distance / support - 0.8) / 0.2).clamp(0.0, 1.0);
+            let current_locality = 1.0 - edge * edge * (3.0 - 2.0 * edge);
+            let support_weight = self.onset_weights[index] * current_locality;
             support_weight_sum += support_weight;
             support_weight_squared_sum += support_weight * support_weight;
-            let force = pointer_gradient(
-                self.filtered_center - particle.position,
-                support,
-                peak_acceleration,
-            ) * self.amplitude;
+            support_center += particle.position * support_weight;
+            support_velocity += particle.velocity * support_weight;
+            // Preserve onset offsets within the patch: the target is a local
+            // translation, never a sink that compresses all mass to the cursor.
+            // Forces are compliant; the density solver still owns all positions.
+            let target = self.onset_positions[index] + displacement;
+            // The compact weight sets material stiffness, not a reduced force
+            // ceiling. A genuinely loaded surface patch can reach the existing
+            // ceiling even when its onset sample is away from the kernel peak.
+            let local_stiffness = stiffness * support_weight;
+            let local_damping = 2.0 * local_stiffness.sqrt();
+            let spring = (target - particle.position) * local_stiffness;
+            let damper = (self.filtered_velocity - particle.velocity) * local_damping;
+            let force = (spring + damper).clamp_length_max(peak_acceleration)
+                * (recruitment * self.amplitude);
             self.differential_forces[index] = force;
             particle.force += force;
-            let weight = force.length();
-            weighted_center += particle.position * weight;
-            weighted_material_velocity += particle.velocity * weight;
-            weight_sum += weight;
+            weight_sum += force.length();
         }
         self.field_coverage = weight_sum / (count as f32 * peak_acceleration.max(1.0e-5));
         let effective_particle_count =
@@ -376,14 +447,13 @@ impl MaterialGrab {
             (effective_particle_count / count.max(1) as f32).clamp(0.0, 1.0);
         let force_density = weight_sum / effective_particle_count.max(1.0);
         self.effective_pressure = (force_density / peak_acceleration.max(1.0e-5)).clamp(0.0, 1.0);
-        if weight_sum <= 1.0e-5 {
-            self.field_axis = (self.filtered_center - fallback_center).normalize_or_zero();
-        } else {
-            self.weighted_contact_center = weighted_center / weight_sum;
-            self.weighted_material_velocity = weighted_material_velocity / weight_sum;
-            self.field_axis =
-                (self.filtered_center - self.weighted_contact_center).normalize_or_zero();
+        // Contact observations use the actual retained material neighborhood
+        // even at zero mechanical work and with the virtual cursor farther away.
+        if support_weight_sum > 1.0e-5 {
+            self.weighted_contact_center = support_center / support_weight_sum;
+            self.weighted_material_velocity = support_velocity / support_weight_sum;
         }
+        self.field_axis = (self.filtered_center - self.weighted_contact_center).normalize_or_zero();
     }
 
     #[must_use]
@@ -429,6 +499,15 @@ impl MaterialGrab {
     }
 
     #[must_use]
+    pub(super) fn release_mobility(&self) -> f32 {
+        if self.held {
+            0.0
+        } else {
+            (1.0 - self.amplitude).clamp(0.0, 1.0)
+        }
+    }
+
+    #[must_use]
     pub(super) fn drag_axis(&self) -> Vec2 {
         if self.is_active() {
             self.field_axis
@@ -452,18 +531,6 @@ impl MaterialGrab {
             pressure_impulse: self.pressure_impulse,
         }
     }
-}
-
-fn pointer_gradient(delta: Vec2, support_radius: f32, peak_acceleration: f32) -> Vec2 {
-    let support_radius = support_radius.max(1.0e-5);
-    if wendland_c2_kernel(delta, support_radius) <= 0.0 {
-        return Vec2::ZERO;
-    }
-    // |dW/dx| reaches (540/256)/h at q=1/4. Normalize to give the strength
-    // control the exact meaning "peak acceleration".
-    const WENDLAND_GRADIENT_PEAK: f32 = 540.0 / 256.0;
-    -wendland_c2_gradient(delta, support_radius)
-        * (peak_acceleration.max(0.0) * support_radius / WENDLAND_GRADIENT_PEAK)
 }
 
 fn exponential_transition(current: f32, target: f32, duration: f32, dt: f32) -> f32 {
@@ -515,6 +582,23 @@ mod tests {
     use pet_ecology::{ContactSource, ExternalContact};
 
     use super::*;
+
+    #[test]
+    fn return_mobility_follows_actual_release_amplitude_and_resets_on_regrab() {
+        let mut grab = MaterialGrab::default();
+        let parameters = GrabParameters::default();
+        for _ in 0..30 {
+            grab.update_pointer(true, Vec2::ZERO, Vec2::ZERO, parameters, 1.0 / 120.0);
+        }
+        assert_eq!(grab.release_mobility(), 0.0);
+        grab.update_pointer(false, Vec2::ZERO, Vec2::ZERO, parameters, 1.0 / 120.0);
+        let first = grab.release_mobility();
+        assert!(first > 0.0 && first < 1.0);
+        grab.update_pointer(false, Vec2::ZERO, Vec2::ZERO, parameters, 1.0 / 120.0);
+        assert!(grab.release_mobility() > first);
+        grab.update_pointer(true, Vec2::ZERO, Vec2::ZERO, parameters, 1.0 / 120.0);
+        assert_eq!(grab.release_mobility(), 0.0);
+    }
 
     #[test]
     fn reciprocal_orb_force_is_mass_normalized_and_static_load_is_not_impact() {
@@ -578,23 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn wendland_pointer_gradient_is_compact_smooth_and_peak_calibrated() {
-        let support = 0.24;
-        assert_eq!(pointer_gradient(Vec2::ZERO, support, 6.0), Vec2::ZERO);
-        assert_eq!(
-            pointer_gradient(Vec2::new(support, 0.0), support, 6.0),
-            Vec2::ZERO
-        );
-        let peak = pointer_gradient(Vec2::new(support * 0.25, 0.0), support, 6.0);
-        assert!((peak.length() - 6.0).abs() < 1.0e-5);
-        assert!(peak.x > 0.0);
-        assert_eq!(
-            peak,
-            -pointer_gradient(Vec2::new(-support * 0.25, 0.0), support, 6.0)
-        );
-    }
-
-    #[test]
     fn pointer_field_ignores_raw_pointer_velocity_and_component_labels() {
         let mut still = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
         still[0].position = Vec2::new(-0.05, 0.0);
@@ -634,8 +701,8 @@ mod tests {
         }
         assert_eq!(still[0].force, moving[0].force);
         assert_eq!(still[1].force, moving[1].force);
-        assert!(still[0].force.x > 0.0);
-        assert!(still[1].force.x < 0.0);
+        assert_eq!(still[0].force, Vec2::ZERO);
+        assert_eq!(still[1].force, Vec2::ZERO);
     }
 
     #[test]
@@ -656,6 +723,164 @@ mod tests {
         assert!(
             grab.filtered_velocity.distance(previous_velocity) <= max_acceleration * dt + 1.0e-6
         );
+    }
+
+    #[test]
+    fn stationary_press_does_zero_mechanical_work_but_observes_contact() {
+        let parameters = GrabParameters::default();
+        let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+        for (index, particle) in particles[..5].iter_mut().enumerate() {
+            particle.position = Vec2::new(-0.08 + index as f32 * 0.04, 0.01);
+            particle.velocity = Vec2::new(0.03, -0.02);
+        }
+        let mut grab = MaterialGrab::default();
+        for _ in 0..1200 {
+            grab.update_pointer(
+                true,
+                Vec2::new(0.04, 0.02),
+                Vec2::ZERO,
+                parameters,
+                1.0 / 120.0,
+            );
+            grab.apply_field(&mut particles, 5, Vec2::ZERO, parameters);
+            assert!(particles[..5].iter().all(|p| p.force == Vec2::ZERO));
+            assert_eq!(grab.effective_pressure, 0.0);
+        }
+        let observation = grab.readback();
+        assert!(observation.active && observation.held && observation.area_fraction > 0.0);
+        assert!(observation.contact_center.is_finite());
+        assert!(
+            observation
+                .material_velocity
+                .distance(Vec2::new(0.03, -0.02))
+                < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn captured_grasp_keeps_local_tension_without_selecting_new_distant_material() {
+        let parameters = GrabParameters::default();
+        let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+        for (index, particle) in particles[..7].iter_mut().enumerate() {
+            particle.position = Vec2::new(-0.10 + index as f32 * 0.04, 0.02);
+        }
+        particles[7].position = Vec2::new(4.0, 0.0);
+        let mut grab = MaterialGrab::default();
+        grab.update_pointer(true, Vec2::ZERO, Vec2::ZERO, parameters, 1.0 / 120.0);
+        grab.apply_field(&mut particles, 8, Vec2::ZERO, parameters);
+        for _ in 0..60 {
+            grab.update_pointer(
+                true,
+                Vec2::new(0.08, 0.0),
+                Vec2::ZERO,
+                parameters,
+                1.0 / 120.0,
+            );
+        }
+        grab.apply_field(&mut particles, 8, Vec2::ZERO, parameters);
+        assert!(particles[..7].iter().any(|p| p.force.length() > 0.01));
+        assert!(
+            particles[..8].iter().all(|p| p.force.is_finite()
+                && p.force.length() <= parameters.peak_acceleration + 1.0e-5)
+        );
+        assert_eq!(particles[7].force, Vec2::ZERO);
+        for _ in 0..600 {
+            grab.update_pointer(
+                true,
+                Vec2::new(2.0, 0.0),
+                Vec2::ZERO,
+                parameters,
+                1.0 / 120.0,
+            );
+        }
+        for particle in &mut particles[..8] {
+            particle.force = Vec2::ZERO;
+        }
+        grab.apply_field(&mut particles, 8, Vec2::ZERO, parameters);
+        assert!(particles[..7].iter().any(|p| p.force.length() > 0.01));
+        assert!(
+            particles[..8].iter().all(|p| p.force.is_finite()
+                && p.force.length() <= parameters.peak_acceleration + 1.0e-5)
+        );
+        assert_eq!(particles[7].force, Vec2::ZERO);
+        assert!(grab.effective_pressure > 0.01);
+        let loaded_pressure = grab.effective_pressure;
+        for _ in 0..120 {
+            grab.update_pointer(
+                false,
+                Vec2::new(2.0, 0.0),
+                Vec2::ZERO,
+                parameters,
+                1.0 / 120.0,
+            );
+            for particle in &mut particles[..8] {
+                particle.force = Vec2::ZERO;
+            }
+            grab.apply_field(&mut particles, 8, Vec2::ZERO, parameters);
+        }
+        assert!(grab.effective_pressure < loaded_pressure * 0.001);
+    }
+
+    #[test]
+    fn onset_patch_moves_with_its_local_origin_and_regrab_cancels_old_load() {
+        let parameters = GrabParameters::default();
+        let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+        particles[0].position = Vec2::new(0.04, 0.02);
+        let mut grab = MaterialGrab::default();
+        grab.update_pointer(true, Vec2::ZERO, Vec2::ZERO, parameters, 1.0 / 120.0);
+        let shift = Vec2::new(0.3, -0.2);
+        particles[0].position += shift;
+        grab.update_pointer(true, shift, shift, parameters, 1.0 / 120.0);
+        grab.apply_field(&mut particles, 1, shift, parameters);
+        assert_eq!(particles[0].force, Vec2::ZERO);
+        grab.update_pointer(
+            true,
+            shift + Vec2::new(0.08, 0.0),
+            shift,
+            parameters,
+            1.0 / 120.0,
+        );
+        grab.update_pointer(false, shift, shift, parameters, 1.0 / 120.0);
+        assert!(grab.amplitude > 0.0);
+        grab.update_pointer(
+            true,
+            shift + Vec2::new(-0.08, 0.0),
+            shift,
+            parameters,
+            1.0 / 120.0,
+        );
+        particles[0].force = Vec2::ZERO;
+        grab.apply_field(&mut particles, 1, shift, parameters);
+        assert_eq!(particles[0].force, Vec2::ZERO);
+        assert_eq!(grab.filtered_velocity, Vec2::ZERO);
+    }
+
+    #[test]
+    fn entrained_patch_keeps_offsets_and_stops_loading_when_it_follows_the_cursor() {
+        let parameters = GrabParameters::default();
+        let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+        for (index, particle) in particles[..5].iter_mut().enumerate() {
+            particle.position = Vec2::new(-0.06 + index as f32 * 0.03, 0.01);
+        }
+        let mut grab = MaterialGrab::default();
+        grab.update_pointer(true, Vec2::ZERO, Vec2::ZERO, parameters, 1.0 / 120.0);
+        grab.apply_field(&mut particles, 5, Vec2::ZERO, parameters);
+        let translation = Vec2::new(0.06, 0.0);
+        for _ in 0..120 {
+            grab.update_pointer(true, translation, Vec2::ZERO, parameters, 1.0 / 120.0);
+        }
+        grab.apply_field(&mut particles, 5, Vec2::ZERO, parameters);
+        assert!(grab.effective_pressure > 0.01);
+        // A correctly entrained patch has moved together without collapse.
+        // Such positions are a unit fixture; native replay checks the solver.
+        for particle in &mut particles[..5] {
+            particle.position += translation;
+            particle.velocity = grab.filtered_velocity;
+            particle.force = Vec2::ZERO;
+        }
+        grab.apply_field(&mut particles, 5, Vec2::ZERO, parameters);
+        assert!(grab.effective_pressure < 1.0e-6);
+        assert!(particles[..5].iter().all(|p| p.force.length() < 1.0e-5));
     }
 
     #[test]

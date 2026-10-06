@@ -69,7 +69,7 @@ use self::{
         BondMaterial, BondUpdateParameters, MAX_BONDS, ViscoelasticBond, initialize_bonds,
         solve_bonds, update_bonds,
     },
-    viscosity::apply_xsph_viscosity,
+    viscosity::{apply_strain_rate_dissipation, apply_xsph_viscosity},
     xpbd::{DensityConstraintParameters, SupportPlane, solve_density_constraints},
 };
 
@@ -276,6 +276,12 @@ pub struct LiquidMorphRuntime {
     particles: [LiquidParticle; MAX_LIQUID_PARTICLES],
     particle_count: usize,
     material_grab: MaterialGrab,
+    /// Same-state experimental control; absent from production and persistence.
+    #[cfg(test)]
+    skip_strain_rate_dissipation: bool,
+    /// Actual physical velocities immediately before topology classification.
+    #[cfg(test)]
+    velocities_before_classification: [Vec2; MAX_LIQUID_PARTICLES],
     interaction_probe: LiquidInteractionProbe,
     topology_guard: TopologyGuard,
     topology_decision: TopologyDecision,
@@ -430,6 +436,10 @@ impl LiquidMorphRuntime {
             particles,
             particle_count,
             material_grab: MaterialGrab::default(),
+            #[cfg(test)]
+            skip_strain_rate_dissipation: false,
+            #[cfg(test)]
+            velocities_before_classification: [Vec2::ZERO; MAX_LIQUID_PARTICLES],
             interaction_probe: LiquidInteractionProbe::default(),
             topology_guard: TopologyGuard::default(),
             topology_decision: TopologyDecision::default(),
@@ -1484,6 +1494,13 @@ impl LiquidMorphRuntime {
             dt,
         );
         update_density_and_surface(&mut self.particles, self.particle_count, kernel_radius);
+        #[cfg(test)]
+        for (observed, particle) in self.velocities_before_classification[..self.particle_count]
+            .iter_mut()
+            .zip(&self.particles[..self.particle_count])
+        {
+            *observed = particle.velocity;
+        }
         let component_spacing = component_graph_spacing(
             spacing,
             kernel_radius,
@@ -1503,6 +1520,21 @@ impl LiquidMorphRuntime {
             .map(|bond| bond.strain.max(0.0))
             .fold(0.0_f32, f32::max)
             .max((self.material_stretch_ratio() - 1.0).max(0.0));
+        #[cfg(test)]
+        let apply_return_dissipation = !self.skip_strain_rate_dissipation;
+        #[cfg(not(test))]
+        let apply_return_dissipation = true;
+        if apply_return_dissipation {
+            apply_strain_rate_dissipation(
+                &mut self.particles,
+                self.particle_count,
+                self.components.main_component,
+                kernel_radius,
+                observed_strain,
+                self.material_grab.release_mobility(),
+                dt,
+            );
+        }
         self.component_lifecycle.update(
             &self.particles,
             self.particle_count,

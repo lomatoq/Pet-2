@@ -124,6 +124,54 @@ fn settle(runtime: &mut LiquidMorphRuntime, genome: &Genome, seconds: f32) {
     }
 }
 
+// Retained-offset material no longer uses an artificial point sink to form a
+// parcel. This existing cooperative production profile has a measured visible
+// edge grasp that forms a real 13-particle parcel within the unchanged guard.
+fn controlled_separation_runtime() -> (Genome, LiquidMorphRuntime) {
+    let (genome, mut runtime) = migrated_runtime(0x7EA4);
+    let mut production = runtime.tuning;
+    production.surface_tension = 2.5;
+    production.grab_stiffness = 390.0;
+    production.pointer_support_scale = 2.4;
+    production.pointer_response_hz = 35.0;
+    production.return_strength = 0.05;
+    production.character_field_radius_scale = 1.17;
+    runtime.set_tuning(
+        production,
+        runtime.interaction_tuning,
+        FaceTuning::default(),
+        MaterialVariant::CinematicJelly,
+    );
+    settle(&mut runtime, &genome, 2.0);
+    let onset = Vec2::new(0.30, 0.03);
+    assert!(runtime.hit_test_main_component(onset));
+    let render = runtime.render_state();
+    let density: f32 = render.particles[..render.particle_count].iter().map(|particle| {
+        let delta = onset - particle.position;
+        let q = Vec2::new(
+            delta.dot(particle.axis_major) / particle.major_radius,
+            delta.dot(particle.axis_major.perp()) / particle.minor_radius,
+        );
+        (1.0 - q.length_squared()).max(0.0).powi(3) * particle.density
+    }).sum();
+    assert!(density >= runtime.tuning.iso_threshold, "onset density={density}");
+    (genome, runtime)
+}
+
+fn controlled_separation_sensor(local: Vec2, held: bool) -> SensorFrame {
+    let mut sensors = pointer_sensor(local, held);
+    if held {
+        sensors.interaction_actuation = InteractionBodyActuation {
+            compliance_delta: 0.25,
+            cohesion_delta: -0.25,
+            cooperation: 1.0,
+            allow_intentional_bud: true,
+            ..InteractionBodyActuation::default()
+        };
+    }
+    sensors
+}
+
 fn particle_center(runtime: &LiquidMorphRuntime) -> Vec2 {
     runtime.particles[..runtime.particle_count]
         .iter()
@@ -292,6 +340,7 @@ fn idle_and_sparse_reconstruction_obey_the_new_contract() {
 fn stationary_pointer_field_settles_without_jitter_or_step_spikes() {
     let (genome, mut runtime) = migrated_runtime(0x501D);
     settle(&mut runtime, &genome, 2.0);
+    let mut untouched = runtime.clone();
     let feedback = BodyFeedback::default();
     let sensors = pointer_sensor(Vec2::new(0.28, 0.02), true);
     let motion = DropletMotion {
@@ -300,9 +349,8 @@ fn stationary_pointer_field_settles_without_jitter_or_step_spikes() {
     };
     let kernel_radius = KERNEL_RADIUS * runtime.tuning.kernel_radius_scale;
     let mut maximum_step = 0.0_f32;
-    let mut initial_rms = 0.0_f32;
-    let mut initial_samples = 0.0_f32;
     let mut tail_rms = 0.0_f32;
+    let mut untouched_tail_rms = 0.0_f32;
     let mut tail_samples = 0.0_f32;
     for tick in 0..1_200 {
         let before: Vec<Vec2> = runtime.particles[..runtime.particle_count]
@@ -310,25 +358,39 @@ fn stationary_pointer_field_settles_without_jitter_or_step_spikes() {
             .map(|particle| particle.position)
             .collect();
         step(&mut runtime, &genome, &sensors, &feedback, motion);
+        step(
+            &mut untouched,
+            &genome,
+            &SensorFrame::default(),
+            &feedback,
+            motion,
+        );
         for (particle, previous) in runtime.particles[..runtime.particle_count]
             .iter()
             .zip(before)
         {
             maximum_step = maximum_step.max(particle.position.distance(previous));
         }
-        if (60..180).contains(&tick) {
-            initial_rms += rms_speed(&runtime);
-            initial_samples += 1.0;
-        } else if tick >= 1_080 {
+        if tick >= 1_080 {
             tail_rms += rms_speed(&runtime);
+            untouched_tail_rms += rms_speed(&untouched);
             tail_samples += 1.0;
         }
     }
-    initial_rms /= initial_samples;
     tail_rms /= tail_samples;
+    untouched_tail_rms /= tail_samples;
+    // A zero-displacement touch no longer adds a compressive/damping sink.
+    // Preserve the natural baseline, while still rejecting contact jitter.
     assert!(
-        tail_rms < initial_rms * 0.75 && tail_rms < 0.06,
-        "pointer hold did not attenuate: initial rms={initial_rms}, tail rms={tail_rms}"
+        tail_rms <= untouched_tail_rms * 1.15 + 0.001 && tail_rms < 0.06,
+        "stationary touch injected motion: untouched rms={untouched_tail_rms}, held rms={tail_rms}"
+    );
+    assert_eq!(
+        runtime
+            .embodied_interaction_frame()
+            .contact
+            .effective_pressure,
+        0.0
     );
     assert!(maximum_step < kernel_radius * 0.10, "step={maximum_step}");
     assert_eq!(runtime.diagnostics().failsafe_hits, 0);
@@ -541,10 +603,105 @@ fn real_detached_mass_preserves_inherited_flight_translation() {
     );
 }
 
+fn internal_return_motion(runtime: &LiquidMorphRuntime) -> (f32, Vec2) {
+    let particles = &runtime.particles[..runtime.particle_count];
+    let mass = particles.iter().map(|p| p.inverse_mass.recip()).sum::<f32>();
+    let center = particles.iter().map(|p| p.position / p.inverse_mass).sum::<Vec2>() / mass;
+    let velocity = particles.iter().map(|p| p.velocity / p.inverse_mass).sum::<Vec2>() / mass;
+    let inertia = particles.iter().map(|p| {
+        (p.position - center).length_squared() / p.inverse_mass
+    }).sum::<f32>();
+    let angular = particles.iter().map(|p| {
+        (p.position - center).perp_dot(p.velocity - velocity) / p.inverse_mass
+    }).sum::<f32>() / inertia.max(1.0e-5);
+    let kinetic = particles.iter().map(|p| {
+        let relative = p.velocity - velocity - (p.position - center).perp() * angular;
+        relative.length_squared() * 0.5 / p.inverse_mass
+    }).sum::<f32>();
+    let variance = particles.iter().map(|p| {
+        let q = p.position - center;
+        q * q / p.inverse_mass
+    }).sum::<Vec2>() / mass;
+    (kinetic, variance)
+}
+
+#[test]
+fn same_state_return_dissipation_reduces_energy_without_numbing_gentle_motion() {
+    // Stable numerical/material profile only: no saved pet state or memories.
+    let profile: crate::LiquidTuningProfile = serde_json::from_str(include_str!(
+        "../../tests/fixtures/v692-active-liquid-profile.json"
+    )).expect("reviewed production profile fixture");
+    let genome = Genome::from_seed(profile.seed);
+    for (name, distance) in [("gentle", 0.12_f32), ("large", 0.56)] {
+        let mut runtime = LiquidMorphRuntime::new(profile.seed);
+        runtime.set_tuning(profile.pbf, profile.interaction, profile.face, profile.material.variant);
+        settle(&mut runtime, &genome, 2.0);
+        let feedback = BodyFeedback::default();
+        let motion = DropletMotion { world_to_body_scale: Vec2::ONE, ..DropletMotion::default() };
+        assert!(runtime.hit_test_main_component(Vec2::new(0.20, 0.03)));
+        for tick in 0..480 {
+            let t = (tick as f32 * DT / 2.0).clamp(0.0, 1.0);
+            let local = Vec2::new(0.20 + distance * t * t * (3.0 - 2.0 * t), 0.03);
+            step(&mut runtime, &genome, &pointer_sensor(local, true), &feedback, motion);
+        }
+        let initial_checksum = runtime.body_material_snapshot(
+            profile.seed, profile.schema_version, profile.profile_revision
+        ).total_mass_bits_checksum;
+        let mut reference = runtime.clone();
+        assert_eq!(runtime.particles, reference.particles);
+        reference.skip_strain_rate_dissipation = true;
+        let released = pointer_sensor(Vec2::new(0.20 + distance, 0.03), false);
+        let mut sums = [0.0_f32; 2];
+        let mut peaks = [0.0_f32; 2];
+        let mut shape_motion = [0.0_f32; 2];
+        let initial_variance = internal_return_motion(&runtime).1;
+        let mut previous_variance = [initial_variance; 2];
+        let mut maximum_particle_difference = 0.0_f32;
+        for tick in 0..480 {
+            step(&mut runtime, &genome, &released, &feedback, motion);
+            step(&mut reference, &genome, &released, &feedback, motion);
+            for (i, state) in [&runtime, &reference].into_iter().enumerate() {
+                let (energy, variance) = internal_return_motion(state);
+                peaks[i] = peaks[i].max(energy);
+                if (60..240).contains(&tick) {
+                    sums[i] += energy * DT;
+                    shape_motion[i] += variance.distance(previous_variance[i]);
+                }
+                previous_variance[i] = variance;
+                assert_eq!(state.diagnostics().component_count, 1);
+                assert_eq!(state.diagnostics().failsafe_hits, 0);
+                assert_eq!(state.diagnostics().recovery_count, 0);
+                assert!(state.diagnostics().finite);
+                assert_eq!(state.body_material_snapshot(
+                    profile.seed, profile.schema_version, profile.profile_revision
+                ).total_mass_bits_checksum, initial_checksum);
+            }
+            maximum_particle_difference = maximum_particle_difference.max(
+                runtime.particles[..runtime.particle_count].iter()
+                    .zip(&reference.particles[..reference.particle_count])
+                    .map(|(a,b)| a.position.distance(b.position)).fold(0.0_f32, f32::max)
+            );
+        }
+        if name == "gentle" {
+            assert_eq!(sums[0], sums[1]);
+            assert_eq!(peaks[0], peaks[1]);
+            assert_eq!(shape_motion[0], shape_motion[1]);
+            assert_eq!(maximum_particle_difference, 0.0);
+        } else {
+            assert!(sums[0] <= sums[1] * 0.98, "return energy={sums:?}");
+            assert!(peaks[0] <= peaks[1], "return peaks={peaks:?}");
+            assert!((shape_motion[0] - shape_motion[1]).abs() <= shape_motion[1] * 0.05,
+                "liquid deformation was suppressed: {shape_motion:?}");
+        }
+    }
+}
+
 #[test]
 fn mass_is_conserved_before_during_and_after_remerge() {
-    let (genome, mut runtime) = migrated_runtime(0x7EA4);
-    settle(&mut runtime, &genome, 2.0);
+    let (genome, mut runtime) = controlled_separation_runtime();
+    let initial_checksum = runtime
+        .body_material_snapshot(0x7EA4, crate::LIQUID_TUNING_SCHEMA_VERSION, 0)
+        .total_mass_bits_checksum;
     let initial_mass_bits = runtime.particles[..runtime.particle_count]
         .iter()
         .map(|particle| particle.inverse_mass.max(1.0e-5).recip())
@@ -555,15 +712,15 @@ fn mass_is_conserved_before_during_and_after_remerge() {
         world_to_body_scale: Vec2::ONE,
         ..DropletMotion::default()
     };
-    let mut observed_natural_tear = None;
-    let mut release_position = Vec2::new(0.82, 0.03);
-    for tick in 0..420 {
-        let t = tick as f32 / 419.0;
-        let local = Vec2::new(0.24 + t * 0.58, 0.03);
+    let mut observed_controlled_tear = None;
+    let mut release_position = Vec2::new(1.10, 0.03);
+    for tick in 0..720 {
+        let t = tick as f32 / 719.0;
+        let local = Vec2::new(0.30 + t * 0.80, 0.03);
         step(
             &mut runtime,
             &genome,
-            &pointer_sensor(local, true),
+            &controlled_separation_sensor(local, true),
             &feedback,
             motion,
         );
@@ -575,39 +732,40 @@ fn mass_is_conserved_before_during_and_after_remerge() {
                 .sum::<f32>()
                 .to_bits();
             assert_eq!(detached_mass_bits, initial_mass_bits);
-            observed_natural_tear = Some(detached);
+            assert_eq!(
+                runtime
+                    .body_material_snapshot(0x7EA4, crate::LIQUID_TUNING_SCHEMA_VERSION, 0)
+                    .total_mass_bits_checksum,
+                initial_checksum
+            );
+            observed_controlled_tear = Some(detached);
             release_position = local;
             break;
         }
     }
     assert!(
-        observed_natural_tear.is_some(),
-        "no 8–16 particle natural tear was observed"
+        observed_controlled_tear.is_some(),
+        "no 8–16 particle controlled tear was observed"
     );
 
     let released = pointer_sensor(release_position, false);
-    let mut previous_velocities: Vec<Vec2> = runtime.particles[..runtime.particle_count]
-        .iter()
-        .map(|particle| particle.velocity)
-        .collect();
     let mut previous_components = runtime.diagnostics().component_count;
-    let mut merge_delta_v = 0.0_f32;
+    let mut merge_handoff_delta_v = 0.0_f32;
     let mut mass_inside_field_at_three_seconds = 0_usize;
     for tick in 0..600 {
         step(&mut runtime, &genome, &released, &feedback, motion);
         let components = runtime.diagnostics().component_count;
         if previous_components > 1 && components == 1 {
-            merge_delta_v = runtime.particles[..runtime.particle_count]
+            // The visible iso-graph rejoins before density-kernel centers touch.
+            // Ordinary packing can occur in this same frame independently. Test
+            // the actual classification/return handoff after the physical solve.
+            merge_handoff_delta_v = runtime.particles[..runtime.particle_count]
                 .iter()
-                .zip(&previous_velocities)
+                .zip(&runtime.velocities_before_classification[..runtime.particle_count])
                 .map(|(particle, previous)| particle.velocity.distance(*previous))
                 .fold(0.0_f32, f32::max);
         }
         previous_components = components;
-        previous_velocities = runtime.particles[..runtime.particle_count]
-            .iter()
-            .map(|particle| particle.velocity)
-            .collect();
         if tick == 359 {
             let radii = Vec2::new(0.35, 0.43) * runtime.tuning.character_field_radius_scale;
             mass_inside_field_at_three_seconds = runtime.particles[..runtime.particle_count]
@@ -626,6 +784,12 @@ fn mass_is_conserved_before_during_and_after_remerge() {
         .sum::<f32>()
         .to_bits();
     assert_eq!(final_mass_bits, initial_mass_bits);
+    assert_eq!(
+        runtime
+            .body_material_snapshot(0x7EA4, crate::LIQUID_TUNING_SCHEMA_VERSION, 0)
+            .total_mass_bits_checksum,
+        initial_checksum
+    );
     assert_eq!(diagnostics.component_count, 1, "{diagnostics:?}");
     assert!(
         diagnostics.main_mass >= runtime.particle_count as f32 * 0.95,
@@ -637,7 +801,8 @@ fn mass_is_conserved_before_during_and_after_remerge() {
         runtime.particle_count
     );
     assert!(rms_speed(&runtime) < 0.055, "rms={}", rms_speed(&runtime));
-    assert!(merge_delta_v < 0.08, "merge delta-v={merge_delta_v}");
+    assert!(merge_handoff_delta_v < 0.08,
+        "merge handoff delta-v={merge_handoff_delta_v}");
     assert_eq!(diagnostics.failsafe_hits, 0, "{diagnostics:?}");
     assert_eq!(diagnostics.recovery_count, 0, "{diagnostics:?}");
 }
@@ -645,22 +810,21 @@ fn mass_is_conserved_before_during_and_after_remerge() {
 #[test]
 fn fixed_seed_replays_identical_split_and_remerge_ticks() {
     fn replay() -> (u32, u32) {
-        let (genome, mut runtime) = migrated_runtime(0x7EA4);
-        settle(&mut runtime, &genome, 2.0);
+        let (genome, mut runtime) = controlled_separation_runtime();
         let feedback = BodyFeedback::default();
         let motion = DropletMotion {
             world_to_body_scale: Vec2::ONE,
             ..DropletMotion::default()
         };
         let mut split_tick = None;
-        let mut release_position = Vec2::new(0.82, 0.03);
-        for tick in 0..420_u32 {
-            let phase = tick as f32 / 419.0;
-            let local = Vec2::new(0.24 + phase * 0.58, 0.03);
+        let mut release_position = Vec2::new(1.10, 0.03);
+        for tick in 0..720_u32 {
+            let phase = tick as f32 / 719.0;
+            let local = Vec2::new(0.30 + phase * 0.80, 0.03);
             step(
                 &mut runtime,
                 &genome,
-                &pointer_sensor(local, true),
+                &controlled_separation_sensor(local, true),
                 &feedback,
                 motion,
             );
@@ -695,21 +859,7 @@ fn fixed_seed_replays_identical_split_and_remerge_ticks() {
 
 #[test]
 fn voluntary_separation_uses_real_production_particles_under_the_hard_guard() {
-    let (genome, mut runtime) = migrated_runtime(0x7EA4);
-    let mut production = runtime.tuning;
-    production.surface_tension = 2.5;
-    production.grab_stiffness = 390.0;
-    production.pointer_support_scale = 2.4;
-    production.pointer_response_hz = 35.0;
-    production.return_strength = 0.05;
-    production.character_field_radius_scale = 1.17;
-    runtime.set_tuning(
-        production,
-        runtime.interaction_tuning,
-        FaceTuning::default(),
-        MaterialVariant::CinematicJelly,
-    );
-    settle(&mut runtime, &genome, 2.0);
+    let (genome, mut runtime) = controlled_separation_runtime();
     let feedback = BodyFeedback::default();
     let motion = DropletMotion {
         world_to_body_scale: Vec2::ONE,
@@ -722,17 +872,10 @@ fn voluntary_separation_uses_real_production_particles_under_the_hard_guard() {
     let mut budget_rejections = 0_u32;
     let mut maximum_predicted_components = 0_usize;
     let mut minimum_predicted_fragment = usize::MAX;
-    let mut release_position = Vec2::new(0.82, 0.03);
-    for tick in 0..420 {
-        let phase = tick as f32 / 419.0;
-        let mut sensors = pointer_sensor(Vec2::new(0.24 + phase * 0.58, 0.03), true);
-        sensors.interaction_actuation = InteractionBodyActuation {
-            compliance_delta: 0.25,
-            cohesion_delta: -0.25,
-            cooperation: 1.0,
-            allow_intentional_bud: true,
-            ..InteractionBodyActuation::default()
-        };
+    let mut release_position = Vec2::new(1.10, 0.03);
+    for tick in 0..720 {
+        let phase = tick as f32 / 719.0;
+        let sensors = controlled_separation_sensor(Vec2::new(0.30 + phase * 0.80, 0.03), true);
         step(&mut runtime, &genome, &sensors, &feedback, motion);
         maximum_detached = maximum_detached.max(
             runtime
@@ -756,7 +899,7 @@ fn voluntary_separation_uses_real_production_particles_under_the_hard_guard() {
         minimum_predicted_fragment =
             minimum_predicted_fragment.min(runtime.topology_decision.minimum_fragment_particles);
         if maximum_detached > 0.0 {
-            release_position = Vec2::new(0.24 + phase * 0.58, 0.03);
+            release_position = Vec2::new(0.30 + phase * 0.80, 0.03);
             break;
         }
     }

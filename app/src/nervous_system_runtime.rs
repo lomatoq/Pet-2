@@ -36,9 +36,12 @@ pub struct NervousSystemRuntime {
     voice_feedback: VoiceFeedbackV1,
     previous_voice_energy: f32,
     voice_mouth_open: f32,
+    voice_active: bool,
     startle_face: f32,
     companion_expression: Option<CompanionExpressionDirector>,
     companion_body_style: pet_body::BodyStyleTarget,
+    companion_mouth_aperture: Option<f32>,
+    presented_semantic_mouth: Option<f32>,
     blink_owner: pet_body::BlinkOwner,
     blink_reason: pet_body::BlinkReason,
     ordinary_blink_active: bool,
@@ -71,9 +74,12 @@ impl Default for NervousSystemRuntime {
             voice_feedback: VoiceFeedbackV1::default(),
             previous_voice_energy: 0.0,
             voice_mouth_open: 0.0,
+            voice_active: false,
             startle_face: 0.0,
             companion_expression: None,
             companion_body_style: pet_body::BodyStyleTarget::default(),
+            companion_mouth_aperture: None,
+            presented_semantic_mouth: None,
             blink_owner: pet_body::BlinkOwner::Physiological,
             blink_reason: pet_body::BlinkReason::None,
             ordinary_blink_active: false,
@@ -174,6 +180,7 @@ impl NervousSystemRuntime {
         let spectral_flux = (emitted - self.previous_voice_energy).abs().clamp(0.0, 1.0);
         self.previous_voice_energy = emitted;
         self.voice_mouth_open = visual.mouth_open.clamp(0.0, 1.0);
+        self.voice_active = visual.active;
         let octave_offset =
             (visual.pitch_normalized.clamp(0.0, 1.0) - 0.5) * genome.pitch_range_octaves;
         self.voice_feedback = VoiceFeedbackV1 {
@@ -434,7 +441,15 @@ impl NervousSystemRuntime {
                 | pet_body::FixationGazeMode::AvoidantCheck
                 | pet_body::FixationGazeMode::Sleep
         );
+        let semantic_mouth_aperture = surviving_mouth_aperture(
+            self.companion_mouth_aperture,
+            phenotype.expression,
+        );
         calibration.apply(&mut phenotype);
+        // Keep the command through calibration, then validate later writers.
+        let semantic_mouth_aperture =
+            semantic_mouth_aperture.map(|_| phenotype.expression.mouth_open);
+        let mut scene_expression_replaced = false;
         if let Some(motor) = &motor
             && let Some(pose) = motor.scene_pose
             && self.snapshot.felt.pain_like < 0.2
@@ -444,8 +459,27 @@ impl NervousSystemRuntime {
             && !protective
         {
             phenotype.expression = pose.expression();
+            scene_expression_replaced = true;
         }
         phenotype.apply_to_intent(intent, sensors, body.simulation.feedback.world_position);
+        // Legacy phenotype projection intentionally preserves the incoming jaw
+        // for audio. An awake, unprotected semantic owner must explicitly cross
+        // that boundary; actual feeding can still replace it later in main.
+        let semantic_mouth_aperture = apply_semantic_mouth_aperture(
+            intent,
+            semantic_mouth_aperture,
+            self.presented_semantic_mouth,
+            protective
+                || scene_expression_replaced
+                || final_gaze_mode == pet_body::FixationGazeMode::Sleep
+                || self.snapshot.felt.pain_like > 0.2
+                || self.snapshot.felt.startle > 0.35
+                || self.startle_face > 0.1
+                || self.voice_active
+                || self.voice_feedback.phonating
+                || (self.companion_mouth_aperture.is_some()
+                    && semantic_mouth_aperture.is_none()),
+        );
         if let Some(motor) = &motor {
             SomaticActuationBus::apply_to_intent(motor.packet, motor.context, intent);
             body.set_somatic_actuation(motor.packet.clone());
@@ -539,6 +573,9 @@ impl NervousSystemRuntime {
         sensors.interaction_actuation = phenotype.interaction;
         self.actuation = phenotype.clone();
         body.set_companion_body_style(self.companion_body_style);
+        self.presented_semantic_mouth =
+            surviving_mouth_aperture(semantic_mouth_aperture, intent.expression);
+        body.set_companion_mouth_aperture(self.presented_semantic_mouth);
         body.set_fast_phenotype_actuation(phenotype);
     }
 
@@ -552,6 +589,9 @@ impl NervousSystemRuntime {
     ) {
         self.actuation.expression = intent.expression;
         self.actuation.face.gaze_target = intent.gaze_target;
+        self.presented_semantic_mouth =
+            surviving_mouth_aperture(self.presented_semantic_mouth, intent.expression);
+        body.set_companion_mouth_aperture(self.presented_semantic_mouth);
         body.set_fast_phenotype_actuation(self.actuation.clone());
         let command = body.simulation.preview_motor_velocity(
             &life.state.genome.body,
@@ -767,7 +807,7 @@ impl NervousSystemRuntime {
                 body_speed: self.body_feedback.motion.velocity.length(),
                 motor_error: (actual - intended).length().clamp(0.0, 1.0),
                 audio_mouth_open: self.voice_mouth_open,
-                audio_active: self.voice_feedback.phonating,
+                audio_active: self.voice_active || self.voice_feedback.phonating,
                 target_velocity: self.gaze_object_velocity,
                 protective_reflex: self.startle_face > 0.25
                     || self.snapshot.felt.startle > 0.55
@@ -778,6 +818,8 @@ impl NervousSystemRuntime {
         );
         apply_companion_expression(&mut actuation, companion);
         self.companion_body_style = companion.body;
+        self.companion_mouth_aperture =
+            companion.owns_mouth_aperture.then_some(companion.face.mouth_open);
         self.blink_owner = companion.blink_owner;
         self.blink_reason = companion.blink_reason;
         // Motor physiology and defensive ownership must survive R14's face layer.
@@ -1076,6 +1118,38 @@ fn motor_startle_recruits_eyes_brows_and_mouth_without_erasing_blinks() {
     assert_eq!(expression.blink_left, 0.7);
 }
 
+fn surviving_mouth_aperture(
+    expected: Option<f32>,
+    expression: lifecore::ExpressionState,
+) -> Option<f32> {
+    expected.filter(|value| {
+        value.is_finite()
+            && *value > 0.0
+            && (expression.mouth_open - value).abs() <= 0.0001
+    })
+}
+
+fn apply_semantic_mouth_aperture(
+    intent: &mut BodyIntent,
+    next: Option<f32>,
+    previous: Option<f32>,
+    blocked: bool,
+) -> Option<f32> {
+    if blocked {
+        return None;
+    }
+    if let Some(aperture) = next.filter(|value| value.is_finite() && *value > 0.0) {
+        intent.expression.mouth_open = aperture.clamp(0.0, 1.0);
+        return Some(intent.expression.mouth_open);
+    }
+    if surviving_mouth_aperture(previous, intent.expression).is_some() {
+        // Release only our surviving command. A replaced feeding/audio jaw is
+        // owned elsewhere and must never be closed by this semantic release.
+        intent.expression.mouth_open = 0.0;
+    }
+    None
+}
+
 fn apply_companion_expression(
     actuation: &mut FastPhenotypeActuation,
     target: pet_body::CompanionExpressionTarget,
@@ -1242,6 +1316,105 @@ fn measured_rest_quality(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_mouth_crosses_real_projection_holds_and_releases_through_body() {
+        let mut nervous = NervousSystemRuntime::default();
+        let mut life = LifeCore::new(lifecore::Genome::from_seed(42), 11);
+        let mut vita = VitaRuntime::new(42, None);
+        let morph = MorphBrain::new(42, None).unwrap();
+        let mut body = ProceduralBody::generate(&life.state.genome).unwrap();
+        let mut sensors = SensorFrame::default();
+        let mut intent = life.tick(&sensors, &lifecore::BodyFeedback::default(), 0.05).body_intent;
+        let target = lifecore::IntentTarget {
+            position: Some(glam::Vec2::new(0.65, 0.5)), confidence: 0.9, ..Default::default()
+        };
+        assert!(vita.synchronize_execution_scene(lifecore::PrimaryIntent::Inspect,
+            target, lifecore::ExpectedOutcome::default()));
+        // Start from a closed legacy jaw: copying actuation alone preserved this
+        // zero and prevented the director's meaningful aperture from reaching body.
+        intent.expression.mouth_open = 0.0;
+        for _ in 0..420 {
+            nervous.apply_motor_actuation(&mut life, &vita, &morph, &mut body,
+                &mut sensors, &mut intent, None, 1.0 / 60.0);
+            body.embodied_update(&intent, &sensors, lifecore::AffectState::default(),
+                pet_body::VisualMindInput::default(), pet_body::VoiceVisualState::default(), 1.0 / 60.0);
+        }
+        let command = nervous.companion_mouth_aperture.unwrap();
+        assert!((intent.expression.mouth_open - command).abs() < 0.0001);
+        let held = body.render_parameters(&life.state.genome, 0.0).mouth_open;
+        assert!(held > command * 0.95, "command={command} rendered={held}");
+        assert!(vita.synchronize_execution_scene(lifecore::PrimaryIntent::EatAccept,
+            target, lifecore::ExpectedOutcome::default()));
+        nervous.apply_motor_actuation(&mut life, &vita, &morph, &mut body,
+            &mut sensors, &mut intent, None, 1.0 / 60.0);
+        assert_eq!(intent.expression.mouth_open, 0.0, "readiness releases our question jaw");
+        body.embodied_update(&intent, &sensors, lifecore::AffectState::default(),
+            pet_body::VisualMindInput::default(), pet_body::VoiceVisualState::default(), 1.0 / 60.0);
+        assert!((held - body.render_parameters(&life.state.genome, 0.0).mouth_open).abs() < 0.003);
+        for _ in 0..120 {
+            body.embodied_update(&intent, &sensors, lifecore::AffectState::default(),
+                pet_body::VisualMindInput::default(), pet_body::VoiceVisualState::default(), 1.0 / 60.0);
+        }
+        assert!(body.render_parameters(&life.state.genome, 0.0).mouth_open < 0.001);
+    }
+
+    #[test]
+    fn real_semantic_mouth_bridge_preserves_voice_sleep_scene_and_defense() {
+        for priority in 0..5 {
+            let mut nervous = NervousSystemRuntime::default();
+            let mut life = LifeCore::new(lifecore::Genome::from_seed(42), 11);
+            let mut vita = VitaRuntime::new(42, None);
+            let morph = MorphBrain::new(42, None).unwrap();
+            let mut body = ProceduralBody::generate(&life.state.genome).unwrap();
+            let mut sensors = SensorFrame::default();
+            let mut intent = life.tick(&sensors, &lifecore::BodyFeedback::default(), 0.05).body_intent;
+            vita.synchronize_execution_scene(lifecore::PrimaryIntent::Inspect,
+                lifecore::IntentTarget { confidence: 0.9, ..Default::default() },
+                lifecore::ExpectedOutcome::default());
+            intent.expression.mouth_open = 0.43;
+            let mut packet = SomaticActuationPacket::default();
+            let context = pet_motor::BehaviorContextFrame::default();
+            let scene_pose = match priority {
+                0 => {
+                    nervous.voice_feedback.phonating = true;
+                    nervous.voice_mouth_open = 0.43;
+                    None
+                }
+                1 => {
+                    packet.program = Some(pet_motor::BehaviorProgramId::RestNremSleep);
+                    packet.locomotion.pose = pet_motor::MotorPoseIntent::SupportedSleep;
+                    None
+                }
+                2 => Some(lifecore::FacePose::Affectionate),
+                3 => {
+                    packet.program = Some(pet_motor::BehaviorProgramId::DefenseThreatHardenCompact);
+                    None
+                }
+                _ => {
+                    // Actual audio can own a quiet opening before the heard
+                    // energy crosses the phonation threshold.
+                    nervous.observe_voice(AudioVisualFeedback {
+                        active: true, mouth_open: 0.43, envelope: 0.005,
+                        ..Default::default()
+                    }, AudioCallbackLevels::default(), &life.state.genome.voice);
+                    assert!(!nervous.voice_feedback.phonating);
+                    None
+                }
+            };
+            nervous.apply_motor_actuation(&mut life, &vita, &morph, &mut body,
+                &mut sensors, &mut intent, Some(MotorActuationFrame {
+                    packet: &packet, context: &context, scene_pose
+                }), 0.05);
+            assert_eq!(nervous.presented_semantic_mouth, None, "priority={priority}");
+            if matches!(priority, 0 | 4) { assert_eq!(intent.expression.mouth_open, 0.43); }
+        }
+        let mut intent = LifeCore::new(lifecore::Genome::from_seed(42), 11)
+            .tick(&SensorFrame::default(), &lifecore::BodyFeedback::default(), 0.05).body_intent;
+        intent.expression.mouth_open = 0.4; // actual feeding replaced our .06
+        assert_eq!(apply_semantic_mouth_aperture(&mut intent, None, Some(0.06), false), None);
+        assert_eq!(intent.expression.mouth_open, 0.4);
+    }
 
     #[test]
     fn recorded_pre_incident_supported_rest_does_not_self_interrupt_into_startle() {

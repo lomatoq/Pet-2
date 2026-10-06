@@ -336,15 +336,33 @@ fn derive_felt(
     // non-zero tail at pressure zero. Resting support is a separate channel.
     let touch_present = bool_value(b.contact.contact_count > 0);
     let gentle_motion = 1.0 - smoothstep(0.18, 0.55, b.contact.tangential_speed);
+    let yielding_care = crate::interaction::MaterialCareEvidence {
+        active: b.contact.contact_count > 0,
+        area: b.contact.area,
+        pressure: b.contact.pressure,
+        // BodyFeedbackV2 normalizes the measured relative speed by eight.
+        slip_speed: b.contact.tangential_speed * 8.0,
+        strain: b.shape.maximum_strain,
+        neck_tension: b.shape.neck_tension,
+        detached_mass: b.topology.detached_mass_fraction,
+        topology_intact: b.topology.connected_components == 1 && b.topology.budget_remaining > 0.99,
+    }
+    .quality();
+    let low_pressure_touch = soft_band(
+        b.contact.pressure,
+        0.03,
+        source.soft_touch_pressure_max.max(0.031),
+        0.10,
+    );
     let pleasant = unit(
         touch_present
-            * soft_band(
-                b.contact.pressure,
-                0.03,
-                source.soft_touch_pressure_max.max(0.031),
-                0.10,
-            )
+            * low_pressure_touch.max(yielding_care)
             * (1.0 - pain_like)
+            * (1.0 - smoothstep(0.30, 0.58, b.shape.maximum_strain.max(b.shape.neck_tension)))
+            * (1.0 - smoothstep(0.005, 0.025, b.topology.detached_mass_fraction))
+            * (1.0 - source.affect.stress)
+            * (1.0 - source.gesture.boundary_violation)
+            * (1.0 - smoothstep(0.12, 0.50, b.contact.tangential_speed))
             * (0.75 + 0.25 * d.social_warmth)
             * (0.75 + 0.25 * a.expectedness)
             * (0.65 + 0.35 * gentle_motion),
@@ -674,6 +692,50 @@ fn soft_band(value: f32, lo: f32, hi: f32, feather: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::{Genome, VitaSomaticFrame};
+
+    #[test]
+    fn moderate_force_density_can_be_pleasant_only_when_material_yields_safely() {
+        let mut gentle = source();
+        gentle.soft_touch_pressure_max = 0.24;
+        gentle.affect.stress = 0.0;
+        gentle.body.contact.contact_count = 1;
+        gentle.body.contact.area = 0.25;
+        gentle.body.contact.pressure = 0.50;
+        gentle.body.contact.tangential_speed = 0.18 / 8.0;
+        gentle.body.shape.maximum_strain = 0.24;
+        gentle.body.shape.neck_tension = 0.14;
+        let felt = |s: &EmbodimentSourceFrame| {
+            derive_felt(
+                s,
+                DerivedNervousState::default(),
+                &BodyInteroceptionDirector::default(),
+                0.05,
+            )
+        };
+        let happy = felt(&gentle);
+        assert!(happy.contact_pleasantness > 0.45, "{happy:?}");
+        assert!(happy.pain_like < 0.01);
+        let mut long = gentle.clone();
+        long.body.contact.duration = 60.0;
+        assert_eq!(felt(&long).contact_pleasantness, happy.contact_pleasantness);
+        let mut rough = gentle.clone();
+        rough.body.contact.tangential_speed = 2.0 / 8.0;
+        assert!(felt(&rough).contact_pleasantness < 0.05);
+        let mut overstretched = gentle.clone();
+        overstretched.body.contact.pressure = 0.18;
+        overstretched.body.shape.maximum_strain = 0.75;
+        assert_eq!(felt(&overstretched).contact_pleasantness, 0.0);
+        assert!(felt(&overstretched).pain_like > 0.4);
+        let mut detached = gentle.clone();
+        detached.body.topology.detached_mass_fraction = 0.1;
+        assert_eq!(felt(&detached).contact_pleasantness, 0.0);
+        let mut absent = gentle.clone();
+        absent.body.contact.contact_count = 0;
+        assert_eq!(felt(&absent).contact_pleasantness, 0.0);
+        let mut stressed = gentle.clone();
+        stressed.affect.stress = 1.0;
+        assert_eq!(felt(&stressed).contact_pleasantness, 0.0);
+    }
 
     fn source() -> EmbodimentSourceFrame {
         let genome = Genome::from_seed(7);

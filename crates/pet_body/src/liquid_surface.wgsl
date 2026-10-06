@@ -1156,11 +1156,89 @@ fn ink_membrane_coordinate(point: vec2<f32>, material: vec2<f32>) -> vec2<f32> {
     return point + displacement * (0.22 / sqrt(1.0 + dot(displacement, displacement) / 0.0144));
 }
 
+// Neuro Noise by Ksenia Kondrashova / @zozuar (MIT).
+// https://codepen.io/ksenia-k/pen/vYwgrWv — see THIRD_PARTY_NEURO_NOISE.md.
+// The original recursive sine feedback survives; its pow(pow(n,3),10)
+// amplification does not. One bounded field supplies the volume AND face.
+fn ink_neuro_flow(coordinate: vec2<f32>, energy: vec4<f32>, footprint: f32) -> vec2<f32> {
+    var uv = coordinate * 0.38 + vec2<f32>(0.25);
+    var accumulator = vec2<f32>(0.0);
+    var result = vec2<f32>(0.0);
+    var weight = 0.0;
+    var scale = 8.0;
+    let feedback = 0.16 + energy.w * 0.14 + 0.025 * sin(energy.y);
+    // Constant one-radian rotation, rather than two more trig calls per fold.
+    let rotation = mat2x2<f32>(vec2<f32>(0.5403023, 0.8414710),
+        vec2<f32>(-0.8414710, 0.5403023));
+    for (var layer = 0u; layer < 10u; layer += 1u) {
+        uv = rotation * uv;
+        accumulator = rotation * accumulator * 0.72;
+        // The integrated phase is used directly: TAU wrapping is seamless.
+        let argument = uv * scale + f32(layer) + accumulator - energy.x;
+        accumulator += sin(argument) * 0.70 + vec2<f32>(2.4 * feedback);
+        // Screen footprint taper estimates the added feedback detail.
+        // It is a soft LOD estimate, not an exact derivative of the recursion.
+        let band = 1.0 - smoothstep(0.38, 0.85,
+            max(footprint, 0.013) * 0.38 * scale * (1.0 + f32(layer) * 0.35));
+        result += (vec2<f32>(0.5) + 0.5 * cos(argument)) * band / scale;
+        weight += band / scale;
+        scale *= 1.2;
+    }
+    // Preserve the field's DC level as fine folds fade at small display sizes.
+    result /= max(weight, 0.0001);
+    let light = smoothstep(0.45, 1.55, result.x + result.y);
+    let dispersion = saturate(0.5 + (result.x - result.y) * 1.2);
+    return vec2<f32>(light, dispersion);
+}
+
+// A latent inner-to-outer attractor, never a painted line or an opaque core.
+// Return along-curve coordinate, signed normal offset, nearest distance and
+// thickness scale. Eight chords approximate the authored curve; this helper
+// does not claim an exact curved SDF. Light has its own compact support below.
+fn ink_brow_zone(point: vec2<f32>, side: f32) -> vec4<f32> {
+    let e = pearl_emotion();
+    let shape = globals.face_brows[select(1u, 0u, side < 0.0)];
+    let center = pearl_eye_center(side) - globals.gaze_pupil.xy * vec2<f32>(0.006, 0.004)
+        + vec2<f32>(0.0, 0.086 + globals.lids_brows.w * 0.019 + e.z * 0.011);
+    let local = point - center;
+    let pleasant = max(globals.brow_mouth.w, 0.0) * (1.0 - e.x) * (1.0 - e.z);
+    let inner = shape.x * 0.048 - e.x * 0.014 + e.y * 0.018;
+    let outer = shape.y * 0.048 + e.x * 0.006 - e.y * 0.010;
+    let arch = shape.z * 0.032 + pleasant * 0.012 - e.x * 0.010;
+    var distance = 1.0;
+    var along = 0.5;
+    var normal_offset = 0.0;
+    for (var segment = 0u; segment < 8u; segment += 1u) {
+        let u0 = f32(segment) / 8.0;
+        let u1 = f32(segment + 1u) / 8.0;
+        let a = vec2<f32>(side * (u0 - 0.5) * 0.088,
+            mix(inner, outer, u0) + arch * 4.0 * u0 * (1.0 - u0) + pleasant * 0.004);
+        let b = vec2<f32>(side * (u1 - 0.5) * 0.088,
+            mix(inner, outer, u1) + arch * 4.0 * u1 * (1.0 - u1) + pleasant * 0.004);
+        let edge = b - a;
+        let t = saturate(dot(local - a, edge) / max(dot(edge, edge), 0.000001));
+        let delta = local - a - edge * t;
+        let d = length(delta);
+        if (d < distance) {
+            let tangent = normalize(edge);
+            distance = d;
+            // Continue past the guide endpoints so the pools have rounded
+            // shoulders rather than a cap obtained by clamping fragment X.
+            along = mix(u0, u1, t) + dot(delta, tangent) / 0.088;
+            normal_offset = dot(delta, vec2<f32>(-tangent.y, tangent.x)) * side;
+        }
+    }
+    return vec4<f32>(along, normal_offset, distance, clamp(shape.w, 0.65, 1.45));
+}
+
 fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     let field = density_at(input.uv);
     let density = field.r;
     let iso = globals.liquid_meta.z;
     let aa = max(fwidth(density)*1.12,0.006);
+    // Compute screen footprint before the field-support early return.
+    let point = local_point(input.uv);
+    let pixel_width = max(length(dpdx(point)), length(dpdy(point)));
     let coverage = smoothstep(iso-aa,iso+aa,density);
     if (density < iso*0.025) { return vec4<f32>(0.0); }
     let texel=vec2<f32>(globals.liquid_meta.w,globals.render_mode.w);
@@ -1172,7 +1250,6 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     // Gaussian splat. Deep inside we use optical height, never this approximation.
     let distance=log(max(density,0.00001)/iso)*density/max(length(gradient),0.00001)/native_scale;
     let inward=normalize(gradient+vec2<f32>(0.000001,0.0));
-    let point=local_point(input.uv);
     let material=material_flow_at(input.uv)/max(density,0.00001);
     let cap=textureSample(optical_volume_texture,density_sampler,
         (point-globals.optical_volume_bounds.xy)*globals.optical_volume_bounds.zw);
@@ -1185,6 +1262,7 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     // Two broad currents share a circulation direction. Their different rates
     // stretch the luminous pools, without a seam, phase reset or random flicker.
     let energy=globals.energy_dynamics;
+    let flow = ink_neuro_flow(coord, energy, pixel_width);
     let current=ink_current_coordinate(coord,energy.x,energy.y);
     let undertow=ink_current_coordinate(coord,energy.y,energy.x);
     // A finite core prevents a near-zero coordinate from becoming a full
@@ -1206,7 +1284,7 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     let arc=0.28+pool*0.72;
     let inner=max(distance,0.0);
     let agitation=energy.w*0.08*sin(energy.x*3.0+dot(orbit,vec2<f32>(3.0,5.0)));
-    let shell_width=mix(1.65,7.8,pool)*(1.0+local_strain*0.08+agitation);
+    let shell_width=mix(2.0,8.3,pool)*(1.0+local_strain*0.08+agitation);
     let shoulder=exp(-inner/mix(4.5,14.5,pool));
     let luminous_core=exp(-pow((distance-shell_width*0.50)/shell_width,2.0));
     let body_light=saturate(dot(normal,normalize(vec3<f32>(-0.50,0.60,0.62))));
@@ -1218,39 +1296,110 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     color+=spectral*luminous_core*arc*0.24*radiance;
     // A rounded white-hot center dissolves into the wider colored membrane.
     // Both its width and strength travel with the same broad energy pool.
-    let soft_center=exp(-pow((distance-shell_width*0.28)/max(1.5,shell_width*0.42),2.0));
+    let soft_center=exp(-pow((distance-shell_width*0.28)/max(2.0,shell_width*0.55),2.0));
     color+=mix(vec3<f32>(1.12,1.18,1.25),globals.energy_palette.rgb,0.07)
-        *soft_center*arc*1.02*radiance;
+        *soft_center*arc*0.85*radiance;
     let face_point=face_space(point);
-    // Broad faint volumes drift with the body. No lines, sheets or bright
-    // filament crosses its interior. Optical coordinates stay coherent when
-    // material labels fold during compression; the face keeps a dark backing.
-    let volume_current=ink_current_coordinate(point,energy.x,energy.y);
-    let volume_undertow=ink_current_coordinate(point,energy.y,energy.x);
-    let cloud_a=(volume_current-vec2<f32>(-0.12,-0.11))/vec2<f32>(0.23,0.18);
-    let cloud_b=(volume_undertow-vec2<f32>(0.17,0.05))/vec2<f32>(0.20,0.25);
-    let volume_pool=exp(-dot(cloud_a,cloud_a))*0.022
-        +exp(-dot(cloud_b,cloud_b))*0.012;
+    // Soft folded rivers live beneath the membrane, with the face's dark
+    // backing retained. Their brightness is bounded even on Rgba16Float.
     let face_reserve=1.0-smoothstep(0.12,0.25,
         length((face_point-vec2<f32>(0.0,0.025))*vec2<f32>(1.0,1.35)));
-    let interior=smoothstep(4.0,16.0,inner)*(1.0-face_reserve*0.88);
-    let current_light=volume_pool*interior*radiance*(0.75+body_light*0.25);
-    color+=mix(spectral,globals.energy_palette.rgb,0.7)*current_light;
+    // Agitated anger/fear gather near the membrane; calm/joy flow in the core.
+    // Sleep's small measured amplitude fades the volume almost completely.
+    let edge_pressure = smoothstep(0.12,0.45,energy.w);
+    let visibility = pow(saturate((energy.z-0.045)/0.68),1.25);
+    let core_presence = exp(-dot(point,point)/0.080);
+    let edge_presence = exp(-inner/17.0);
+    let placement = mix(core_presence,edge_presence,edge_pressure);
+    let interior=smoothstep(2.0,10.0,inner)*(1.0-face_reserve*0.55)
+        *placement*visibility;
+    let flow_spectrum = mix(vec3<f32>(0.16,0.43,1.15),vec3<f32>(0.85,0.28,0.95),flow.y);
+    let flow_color = mix(flow_spectrum, globals.energy_palette.rgb, globals.energy_palette.a * 0.72);
+    let current_light = (0.003 + flow.x * 0.06) * interior * radiance
+        * (0.75 + body_light * 0.25);
+    color += flow_color * current_light;
+    color += mix(vec3<f32>(0.74,0.84,1.0),flow_color,0.35)
+        * flow.x * 0.004 * interior * radiance;
     let left_distance=pearl_eye_distance(face_point,-1.0);
     let right_distance=pearl_eye_distance(face_point,1.0);
     let eye_distance=min(left_distance,right_distance);
-    let eye_aa=max(fwidth(eye_distance)*0.75,0.0012);
+    let face_pixel = pixel_width / max(min(globals.face_frame_b.z, globals.face_frame_b.w), 0.01);
+    let eye_aa=max(face_pixel*0.55,0.0012);
     let eyes=(1.0-smoothstep(-eye_aa,eye_aa,eye_distance))*globals.face_tuning.x;
-    let face_current=face_point.y*43.0+face_point.x*9.0-energy.x*3.0
-        +sin(energy.y+face_point.x*5.0)*0.45;
-    let eye_pool=0.5+0.5*sin(face_current);
+    let eye_pool = 0.32 + flow.x * 0.68;
     let eye_glow=exp(-max(eye_distance,0.0)/0.014)*globals.face_tuning.x;
-    let eye_energy=mix(vec3<f32>(0.68,1.15,1.95),vec3<f32>(2.70,2.48,3.12),eye_pool)
-        *mix(vec3<f32>(1.0),globals.energy_palette.rgb,0.10)*(0.65+energy.z*0.65);
+    let face_spectrum = mix(flow_color, vec3<f32>(1.0), 0.76);
+    let eye_energy = mix(vec3<f32>(1.12,1.40,1.95),vec3<f32>(2.45,2.45,2.75),eye_pool)
+        *face_spectrum*(0.70+energy.z*0.55);
     color+=vec3<f32>(0.22,0.30,0.48)*eye_glow*(0.12+eye_pool*0.10);
     color=mix(color,eye_energy,eyes);
-    let brows=max(pearl_brow(face_point,-1.0),pearl_brow(face_point,1.0))*globals.face_tuning.x;
-    color+=mix(vec3<f32>(0.44,0.70,1.10),vec3<f32>(1.02,0.91,1.30),eye_pool)*brows;
+    // The latent guide defines the semantic neighborhood. Overlapping currents
+    // deform its shared proximity volume; there is no separate opaque core.
+    let brow_side = select(-1.0, 1.0, face_point.x > 0.0);
+    let brow_zone = ink_brow_zone(face_point, brow_side);
+    var brows = 0.0;
+    // Include the entire warped normal profile, extended guide shoulders and
+    // sampling footprint. This branch must not cut a visible density edge.
+    if (brow_zone.z < 0.050 * brow_zone.w + 0.018 + face_pixel) {
+        let brow_emotion = pearl_emotion();
+        let brow_joy = smoothstep(0.04, 0.50, globals.brow_mouth.w)
+            * (1.0 - brow_emotion.x) * (1.0 - brow_emotion.z * 0.30);
+        let brow_wake = smoothstep(0.075, 0.26, energy.z);
+        let brow_charge = (0.18 + brow_emotion.x * 0.62 + brow_joy * 0.42
+            + brow_emotion.z * 0.20) * (0.04 + brow_wake * 0.96) * 0.35;
+        // One shared attraction field, not individually faded islands. Broad
+        // currents overlap in its coordinates, width and optical concentration.
+        // All temporal terms are periodic in the existing integrated phases.
+        let current_a = sin(brow_zone.x * 3.141592654 - energy.x + sin(energy.y) * 0.35);
+        let current_b = sin(brow_zone.x * 6.283185307 + energy.y + sin(energy.x) * 0.30);
+        let warped_u = brow_zone.x + current_a * 0.065 + current_b * 0.035;
+        let normal_shift = current_a * (0.003 + brow_emotion.x * 0.003)
+            + current_b * 0.003;
+        let brow_coordinate = vec2<f32>((warped_u - 0.5) * 0.75,
+            (brow_zone.y - normal_shift) * 9.0);
+        // Cached footprint includes a bound for the along-coordinate warp.
+        // No derivatives are evaluated inside this spatial branch.
+        let brow_footprint = face_pixel * 13.0;
+        let brow_sample = ink_neuro_flow(brow_coordinate, energy, brow_footprint);
+        // Unresolved recursive detail tends to its mean density/chroma instead
+        // of extinguishing the semantic zone at the smallest native size.
+        // Broad shared currents still deform the common proximity volume.
+        let brow_flow = mix(brow_sample, vec2<f32>(0.5),
+            smoothstep(0.12, 0.28, brow_footprint));
+        let warped_normal = brow_zone.y - normal_shift - (brow_flow.x - 0.5) * 0.0035;
+        let overlap = 0.5 + 0.5 * current_a * current_b;
+        let inward = 1.0 - smoothstep(0.10, 0.75, warped_u);
+        let normal_radius = (0.012 + overlap * 0.008
+            + brow_emotion.x * inward * 0.004) * brow_zone.w;
+        let along_radius = 0.66 + brow_joy * 0.06;
+        let along_center = 0.5 - brow_emotion.x * 0.08;
+        let along_aa = face_pixel * 0.5 / 0.088;
+        let normal_aa = face_pixel * 0.5;
+        let along_q = (warped_u - along_center) / (along_radius + along_aa);
+        let normal_q = warped_normal / (normal_radius + normal_aa);
+        // A single compact C2 proximity volume. Its cross-section changes and
+        // shifts continuously; no permanent solid core or separate halo exists.
+        let along_support = max(0.0, 1.0 - along_q * along_q);
+        let normal_support = max(0.0, 1.0 - normal_q * normal_q);
+        let sampling_mass = (along_radius / (along_radius + along_aa))
+            * (normal_radius / (normal_radius + normal_aa));
+        let concentration = 0.25 + brow_flow.x * 0.50 + overlap * 0.25;
+        let brow_density = pow(along_support * normal_support, 3.0)
+            * concentration * sampling_mass;
+        brows = saturate(brow_density * brow_charge) * globals.face_tuning.x;
+        let brow_spectrum = mix(vec3<f32>(0.30, 0.58, 1.0),
+            vec3<f32>(0.86, 0.36, 0.94), brow_flow.y);
+        let brow_tint = mix(brow_spectrum, globals.energy_palette.rgb,
+            globals.energy_palette.a * 0.55);
+        // Light comes from the shared proximity density, with no separately
+        // painted opaque core, outline or halo.
+        // Scatter white light throughout occupied volume. Whitening only its
+        // density maximum made a colored elongated zone read as a white dot.
+        // Occupancy still fades to zero; this does not paint a fixed core.
+        let brow_light = mix(brow_tint, vec3<f32>(1.28, 1.34, 1.46),
+            0.78 + brow_flow.x * 0.08);
+        color += brow_light * brows * (0.52 + energy.z * 0.68);
+    }
     // Facial deformation and contact socket are identical to the production
     // expression path. Light replaces ink; no second animation clock is added.
     let face_gaze=globals.gaze_pupil.xy;
@@ -1262,7 +1411,10 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     let smile_curve=clamp(globals.brow_mouth.w*1.15-expression.x*0.45,-1.0,1.0);
     let compression=clamp(globals.face_mouth.w,0.0,1.0);
     let tension=clamp(globals.mouth_voice.x,0.0,1.0);
-    let opening=smoothstep(0.0,0.85,globals.brow_mouth.z)*(1.0-compression*0.72);
+    // A smooth monotone aperture knee keeps small semantic jaw gestures
+    // visible. The previous cubic remap nearly erased openings around 0.06.
+    let jaw = saturate(globals.brow_mouth.z/0.85);
+    let opening = jaw*(1.65-0.65*jaw)*(1.0-compression*0.72);
     let happiness=max(globals.brow_mouth.w,0.0)*(1.0-expression.z);
     let width=mix(0.045,mix(0.039+0.015*happiness,0.027,expression.z),opening)
         *clamp(globals.face_mouth.x,0.55,1.50);
@@ -1288,11 +1440,19 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
     // A rounded swept contour also represents the sealed line at height zero.
     // Its corners remain attached during asymmetric coarticulation and speech.
     let mouth_distance=length(vec2<f32>(mouth_local.x-x,max(abs(mouth_local.y-centerline)-half_height,0.0)));
-    let mouth=(1.0-smoothstep(0.003,0.006,mouth_distance))*globals.face_tuning.x;
+    let mouth=(1.0-smoothstep(0.0025,0.0070,mouth_distance))*globals.face_tuning.x;
     let mouth_glow=exp(-max(mouth_distance-0.004,0.0)/0.010)*globals.face_tuning.x;
-    let mouth_pool=0.5+0.5*sin(mouth_local.x*32.0+mouth_local.y*24.0-energy.x*3.0+0.6);
+    var mouth_pool = eye_pool;
+    var mouth_spectrum = face_spectrum;
+    if (mouth_distance < 0.018) {
+        let mouth_flow = ink_neuro_flow(mouth_local*vec2<f32>(5.5,8.0),energy,face_pixel*8.0);
+        mouth_pool = 0.28+mouth_flow.x*0.72;
+        let mouth_tint = mix(vec3<f32>(0.30,0.60,1.0),vec3<f32>(0.87,0.40,0.98),mouth_flow.y);
+        mouth_spectrum = mix(mix(mouth_tint,globals.energy_palette.rgb,
+            globals.energy_palette.a*0.55),vec3<f32>(1.0),0.76);
+    }
     color+=vec3<f32>(0.24,0.32,0.50)*mouth_glow*(0.10+mouth_pool*0.09);
-    color=mix(color,mix(vec3<f32>(0.50,0.87,1.42),vec3<f32>(1.80,1.61,2.18),mouth_pool),mouth);
+    color=mix(color,mouth_spectrum * mix(vec3<f32>(0.95,1.12,1.48),vec3<f32>(1.80,1.76,2.10),mouth_pool),mouth);
     let extension=globals.self_care.x;
     let tongue_root=vec2<f32>(0.0,centerline-half_height*0.12);
     let tongue_length=0.037*extension;
@@ -1327,7 +1487,7 @@ fn living_ink_surface(input: VertexOutput) -> vec4<f32> {
         var diagnostic=vec3<f32>(0.0);
         if(debug<1.5) { diagnostic=vec3<f32>(saturate(density/(iso*3.0))); }
         else if(debug<2.5) { diagnostic=vec3<f32>(alpha); }
-        else if(debug<3.5) { diagnostic=vec3<f32>(max(max(eyes,mouth),tongue),0.0,0.0); }
+        else if(debug<3.5) { diagnostic=vec3<f32>(max(max(max(eyes,mouth),tongue),brows),0.0,0.0); }
         else if(debug<5.5) { diagnostic=vec3<f32>(cap.w); }
         else if(debug<6.5) { diagnostic=vec3<f32>(shoulder); }
         else if(debug<7.5) { diagnostic=normal*0.5+vec3<f32>(0.5); }

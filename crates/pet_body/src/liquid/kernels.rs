@@ -42,6 +42,8 @@ pub fn wendland_c2_kernel(delta: Vec2, radius: f32) -> f32 {
 ///
 /// The vector is exactly zero at the origin and at the support boundary, which
 /// makes it suitable for a moving pointer potential without a force cusp.
+/// Kept for the numeric kernel checks; production touch uses a compliant patch.
+#[cfg(test)]
 #[must_use]
 pub fn wendland_c2_gradient(delta: Vec2, radius: f32) -> Vec2 {
     if radius <= f32::EPSILON {

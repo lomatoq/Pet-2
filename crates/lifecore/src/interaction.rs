@@ -895,13 +895,14 @@ pub fn appraise_embodied_gesture(
     successful_interactions: u32,
     recent_boundary_events: u8,
 ) -> InteractionAppraisal {
+    let care = material_care_from_event(event);
     let pressure_integral = (event.frame.contact.pressure_impulse / 1.2).clamp(0.0, 1.0);
     let effort = event
         .frame
         .material
         .maximum_strain
         .max(event.frame.material.deformation_energy)
-        .max(pressure_integral)
+        .max(pressure_integral * (1.0 - care))
         .clamp(0.0, 1.0);
     let energy = (1.0 - drives.sleep.max(drives.comfort * 0.45)).clamp(0.0, 1.0);
     let recovery_confidence = (1.0
@@ -913,7 +914,11 @@ pub fn appraise_embodied_gesture(
         .clamp(0.0, 1.0);
     let sustained_overstrain =
         ((event.frame.material.maximum_strain - 0.58) / 0.42).clamp(0.0, 1.0);
-    let excessive_pressure = ((pressure_integral - 0.55) / 0.45).clamp(0.0, 1.0);
+    // Force integrated over a long, yielding caress is not excessive pressure.
+    // Boundaries follow the current load; pressure/strain are still independent
+    // witnesses even when the classifier calls a rough pull a slow stretch.
+    let excessive_pressure =
+        ((event.frame.contact.effective_pressure - 0.55) / 0.45).clamp(0.0, 1.0);
     let low_energy_high_demand = (1.0 - energy) * effort;
     let boundary_need = sustained_overstrain
         .max(excessive_pressure)
@@ -949,8 +954,11 @@ pub fn appraise_embodied_gesture(
             | EmbodiedGestureKind::Tickle
             | EmbodiedGestureKind::FragmentHelp
     );
+    let care_valence = care * (1.0 - affect.stress) * (1.0 - affect.frustration);
     let mut appraisal = InteractionAppraisal {
-        valence: ((if inherently_positive { 0.38 } else { 0.08 }) + cooperation * 0.35
+        valence: ((if inherently_positive { 0.38 } else { 0.08 })
+            + care_valence * 0.30
+            + cooperation * 0.35
             - boundary_need * 0.72)
             .clamp(-1.0, 1.0),
         arousal: affect
@@ -1040,19 +1048,41 @@ pub fn interaction_response_plan(
                 plan.expected_receiver_effect = ReceiverEffect::ContinueGently;
             }
             EmbodiedGestureKind::SlowStretch => {
-                plan.reason = InteractionReasonCode::EffortfulResistance;
-                plan.communicative_intent = if appraisal.cooperation > 0.48 {
-                    CommunicativeIntent::YieldAndInviteReturn
+                // Remove the generic cooperation term: willingness to play is
+                // not evidence that a stressed pet enjoys the current touch.
+                let accepted_care = ((appraisal.valence - 0.08 - appraisal.cooperation * 0.35
+                    + appraisal.boundary_need * 0.72)
+                    / 0.30)
+                    .clamp(0.0, 1.0);
+                let care = material_care_from_event(event)
+                    * accepted_care
+                    * (1.0 - appraisal.boundary_need);
+                if care > 0.35 {
+                    plan.reason = InteractionReasonCode::GentleContact;
+                    plan.communicative_intent = CommunicativeIntent::AcknowledgeContact;
+                    expression.eye_aperture = 0.94 - care * 0.10;
+                    expression.mouth_curve = 0.12 + care * 0.18;
+                    expression.relief = care * 0.16;
+                    expression.mouth_compression = appraisal.effort * 0.12;
+                    plan.body.compliance_delta = care * 0.08;
+                    plan.body.cooperation = appraisal.cooperation;
+                    plan.body.resistance = (1.0 - care) * 0.18;
+                    plan.expected_receiver_effect = ReceiverEffect::ContinueGently;
                 } else {
-                    CommunicativeIntent::ResistSafely
-                };
-                expression.eye_aperture = 0.78;
-                expression.effort = appraisal.effort;
-                expression.mouth_compression = appraisal.effort * 0.72;
-                plan.body.cooperation = appraisal.cooperation;
-                plan.body.resistance = 1.0 - appraisal.cooperation;
-                plan.body.cohesion_delta = -0.06 * appraisal.cooperation;
-                plan.body.allow_intentional_bud = appraisal.cooperation > 0.62;
+                    plan.reason = InteractionReasonCode::EffortfulResistance;
+                    plan.communicative_intent = if appraisal.cooperation > 0.48 {
+                        CommunicativeIntent::YieldAndInviteReturn
+                    } else {
+                        CommunicativeIntent::ResistSafely
+                    };
+                    expression.eye_aperture = 0.78;
+                    expression.effort = appraisal.effort;
+                    expression.mouth_compression = appraisal.effort * 0.72;
+                    plan.body.cooperation = appraisal.cooperation;
+                    plan.body.resistance = 1.0 - appraisal.cooperation;
+                    plan.body.cohesion_delta = -0.06 * appraisal.cooperation;
+                    plan.body.allow_intentional_bud = appraisal.cooperation > 0.62;
+                }
             }
             EmbodiedGestureKind::Tickle | EmbodiedGestureKind::RhythmicTouch => {
                 plan.reason = InteractionReasonCode::RhythmRecognition;
@@ -1178,6 +1208,79 @@ pub fn interaction_response_plan(
     plan
 }
 
+/// Shared physical evidence for the live interoceptive graph and event response.
+/// A mouse's force-density proxy may be moderate while a small patch yields
+/// safely. Neither elapsed holding nor the categorical gesture grants pleasure.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MaterialCareEvidence {
+    pub active: bool,
+    pub area: f32,
+    pub pressure: f32,
+    /// Relative cursor/material speed in body radii per second.
+    pub slip_speed: f32,
+    pub strain: f32,
+    pub neck_tension: f32,
+    pub detached_mass: f32,
+    pub topology_intact: bool,
+}
+
+impl MaterialCareEvidence {
+    pub(crate) fn quality(self) -> f32 {
+        let observations = [
+            self.area,
+            self.pressure,
+            self.slip_speed,
+            self.strain,
+            self.neck_tension,
+            self.detached_mass,
+        ];
+        if !self.active
+            || !self.topology_intact
+            || observations
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return 0.0;
+        }
+        let ramp = |lo: f32, hi: f32, value: f32| {
+            let t = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        ramp(0.002, 0.03, self.area)
+            * (1.0 - ramp(0.50, 0.75, self.area))
+            * ramp(0.005, 0.025, self.pressure)
+            * (1.0 - ramp(0.46, 0.72, self.pressure))
+            * (1.0 - ramp(0.35, 1.40, self.slip_speed))
+            * (1.0 - ramp(0.30, 0.58, self.strain))
+            * (1.0 - ramp(0.18, 0.48, self.neck_tension))
+            * (1.0 - ramp(0.005, 0.025, self.detached_mass))
+    }
+}
+
+fn material_care_from_event(event: EmbodiedGestureEvent) -> f32 {
+    let contact = event.frame.contact;
+    let material = event.frame.material;
+    let care = MaterialCareEvidence {
+        active: contact.active,
+        area: contact.area_fraction,
+        pressure: contact.effective_pressure,
+        slip_speed: contact.relative_velocity_local.length(),
+        strain: material.maximum_strain,
+        neck_tension: material.neck_tension,
+        detached_mass: material.detached_mass_fraction,
+        topology_intact: !material.topology_budget_exhausted && material.component_count == 1,
+    }
+    .quality();
+    // A brief shock may already have entrained its material patch, so check the
+    // actual pointer acceleration too rather than relying on slip alone.
+    let acceleration = contact.pointer_acceleration;
+    if !acceleration.is_finite() || acceleration < 0.0 {
+        return 0.0;
+    }
+    let t = ((acceleration - 2.0) / 6.0).clamp(0.0, 1.0);
+    care * (1.0 - t * t * (3.0 - 2.0 * t))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionConsistencyError {
     BoundaryCelebration,
@@ -1254,6 +1357,114 @@ fn bounded(value: f32, minimum: f32, maximum: f32, fallback: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn yielding_stretch() -> EmbodiedGestureEvent {
+        EmbodiedGestureEvent {
+            classification: GestureClassification {
+                episode_id: 1,
+                kind: EmbodiedGestureKind::SlowStretch,
+                confidence: 0.9,
+                committed: true,
+                ..Default::default()
+            },
+            frame: EmbodiedInteractionFrame {
+                contact: PointerMaterialContact {
+                    active: true,
+                    area_fraction: 0.25,
+                    effective_pressure: 0.50,
+                    relative_velocity_local: Vec2::new(0.18, 0.0),
+                    pointer_acceleration: 0.30,
+                    pressure_impulse: 0.12,
+                    ..Default::default()
+                },
+                material: BodyMaterialState {
+                    maximum_strain: 0.24,
+                    deformation_energy: 0.12,
+                    neck_tension: 0.14,
+                    ..EmbodiedInteractionFrame::default().material
+                },
+                ..Default::default()
+            },
+            boundary: GestureBoundaryEvent::None,
+            observation_quality: 1.0,
+        }
+    }
+
+    fn stretch_response(
+        event: EmbodiedGestureEvent,
+        stress: f32,
+    ) -> (InteractionAppraisal, InteractionResponsePlan) {
+        let genome = crate::Genome::from_seed(7);
+        let mut drives = Drives::initial(&genome.temperament);
+        drives.sleep = 0.10;
+        let affect = AffectState {
+            stress,
+            frustration: 0.0,
+            ..Default::default()
+        };
+        let appraisal = appraise_embodied_gesture(event, drives, affect, &genome.temperament, 0, 0);
+        let plan = interaction_response_plan(event, appraisal, 1, 1, 1.0, 1.15, 1.25);
+        validate_interaction_expression_consistency(appraisal, plan).unwrap();
+        (appraisal, plan)
+    }
+
+    #[test]
+    fn safe_yielding_stretch_is_care_without_elapsed_permission_or_forced_voice() {
+        let brief = yielding_stretch();
+        let mut long = brief;
+        long.frame.contact.contact_seconds = 60.0;
+        long.frame.contact.pressure_impulse = 60.0;
+        let (short_appraisal, short_plan) = stretch_response(brief, 0.0);
+        let (long_appraisal, long_plan) = stretch_response(long, 0.0);
+        for plan in [short_plan, long_plan] {
+            assert_eq!(plan.reason, InteractionReasonCode::GentleContact);
+            assert_eq!(
+                plan.expected_receiver_effect,
+                ReceiverEffect::ContinueGently
+            );
+            assert!(plan.expression.mouth_curve > 0.2);
+            assert!(plan.body.compliance_delta > 0.04 && plan.body.resistance < 0.05);
+            assert_eq!(plan.voice_trigger, None);
+            assert!(!plan.body.allow_intentional_bud);
+        }
+        assert!(long_appraisal.boundary_need < 0.10);
+        assert!((short_appraisal.valence - long_appraisal.valence).abs() < 0.08);
+    }
+
+    #[test]
+    fn gentle_label_cannot_turn_jerks_overstrain_fragments_or_stress_into_care() {
+        let safe = yielding_stretch();
+        let mut jerk = safe;
+        jerk.frame.contact.pointer_acceleration = 12.0;
+        let mut slip = safe;
+        slip.frame.contact.relative_velocity_local = Vec2::new(2.0, 0.0);
+        let mut overloaded = safe;
+        overloaded.frame.material.maximum_strain = 0.92;
+        overloaded.frame.contact.effective_pressure = 0.96;
+        let mut necked = safe;
+        necked.frame.material.neck_tension = 0.70;
+        let mut fragmented = safe;
+        fragmented.frame.material.component_count = 2;
+        fragmented.frame.material.detached_mass_fraction = 0.15;
+        let mut whole_body = safe;
+        whole_body.frame.contact.area_fraction = 0.90;
+        let mut absent = safe;
+        absent.frame.contact.active = false;
+        for event in [
+            jerk, slip, overloaded, necked, fragmented, whole_body, absent,
+        ] {
+            let (_, plan) = stretch_response(event, 0.0);
+            assert_ne!(
+                plan.reason,
+                InteractionReasonCode::GentleContact,
+                "{event:?}"
+            );
+            assert_eq!(plan.expression.relief, 0.0);
+        }
+        let (_, stressed) = stretch_response(safe, 1.0);
+        assert_ne!(stressed.reason, InteractionReasonCode::GentleContact);
+        assert_eq!(stressed.expression.relief, 0.0);
+    }
 
     #[test]
     fn physical_contact_validation_allows_normal_float_rounding() {

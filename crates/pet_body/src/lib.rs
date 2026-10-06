@@ -222,6 +222,8 @@ pub struct ProceduralBody {
     chromatic_motion: Vec2,
     mouth_context_age: f32,
     mouth_context_open: f32,
+    companion_mouth_aperture: Option<f32>,
+    companion_mouth_active: bool,
     contained_face: liquid::SmoothFaceOrigin,
     face_mass_anchor: Option<Vec2>,
     fast_phenotype: FastPhenotypeActuation,
@@ -268,6 +270,8 @@ impl ProceduralBody {
             chromatic_motion: Vec2::ZERO,
             mouth_context_age: 0.0,
             mouth_context_open: 0.0,
+            companion_mouth_aperture: None,
+            companion_mouth_active: false,
             contained_face: liquid::SmoothFaceOrigin::default(),
             face_mass_anchor: None,
             fast_phenotype: FastPhenotypeActuation::default(),
@@ -375,6 +379,13 @@ impl ProceduralBody {
     pub fn set_companion_body_style(&mut self, style: BodyStyleTarget) {
         self.embodiment.set_companion_body_style(style);
         self.simulation.set_semantic_buoyancy(style.buoyancy);
+    }
+
+    /// Protect only the director aperture that survives final intent writers.
+    /// Feeding, voice and self-care retain their existing independent authority.
+    pub fn set_companion_mouth_aperture(&mut self, aperture: Option<f32>) {
+        self.companion_mouth_aperture =
+            aperture.filter(|value| value.is_finite() && *value > 0.0);
     }
 
     pub fn set_feeding_expression_active(&mut self, active: bool) {
@@ -686,6 +697,19 @@ impl ProceduralBody {
         voice: VoiceVisualState,
         dt: f32,
     ) {
+        let semantic_mouth_active = !voice.active
+            && !matches!(intent.locomotion, lifecore::LocomotionMode::Sleep | lifecore::LocomotionMode::Cocoon)
+            && !matches!(intent.pose, PoseIntent::Sleeping | PoseIntent::Cocoon)
+            && self.companion_mouth_aperture.is_some_and(|aperture| {
+                (intent.expression.mouth_open - aperture).abs() <= 0.0001
+            });
+        if self.companion_mouth_active && !semantic_mouth_active {
+            // Ownership ended because the command changed. Give the existing
+            // expression/body motors their normal release instead of instantly
+            // cutting the residual aperture at the stale render-age boundary.
+            self.mouth_context_age = 0.0;
+        }
+        self.companion_mouth_active = semantic_mouth_active;
         if (intent.expression.mouth_open - self.mouth_context_open).abs() > 0.12 || voice.active {
             self.mouth_context_age = 0.0;
             self.mouth_context_open = intent.expression.mouth_open;
@@ -1364,6 +1388,7 @@ impl ProceduralBody {
             .max(voice_authority)
             .max(self.feeding_mouth_activity)
             .max(f32::from(self.feeding_expression_active))
+            .max(f32::from(self.companion_mouth_active))
             .max(self.self_care.strength)
             .max(semantic_aperture);
         pose.mouth_open = pose.mouth_open.clamp(0.0, 1.0);
@@ -1794,6 +1819,61 @@ mod tests {
             neutral.simulation.feedback.world_position,
             compact.simulation.feedback.world_position
         );
+    }
+
+    #[test]
+    fn semantic_small_mouth_survives_only_while_the_final_command_owns_it() {
+        let genome = Genome::from_seed(42);
+        let mut owned = ProceduralBody::generate(&genome).unwrap();
+        let mut uncued = ProceduralBody::generate(&genome).unwrap();
+        let mut goal = intent(LocomotionMode::Hover, Vec2::splat(0.5));
+        goal.expression.mouth_open = 0.06;
+        goal.expression.mouth_curve = 0.0;
+        goal.expression.brow_raise = 0.0;
+        owned.set_companion_mouth_aperture(Some(0.06));
+        for _ in 0..420 {
+            for body in [&mut owned, &mut uncued] {
+                body.embodied_update(&goal, &SensorFrame::default(), AffectState::default(),
+                    VisualMindInput::default(), VoiceVisualState::default(), 1.0 / 60.0);
+            }
+        }
+        let held = owned.render_parameters(&genome, 0.0).mouth_open;
+        assert!(held > 0.055, "meaningful small aperture={held}");
+        assert!(uncued.render_parameters(&genome, 0.0).mouth_open < 0.001);
+        // A late writer closes the command. Keep the current physical release,
+        // then let the existing motors converge, rather than cutting pixels.
+        goal.expression.mouth_open = 0.0;
+        owned.embodied_update(&goal, &SensorFrame::default(), AffectState::default(),
+            VisualMindInput::default(), VoiceVisualState::default(), 1.0 / 60.0);
+        assert!(!owned.companion_mouth_active);
+        let first_release = owned.render_parameters(&genome, 0.0).mouth_open;
+        assert!((held - first_release).abs() < 0.006);
+        for _ in 0..120 {
+            owned.embodied_update(&goal, &SensorFrame::default(), AffectState::default(),
+                VisualMindInput::default(), VoiceVisualState::default(), 1.0 / 60.0);
+        }
+        assert!(owned.render_parameters(&genome, 0.0).mouth_open < 0.001);
+    }
+
+    #[test]
+    fn semantic_mouth_authority_yields_to_sleep_voice_and_replaced_aperture() {
+        let genome = Genome::from_seed(42);
+        for priority in 0..4 {
+            let mut body = ProceduralBody::generate(&genome).unwrap();
+            let mut goal = intent(LocomotionMode::Hover, Vec2::splat(0.5));
+            goal.expression.mouth_open = 0.06;
+            body.set_companion_mouth_aperture(Some(0.06));
+            let mut voice = VoiceVisualState::default();
+            match priority {
+                0 => goal.locomotion = LocomotionMode::Sleep,
+                1 => goal.pose = PoseIntent::Cocoon,
+                2 => { voice.active = true; voice.mouth_open = 0.3; voice.envelope = 0.6; }
+                _ => goal.expression.mouth_open = 0.025,
+            }
+            body.embodied_update(&goal, &SensorFrame::default(), AffectState::default(),
+                VisualMindInput::default(), voice, 1.0 / 60.0);
+            assert!(!body.companion_mouth_active, "priority={priority}");
+        }
     }
 
     #[test]

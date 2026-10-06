@@ -113,6 +113,9 @@ pub struct ExpressionEvidence {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CompanionExpressionTarget {
     pub face: FaceTarget,
+    /// A current semantic cause for a sustained aperture, not a jaw animation.
+    /// The host must revoke it if a later writer replaces the aperture.
+    pub owns_mouth_aperture: bool,
     pub body: BodyStyleTarget,
     pub gaze: Option<Vec2>,
     pub blink_left: f32,
@@ -314,6 +317,66 @@ impl CompanionExpressionDirector {
                 face.geometry.brows = [[0.16 + expected_before * 0.20, 0.0, 0.30, 1.0]; 2];
                 face.geometry.mouth[0] = 0.94 - intent.frustration * 0.13;
             }
+            PrimaryIntent::EatInspect => {
+                // Checking food recruits attention and holds a small question.
+                // Uncertainty changes the whole face; it never invents chewing.
+                let uncertainty =
+                    (1.0 - intent.confidence).max(intent.expected_outcome.uncertainty);
+                face.eye_aperture =
+                    0.96 - intent.fatigue * 0.25 - uncertainty * 0.07;
+                face.brow_raise = 0.12 + uncertainty * 0.20 + orienting * 0.16;
+                face.brow_tension = 0.02 + uncertainty * 0.08;
+                face.mouth_open = (0.025 + intent.curiosity * 0.035)
+                    * (1.0 - intent.fatigue * 0.55);
+                face.mouth_curve = 0.02 + intent.confidence * 0.06 - uncertainty * 0.06;
+                face.mouth_compression = uncertainty * 0.22;
+                face.geometry.mouth[0] = 0.88 + intent.confidence * 0.12;
+                face.geometry.brows = [[uncertainty * 0.14, 0.0, 0.30, 1.0]; 2];
+                for lid in &mut face.geometry.lids {
+                    lid[0] = -uncertainty * 0.09;
+                    lid[1] = -intent.fatigue * 0.14;
+                    lid[3] = intent.curiosity * 0.10;
+                }
+            }
+            PrimaryIntent::EatAccept => {
+                // Readiness is not consumption or pleasure: the real feeding
+                // controller owns jaw cycles after the mouth reaches its food.
+                let uncertainty =
+                    (1.0 - intent.confidence).max(intent.expected_outcome.uncertainty);
+                let readiness = intent.confidence * (1.0 - uncertainty);
+                face.eye_aperture = 0.95 - intent.fatigue * 0.24;
+                face.brow_raise = 0.06 + uncertainty * 0.12;
+                face.brow_tension = 0.02 + uncertainty * 0.04;
+                face.mouth_open = 0.0;
+                face.mouth_curve = 0.02 + readiness * 0.08;
+                face.mouth_compression = uncertainty * 0.08;
+                face.geometry.mouth[0] = 0.90 + readiness * 0.12;
+                for lid in &mut face.geometry.lids {
+                    lid[1] = -intent.fatigue * 0.14;
+                    lid[2] = readiness * 0.05;
+                }
+            }
+            PrimaryIntent::EatReject => {
+                // Refusal compresses the lips while the eyes still evaluate
+                // the object. Physical pain/defense remains the final owner.
+                let aversion = intent.discomfort.max(intent.frustration);
+                let uncertainty =
+                    (1.0 - intent.confidence).max(intent.expected_outcome.uncertainty);
+                face.eye_aperture = 0.92 - intent.fatigue * 0.24 - aversion * 0.08;
+                face.brow_raise = 0.05 + uncertainty * 0.18;
+                face.brow_tension = 0.08 + aversion * 0.16;
+                face.mouth_open = 0.0;
+                face.mouth_curve = -0.04 - aversion * 0.14;
+                face.mouth_tension = 0.12 + aversion * 0.18;
+                face.mouth_compression = 0.28 + intent.confidence * 0.18;
+                face.geometry.mouth = [0.88 - aversion * 0.08, 0.0, 0.0,
+                    face.mouth_compression * 0.30];
+                face.geometry.brows = [[uncertainty * 0.12, -aversion * 0.06, 0.25, 1.0]; 2];
+                for lid in &mut face.geometry.lids {
+                    lid[0] = -aversion * 0.08;
+                    lid[1] = -intent.fatigue * 0.14;
+                }
+            }
             _ => {}
         }
 
@@ -477,6 +540,15 @@ impl CompanionExpressionDirector {
         sanitize_body(&mut body);
         CompanionExpressionTarget {
             face,
+            owns_mouth_aperture: !danger
+                && !sleeping
+                && !evidence.audio_active
+                && face.mouth_open > 0.0
+                && matches!(intent.primary,
+                    PrimaryIntent::Inspect | PrimaryIntent::Explore
+                    | PrimaryIntent::SearchObject | PrimaryIntent::EatInspect
+                    | PrimaryIntent::InvitePlay | PrimaryIntent::Chase
+                    | PrimaryIntent::Intercept | PrimaryIntent::Celebrate),
             body,
             gaze: gaze.target,
             blink_left: blink.left,
@@ -513,7 +585,8 @@ fn gaze_mode_for(intent: PrimaryIntent, uncertainty: f32) -> CompanionGazeMode {
         PrimaryIntent::Avoid | PrimaryIntent::GuardPain | PrimaryIntent::RejectContact => {
             CompanionGazeMode::AvoidantCheck
         }
-        PrimaryIntent::Inspect | PrimaryIntent::Explore | PrimaryIntent::SearchObject => {
+        PrimaryIntent::Inspect | PrimaryIntent::Explore | PrimaryIntent::SearchObject
+        | PrimaryIntent::EatInspect => {
             CompanionGazeMode::Inspect
         }
         _ => CompanionGazeMode::Track,
@@ -940,6 +1013,67 @@ mod tests {
             face = director.tick(input, evidence, 1.0 / 60.0).face;
         }
         face
+    }
+
+    #[test]
+    fn food_check_readiness_and_refusal_coordinate_without_simulating_consumption() {
+        let checked = held(intent(PrimaryIntent::EatInspect), Default::default(), 2.0);
+        let ready = held(intent(PrimaryIntent::EatAccept), Default::default(), 2.0);
+        let refused = held(intent(PrimaryIntent::EatReject), Default::default(), 2.0);
+        assert!(checked.mouth_open > 0.02);
+        assert_eq!(ready.mouth_open, 0.0);
+        assert_eq!(refused.mouth_open, 0.0);
+        assert!(ready.mouth_curve > refused.mouth_curve);
+        assert!(refused.mouth_compression > ready.mouth_compression + 0.15);
+        for primary in [PrimaryIntent::EatInspect, PrimaryIntent::EatAccept, PrimaryIntent::EatReject] {
+            let fresh = held(intent(primary), Default::default(), 2.0);
+            let tired = held(CompanionIntentFrame { fatigue: 0.9, ..intent(primary) },
+                Default::default(), 2.0);
+            assert!(fresh.eye_aperture - tired.eye_aperture > 0.20);
+            assert!(tired.geometry.lids[0][1] < fresh.geometry.lids[0][1]);
+        }
+        let cautious = held(CompanionIntentFrame {
+            confidence: 0.1, ..intent(PrimaryIntent::EatInspect)
+        }, Default::default(), 2.0);
+        assert!(cautious.brow_raise > checked.brow_raise + 0.10);
+        assert!(cautious.mouth_compression > checked.mouth_compression + 0.10);
+        assert!(cautious.geometry.maximum_error(checked.geometry) > 0.08);
+
+        // An interrupted check releases through the actual geometry motor.
+        let mut motor = crate::ExpressionRuntime::default();
+        motor.managed_actions = true;
+        let expression = |face: FaceTarget| lifecore::ExpressionState {
+            geometry: face.geometry, mouth_open: face.mouth_open,
+            ..Default::default()
+        };
+        for _ in 0..120 { motor.update(expression(cautious), 0.0, 1.0 / 60.0); }
+        let previous = motor.current;
+        motor.update(expression(ready), 0.0, 1.0 / 60.0);
+        assert!(motor.current.geometry.maximum_error(previous.geometry) < 0.03);
+        assert!(motor.current.mouth_open > 0.0);
+        for _ in 0..120 { motor.update(expression(ready), 0.0, 1.0 / 60.0); }
+        assert!(motor.current.geometry.maximum_error(ready.geometry) < 0.001);
+        assert!(motor.current.mouth_open < 0.001);
+    }
+
+    #[test]
+    fn semantic_mouth_ownership_is_revoked_by_physiology_and_audio() {
+        let mut director = CompanionExpressionDirector::new(42);
+        for primary in [PrimaryIntent::Inspect, PrimaryIntent::EatInspect, PrimaryIntent::Celebrate] {
+            let input = intent(primary);
+            assert!(director.tick(input, Default::default(), 0.05).owns_mouth_aperture);
+            assert!(!director.tick(input, ExpressionEvidence {
+                protective_reflex: true, ..Default::default()
+            }, 0.05).owns_mouth_aperture);
+            let voiced = director.tick(input, ExpressionEvidence {
+                audio_active: true, audio_mouth_open: 0.37, ..Default::default()
+            }, 0.05);
+            assert!(!voiced.owns_mouth_aperture);
+            assert_eq!(voiced.face.mouth_open, 0.37);
+        }
+        for primary in [PrimaryIntent::Sleep, PrimaryIntent::Rest, PrimaryIntent::EatAccept, PrimaryIntent::EatReject] {
+            assert!(!director.tick(intent(primary), Default::default(), 0.05).owns_mouth_aperture);
+        }
     }
 
     #[test]
