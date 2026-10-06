@@ -17,3 +17,8 @@ __pycache__/
 /models/
 /reports/v68/
 /scripts/v68_*.py
+
+/reports/v681/
+/scripts/patch_v681.py
+/scripts/patch_vision_permission.py
+/scripts/patch_v681_followup.py

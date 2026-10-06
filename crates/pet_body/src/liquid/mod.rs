@@ -6,6 +6,7 @@ mod component_lifecycle;
 mod components;
 mod contact_surface;
 mod support_contact;
+mod living_flow;
 pub use contact_surface::{
     SmoothFaceOrigin, contact_surface_bounds, contact_surface_circle, contact_surface_min_y,
     contact_surface_support, contain_face_origin,
@@ -1273,6 +1274,20 @@ impl LiquidMorphRuntime {
                 motion.world_to_body_scale,
                 support_normal,
                 self.tuning.posture_gain,
+            );
+        }
+        // Production-only internal motion. The shared material phase remains
+        // continuous through attention and mood changes; support mobility is
+        // applied before every conservation projection, not only at the end.
+        if !sensors.pet_dragged && !self.material_grab.is_active()
+            && _intent.locomotion != lifecore::LocomotionMode::Sleep
+            && !matches!(_intent.pose, lifecore::PoseIntent::Sleeping | lifecore::PoseIntent::Cocoon)
+        {
+            posture_energy += living_flow::apply(
+                &mut self.particles, self.particle_count, self.components.main_component,
+                self.components.main_com, self.material_breath_phase + self.seed_phase,
+                _mind, self.somatic_actuation.internal.flow_strength_multiplier,
+                support_plane, motion.velocity.length(),
             );
         }
         let physical_packet = self.environment_support.as_ref().map(|support| {
@@ -3748,7 +3763,18 @@ fn apply_somatic_actuation(
                 | SomaticFieldKind::MassShift
                 | SomaticFieldKind::GravityBias => axis,
             };
-            let force = (direction * field.strength * weight * 2.4).clamp_length_max(2.4);
+            // A surface-normal ripple deforms free liquid, not the solid
+            // contact skin. All directed reach, grip and support fields keep
+            // their authority; this gate only localizes the authored Wave.
+            let mobility = if field.kind == SomaticFieldKind::Wave
+                && field.space == FieldSpace::SurfaceTangentNormal {
+                support_plane.map_or(1.0, |plane| {
+                    let gap = (particle.position - plane.point)
+                        .dot(plane.normal.normalize_or_zero()) - plane.clearance;
+                    smoothstep01(((gap - 0.025) / 0.14).clamp(0.0, 1.0))
+                })
+            } else { 1.0 };
+            let force = (direction * field.strength * weight * 2.4 * mobility).clamp_length_max(2.4);
             particle.force += force;
             let energy = force.length() * safe_dt;
             metrics.total_field_energy += energy;
@@ -3820,8 +3846,15 @@ fn apply_somatic_actuation(
                 } else {
                     5.0 - support.normal_compliance * 2.4
                 };
-            let friction =
-                -tangent * particle.velocity.dot(tangent) * support.tangent_friction * 0.65;
+            // Fluid-wall slip is local to the contacting particle layer.
+            // Applying wall drag through three contact depths also damps the
+            // free bulk, so its density profile keeps creeping after landing.
+            // Preserve the user's wall friction, but not that artificial volume drag.
+            let wall_slip = if wetting {
+                (1.0 - normal_distance.max(0.0) / (PARTICLE_SPACING * 0.5)).clamp(0.0, 1.0)
+            } else { 1.0 };
+            let friction = -tangent * particle.velocity.dot(tangent)
+                * support.tangent_friction * 0.65 * wall_slip;
             // The bottom layer receives the wall reaction, not a persistent
             // downward pull that the host cancels by lifting the whole pet.
             let load = -normal

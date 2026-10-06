@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::JoinHandle,
@@ -79,6 +79,7 @@ struct Job {
     masks: [RectI; 2],
     position: Vec2,
     submitted: Instant,
+    permission: u64,
 }
 struct Observation {
     id: u64,
@@ -86,6 +87,7 @@ struct Observation {
     prediction: ScenePrediction,
     position: Vec2,
     submitted: Instant,
+    permission: u64,
 }
 enum Event {
     Ready,
@@ -99,11 +101,16 @@ pub struct VisionBridge {
     window: Arc<Window>,
     settings: Settings,
     enabled: Arc<AtomicBool>,
+    permission: Arc<AtomicU64>,
     tx: Option<SyncSender<Job>>,
     rx: Option<Receiver<Event>>,
     worker: Option<JoinHandle<()>>,
     settings_poll: Instant,
     last_submit: Instant,
+    context_since: Instant,
+    last_sampled_context: Option<u64>,
+    budget_updated: Instant,
+    query_tokens: f32,
     last_status: Instant,
     last_cue: Instant,
     next_id: u64,
@@ -160,11 +167,16 @@ impl VisionBridge {
             window,
             settings,
             enabled: Arc::new(AtomicBool::new(false)),
+            permission: Arc::new(AtomicU64::new(0)),
             tx: None,
             rx: None,
             worker: None,
             settings_poll: old,
             last_submit: old,
+            context_since: old,
+            last_sampled_context: None,
+            budget_updated: Instant::now(),
+            query_tokens: 2.0,
             last_status: old,
             last_cue: old,
             next_id: 1,
@@ -198,15 +210,15 @@ impl VisionBridge {
         }
         self.settings_poll = Instant::now();
         let path = self.root.join("vision-settings.json");
-        if path.exists() {
-            self.settings = fs::read(path)
-                .ok()
-                .filter(|b| b.len() <= 4096)
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_default();
-        }
+        // Deletion, malformed input and unreadable settings all revoke capture.
+        self.settings = fs::read(path)
+            .ok()
+            .filter(|b| b.len() <= 4096)
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         self.settings.interval_seconds = self.settings.interval_seconds.clamp(8, 60);
         if !self.settings.enabled {
+            update_permission(&self.permission, false, false);
             self.enabled.store(false, Ordering::Release);
             self.tx.take();
             self.rx.take();
@@ -251,6 +263,7 @@ impl VisionBridge {
         let (events, rx) = mpsc::sync_channel::<Event>(4);
         let window = Arc::clone(&self.window);
         let enabled = Arc::clone(&self.enabled);
+        let permission = Arc::clone(&self.permission);
         enabled.store(true, Ordering::Release);
         self.state = "loading".into();
         self.last_error = None;
@@ -270,7 +283,9 @@ impl VisionBridge {
                     if !enabled.load(Ordering::Acquire) {
                         break;
                     }
-                    if job.submitted.elapsed() > Duration::from_secs(3) {
+                    if !permission_valid(&permission, job.permission)
+                        || job.submitted.elapsed() > Duration::from_secs(3)
+                    {
                         let _ = events.send(Event::Skipped(job.id));
                         continue;
                     }
@@ -283,6 +298,7 @@ impl VisionBridge {
                     let mut frame = None;
                     while start.elapsed() < Duration::from_millis(800)
                         && enabled.load(Ordering::Acquire)
+                        && permission_valid(&permission, job.permission)
                     {
                         std::thread::sleep(Duration::from_millis(25));
                         if let Some(candidate) =
@@ -301,11 +317,21 @@ impl VisionBridge {
                     if !enabled.load(Ordering::Acquire) {
                         break;
                     }
+                    if !permission_valid(&permission, job.permission) {
+                        let _ = events.send(Event::Skipped(job.id));
+                        continue;
+                    }
                     let Some(rgb) = masked_rgb(&frame, &job.masks) else {
                         let _ = events.send(Event::Skipped(job.id));
                         continue;
                     };
-                    match engine.classify(frame.width, frame.height, rgb, 256) {
+                    match engine.classify_with_cancellation(
+                        frame.width,
+                        frame.height,
+                        rgb,
+                        256,
+                        Some((Arc::clone(&permission), job.permission)),
+                    ) {
                         Ok(prediction) => {
                             let _ = events.send(Event::Observation(Observation {
                                 id: job.id,
@@ -313,10 +339,15 @@ impl VisionBridge {
                                 prediction,
                                 position: job.position,
                                 submitted: job.submitted,
+                                permission: job.permission,
                             }));
                         }
                         Err(e) => {
-                            let _ = events.send(Event::Failed(job.id, e.to_string()));
+                            if permission_valid(&permission, job.permission) {
+                                let _ = events.send(Event::Failed(job.id, e.to_string()));
+                            } else {
+                                let _ = events.send(Event::Skipped(job.id));
+                            }
                         }
                     }
                 }
@@ -335,6 +366,12 @@ impl VisionBridge {
         self.poll_settings();
         self.ensure_worker();
         let now = Instant::now();
+        // A short confirmation burst, then at most one budget token per 8s.
+        // Rapid task switching cannot turn semantic sensing into a busy loop.
+        self.query_tokens = (self.query_tokens
+            + now.duration_since(self.budget_updated).as_secs_f32() / 8.0)
+            .min(2.0);
+        self.budget_updated = now;
         let category = snapshot
             .active_application
             .as_ref()
@@ -344,7 +381,9 @@ impl VisionBridge {
             snapshot.active_application, snapshot.active_window
         );
         let context = lifecore::stable_hash_bytes(context_bytes.as_bytes());
-        if context != self.context {
+        let context_changed = context != self.context;
+        if context_changed {
+            self.context_since = now;
             self.current = None;
             self.attention = None;
             self.stable = 0;
@@ -354,6 +393,11 @@ impl VisionBridge {
         let paused = paused
             || category == AppCategory::Communication
             || snapshot.user_idle_seconds_or_zero() > 180.0;
+        update_permission(
+            &self.permission,
+            self.settings.enabled && !paused,
+            context_changed,
+        );
         if paused {
             self.current = None;
             self.attention = None;
@@ -399,6 +443,7 @@ impl VisionBridge {
                     if !self.settings.enabled
                         || paused
                         || obs.context != context
+                        || !permission_valid(&self.permission, obs.permission)
                         || obs.submitted.elapsed() > Duration::from_secs(9)
                     {
                         self.skipped += 1;
@@ -450,12 +495,20 @@ impl VisionBridge {
                 }
             }
         }
+        let fast_confirmation = self.last_sampled_context != Some(context)
+            || (self.stable == 1 && self.proposed.is_some_and(|(c, _)| c == context));
+        let interval = if fast_confirmation {
+            2
+        } else {
+            self.settings.interval_seconds
+        };
         if self.settings.enabled
             && !paused
             && !self.busy
             && self.state != "loading"
-            && self.last_submit.elapsed()
-                >= Duration::from_secs(u64::from(self.settings.interval_seconds))
+            && self.query_tokens >= 1.0
+            && self.context_since.elapsed() >= Duration::from_millis(650)
+            && self.last_submit.elapsed() >= Duration::from_secs(u64::from(interval))
             && let Some(rect) = snapshot.active_window
             && rect.is_valid()
             && let Ok(origin) = self.window.outer_position()
@@ -475,10 +528,13 @@ impl VisionBridge {
                     masks,
                     position: (min + max) * 0.5,
                     submitted: now,
+                    permission: self.permission.load(Ordering::Acquire),
                 };
                 if self.tx.as_ref().is_some_and(|tx| tx.try_send(job).is_ok()) {
                     self.next_id = self.next_id.saturating_add(1);
                     self.busy = true;
+                    self.last_sampled_context = Some(context);
+                    self.query_tokens = (self.query_tokens - 1.0).max(0.0);
                     self.last_submit = now;
                 }
             }
@@ -491,6 +547,7 @@ impl VisionBridge {
                 "schema_version":1,"enabled":self.settings.enabled,"state":self.state,"paused":paused,"inference_busy":self.busy,
                 "model":"LFM2.5-VL-450M-ONNX","provider":"CPU, 2 threads","scope":"active window, local only",
                 "completed":self.completed,"accepted":self.accepted,"ambiguous":self.ambiguous,"skipped":self.skipped,
+                "query_budget_tokens":self.query_tokens,"confirmation_interval_seconds":2,"context_debounce_ms":650,
                 "last_latency_ms":self.last_latency_ms,"scene":self.current.as_ref().map(|(_,p,_)|p.kind),"error":self.last_error,
                 "memory_entries":self.memory.entries.len(),"screenshots_saved":false,"model_revision":pet_vision::MODEL_REVISION}),
             );
@@ -522,9 +579,23 @@ impl VisionBridge {
 }
 impl Drop for VisionBridge {
     fn drop(&mut self) {
+        update_permission(&self.permission, false, true);
         self.enabled.store(false, Ordering::Release);
         self.tx.take();
     }
+}
+
+// One atomic word carries both permission (odd) and context generation. A
+// pause, revocation or context switch invalidates queued AND running work.
+fn update_permission(epoch: &AtomicU64, allowed: bool, context_changed: bool) {
+    let current = epoch.load(Ordering::Acquire);
+    if context_changed || ((current & 1 != 0) != allowed) {
+        let next = (current & !1).wrapping_add(2) | u64::from(allowed);
+        epoch.store(next, Ordering::Release);
+    }
+}
+fn permission_valid(epoch: &AtomicU64, token: u64) -> bool {
+    token & 1 != 0 && epoch.load(Ordering::Acquire) == token
 }
 
 fn matches_region(frame: &DesktopBackgroundFrame, region: DesktopBackgroundCaptureRegion) -> bool {
@@ -586,6 +657,24 @@ impl IdleSeconds for DesktopSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pause_revocation_and_context_switch_invalidate_old_capture_leases() {
+        let gate = AtomicU64::new(0);
+        assert!(!permission_valid(&gate, 0));
+        update_permission(&gate, true, false);
+        let first = gate.load(Ordering::Acquire);
+        assert!(permission_valid(&gate, first));
+        update_permission(&gate, true, false);
+        assert!(permission_valid(&gate, first));
+        update_permission(&gate, true, true);
+        assert!(!permission_valid(&gate, first));
+        let second = gate.load(Ordering::Acquire);
+        assert!(permission_valid(&gate, second));
+        update_permission(&gate, false, false);
+        assert!(!permission_valid(&gate, second));
+        update_permission(&gate, true, false);
+        assert!(!permission_valid(&gate, second));
+    }
     #[test]
     fn scene_memory_is_bounded_and_recognition_does_not_fabricate_rewards() {
         let mut memory = SceneMemory::default();

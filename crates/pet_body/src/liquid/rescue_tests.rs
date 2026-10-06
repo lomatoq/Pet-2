@@ -1485,3 +1485,50 @@ fn cradle_roundoff_cannot_invert_the_translation_interval() {
     super::xpbd::repair_cradle_penetration(&mut particles, 2, Some(super::xpbd::CradleBoundary { minimum, maximum, component_id: 0 }));
     assert!(particles[..2].iter().all(|p| p.position.is_finite() && p.velocity == Vec2::ZERO));
 }
+
+#[test]
+fn v681_living_flow_changes_real_particles_in_the_production_solver() {
+    let (genome, mut live) = migrated_runtime(42);
+    let (_, mut still) = migrated_runtime(42);
+    live.somatic_actuation.internal.flow_strength_multiplier = 1.0;
+    still.somatic_actuation.internal.flow_strength_multiplier = 0.0;
+    let mut peak_rms = 0.0_f32;
+    for tick in 0..720 {
+        idle_step(&mut live, &genome);
+        idle_step(&mut still, &genome);
+        if tick >= 360 {
+            let rms = (live.particles[..live.particle_count].iter()
+                .zip(&still.particles[..still.particle_count])
+                .map(|(a,b)| a.position.distance_squared(b.position)).sum::<f32>()
+                / live.particle_count as f32).sqrt();
+            peak_rms = peak_rms.max(rms);
+        }
+        assert!(live.diagnostics().finite);
+        assert_eq!(live.diagnostics().component_count, 1);
+        assert_eq!(live.diagnostics().failsafe_hits, 0);
+        assert_eq!(live.particle_count, still.particle_count);
+    }
+    assert!(peak_rms > 0.00005 && peak_rms < 0.04, "physical RMS={peak_rms}");
+}
+
+#[test]
+fn v681_supported_wave_moves_free_material_not_the_contact_skin() {
+    let (_, runtime) = migrated_runtime(42);
+    let mut particles = [LiquidParticle::default(); MAX_LIQUID_PARTICLES];
+    for (i, y) in [0.010, 0.08, 0.3].iter().enumerate() {
+        particles[i].position = Vec2::new(0.02, *y);
+        particles[i].inverse_mass = 1.0;
+    }
+    let mut packet = SomaticActuationPacket::default();
+    packet.fields[0] = Some(pet_motor::LocalSomaticField {
+        kind: SomaticFieldKind::Wave, space: FieldSpace::SurfaceTangentNormal,
+        center: Vec2::ZERO, axis: Vec2::Y, radius: 0.6, strength: 0.1,
+        falloff: 2.0, frequency_hz: 0.7, phase_01: 0.25, target_component: None,
+    });
+    apply_somatic_actuation(&mut particles,3,Vec2::ZERO,runtime.components,
+        Vec2::ZERO,Vec2::ZERO,Vec2::ONE,&packet,
+        Some(SupportPlane { point:Vec2::ZERO,normal:Vec2::Y,clearance:0.0 }),0.0,DT);
+    assert_eq!(particles[0].force,Vec2::ZERO);
+    assert!(particles[2].force.length() > 0.001);
+    assert!(particles[1].force.length() > 0.0);
+}

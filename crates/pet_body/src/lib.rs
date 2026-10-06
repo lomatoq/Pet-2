@@ -734,6 +734,12 @@ impl ProceduralBody {
         if !suppressed && self.self_care_motor.kind != lifecore::SelfCareKind::None {
             self.self_care.compose_body(&mut care_packet);
         }
+        // Reaching with the real mouth is a precision action. Decorative
+        // circulation yields to that controller; optical life and authored
+        // contact/motor fields keep running. The user's base packet is intact.
+        if self.feeding_expression_active || self.feeding_mouth_activity > 0.01 {
+            care_packet.internal.flow_strength_multiplier = 0.0;
+        }
         self.embodiment.liquid.set_somatic_actuation(care_packet);
 
         // The caller already composed R14, motor and semantic scene expression.

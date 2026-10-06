@@ -10,7 +10,11 @@ use std::{
     fs::File,
     io::Read,
     path::Path,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 use tokenizers::Tokenizer;
@@ -59,6 +63,10 @@ pub struct ScenePrediction {
 impl ScenePrediction {
     pub fn trustworthy(&self) -> bool {
         self.kind != SceneKind::Unknown
+            && [self.support, self.margin, self.label_mass]
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            && self.elapsed_ms >= 0.0
             && self.support >= 0.70
             && self.margin >= 0.25
             && self.label_mass >= 0.20
@@ -150,6 +158,9 @@ impl VisionEngine {
                 return Err("Unexpected label tokenization".into());
             }
             label_ids[i] = encoding.get_ids()[0] as usize;
+            if label_ids[i] >= 65536 {
+                return Err("Label token is outside the pinned decoder vocabulary".into());
+            }
         }
         Ok(Self {
             embedding: session("embed_tokens_fp16")?,
@@ -167,6 +178,23 @@ impl VisionEngine {
         rgb: Vec<u8>,
         side: u32,
     ) -> Result<ScenePrediction> {
+        self.classify_with_cancellation(width, height, rgb, side, None)
+    }
+
+    pub fn classify_with_cancellation(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgb: Vec<u8>,
+        side: u32,
+        permission: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Result<ScenePrediction> {
+        if permission
+            .as_ref()
+            .is_some_and(|(epoch, token)| token & 1 == 0 || epoch.load(Ordering::Acquire) != *token)
+        {
+            return Err("Vision request was revoked".into());
+        }
         if width == 0
             || height == 0
             || width > 4096
@@ -203,11 +231,19 @@ impl VisionEngine {
         let cancel = Arc::clone(&options);
         // The watchdog exits immediately on success/error; one inference at a time.
         std::thread::spawn(move || {
-            if matches!(
-                wait.recv_timeout(Duration::from_secs(8)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ) {
-                let _ = cancel.terminate();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let revoked = permission.as_ref().is_some_and(|(epoch, token)| {
+                    token & 1 == 0 || epoch.load(Ordering::Acquire) != *token
+                });
+                if revoked || Instant::now() >= deadline {
+                    let _ = cancel.terminate();
+                    break;
+                }
+                match wait.recv_timeout(Duration::from_millis(25)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
             }
         });
         let _completion = Completion(done);
@@ -357,6 +393,20 @@ mod tests {
         p.support = 0.98;
         assert!(p.trustworthy());
         p.elapsed_ms = 9000.;
+        assert!(!p.trustworthy());
+        p.elapsed_ms = 1000.;
+        for bad in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+            let mut invalid = p.clone();
+            invalid.support = bad;
+            assert!(!invalid.trustworthy());
+            invalid = p.clone();
+            invalid.margin = bad;
+            assert!(!invalid.trustworthy());
+            invalid = p.clone();
+            invalid.label_mass = bad;
+            assert!(!invalid.trustworthy());
+        }
+        p.elapsed_ms = -1.;
         assert!(!p.trustworthy());
         p.elapsed_ms = 1000.;
         p.kind = SceneKind::Unknown;

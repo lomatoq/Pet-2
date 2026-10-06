@@ -71,7 +71,8 @@ fn run(dir: &std::path::Path, case: &str, seed: u64, legacy: bool) -> Result<ser
         let waking = core.state.current_action == ActionId::WakeUp
             || packet.program == Some(BehaviorProgramId::RestRemDreamWake);
         let evidence = ToiletingEvidence { needed: gut.needs_to_go() || waste.active(),
-            allowed: !dragged, sleeping, waking, at_site, supported, slow: !interrupted };
+            allowed: !dragged, sleeping, waking, at_site, supported, slow: !interrupted,
+            distance_to_site: Some(if at_site { 0.0 } else { 0.2 }) };
         let execution = coordinator.step(evidence, DT);
         if !legacy && execution.reserve_awake { core.reserve_awake_for_physiology(); }
         if (execution.may_approach || (legacy && evidence.needed && evidence.allowed)) && first_approach.is_none() { first_approach = Some(seconds); }

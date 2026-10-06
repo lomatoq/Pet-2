@@ -1,0 +1,69 @@
+"""Summarize only completed checks and verify that tested source did not change."""
+import hashlib,json,os,re,sys
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1]; D=Path(os.environ.get('PET2_VALIDATION_DIR',str(ROOT/'reports/v681')))
+records={}
+for stage in ['workspace','build','gpu-build','contact','native','native-cancel','gpu','fresh-behavior','persistence']:
+    r=json.loads((D/(stage+'-result.json')).read_text(encoding='utf-8'))
+    assert r['exit']==0,(stage,r)
+    records[stage]=r
+paths=sorted(p for parent in ['app','crates','tools','config'] for p in (ROOT/parent).rglob('*')
+             if p.is_file() and p.suffix in ['.rs','.toml','.wgsl','.json'])
+h=hashlib.sha256()
+for p in paths:h.update(p.relative_to(ROOT).as_posix().encode());h.update(p.read_bytes())
+assert h.hexdigest()==json.loads((D/'source-digest.json').read_text(encoding='utf-8'))['sha256']
+log=(D/'workspace.log').read_text(encoding='utf-8',errors='replace')
+rows=re.findall(r'test result: (?:ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored',log)
+summary={k:sum(int(x[i]) for x in rows) for i,k in enumerate(['passed','failed','ignored'])}
+assert summary['passed']>1100 and summary['failed']==0
+summary.update({'test_target_summaries':len(rows),'source_sha256':h.hexdigest(),
+                'native_cancellation_additionally_run':True,'existing_acceptance_limits_changed':False})
+(D/'test-summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+contact=(D/'contact.log').read_text(encoding='utf-8')
+jitter=float(re.search(r'contact temporal range: ([0-9.eE+-]+)px',contact)[1])
+assert jitter<.05
+n=records['native'];g=records['gpu']
+text=f'''# Pet2 V68.1 — результаты проверки
+
+## Итог
+
+Rust workspace, release: **{summary['passed']} пройдено, {summary['failed']} ошибок, {summary['ignored']} пропущено по аннотациям проекта**. Пропуски не считаются успешными тестами. Аппаратный тест отмены VLM, отмеченный ignored в обычном прогоне, дополнительно выполнен с настоящими весами и ONNX Runtime.
+
+Все обязательные этапы завершились с кодом 0: полные тесты, сборка трёх исполняемых файлов, нативная модель, отмена запроса, GPU-рендер, игра на новом тестовом питомце и сохранение изолированной копии существующего состояния.
+
+Временные диагностические параметры теста опоры удалены. Исходный тест и его допуск 0,05 пикселя сохранены. Измеренный размах контактного контура: **{jitter:.6f} пикселя**. Сценарии кормления внутри домика, входа снаружи и последовательных крошек проходят. Производственный тест показывает движение реальных частиц от нового потока; отдельные тесты проверяют сохранение суммарной силы, момента и отсутствие объёмного раздувания.
+
+## Модель
+
+Нативный C++ ONNX Runtime вызывается из Rust. Профиль: LFM2.5-VL-450M, Q8 vision / FP16 embeddings / Q4 decoder, CPU, два потока. Все 11 фиксированных файлов модели проверены по SHA-256.
+
+Проверены четыре синтетические картинки по три раза: {n['observations']} наблюдений, {n['accepted']} принятых. Уверенно принятые ответы должны соответствовать эталонной категории; неоднозначные ответы отклоняются. Требуется распознавание документа и графика. Это **не** оценка точности на всём реальном рабочем столе и не подтверждение универсального понимания интерфейсов.
+
+Медиана вызова классификатора: {n['median_ms']:.1f} мс; выборочный p95: {n['p95_ms']:.1f} мс. Замеры не включают захват экрана и ожидание второго подтверждения. Детальные ответы находятся в native-result.json.
+
+В тесте отмены разрешение отзывалось через 80 мс после начала запроса; время прекращения вызова и успешная повторная работа того же engine записаны в native-cancel.log. Это отдельный тест вычислительного вызова, не замер задержки файлового переключателя настройки.
+
+## Изображение
+
+Получено {g['captured_frames']} кадров настоящим production-рендерером. Геометрия отдельно заморожена; только EnergyExpression меняется на чёрном, белом и сложном фоне. На каждом фоне обнаружено движение конечных пикселей, а не только внутренних параметров. Материал, форма и лицо дополнительно проверяются по material-review.png. physics.json содержит измерения настоящего решателя.
+
+Эти кадры — изолированный рендер с копией художественного профиля, не запись приватного рабочего стола. Данный тест не является замером FPS установленного приложения.
+
+## Сохранение
+
+Игровой headless smoke выполнен на новом изолированном питомце с seed 42. Существующая личность проверяется отдельно: копия сохранения загружается, симулируется и сохраняется без --reset-pet; геном должен сохраниться, экспорт должен совпасть с сохранённым состоянием. Сон у питомца с высокой потребностью во сне не считается ошибкой. Живой профиль этой проверкой не изменяется. Пересборка не закрывает и не переключает работающую версию.
+
+## Границы
+
+Зрение выдаёт девять грубых категорий и ограниченные сигналы внимания. В данном релизе не реализовано произвольное понимание сотен действий, генерация новых игр или универсальная предметная world model. Веса VLM не дообучаются на пользовательских снимках.
+
+macOS-сборка и macOS-установка этим прогоном не подтверждаются.
+
+## Привязка к коду
+
+SHA-256 проверенного дерева Rust/WGSL/TOML/JSON: `{h.hexdigest()}`.
+
+Source commit итогового пакета и SHA-256 каждого поставленного файла находятся в release-manifest.json. Неудачные промежуточные эксперименты сохранены в reports/v681 рабочего дерева и не выдаются за пройденные проверки.
+'''
+(D/'VALIDATION.md').write_text(text,encoding='utf-8',newline='\n')
+print(json.dumps(summary),flush=True)
