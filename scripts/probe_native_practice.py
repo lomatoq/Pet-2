@@ -38,7 +38,7 @@ def read(name):
     try:return json.loads((profile/name).read_text(encoding='utf-8-sig'))
     except (OSError,ValueError):return {}
 
-rows=[];sent=False;success=False;initial=0;started=time.monotonic()
+rows=[];sent=False;success=False;initial=0;started=time.monotonic();started_unix_ms=int(time.time()*1000);request_id=0;observed_requested_family=False
 stdout=(D/'native-practice-stdout.log').open('w',encoding='utf-8')
 stderr=(D/'native-practice-stderr.log').open('w',encoding='utf-8')
 p=subprocess.Popen([str(exe),'--data-dir',str(profile),'--no-audio','--debug-log'],cwd=package,stdout=stdout,stderr=stderr,creationflags=subprocess.CREATE_NO_WINDOW)
@@ -46,13 +46,18 @@ try:
     while time.monotonic()-started<90:
         if p.poll() is not None:raise RuntimeError('Diagnostic desktop pet exited')
         status=read('grounded-status.json');stats=status.get('stats',{})
-        if status.get('instance') and not sent:
+        own_runtime=read('runtime-load-ack.json').get('pid')==p.pid
+        if own_runtime and status.get('instance',0)>=started_unix_ms and not sent:
             initial=stats.get('plan_successes',0)
             request={'id':int(time.time()*1000),'instance':status['instance'],'issued_unix_ms':int(time.time()*1000),'action':'practice','family':'roll','level':0}
+            request_id=request['id']
             tmp=profile/'grounded-control.tmp';tmp.write_text(json.dumps(request),encoding='utf-8');os.replace(tmp,profile/'grounded-control.json');sent=True
         if status:
             rows.append({'seconds':round(time.monotonic()-started,2),'stats':stats,'exercise':status.get('exercise'),'suspended':status.get('suspended'),'message':status.get('message')})
-            if stats.get('plan_successes',0)>initial:
+            ack=read('grounded-control-ack.json')
+            x=status.get('exercise') or {}
+            observed_requested_family |= sent and x.get('family')=='roll'
+            if ack.get('id')==request_id and ack.get('applied') is True and observed_requested_family and stats.get('plan_successes',0)>initial:
                 success=True;break
         time.sleep(1)
 finally:
